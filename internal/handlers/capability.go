@@ -343,8 +343,15 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.httpClient.Do(upstreamReq)
 	if err != nil {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "used", 0, "upstream_error: "+err.Error(), tok.Nonce)
-		writeError(w, r, http.StatusBadGateway, "upstream_error", err.Error())
+		// NEVER return or persist the raw client error. It is a *url.Error
+		// whose Error() embeds the full outbound URL including RawQuery; for a
+		// query-injected secret (InjectionSpec.Type == "query") that URL holds
+		// the decrypted secret in cleartext, so err.Error() would leak the
+		// secret to the calling agent (USE-without-SEE break) AND write it to
+		// the capability_log.error audit column. The caller gets a generic
+		// message; the log gets a URL/query-redacted rendering.
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "used", 0, "upstream_error: "+redactUpstreamError(err), tok.Nonce)
+		writeError(w, r, http.StatusBadGateway, "upstream_error", "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
@@ -436,6 +443,34 @@ func injectSecret(req *http.Request, spec InjectionSpec, value []byte) error {
 		return fmt.Errorf("unsupported injection type %q", spec.Type)
 	}
 	return nil
+}
+
+// redactUpstreamError renders an outbound proxy error safe to persist to the
+// capability_log.error audit column. net/http surfaces transport failures
+// (DNS, connection refused/timeout, TLS, and the GuardedWebhookClient SSRF
+// block) as *url.Error values whose Error() embeds the full request URL,
+// including RawQuery. When a secret is injected as a query parameter
+// (InjectionSpec.Type == "query", see injectSecret) that URL carries the
+// decrypted secret in cleartext, so persisting err.Error() verbatim would
+// write the secret at rest. This strips the query string and any userinfo
+// from the embedded URL while keeping the operation + transport failure
+// reason for debugging. Callers of the proxy still receive only a generic
+// message, never this string.
+func redactUpstreamError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		safeURL := "[redacted]"
+		if u, perr := url.Parse(uerr.URL); perr == nil {
+			u.RawQuery = ""
+			u.User = nil
+			safeURL = u.String()
+		}
+		return fmt.Sprintf("%s %q: %v", uerr.Op, safeURL, uerr.Err)
+	}
+	return err.Error()
 }
 
 func parseDestinationPatterns(raw string) []string {

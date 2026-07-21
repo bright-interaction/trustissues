@@ -141,6 +141,13 @@ func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Guard the nonce length ourselves: gcm.Open PANICS on a wrong-length
+	// (e.g. nil/empty) nonce rather than returning an error, which would
+	// otherwise surface as a bare HTTP 500 via chi's Recoverer. A malformed
+	// stored nonce must degrade to a handled decrypt error, never a panic.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
+	}
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
@@ -304,6 +311,13 @@ func (h *VaultHandler) decrypt(ciphertext, nonce []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// Guard the nonce length ourselves: gcm.Open PANICS on a wrong-length
+	// (e.g. nil/empty) nonce rather than returning an error, which would
+	// otherwise surface as a bare HTTP 500 via chi's Recoverer. A malformed
+	// stored nonce must degrade to a handled decrypt error, never a panic.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
+	}
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
@@ -943,7 +957,16 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 
 	// Decrypt the current value once. provider.Rotate() needs it to
 	// authenticate against the provider API when minting the successor key.
-	entryRow, _ := h.queries.GetVaultEntryForRotation(ctx, id)
+	// Do NOT ignore this error: on an empty row (the pre-fix auto_rotate=1
+	// filter returned sql.ErrNoRows for on-demand entries) the zero-value
+	// nonce would reach h.decrypt. Ownership + meta were already verified
+	// above, so a failure here is a genuine load error, not a missing entry.
+	entryRow, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	if err != nil {
+		logError(r, "vault.rotate: load entry for rotation failed", "entry", id, "error", err)
+		writeInternalError(w, r, "failed to load secret for rotation")
+		return
+	}
 	if currentValue, decErr := h.decrypt(entryRow.EncryptedValue, entryRow.Nonce); decErr == nil {
 		oldValue = string(currentValue)
 		// Best-effort zero of the plaintext slice. oldValue copy outlives this.

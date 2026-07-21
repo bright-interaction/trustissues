@@ -105,7 +105,7 @@ func (q *Queries) GetUserPasswordHash(ctx context.Context, id string) (string, e
 
 const getVaultEntryForRotation = `-- name: GetVaultEntryForRotation :one
 SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
-FROM vault_entries WHERE id = ? AND auto_rotate = 1
+FROM vault_entries WHERE id = ?
 `
 
 type GetVaultEntryForRotationRow struct {
@@ -123,6 +123,15 @@ type GetVaultEntryForRotationRow struct {
 	RotationTargets      sql.NullString `json:"rotation_targets"`
 }
 
+// On-demand path: fetch a single entry (with its secret + rotation fields) by
+// id, with NO auto_rotate filter. This backs the manual Rotate and ValidateKey
+// handlers plus the rotation-log re-fetches, all of which are user-triggered
+// operations that MUST work for every entry regardless of auto_rotate (this is
+// an on-demand rotation product). The scheduled sweep uses a separate query,
+// ListVaultEntriesNeedingRotation, which keeps its own auto_rotate = 1 gate.
+// Do NOT re-add "AND auto_rotate = 1" here: it makes manual rotate panic
+// (empty row -> nil nonce -> GCM) and validate 404 for every entry that is not
+// auto-rotating.
 func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetVaultEntryForRotationRow, error) {
 	row := q.db.QueryRowContext(ctx, getVaultEntryForRotation, id)
 	var i GetVaultEntryForRotationRow

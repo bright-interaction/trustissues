@@ -76,6 +76,15 @@ type Querier interface {
 	GetUserPasswordHash(ctx context.Context, id string) (string, error)
 	GetUserTOTPState(ctx context.Context, id string) (GetUserTOTPStateRow, error)
 	GetVaultAutoLockMaxMinutes(ctx context.Context) (string, error)
+	// On-demand path: fetch a single entry (with its secret + rotation fields) by
+	// id, with NO auto_rotate filter. This backs the manual Rotate and ValidateKey
+	// handlers plus the rotation-log re-fetches, all of which are user-triggered
+	// operations that MUST work for every entry regardless of auto_rotate (this is
+	// an on-demand rotation product). The scheduled sweep uses a separate query,
+	// ListVaultEntriesNeedingRotation, which keeps its own auto_rotate = 1 gate.
+	// Do NOT re-add "AND auto_rotate = 1" here: it makes manual rotate panic
+	// (empty row -> nil nonce -> GCM) and validate 404 for every entry that is not
+	// auto-rotating.
 	GetVaultEntryForRotation(ctx context.Context, id string) (GetVaultEntryForRotationRow, error)
 	// ============================================================================
 	// Vault lookup for service-side resolution (owner-scoped, name-keyed)

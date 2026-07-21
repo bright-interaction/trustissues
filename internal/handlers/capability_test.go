@@ -44,6 +44,54 @@ func TestExtractCapabilityToken(t *testing.T) {
 	}
 }
 
+// TestRedactUpstreamError locks the USE-without-SEE boundary: an outbound
+// proxy failure must never carry the injected secret into the caller-facing
+// error or the capability_log.error audit column. net/http surfaces such
+// failures as *url.Error values whose Error() embeds the full request URL,
+// including a query-injected secret.
+func TestRedactUpstreamError(t *testing.T) {
+	const secret = "sk-QUERYLEAK-SECRET-777"
+
+	// Exactly the shape http.Client.Do produces when a query-injected secret
+	// sits in the URL and the dial fails (SSRF guard / timeout / refused).
+	uerr := &url.Error{
+		Op:  "Post",
+		URL: "https://10.0.0.1/v1/chat?api_key=" + secret + "&foo=bar",
+		Err: context.DeadlineExceeded,
+	}
+	if raw := uerr.Error(); !strings.Contains(raw, secret) {
+		t.Fatalf("precondition: raw *url.Error should embed the secret, got %q", raw)
+	}
+
+	got := redactUpstreamError(uerr)
+	if strings.Contains(got, secret) {
+		t.Fatalf("redacted error leaked the secret: %q", got)
+	}
+	if strings.Contains(got, "api_key") || strings.Contains(got, "foo=bar") || strings.Contains(got, "?") {
+		t.Fatalf("redacted error retained the query string: %q", got)
+	}
+	// Keeps operation, host+path, and transport reason for operator debugging.
+	for _, want := range []string{"Post", "https://10.0.0.1/v1/chat", "deadline exceeded"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("redacted error dropped %q: %q", want, got)
+		}
+	}
+
+	// A secret embedded in URL userinfo is stripped too.
+	uerr2 := &url.Error{Op: "Get", URL: "https://user:" + secret + "@ex.com/x", Err: context.DeadlineExceeded}
+	if got2 := redactUpstreamError(uerr2); strings.Contains(got2, secret) {
+		t.Fatalf("redacted error leaked userinfo secret: %q", got2)
+	}
+
+	// Non-*url.Error passes through unchanged (no URL to leak).
+	if got3 := redactUpstreamError(context.Canceled); got3 != context.Canceled.Error() {
+		t.Fatalf("non-url error should pass through, got %q", got3)
+	}
+	if redactUpstreamError(nil) != "" {
+		t.Fatal("nil error should redact to empty string")
+	}
+}
+
 func TestProxyBaseURL(t *testing.T) {
 	r := httptest.NewRequest("POST", "/api/secrets/issue", nil)
 	r.Host = "trustissues.example.com"

@@ -122,6 +122,35 @@ func TestVaultEncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDecryptRejectsMalformedNonce guards the manual-rotate crash backstop:
+// gcm.Open PANICS on a wrong-length (e.g. nil/empty) nonce, which chi's
+// Recoverer turns into a bare HTTP 500. decrypt / decryptWithKey must instead
+// return a handled error for any nonce that is not exactly gcm.NonceSize().
+func TestDecryptRejectsMalformedNonce(t *testing.T) {
+	vh := NewVaultHandler(nil, nil, &config.Config{VaultKey: "test-vault-key"})
+	ct, goodNonce, err := vh.encrypt([]byte("secret"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	for _, bad := range [][]byte{nil, {}, {0x00}, make([]byte, len(goodNonce)-1), make([]byte, len(goodNonce)+1)} {
+		if _, err := vh.decrypt(ct, bad); err == nil {
+			t.Fatalf("decrypt accepted malformed nonce (len=%d), want error", len(bad))
+		}
+	}
+
+	// decryptWithKey (the legacy-key path) shares the same guard.
+	var key [32]byte
+	if _, err := decryptWithKey(key, ct, nil); err == nil {
+		t.Fatal("decryptWithKey accepted nil nonce, want error")
+	}
+
+	// Sanity: the correct nonce still round-trips.
+	if _, err := vh.decrypt(ct, goodNonce); err != nil {
+		t.Fatalf("decrypt with valid nonce failed: %v", err)
+	}
+}
+
 // encryptWithKeyForTest mirrors the internal AES-256-GCM encryption with an
 // explicit key, used to seed legacy v1 rows.
 func encryptWithKeyForTest(t *testing.T, key [32]byte, plaintext []byte) (ciphertext, nonce []byte) {
