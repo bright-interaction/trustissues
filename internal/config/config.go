@@ -1,0 +1,149 @@
+// Package config centralizes all environment configuration for Trustissues.
+// Every environment variable read in the application goes through this
+// package; no other package calls os.Getenv directly. All variables use the
+// TRUSTISSUES_ prefix.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// Config holds all application configuration loaded from environment variables.
+type Config struct {
+	// Port is the HTTP listen port. Env: TRUSTISSUES_PORT (default 8080).
+	Port int
+	// JWTSecret signs session JWTs. Env: TRUSTISSUES_JWT_SECRET (required).
+	JWTSecret string
+	// VaultKey is the symmetric key protecting encrypted columns (vault
+	// entries, TOTP seeds, notification channel configs).
+	// Env: TRUSTISSUES_VAULT_KEY (required).
+	VaultKey string
+	// BaseURL is the externally reachable URL of this instance.
+	// Env: TRUSTISSUES_BASE_URL (default http://localhost:8080).
+	BaseURL string
+	// DataDir holds the SQLite database. Env: TRUSTISSUES_DATA_DIR (default ./data).
+	DataDir string
+	// FrontendDir is the built frontend to serve.
+	// Env: TRUSTISSUES_FRONTEND_DIR (default ./frontend/dist).
+	FrontendDir string
+	// LogLevel is one of debug, info, warn, error.
+	// Env: TRUSTISSUES_LOG_LEVEL (default info).
+	LogLevel string
+}
+
+// Load reads configuration from TRUSTISSUES_* environment variables.
+// TRUSTISSUES_JWT_SECRET and TRUSTISSUES_VAULT_KEY are required; the process
+// must refuse to start without them (auth and at-rest encryption are never
+// optional). All other fields have defaults.
+func Load() (*Config, error) {
+	cfg := &Config{
+		Port:        envInt("TRUSTISSUES_PORT", 8080),
+		JWTSecret:   os.Getenv("TRUSTISSUES_JWT_SECRET"),
+		VaultKey:    os.Getenv("TRUSTISSUES_VAULT_KEY"),
+		BaseURL:     envStr("TRUSTISSUES_BASE_URL", "http://localhost:8080"),
+		DataDir:     envStr("TRUSTISSUES_DATA_DIR", "./data"),
+		FrontendDir: envStr("TRUSTISSUES_FRONTEND_DIR", "./frontend/dist"),
+		LogLevel:    envStr("TRUSTISSUES_LOG_LEVEL", "info"),
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// SlogLevel converts the string log level to a slog.Level.
+func (c *Config) SlogLevel() slog.Level {
+	switch strings.ToLower(c.LogLevel) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// Validate checks the configuration for errors and returns all found issues.
+// Called at startup so misconfiguration fails fast instead of surfacing as
+// runtime auth or crypto failures.
+func (c *Config) Validate() error {
+	var errs []string
+
+	if c.Port < 1 || c.Port > 65535 {
+		errs = append(errs, fmt.Sprintf("TRUSTISSUES_PORT must be between 1 and 65535 (got %d)", c.Port))
+	}
+
+	// Auth is never optional: refuse to start without the required secrets.
+	if c.JWTSecret == "" {
+		errs = append(errs, "TRUSTISSUES_JWT_SECRET is required (generate one: openssl rand -hex 32)")
+	} else if len(c.JWTSecret) < 32 {
+		errs = append(errs, "TRUSTISSUES_JWT_SECRET must be at least 32 characters")
+	}
+
+	if c.VaultKey == "" {
+		errs = append(errs, "TRUSTISSUES_VAULT_KEY is required (generate one: openssl rand -hex 32)")
+	} else if len(c.VaultKey) < 32 {
+		errs = append(errs, "TRUSTISSUES_VAULT_KEY must be at least 32 characters")
+	}
+
+	if c.BaseURL != "" {
+		u, err := url.Parse(c.BaseURL)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("TRUSTISSUES_BASE_URL is invalid: %v", err))
+		} else if u.Scheme != "http" && u.Scheme != "https" {
+			errs = append(errs, "TRUSTISSUES_BASE_URL must use http or https scheme")
+		}
+	}
+
+	if c.DataDir == "" {
+		errs = append(errs, "TRUSTISSUES_DATA_DIR is required")
+	}
+
+	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if c.LogLevel != "" && !validLogLevels[strings.ToLower(c.LogLevel)] {
+		errs = append(errs, fmt.Sprintf("TRUSTISSUES_LOG_LEVEL must be one of: debug, info, warn, error (got %q)", c.LogLevel))
+	}
+
+	if len(errs) > 0 {
+		return errors.New("config validation failed:\n  - " + strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// WarnWeakConfig logs warnings for configuration that works but may be
+// insecure. Call after Validate() succeeds.
+func (c *Config) WarnWeakConfig() {
+	if strings.Contains(c.BaseURL, "localhost") || strings.Contains(c.BaseURL, "127.0.0.1") {
+		slog.Warn("TRUSTISSUES_BASE_URL is set to localhost, update for production use")
+	}
+	if strings.HasPrefix(c.BaseURL, "http://") && !strings.Contains(c.BaseURL, "localhost") && !strings.Contains(c.BaseURL, "127.0.0.1") {
+		slog.Warn("TRUSTISSUES_BASE_URL uses HTTP instead of HTTPS, session cookies carry the Secure flag and will not be sent over plain HTTP")
+	}
+}
+
+// envStr returns the value of an environment variable or a default.
+func envStr(key, defaultVal string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
+// envInt returns the value of an environment variable as int or a default.
+func envInt(key string, defaultVal int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return defaultVal
+}

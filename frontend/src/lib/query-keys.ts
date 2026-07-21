@@ -1,0 +1,28 @@
+export const queryKeys = {
+  auth: {
+    me: ['auth', 'me'] as const,
+    sessions: ['auth', 'sessions'] as const,
+  },
+  activity: {
+    all: ['activity'] as const,
+    list: (params?: Record<string, unknown>) =>
+      [...queryKeys.activity.all, 'list', params] as const,
+  },
+  admin: {
+    users: () => ['admin', 'users'] as const,
+    invitations: () => ['admin', 'invitations'] as const,
+  },
+  settings: {
+    all: ['settings'] as const,
+    vaultPolicy: () => ['settings', 'vault-policy'] as const,
+    smtp: () => ['settings', 'smtp'] as const,
+    sessionDuration: () => ['settings', 'session-duration'] as const,
+  },
+  // Reserved for the vault module (src/pages/Vault.tsx and friends).
+  vault: {
+    all: ['vault'] as const,
+    list: () => ['vault', 'list'] as const,
+    entry: (id: string) => ['vault', 'entry', id] as const,
+    targets: (id: string) => ['vault', 'targets', id] as const,
+  },
+};

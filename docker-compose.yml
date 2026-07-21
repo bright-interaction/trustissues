@@ -1,0 +1,22 @@
+services:
+  trustissues:
+    build:
+      context: .
+      args:
+        - SERVER_VERSION
+    container_name: trustissues
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - trustissues_data:/app/data
+    environment:
+      # Required secrets: the server refuses to start without them.
+      # Generate with: openssl rand -hex 32
+      - TRUSTISSUES_JWT_SECRET=${TRUSTISSUES_JWT_SECRET}
+      - TRUSTISSUES_VAULT_KEY=${TRUSTISSUES_VAULT_KEY}
+      - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
+      - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}
+
+volumes:
+  trustissues_data:

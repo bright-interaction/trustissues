@@ -1,0 +1,125 @@
+Trustissues Sustainable Use License
+
+Version 1.0
+
+This is a "fair-code" license (https://faircode.io). The source is open
+and free to read, run, and modify. It is NOT an OSI "open source" license,
+because it places one limit on commercial use: you may not resell
+Trustissues itself or run it as a service for third parties. The
+plain-English summary below is not part of the legal terms; the terms that
+follow it govern.
+
+------------------------------------------------------------------------
+Plain-English summary (informational, not the license)
+
+You CAN:
+  - Run Trustissues on your own servers / VPS, for free, forever.
+  - Use it for your own business, internally and commercially, to manage
+    your own passwords, API keys, and secret rotation.
+  - Manage secrets for your own clients as part of a service you provide
+    (e.g. an agency or MSP operating a deployment on a client's behalf).
+  - Read, modify, and self-distribute the source, keeping this license.
+
+You CANNOT, without a separate commercial agreement from the Licensor:
+  - Sell Trustissues, or offer it to third parties as a hosted or managed
+    service whose value derives substantially from Trustissues' own
+    functionality (i.e. a competing "Trustissues cloud", or a hosted
+    password-management or secrets-rotation service built on its engine).
+  - Remove or obscure the licensing, copyright, or attribution notices,
+    or use the "Trustissues" or "Bright Interaction" names or logos for a
+    fork without permission.
+------------------------------------------------------------------------
+
+1. Definitions
+
+   "Software" means the Trustissues source code, binaries, and
+   documentation distributed under this license.
+
+   "Licensor" means Bright Interaction, the copyright holder.
+
+   "You" means the individual or entity exercising the rights below.
+
+   "Your Customers" means third parties to whom You provide professional
+   services (such as hosting, managed infrastructure, DevOps, or
+   consulting) where the primary thing You provide is Your service, not
+   the Software itself.
+
+   "Provide a Competing Service" means making the Software, or a modified
+   version of it, available to third parties as a hosted, managed, or
+   white-labeled product or service whose value derives substantially from
+   the Software's own functionality, including any offering that competes
+   with a hosted Trustissues product offered by the Licensor.
+
+2. Grant
+
+   Subject to the conditions in Sections 3 and 4, the Licensor grants You
+   a worldwide, royalty-free, non-exclusive, non-sublicensable license to
+   use, copy, modify, and distribute the Software for any purpose,
+   including commercial purposes.
+
+3. Permitted commercial use
+
+   For the avoidance of doubt, the following are expressly permitted:
+
+   (a) running the Software for Your own internal business operations,
+       including managing Your own production credentials and secrets;
+
+   (b) using the Software to manage credentials and secrets for Your
+       Customers as part of a professional service, including operating a
+       Customer-specific deployment on their behalf;
+
+   (c) distributing the Software, modified or unmodified, free of charge,
+       provided this license and all notices travel with it.
+
+4. Conditions and limitations
+
+   (a) You may not Provide a Competing Service without a separate
+       commercial license from the Licensor.
+
+   (b) You may not sell the Software as a product where the value of the
+       sale derives substantially from the Software's own functionality.
+
+   (c) You may not remove, alter, or obscure any licensing, copyright, or
+       attribution notice in the Software, and You must ensure that anyone
+       who receives any part of the Software from You also receives a copy
+       of this license.
+
+   (d) "Trustissues" and "Bright Interaction", and associated logos, are
+       trademarks of the Licensor. This license grants no rights to use
+       those marks. A fork must be clearly renamed and must not imply
+       endorsement by or affiliation with the Licensor.
+
+5. Patents
+
+   The Licensor grants You a license to any patent claims it can license
+   that are necessarily infringed by the Software, limited to the rights
+   granted in Section 2. This patent license terminates if You bring a
+   patent claim alleging the Software infringes a patent.
+
+6. Termination
+
+   If You violate this license, Your rights under it terminate
+   automatically. They may be reinstated by the Licensor in writing. On
+   termination You must stop using and distributing the Software, though
+   copies already distributed in compliance remain licensed.
+
+7. Commercial licenses
+
+   If You want to do something this license does not permit, including
+   Providing a Competing Service, contact the Licensor at
+   licensing@brightinteraction.com for a separate commercial license.
+
+8. Disclaimer of warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+9. Limitation of liability
+
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+   OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+   IN THE SOFTWARE.
+
+Copyright (c) Bright Interaction. All rights reserved.

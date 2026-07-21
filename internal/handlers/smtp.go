@@ -1,0 +1,201 @@
+package handlers
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/smtp"
+	"strings"
+)
+
+// sendInvitationEmail sends a branded invitation email via SMTP.
+func sendInvitationEmail(host, port, from, username, password string, useTLS bool, toEmail, name, code, serverURL string) error {
+	if port == "" {
+		if useTLS {
+			port = "465"
+		} else {
+			port = "587"
+		}
+	}
+
+	addr := net.JoinHostPort(host, port)
+
+	subject := "You've been invited to Trustissues"
+	htmlBody := buildInvitationHTML(name, code, serverURL)
+
+	msg := buildMIMEMessage(from, toEmail, subject, htmlBody)
+
+	var auth smtp.Auth
+	if username != "" && password != "" {
+		auth = smtp.PlainAuth("", username, password, host)
+	}
+
+	if useTLS && port == "465" {
+		// Implicit TLS (SMTPS)
+		return sendMailTLS(addr, host, auth, from, toEmail, msg)
+	}
+
+	// STARTTLS (port 587 or 25)
+	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg)
+}
+
+// sendTestEmail sends a short test message so admins can verify their SMTP
+// settings from the Settings page.
+func sendTestEmail(host, port, from, username, password string, useTLS bool, toEmail string) error {
+	if port == "" {
+		if useTLS {
+			port = "465"
+		} else {
+			port = "587"
+		}
+	}
+
+	addr := net.JoinHostPort(host, port)
+	subject := "Trustissues SMTP test"
+	htmlBody := `<p>This is a test email from Trustissues. Your SMTP settings work.</p>`
+	msg := buildMIMEMessage(from, toEmail, subject, htmlBody)
+
+	var auth smtp.Auth
+	if username != "" && password != "" {
+		auth = smtp.PlainAuth("", username, password, host)
+	}
+
+	if useTLS && port == "465" {
+		return sendMailTLS(addr, host, auth, from, toEmail, msg)
+	}
+	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg)
+}
+
+func buildMIMEMessage(from, to, subject, htmlBody string) []byte {
+	// Sanitize header values to prevent CRLF header injection
+	sanitize := func(s string) string {
+		s = strings.ReplaceAll(s, "\r", "")
+		s = strings.ReplaceAll(s, "\n", "")
+		return s
+	}
+	headers := fmt.Sprintf(
+		"From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n",
+		sanitize(from), sanitize(to), sanitize(subject),
+	)
+	return []byte(headers + htmlBody)
+}
+
+func sendMailTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
+	tlsConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("TLS dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return fmt.Errorf("SMTP client failed: %w", err)
+	}
+	defer client.Quit()
+
+	if auth != nil {
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP auth failed: %w", err)
+		}
+	}
+
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM failed: %w", err)
+	}
+	if err := client.Rcpt(to); err != nil {
+		return fmt.Errorf("SMTP RCPT TO failed: %w", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA failed: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("SMTP write failed: %w", err)
+	}
+	return w.Close()
+}
+
+func sendMailSTARTTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
+	client, err := smtp.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("SMTP dial failed: %w", err)
+	}
+	defer client.Quit()
+
+	// Try STARTTLS
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		tlsConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			return fmt.Errorf("STARTTLS failed: %w", err)
+		}
+	}
+
+	if auth != nil {
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP auth failed: %w", err)
+		}
+	}
+
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM failed: %w", err)
+	}
+	if err := client.Rcpt(to); err != nil {
+		return fmt.Errorf("SMTP RCPT TO failed: %w", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA failed: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("SMTP write failed: %w", err)
+	}
+	return w.Close()
+}
+
+func buildInvitationHTML(name, code, serverURL string) string {
+	greeting := "Hi"
+	if name != "" {
+		greeting = "Hi " + name
+	}
+
+	serverURL = strings.TrimRight(serverURL, "/")
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:520px;margin:40px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+  <div style="background:#0f172a;padding:28px 32px;text-align:center">
+    <span style="color:white;font-size:20px;font-weight:700;vertical-align:middle">Trustissues</span>
+  </div>
+  <div style="padding:32px">
+    <h2 style="color:#0f172a;margin:0 0 8px;font-size:22px">You've been invited to Trustissues</h2>
+    <p style="color:#475569;margin:0 0 24px;font-size:15px;line-height:1.6">
+      %s, you've been invited to use Trustissues, a secure password manager for your team.
+    </p>
+    <div style="background:#f1f5f9;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px">
+      <p style="color:#64748b;margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:1px">Your Setup Code</p>
+      <p style="color:#0f172a;margin:0;font-size:32px;font-weight:700;letter-spacing:4px;font-family:monospace">%s</p>
+    </div>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:20px;margin-bottom:24px">
+      <p style="color:#64748b;margin:0 0 4px;font-size:13px">Server URL</p>
+      <p style="color:#0f172a;margin:0;font-size:14px;font-family:monospace;word-break:break-all">%s</p>
+    </div>
+    <h3 style="color:#0f172a;margin:0 0 12px;font-size:15px">Getting Started</h3>
+    <ol style="color:#475569;margin:0 0 24px;padding-left:20px;font-size:14px;line-height:2">
+      <li>Open the server URL above (or install the vault browser extension)</li>
+      <li>Choose <strong>"Have a setup code?"</strong></li>
+      <li>Enter your setup code</li>
+    </ol>
+    <p style="color:#94a3b8;margin:0;font-size:12px">
+      This invitation expires in 48 hours. If it has expired, ask your administrator for a new one.
+    </p>
+  </div>
+  <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 32px;text-align:center">
+    <p style="color:#94a3b8;margin:0;font-size:12px">Sent from Trustissues &middot; Self-hosted Secret Management</p>
+  </div>
+</div>
+</body>
+</html>`, greeting, code, serverURL)
+}
