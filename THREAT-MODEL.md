@@ -171,3 +171,40 @@ mitigation until the code-side fix ships.
    see everything by design. This is why several Phase 2 items (tamper-evident
    agent audit, post-deletion attribution) are safe to defer. See `DEFERRED.md`.
    Do not run one instance as a shared vault for mutually-distrusting teams.
+
+## The AI boundary (gateway + MCP + Shield)
+
+Trustissues can let an assistant or app use AI and stored credentials. The
+protections differ by asset, and it is important to be precise:
+
+- **Credentials: fully protected.** The AI gateway injects the provider key
+  server-side; the MCP `use_secret` returns a single-use, destination-bound
+  capability token, never a value. The AI and the human never see the secret,
+  in use or at rest, and every use is attributed and logged.
+- **PII in prompts/tool results: protected only with Shield on.** With
+  `TRUSTISSUES_SHIELD_KEY` set, structured PII (email, phone, personnummer, IBAN)
+  is tokenized before it crosses to the external model and resolved server-side
+  for the trusted caller. Arbitrary names/companies in free-form prompts are NOT
+  caught by the regex path (see DEFERRED (g)). With Shield off, prompt content
+  passes through to the provider unchanged.
+- **The prompt itself is never private from the provider.** Anthropic/OpenAI see
+  whatever (tokenized) content the model needs to reason. Shield keeps the raw
+  PII off that boundary; it does not make the conversation invisible to the
+  provider. Full privacy requires a self-hosted model.
+- **The server still decrypts to inject.** Server-side injection means the vault
+  process transiently holds plaintext (the documented trust model). "Use without
+  the AI or human seeing it" is achievable; "use without the server seeing it" is
+  not, when the server does the injecting.
+
+**Confused-deputy / prompt-injection controls.** Because an assistant can invoke
+`use_secret`, a malicious prompt could try to make it act toward an
+attacker-chosen destination. Mitigations, all enforced server-side: the secret's
+`destination_patterns` allow-list is a hard ceiling a token request can only
+narrow; tokens are single-use and destination-bound; per-(agent, secret) grants
+gate issuance; the `/proxy` client refuses redirects (no key egress) and forwards
+only to the bound host. High-risk automations should still keep a human in the
+loop.
+
+**Fail-safe posture.** A set-but-wrong-length `TRUSTISSUES_SHIELD_KEY` refuses to
+boot rather than silently disabling tokenization; the gateway rejects (never
+forwards) a request whose body cannot be tokenized while Shield is on.

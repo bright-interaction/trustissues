@@ -178,6 +178,34 @@ Backup rules (the short version):
 `chmod 600 "$TRUSTISSUES_DATA_DIR"/trustissues.db*` after first boot on a
 multi-user host.
 
+## AI gateway and MCP (use AI while keeping secrets)
+
+Trustissues can act as a safe boundary between your team and Claude/OpenAI so an
+assistant or app gets the power of AI without ever holding a credential, and
+without leaking PII to the model.
+
+**AI gateway.** An admin points a provider at a stored key in Settings > AI &
+MCP (each key is an `api_key` vault entry). Devs then aim their Anthropic or
+OpenAI SDK at this instance instead of the provider:
+
+- base URL `https://<your-host>/api/ai/anthropic` (or `/api/ai/openai`)
+- authenticate with an API key from Settings > API keys (`X-API-Key` header)
+
+Trustissues injects the team's provider key server-side (the dev never holds
+it), tokenizes PII in the prompt through Shield before it egresses, resolves the
+markers in the response, and logs attributed usage. Non-streaming only in v1
+(`"stream": false`).
+
+**MCP.** A remote MCP endpoint at `https://<your-host>/api/mcp` (JSON-RPC) that
+Claude and ChatGPT connectors can add, authenticated with an API key
+(`X-API-Key`). It exposes `list_secrets` (names only) and `use_secret` (mints a
+single-use, destination-bound capability token so the assistant acts with a
+secret it never sees, via `/proxy`). Tool results pass through Shield.
+
+**Shield.** Set `TRUSTISSUES_SHIELD_KEY` (exactly 32 bytes) to turn on
+LLM-boundary tokenization; leave it unset to pass data through unchanged. See
+`THREAT-MODEL.md` for exactly what Shield does and does not protect.
+
 ## Browser extension setup
 
 The `vault_only` role is the browser-extension role. To connect the extension a

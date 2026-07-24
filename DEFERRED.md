@@ -141,3 +141,28 @@ the trusted admin, who knows who they just removed. The historical record is
 degraded (actor becomes "(system)") but not falsified, and no row is destroyed.
 Faithful post-deletion attribution matters most for compliance / multi-admin
 setups, which arrive with the Phase 2 teams work.
+
+## (g) AI gateway + MCP: streaming, connector OAuth, unstructured-PII coverage
+
+Shipped in the AI-boundary phases: the AI gateway (server-side provider-key
+injection + Shield tokenization), a remote HTTP MCP (list_secrets + use_secret),
+and the operator UI. Three follow-ups are intentionally deferred:
+
+1. **Streaming.** The gateway is non-streaming in v1: Shield markers can span SSE
+   chunks, so a streamed response cannot be reliably tokenized/resolved. Design:
+   buffer-and-resolve per SSE event, or pass streaming through only when Shield
+   is off. Until then `"stream": true` is rejected.
+2. **MCP connector OAuth.** The MCP + gateway authenticate with a per-user
+   API key sent as `X-API-Key`. Some hosted connectors prefer OAuth or a bearer
+   token. Add an OAuth authorization-server surface (or bearer acceptance) so
+   any connector UI can complete a standard flow.
+3. **Unstructured-PII coverage.** Shield's gateway/MCP path uses the regex safety
+   net, which catches structured PII (email, phone, personnummer, IBAN) but not
+   arbitrary names/companies (those need the struct-tag path, which suits typed
+   tool responses, not free-form prompts). Consider an NER pass for free-form
+   prompt bodies if name-level tokenization is required.
+
+**Why safe to defer.** The core guarantee (credentials never reach the AI or the
+human; structured PII tokenized before egress; single-use destination-bound
+capability tokens) holds today. These three widen coverage and connector
+ergonomics, they do not change the security floor.
