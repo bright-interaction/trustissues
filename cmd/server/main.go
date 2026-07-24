@@ -210,6 +210,7 @@ func main() {
 		slog.Info("shield enabled", "hint_level", cfg.ShieldHintLevel)
 	}
 	aiGatewayHandler := handlers.NewAIGatewayHandler(queries, cfg, vaultHandler, shieldStore)
+	mcpHandler := handlers.NewMCPHandler(queries, cfg, capabilityHandler, shieldStore)
 
 	// Alert channel dispatcher + notification-channel admin CRUD.
 	dispatcher := alerts.NewChannelDispatcher(appCtx, queries, vaultHandler)
@@ -404,6 +405,10 @@ func main() {
 			// Any authenticated caller (session or API key) may use it; the key
 			// itself is never exposed. Non-streaming only in v1.
 			r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
+
+			// Remote HTTP MCP endpoint (JSON-RPC) for Claude/ChatGPT connectors:
+			// list_secrets + use_secret, with Shield tokenizing tool results.
+			r.Post("/mcp", mcpHandler.Handle)
 
 			// Capability bridge token minting (dockyard main.go:894-896).
 			// Sensitive op: rate limited hard.
