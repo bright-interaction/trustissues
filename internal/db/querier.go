@@ -10,10 +10,16 @@ import (
 )
 
 type Querier interface {
+	// ============================================================================
+	// Membership
+	// ============================================================================
+	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	CountActivityEntriesByUser(ctx context.Context, userID sql.NullString) (int64, error)
 	CountAdmins(ctx context.Context) (int64, error)
+	CountCollectionEntries(ctx context.Context, collectionID sql.NullString) (int64, error)
+	CountCollectionManagers(ctx context.Context, collectionID string) (int64, error)
 	CountRecentFailedLoginAttemptsByEmail(ctx context.Context, email string) (int64, error)
 	CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddress string) (int64, error)
 	CountUsers(ctx context.Context) (int64, error)
@@ -27,6 +33,13 @@ type Querier interface {
 	// ============================================================================
 	CountVaultEntriesV1(ctx context.Context) (int64, error)
 	CreateAPIKeyForUser(ctx context.Context, arg CreateAPIKeyForUserParams) error
+	// collections.sql: shared team vaults (collections) + membership, plus the
+	// collection-aware vault-entry queries that replace the per-user-only lookups so
+	// a member sees personal entries AND entries in collections they belong to.
+	// ============================================================================
+	// Collections CRUD
+	// ============================================================================
+	CreateCollection(ctx context.Context, arg CreateCollectionParams) error
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
 	CreateInvitedUser(ctx context.Context, arg CreateInvitedUserParams) (string, error)
 	CreateLoginAttempt(ctx context.Context, arg CreateLoginAttemptParams) error
@@ -44,6 +57,7 @@ type Querier interface {
 	CreateVaultEntry(ctx context.Context, arg CreateVaultEntryParams) error
 	DeleteAPIKey(ctx context.Context, arg DeleteAPIKeyParams) (sql.Result, error)
 	DeleteAPIKeysByUser(ctx context.Context, userID string) error
+	DeleteCollection(ctx context.Context, id string) error
 	DeleteNotificationChannel(ctx context.Context, id string) (sql.Result, error)
 	DeletePendingInvitation(ctx context.Context, id string) (sql.Result, error)
 	DeleteServiceIdentity(ctx context.Context, id string) (sql.Result, error)
@@ -56,6 +70,8 @@ type Querier interface {
 	// vault entry counts. Kept out of the platform-owned query files per the
 	// CONTRACT.md rule (new queries go in new files).
 	ExportActivityEntries(ctx context.Context, arg ExportActivityEntriesParams) ([]ExportActivityEntriesRow, error)
+	GetCollection(ctx context.Context, id string) (Collection, error)
+	GetCollectionMemberRole(ctx context.Context, arg GetCollectionMemberRoleParams) (string, error)
 	GetInvitationForResend(ctx context.Context, id string) (GetInvitationForResendRow, error)
 	GetNotificationChannel(ctx context.Context, id string) (GetNotificationChannelRow, error)
 	GetPasswordHashByUserID(ctx context.Context, id string) (string, error)
@@ -81,6 +97,12 @@ type Querier interface {
 	GetUserPasswordHash(ctx context.Context, id string) (string, error)
 	GetUserTOTPState(ctx context.Context, id string) (GetUserTOTPStateRow, error)
 	GetVaultAutoLockMaxMinutes(ctx context.Context) (string, error)
+	// ============================================================================
+	// Collection-aware vault-entry access
+	// ============================================================================
+	// Returns the owner and collection of an entry so the handler can authorize a
+	// single-entry operation (personal: owner-or-admin; collection: member role).
+	GetVaultEntryAccess(ctx context.Context, id string) (GetVaultEntryAccessRow, error)
 	// On-demand path: fetch a single entry (with its secret + rotation fields) by
 	// id, with NO auto_rotate filter. This backs the manual Rotate and ValidateKey
 	// handlers plus the rotation-log re-fetches, all of which are user-triggered
@@ -120,14 +142,21 @@ type Querier interface {
 	InsertServiceSecretAudit(ctx context.Context, arg InsertServiceSecretAuditParams) error
 	InvalidateUserSessions(ctx context.Context, arg InvalidateUserSessionsParams) error
 	ListAPIKeysByUser(ctx context.Context, userID string) ([]ListAPIKeysByUserRow, error)
+	ListAccessibleVaultEntries(ctx context.Context, arg ListAccessibleVaultEntriesParams) ([]ListAccessibleVaultEntriesRow, error)
+	ListAccessibleVaultEntriesWithSecrets(ctx context.Context, arg ListAccessibleVaultEntriesWithSecretsParams) ([]ListAccessibleVaultEntriesWithSecretsRow, error)
+	// Names visible to the user (personal + collections) for import conflict checks.
+	ListAccessibleVaultEntryNames(ctx context.Context, arg ListAccessibleVaultEntryNamesParams) ([]string, error)
 	ListActivityEntries(ctx context.Context, arg ListActivityEntriesParams) ([]ListActivityEntriesRow, error)
 	ListActivityEntriesByAction(ctx context.Context, arg ListActivityEntriesByActionParams) ([]ListActivityEntriesByActionRow, error)
 	ListActivityEntriesByUser(ctx context.Context, arg ListActivityEntriesByUserParams) ([]ListActivityEntriesByUserRow, error)
+	ListAllCollections(ctx context.Context) ([]Collection, error)
 	// ============================================================================
 	// List entries (metadata only)
 	// ============================================================================
 	ListAllVaultEntries(ctx context.Context) ([]ListAllVaultEntriesRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
+	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
+	ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error)
 	ListEnabledNotificationChannels(ctx context.Context) ([]ListEnabledNotificationChannelsRow, error)
 	ListExpiringVaultEntries(ctx context.Context, windowDays string) ([]ListExpiringVaultEntriesRow, error)
 	ListInvitations(ctx context.Context) ([]ListInvitationsRow, error)
@@ -158,6 +187,7 @@ type Querier interface {
 	// ============================================================================
 	ListVaultEntryNamesByUser(ctx context.Context, userID string) ([]string, error)
 	MarkInvitationRedeemed(ctx context.Context, arg MarkInvitationRedeemedParams) error
+	MatchAccessibleVaultEntriesByURL(ctx context.Context, arg MatchAccessibleVaultEntriesByURLParams) ([]MatchAccessibleVaultEntriesByURLRow, error)
 	// ============================================================================
 	// URL matching (browser extension autofill)
 	// ============================================================================
@@ -167,6 +197,7 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
+	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
 	// ============================================================================
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 	// ============================================================================
@@ -183,8 +214,10 @@ type Querier interface {
 	// patterns are never overwritten.
 	SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error
 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (sql.Result, error)
+	SetVaultEntryCollection(ctx context.Context, arg SetVaultEntryCollectionParams) error
 	StoreTOTPSecret(ctx context.Context, arg StoreTOTPSecretParams) error
 	TouchServiceIdentityLastUsed(ctx context.Context, id string) error
+	UpdateCollection(ctx context.Context, arg UpdateCollectionParams) error
 	UpdateNotificationChannelEnabled(ctx context.Context, arg UpdateNotificationChannelEnabledParams) (sql.Result, error)
 	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
 	UpdateRecoveryCodes(ctx context.Context, arg UpdateRecoveryCodesParams) error

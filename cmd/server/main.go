@@ -166,6 +166,7 @@ func main() {
 	settingsHandler := handlers.NewSettingsHandler(queries)
 	activityHandler := handlers.NewActivityHandler(queries)
 	apiKeyHandler := handlers.NewAPIKeyHandler(queries)
+	collectionHandler := handlers.NewCollectionHandler(queries)
 
 	// Encrypt any plaintext TOTP seeds at rest (idempotent).
 	if err := authHandler.MigrateTOTPSecrets(); err != nil {
@@ -366,8 +367,26 @@ func main() {
 				r.Get("/{id}/targets", vaultHandler.GetTargets)
 				r.Put("/{id}/targets", vaultHandler.UpdateTargets)
 				r.Put("/{id}/schedule", vaultHandler.UpdateSchedule)
+				r.Put("/{id}/collection", vaultHandler.MoveToCollection)
 				r.Post("/import/preview", vaultImportHandler.ImportPreview)
 				r.Post("/import/confirm", vaultImportHandler.ImportConfirm)
+			})
+
+			// Shared team vaults (collections) + membership. Any authenticated
+			// role may hold a collection membership, so this sits in the general
+			// group; the handlers enforce per-collection manager rights for
+			// mutations and 404 non-members.
+			r.Route("/collections", func(r chi.Router) {
+				r.Get("/", collectionHandler.List)
+				r.Post("/", collectionHandler.Create)
+				r.Route("/{id}", func(r chi.Router) {
+					r.Get("/", collectionHandler.Get)
+					r.Put("/", collectionHandler.Update)
+					r.Delete("/", collectionHandler.Delete)
+					r.Get("/members", collectionHandler.ListMembers)
+					r.Post("/members", collectionHandler.AddMember)
+					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
+				})
 			})
 
 			// Capability bridge token minting (dockyard main.go:894-896).

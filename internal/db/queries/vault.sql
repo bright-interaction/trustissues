@@ -28,7 +28,7 @@ SELECT user_id FROM vault_entries WHERE id = ?;
 -- ============================================================================
 
 -- name: ListAllVaultEntries :many
-SELECT id, user_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
+SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
 FROM vault_entries ORDER BY name ASC;
 
 -- name: ListVaultEntriesByUser :many

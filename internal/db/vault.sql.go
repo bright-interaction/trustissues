@@ -287,13 +287,14 @@ func (q *Queries) ImportVaultEntry(ctx context.Context, arg ImportVaultEntryPara
 
 const listAllVaultEntries = `-- name: ListAllVaultEntries :many
 
-SELECT id, user_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
+SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
 FROM vault_entries ORDER BY name ASC
 `
 
 type ListAllVaultEntriesRow struct {
 	ID                   string         `json:"id"`
 	UserID               string         `json:"user_id"`
+	CollectionID         sql.NullString `json:"collection_id"`
 	Name                 string         `json:"name"`
 	Url                  sql.NullString `json:"url"`
 	AliasUrl             sql.NullString `json:"alias_url"`
@@ -327,6 +328,7 @@ func (q *Queries) ListAllVaultEntries(ctx context.Context) ([]ListAllVaultEntrie
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
+			&i.CollectionID,
 			&i.Name,
 			&i.Url,
 			&i.AliasUrl,
