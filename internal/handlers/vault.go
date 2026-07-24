@@ -518,6 +518,23 @@ func (h *VaultHandler) decrypt(ciphertext, nonce []byte) ([]byte, error) {
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
+// DecryptedValueByID returns the decrypted secret value of an entry by id. It
+// exists for server-side consumers that inject a stored credential into an
+// outbound request without exposing it (the AI gateway). It does NOT do access
+// control: the caller must have already authorized (the AI gateway resolves the
+// provider-key entry from an admin-set setting, not from user input).
+func (h *VaultHandler) DecryptedValueByID(ctx context.Context, id string) (string, error) {
+	row, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	pt, err := h.decrypt(row.EncryptedValue, row.Nonce)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
+}
+
 // EncryptValue encrypts a plaintext value using the current PBKDF2 key.
 // Used by other handlers that need vault-compatible encryption.
 func (h *VaultHandler) EncryptValue(plaintext []byte) (ciphertext, nonce []byte, err error) {
