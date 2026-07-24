@@ -24,6 +24,7 @@ import (
 	"github.com/brightinteraction/trustissues/internal/db"
 	"github.com/brightinteraction/trustissues/internal/handlers"
 	timw "github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/brightinteraction/trustissues/internal/shield"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 )
@@ -200,6 +201,15 @@ func main() {
 		os.Exit(1)
 	}
 	serviceSecretsHandler := handlers.NewServiceSecretsHandler(queries, vaultHandler)
+
+	// Shield LLM-boundary tokenization store, shared by the AI gateway (and the
+	// MCP boundary). nil when TRUSTISSUES_SHIELD_KEY is unset (Shield off).
+	var shieldStore shield.Store
+	if cfg.ShieldEnabled() {
+		shieldStore = shield.NewSQLStore(dbConn)
+		slog.Info("shield enabled", "hint_level", cfg.ShieldHintLevel)
+	}
+	aiGatewayHandler := handlers.NewAIGatewayHandler(queries, cfg, vaultHandler, shieldStore)
 
 	// Alert channel dispatcher + notification-channel admin CRUD.
 	dispatcher := alerts.NewChannelDispatcher(appCtx, queries, vaultHandler)
@@ -388,6 +398,12 @@ func main() {
 					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
 				})
 			})
+
+			// AI gateway: proxy LLM calls to Claude/OpenAI with the team's
+			// provider key injected server-side and PII tokenized via Shield.
+			// Any authenticated caller (session or API key) may use it; the key
+			// itself is never exposed. Non-streaming only in v1.
+			r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
 
 			// Capability bridge token minting (dockyard main.go:894-896).
 			// Sensitive op: rate limited hard.
