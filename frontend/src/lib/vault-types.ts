@@ -5,6 +5,16 @@
 
 import { request } from './api';
 
+// A free-form label/value pair stored alongside a vault entry. `secret` is a
+// UI masking hint only; the whole set is encrypted at rest regardless. Present
+// on the create response and on unlocked (revealed) entries, absent on the
+// plain locked list.
+export interface CustomField {
+  label: string;
+  value: string;
+  secret: boolean;
+}
+
 export interface VaultEntry {
   id: string;
   name: string;
@@ -24,6 +34,9 @@ export interface VaultEntry {
   last_rotation_error?: string;
   // Which shared collection the entry lives in, or null for a personal entry.
   collection_id: string | null;
+  // Arbitrary label/value pairs. Present on the create response and on unlocked
+  // entries; absent or empty on the plain locked list.
+  custom_fields?: CustomField[];
   created_at: string;
   updated_at: string;
 }
@@ -122,6 +135,8 @@ export const vaultApi = {
     // Optional destination collection. Requires editor/manager on it; omit or
     // null for a personal entry.
     collection_id?: string | null;
+    // Optional arbitrary label/value pairs, encrypted at rest with the entry.
+    custom_fields?: CustomField[];
   }) =>
     request<VaultEntry>('/vault', {
       method: 'POST',
@@ -139,6 +154,9 @@ export const vaultApi = {
       notes?: string;
       rotation_interval_days?: number | null;
       expires_at?: string | null;
+      // Sending the array REPLACES the whole set; omit to leave it unchanged;
+      // send [] to clear all.
+      custom_fields?: CustomField[];
     }
   ) =>
     request<VaultEntry>(`/vault/${id}`, {
