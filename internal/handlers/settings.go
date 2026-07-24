@@ -24,20 +24,23 @@ func NewSettingsHandler(queries *db.Queries) *SettingsHandler {
 
 // Defaults when the setting rows are missing.
 const (
-	defaultAutoLockMaxMinutes     = 15
-	defaultMinPasswordLength      = 12
-	defaultRotationReminderDays   = 14
-	defaultSessionDurationHours   = 168
-	minPasswordLengthFloor        = 12
-	maxPasswordLengthPolicy       = 64
+	defaultAutoLockMaxMinutes   = 15
+	defaultMinPasswordLength    = 12
+	defaultRotationReminderDays = 14
+	defaultSessionDurationHours = 168
+	minPasswordLengthFloor      = 12
+	maxPasswordLengthPolicy     = 64
 )
 
 // vaultPolicy is the team-wide vault policy, editable by admins in Settings.
-// Field names match the frontend contract (src/lib/types.ts VaultPolicy).
+// The auto-lock field is serialized as auto_lock_max_minutes to match the
+// shipping browser-extension client (bright-vault-extension src/lib/api.ts
+// settings.vaultPolicy) and the CONTRACT.md vault-policy endpoint; the stored
+// setting key is vault_auto_lock_max_minutes.
 type vaultPolicy struct {
 	MinPasswordLength    int  `json:"min_password_length"`
 	RequireTOTP          bool `json:"require_totp"`
-	AutoLockMinutes      int  `json:"auto_lock_minutes"`
+	AutoLockMinutes      int  `json:"auto_lock_max_minutes"`
 	RotationReminderDays int  `json:"rotation_reminder_days"`
 }
 
@@ -88,7 +91,7 @@ func (h *SettingsHandler) UpdateVaultPolicy(w http.ResponseWriter, r *http.Reque
 	}
 
 	if req.AutoLockMinutes < 1 || req.AutoLockMinutes > 1440 {
-		writeValidationError(w, r, "auto_lock_minutes must be between 1 and 1440")
+		writeValidationError(w, r, "auto_lock_max_minutes must be between 1 and 1440")
 		return
 	}
 	if req.MinPasswordLength < minPasswordLengthFloor || req.MinPasswordLength > maxPasswordLengthPolicy {

@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +32,9 @@ const (
 	// UserRoleKey is the context key for the authenticated user's role
 	// (admin/user/vault_only).
 	UserRoleKey contextKey = "user_role"
+	// SessionIDKey is the context key for the validated server-side session id
+	// (the JWT jti). Empty on the API-key path, which has no session.
+	SessionIDKey contextKey = "session_id"
 )
 
 // GetUserID extracts the authenticated user ID from the request context.
@@ -44,6 +49,16 @@ func GetUserID(ctx context.Context) string {
 // GetUserRole extracts the authenticated user's role from the request context.
 func GetUserRole(ctx context.Context) string {
 	if v, ok := ctx.Value(UserRoleKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetSessionID extracts the validated server-side session id (JWT jti) from the
+// request context. Returns an empty string on the API-key path or when no
+// session is present.
+func GetSessionID(ctx context.Context) string {
+	if v, ok := ctx.Value(SessionIDKey).(string); ok {
 		return v
 	}
 	return ""
@@ -181,7 +196,7 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				return
 			}
 
-			userID, iat, err := ParseJWTWithIssuedAt(tokenString, jwtSecret)
+			userID, iat, jti, err := ParseJWTWithIssuedAt(tokenString, jwtSecret)
 			if err != nil {
 				slog.Debug("jwt auth: invalid token", "error", err)
 				http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
@@ -198,6 +213,13 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				writeAuthReject(w, http.StatusUnauthorized, "session expired, please log in again")
 				return
 			}
+			// Server-side session check: a JWT is only valid while its session
+			// row is live (not revoked by logout, not idle past the window).
+			if status, msg := validateSession(ctx, db, userID, jti); msg != "" {
+				writeAuthReject(w, status, msg)
+				return
+			}
+			ctx = context.WithValue(ctx, SessionIDKey, jti)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -206,14 +228,14 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 // ParseJWT parses a JWT token string and returns the user ID from the "sub"
 // claim.
 func ParseJWT(tokenString, secret string) (string, error) {
-	sub, _, err := ParseJWTWithIssuedAt(tokenString, secret)
+	sub, _, _, err := ParseJWTWithIssuedAt(tokenString, secret)
 	return sub, err
 }
 
 // ParseJWTWithIssuedAt validates the token and additionally returns the iat
-// (issued-at) unix seconds, used by the session-revocation check. iat is 0 if
-// the token carries no iat claim.
-func ParseJWTWithIssuedAt(tokenString, secret string) (string, int64, error) {
+// (issued-at) unix seconds and the jti (session id) claim. iat is 0 if the
+// token carries no iat claim; jti is empty if it carries no jti claim.
+func ParseJWTWithIssuedAt(tokenString, secret string) (string, int64, string, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
@@ -221,23 +243,87 @@ func ParseJWTWithIssuedAt(tokenString, secret string) (string, int64, error) {
 		return []byte(secret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	if !token.Valid {
-		return "", 0, jwt.ErrSignatureInvalid
+		return "", 0, "", jwt.ErrSignatureInvalid
 	}
 	sub, err := token.Claims.GetSubject()
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	if sub == "" {
-		return "", 0, jwt.ErrTokenRequiredClaimMissing
+		return "", 0, "", jwt.ErrTokenRequiredClaimMissing
 	}
 	var iat int64
 	if issued, ierr := token.Claims.GetIssuedAt(); ierr == nil && issued != nil {
 		iat = issued.Unix()
 	}
-	return sub, iat, nil
+	var jti string
+	if mc, ok := token.Claims.(jwt.MapClaims); ok {
+		if v, ok := mc["jti"].(string); ok {
+			jti = v
+		}
+	}
+	return sub, iat, jti, nil
+}
+
+// validateSession enforces the server-side session record backing a JWT. It
+// returns ("", "") when the session is valid, or an (HTTP status, message)
+// pair to reject with. A token whose session row is missing (logged out /
+// unknown), revoked, bound to a different user, or idle past the configured
+// window is rejected with 401. On success it bumps last_used_at so the idle
+// clock tracks real activity.
+func validateSession(ctx context.Context, db *sql.DB, userID, jti string) (int, string) {
+	if jti == "" {
+		// Every token this server mints carries a jti; a missing one means a
+		// pre-revocation or forged token. Fail closed.
+		return http.StatusUnauthorized, "session expired, please log in again"
+	}
+
+	var sessUserID string
+	var revokedAt sql.NullString
+	var idle int
+	err := db.QueryRowContext(ctx,
+		"SELECT user_id, revoked_at, (last_used_at <= datetime('now', ?)) FROM sessions WHERE id = ?",
+		sessionIdleModifier(ctx, db), jti,
+	).Scan(&sessUserID, &revokedAt, &idle)
+	if err == sql.ErrNoRows {
+		return http.StatusUnauthorized, "session expired, please log in again"
+	}
+	if err != nil {
+		slog.Error("auth: session lookup failed", "error", err)
+		return http.StatusInternalServerError, "internal error"
+	}
+	if revokedAt.Valid || sessUserID != userID {
+		return http.StatusUnauthorized, "session expired, please log in again"
+	}
+	if idle == 1 {
+		return http.StatusUnauthorized, "session expired due to inactivity, please log in again"
+	}
+
+	// Best effort: record activity so the idle timeout measures inactivity.
+	if _, uerr := db.ExecContext(ctx,
+		"UPDATE sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?", jti); uerr != nil {
+		slog.Error("auth: failed to update session activity", "error", uerr)
+	}
+	return 0, ""
+}
+
+// sessionIdleModifier returns a SQLite datetime modifier ("-N minutes") for the
+// idle-timeout window, reusing the vault auto-lock setting. Defaults to 15
+// minutes when the setting is missing or invalid so a corrupt row cannot
+// disable the timeout.
+func sessionIdleModifier(ctx context.Context, db *sql.DB) string {
+	mins := 15
+	var v string
+	if err := db.QueryRowContext(ctx,
+		"SELECT value FROM settings WHERE key = ?", "vault_auto_lock_max_minutes").Scan(&v); err == nil {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			mins = n
+		}
+	}
+	return fmt.Sprintf("-%d minutes", mins)
 }
 
 // extractSessionToken pulls the JWT from the Authorization header

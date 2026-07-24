@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -31,6 +32,7 @@ type VaultHandler struct {
 	queries       *db.Queries
 	encryptionKey [32]byte // PBKDF2-derived key (current, version 2)
 	legacyKey     [32]byte // SHA-256 key (version 1, only used during migration)
+	bidxKey       [32]byte // PBKDF2-derived key for the URL blind index (HMAC)
 }
 
 // NewVaultHandler creates a new VaultHandler keyed off cfg.VaultKey. The
@@ -55,7 +57,75 @@ func NewVaultHandler(dbConn *sql.DB, queries *db.Queries, cfg *config.Config) *V
 	// Version 1 (legacy): single SHA-256 pass
 	legacyKey := sha256.Sum256([]byte(keySource + ":secrets-vault"))
 
-	return &VaultHandler{db: dbConn, queries: queries, encryptionKey: newKey, legacyKey: legacyKey}
+	// Blind-index key: a SEPARATE PBKDF2 derivation (distinct salt) from the same
+	// vault key, used to HMAC normalized URLs so autofill can match on an
+	// encrypted url column without ever storing the host in cleartext. It must
+	// not equal the value-encryption key: reusing an encryption key as a MAC key
+	// is a well-known cross-primitive footgun.
+	bidxSalt := []byte("trustissues:vault:bidx:v1")
+	bidxDerived := pbkdf2.Key([]byte(keySource), bidxSalt, 600_000, 32, sha256.New)
+	var bidxKey [32]byte
+	copy(bidxKey[:], bidxDerived)
+	for i := range bidxDerived {
+		bidxDerived[i] = 0
+	}
+
+	return &VaultHandler{db: dbConn, queries: queries, encryptionKey: newKey, legacyKey: legacyKey, bidxKey: bidxKey}
+}
+
+// normalizeVaultHost reduces a raw URL to the deterministic form used for the
+// blind index: the lowercased hostname, with scheme, port, path, and query
+// discarded (matching dockyard's host-based autofill matcher). A bare host with
+// no scheme is accepted. It returns "" when no host can be extracted, so such
+// entries never populate a blind index and never match.
+func normalizeVaultHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+// urlBlindIndex computes the deterministic HMAC-SHA256 lookup token for a URL's
+// normalized host. Empty/unparseable inputs yield "" (stored as an empty index
+// that the match query skips). The token is keyed by bidxKey, so it is stable
+// for equality lookups yet reveals nothing about the host to a DB reader.
+func (h *VaultHandler) urlBlindIndex(raw string) string {
+	host := normalizeVaultHost(raw)
+	if host == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, h.bidxKey[:])
+	mac.Write([]byte(host))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// encryptMetaColumns encrypts the free-text metadata columns of a vault entry
+// for at-rest storage using the enc:v1: column scheme. Empty values pass through
+// unchanged (encryptColumn skips them), and already-encrypted values are not
+// double-wrapped, so callers may pass either cleartext or stored ciphertext.
+func (h *VaultHandler) encryptMetaColumns(rawURL, aliasURL, username, category, notes string) (encURL, encAlias, encUser, encCat, encNotes string, err error) {
+	if encURL, err = h.encryptColumn(rawURL); err != nil {
+		return
+	}
+	if encAlias, err = h.encryptColumn(aliasURL); err != nil {
+		return
+	}
+	if encUser, err = h.encryptColumn(username); err != nil {
+		return
+	}
+	if encCat, err = h.encryptColumn(category); err != nil {
+		return
+	}
+	encNotes, err = h.encryptColumn(notes)
+	return
 }
 
 // MigrateEncryption re-encrypts all vault entries that were encrypted with the
@@ -131,6 +201,80 @@ func (h *VaultHandler) MigrateEncryption() error {
 	return nil
 }
 
+// BackfillMetadataAtRest encrypts any free-text metadata columns (url,
+// alias_url, username, category, notes) still stored in cleartext and populates
+// the url_bidx / alias_url_bidx blind indexes for rows written before at-rest
+// metadata encryption landed. Idempotent: enc:v1:-prefixed columns pass through
+// unchanged and the blind index is recomputed deterministically, so it is safe
+// to run on every boot. Mirrors the MigrateEncryption / BackfillMetadataEncryption
+// precedent. Returns the number of rows updated.
+func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rows, err := h.queries.ListVaultEntriesForMetaAtRestBackfill(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("listing vault entries for metadata backfill: %w", err)
+	}
+
+	updated := 0
+	for _, row := range rows {
+		// A row needs a rewrite if any text column still holds cleartext, or if
+		// a blind index is stale/missing relative to its (decrypted) URL.
+		needsMeta := metaColumnNeedsEncrypt(row.Url.String) ||
+			metaColumnNeedsEncrypt(row.AliasUrl.String) ||
+			metaColumnNeedsEncrypt(row.Username.String) ||
+			metaColumnNeedsEncrypt(row.Category.String) ||
+			metaColumnNeedsEncrypt(row.Notes.String)
+
+		// Recover the cleartext host to (re)compute the blind index. decryptColumn
+		// is idempotent on cleartext, so this works whether the column is still
+		// plaintext or already encrypted.
+		urlPlain, derr := h.decryptColumn(row.Url.String)
+		if derr != nil {
+			slog.Error("vault: metadata backfill url decrypt failed", "id", row.ID, "error", derr)
+			continue
+		}
+		aliasPlain, derr := h.decryptColumn(row.AliasUrl.String)
+		if derr != nil {
+			slog.Error("vault: metadata backfill alias_url decrypt failed", "id", row.ID, "error", derr)
+			continue
+		}
+		wantURLBidx := h.urlBlindIndex(urlPlain)
+		wantAliasBidx := h.urlBlindIndex(aliasPlain)
+		needsBidx := wantURLBidx != row.UrlBidx || wantAliasBidx != row.AliasUrlBidx
+
+		if !needsMeta && !needsBidx {
+			continue
+		}
+
+		// encryptColumn is idempotent, so passing the stored value (cleartext or
+		// already-encrypted) never double-wraps it.
+		encURL, encAlias, encUser, encCat, encNotes, encErr := h.encryptMetaColumns(
+			row.Url.String, row.AliasUrl.String, row.Username.String, row.Category.String, row.Notes.String)
+		if encErr != nil {
+			return updated, fmt.Errorf("encrypt metadata for %s: %w", row.ID, encErr)
+		}
+		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+			Url:          toNullString(encURL),
+			AliasUrl:     toNullString(encAlias),
+			Username:     toNullString(encUser),
+			Category:     toNullString(encCat),
+			Notes:        toNullString(encNotes),
+			UrlBidx:      wantURLBidx,
+			AliasUrlBidx: wantAliasBidx,
+			ID:           row.ID,
+		}); err != nil {
+			return updated, fmt.Errorf("persist metadata for %s: %w", row.ID, err)
+		}
+		updated++
+	}
+	if updated > 0 {
+		slog.Info("vault: backfilled metadata-at-rest encryption", "rows_updated", updated)
+	}
+	return updated, nil
+}
+
 // decryptWithKey decrypts data using a specific AES-256-GCM key.
 func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key[:])
@@ -187,11 +331,11 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 	e := vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 row.Name,
-		URL:                  row.Url.String,
-		AliasURL:             row.AliasUrl.String,
-		Username:             row.Username.String,
-		Category:             row.Category.String,
-		Notes:                row.Notes.String,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
@@ -213,11 +357,11 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 		ID:                   row.ID,
 		UserID:               row.UserID,
 		Name:                 row.Name,
-		URL:                  row.Url.String,
-		AliasURL:             row.AliasUrl.String,
-		Username:             row.Username.String,
-		Category:             row.Category.String,
-		Notes:                row.Notes.String,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
@@ -237,11 +381,11 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 		ID:                   row.ID,
 		UserID:               row.UserID,
 		Name:                 row.Name,
-		URL:                  row.Url.String,
-		AliasURL:             row.AliasUrl.String,
-		Username:             row.Username.String,
-		Category:             row.Category.String,
-		Notes:                row.Notes.String,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
@@ -260,11 +404,11 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 row.Name,
-		URL:                  row.Url.String,
-		AliasURL:             row.AliasUrl.String,
-		Username:             row.Username.String,
-		Category:             row.Category.String,
-		Notes:                row.Notes.String,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
@@ -552,6 +696,19 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Encrypt the free-text metadata columns at rest and derive the URL blind
+	// indexes. The display url/alias_url are stored encrypted, so autofill
+	// matching goes through url_bidx/alias_url_bidx (computed from the cleartext
+	// host before encryption), not the ciphertext.
+	encURL, encAlias, encUser, encCat, encNotes, err := h.encryptMetaColumns(req.URL, req.AliasURL, req.Username, req.Category, req.Notes)
+	if err != nil {
+		logError(r, "vault.create: metadata encrypt failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	urlBidx := h.urlBlindIndex(req.URL)
+	aliasBidx := h.urlBlindIndex(req.AliasURL)
+
 	// Use separate INSERT + SELECT instead of RETURNING (mattn/go-sqlite3 has bugs with RETURNING)
 	err = h.queries.CreateVaultEntry(ctx, db.CreateVaultEntryParams{
 		ID:                   entryID,
@@ -559,17 +716,19 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:                 req.Name,
 		EncryptedValue:       encrypted,
 		Nonce:                nonce,
-		Url:                  toNullString(req.URL),
-		AliasUrl:             toNullString(req.AliasURL),
-		Username:             toNullString(req.Username),
-		Category:             toNullString(req.Category),
-		Notes:                toNullString(req.Notes),
+		Url:                  toNullString(encURL),
+		AliasUrl:             toNullString(encAlias),
+		Username:             toNullString(encUser),
+		Category:             toNullString(encCat),
+		Notes:                toNullString(encNotes),
 		AutoLogin:            boolToInt64(req.AutoLogin),
 		RotationIntervalDays: intPtrToNullInt64(req.RotationIntervalDays),
 		ExpiresAt:            stringPtrToNullTime(req.ExpiresAt),
 		Provider:             toNullString(req.Provider),
 		ProviderMeta:         toNullString(providerMeta),
 		AutoRotate:           sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},
+		UrlBidx:              urlBidx,
+		AliasUrlBidx:         aliasBidx,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -688,12 +847,16 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.Category != nil {
-		if err := h.queries.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(*req.Category), ID: id}); err != nil {
+		if enc, encErr := h.encryptColumn(*req.Category); encErr != nil {
+			logError(r, "vault.update: category encrypt failed", "error", encErr)
+		} else if err := h.queries.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update category failed", "error", err)
 		}
 	}
 	if req.Notes != nil {
-		if err := h.queries.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(*req.Notes), ID: id}); err != nil {
+		if enc, encErr := h.encryptColumn(*req.Notes); encErr != nil {
+			logError(r, "vault.update: notes encrypt failed", "error", encErr)
+		} else if err := h.queries.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update notes failed", "error", err)
 		}
 	}
@@ -708,17 +871,23 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.URL != nil {
-		if err := h.queries.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(*req.URL), ID: id}); err != nil {
+		if enc, encErr := h.encryptColumn(*req.URL); encErr != nil {
+			logError(r, "vault.update: url encrypt failed", "error", encErr)
+		} else if err := h.queries.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(*req.URL), ID: id}); err != nil {
 			logError(r, "vault.update: update url failed", "error", err)
 		}
 	}
 	if req.AliasURL != nil {
-		if err := h.queries.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(*req.AliasURL), ID: id}); err != nil {
+		if enc, encErr := h.encryptColumn(*req.AliasURL); encErr != nil {
+			logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
+		} else if err := h.queries.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(*req.AliasURL), ID: id}); err != nil {
 			logError(r, "vault.update: update alias_url failed", "error", err)
 		}
 	}
 	if req.Username != nil {
-		if err := h.queries.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(*req.Username), ID: id}); err != nil {
+		if enc, encErr := h.encryptColumn(*req.Username); encErr != nil {
+			logError(r, "vault.update: username encrypt failed", "error", encErr)
+		} else if err := h.queries.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update username failed", "error", err)
 		}
 	}
@@ -830,6 +999,40 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // their own entries. Auto-lock is enforced client-side against the
 // vault_auto_lock_max_minutes policy served by GET /api/settings/vault-policy
 // (unlock itself is stateless server-side).
+// reauthLocked reports whether the user has too many recent failed re-auth
+// attempts. It shares the login lockout budget (5 failures in 15 minutes) so a
+// stolen session cannot brute-force the account password on the re-auth
+// endpoints (unlock, rotate, validate). Correct re-auths never record a
+// failure, so the frontend's per-mutation re-lock is unaffected. It returns the
+// user's email so a subsequent failure can be recorded. On lookup error it fails
+// open (not locked) rather than bricking re-auth on a transient DB hiccup.
+func (h *VaultHandler) reauthLocked(ctx context.Context, r *http.Request, userID string) (email string, locked bool) {
+	email, err := h.queries.GetUserEmailByID(ctx, userID)
+	if err != nil {
+		logError(r, "vault.reauth: email lookup failed", "error", err)
+		return "", false
+	}
+	count, err := h.queries.CountRecentFailedLoginAttemptsByEmail(ctx, email)
+	if err != nil {
+		logError(r, "vault.reauth: attempt count failed", "error", err)
+		return email, false
+	}
+	return email, count >= 5
+}
+
+// recordReauthFailure logs a failed password re-auth so repeated wrong-password
+// attempts trip the same 5/15m lockout as login.
+func (h *VaultHandler) recordReauthFailure(ctx context.Context, r *http.Request, email string) {
+	if email == "" {
+		return
+	}
+	if err := h.queries.CreateLoginAttempt(ctx, db.CreateLoginAttemptParams{
+		Email: email, IpAddress: clientIP(r), Success: 0,
+	}); err != nil {
+		logError(r, "vault.reauth: failed to record attempt", "error", err)
+	}
+}
+
 func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Password string `json:"password"`
@@ -843,12 +1046,19 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
 
+	email, locked := h.reauthLocked(ctx, r, userID)
+	if locked {
+		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
+		return
+	}
+
 	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
 	if err != nil {
 		writeUnauthorized(w, r, "user not found")
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
 	}
@@ -867,11 +1077,11 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 			vaultEntryMeta: vaultEntryMeta{
 				ID:                   row.ID,
 				Name:                 row.Name,
-				URL:                  row.Url.String,
-				AliasURL:             row.AliasUrl.String,
-				Username:             row.Username.String,
-				Category:             row.Category.String,
-				Notes:                row.Notes.String,
+				URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+				Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+				Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+				Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
 				AutoLogin:            row.AutoLogin != 0,
 				RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 				ExpiresAt:            nullTimePtr(row.ExpiresAt),
@@ -927,12 +1137,19 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// Verify password against current user
 	userID := middleware.GetUserID(r.Context())
 
+	email, locked := h.reauthLocked(ctx, r, userID)
+	if locked {
+		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
+		return
+	}
+
 	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
 	if err != nil {
 		writeUnauthorized(w, r, "user not found")
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
 	}
@@ -1008,8 +1225,11 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			} else {
 				// Log the error but fall through to manual rotation
 				slog.Warn("vault.rotate: provider rotation failed, falling back to manual", "provider", providerName, "error", rotErr)
+				// Redact before persisting: a provider/transport *url.Error embeds
+				// the request URL, which can carry a query-injected secret in
+				// cleartext. redactUpstreamError strips the query + userinfo.
 				_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-					LastRotationError: toNullString(rotErr.Error()),
+					LastRotationError: toNullString(redactUpstreamError(rotErr)),
 					ID:                id,
 				})
 			}
@@ -1148,12 +1368,20 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := middleware.GetUserID(r.Context())
+
+	email, locked := h.reauthLocked(ctx, r, userID)
+	if locked {
+		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
+		return
+	}
+
 	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
 	if err != nil {
 		writeUnauthorized(w, r, "user not found")
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
 	}
@@ -1364,25 +1592,19 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract hostname from URL
-	if !strings.Contains(rawURL, "://") {
-		rawURL = "https://" + rawURL
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Hostname() == "" {
+	// url/alias_url are encrypted at rest, so match by blind index rather than a
+	// LIKE on cleartext: compute the same HMAC over the requested URL's
+	// normalized host and look it up against url_bidx/alias_url_bidx. An
+	// unparseable or hostless URL yields an empty index (matches nothing).
+	bidx := h.urlBlindIndex(rawURL)
+	if bidx == "" {
 		writeBadRequest(w, r, "invalid URL")
 		return
 	}
-	domain := parsed.Hostname()
-
-	// Escape LIKE wildcards to prevent pattern injection
-	escapedDomain := strings.NewReplacer("%", "\\%", "_", "\\_").Replace(domain)
-
-	pattern := "%" + escapedDomain + "%"
 	rows, err := h.queries.MatchVaultEntriesByURL(ctx, db.MatchVaultEntriesByURLParams{
-		UserID:   userID,
-		Url:      sql.NullString{String: pattern, Valid: true},
-		AliasUrl: sql.NullString{String: pattern, Valid: true},
+		UserID:       userID,
+		UrlBidx:      bidx,
+		AliasUrlBidx: bidx,
 	})
 	if err != nil {
 		logError(r, "vault.match: query failed", "error", err)

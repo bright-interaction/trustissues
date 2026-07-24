@@ -32,6 +32,11 @@ type Querier interface {
 	CreateLoginAttempt(ctx context.Context, arg CreateLoginAttemptParams) error
 	CreateNotificationChannel(ctx context.Context, arg CreateNotificationChannelParams) (string, error)
 	CreateServiceIdentity(ctx context.Context, arg CreateServiceIdentityParams) error
+	// Server-side session records. A JWT carries the session id as its jti claim;
+	// the auth middleware rejects any token whose session row is missing, revoked,
+	// or idle past the configured window. This turns stateless JWTs into revocable
+	// sessions so logout and inactivity kill a leaked token immediately.
+	CreateSession(ctx context.Context, arg CreateSessionParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
 	// ============================================================================
 	// Create entry
@@ -138,6 +143,12 @@ type Querier interface {
 	ListUsersWithEntryCount(ctx context.Context) ([]ListUsersWithEntryCountRow, error)
 	ListUsersWithTOTPSecret(ctx context.Context) ([]ListUsersWithTOTPSecretRow, error)
 	ListVaultEntriesByUser(ctx context.Context, userID string) ([]ListVaultEntriesByUserRow, error)
+	// ============================================================================
+	// Metadata-at-rest backfill (encrypt url/alias_url/username/category/notes,
+	// compute url_bidx/alias_url_bidx). Runs once at boot via
+	// VaultHandler.BackfillMetadataAtRest; idempotent (enc:v1: prefix guards it).
+	// ============================================================================
+	ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error)
 	ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVaultEntriesForMetaBackfillRow, error)
 	ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVaultEntriesNeedingRotationRow, error)
 	ListVaultEntriesV1(ctx context.Context) ([]ListVaultEntriesV1Row, error)
@@ -150,6 +161,10 @@ type Querier interface {
 	// ============================================================================
 	// URL matching (browser extension autofill)
 	// ============================================================================
+	// Autofill lookup by blind index. url/alias_url are encrypted at rest and cannot
+	// be LIKE-matched, so the handler computes HMAC-SHA256(normalized_host) from the
+	// requested url (see vault.go urlBlindIndex) and matches it against the stored
+	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
 	// ============================================================================
@@ -157,6 +172,8 @@ type Querier interface {
 	// ============================================================================
 	ResolveVaultReference(ctx context.Context, arg ResolveVaultReferenceParams) (ResolveVaultReferenceRow, error)
 	RevokeServiceIdentity(ctx context.Context, id string) (sql.Result, error)
+	RevokeSession(ctx context.Context, id string) error
+	RevokeUserSessions(ctx context.Context, userID string) error
 	// ============================================================================
 	// Rotate (generate new secret value)
 	// ============================================================================
@@ -177,6 +194,7 @@ type Querier interface {
 	UpdateVaultEntryAutoLogin(ctx context.Context, arg UpdateVaultEntryAutoLoginParams) error
 	UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error
 	UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVaultEntryExpiresAtParams) error
+	UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error
 	// ============================================================================
 	// Update entry - individual metadata fields
 	// ============================================================================

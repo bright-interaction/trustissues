@@ -7,15 +7,21 @@ services:
     container_name: trustissues
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # Publish to host loopback ONLY. This app speaks plaintext HTTP; TLS must
+      # terminate in a reverse proxy (Caddy) in front of it. Never publish this
+      # port on 0.0.0.0: that would expose credentials over unencrypted HTTP.
+      # Prefer having Caddy reach the container over the internal Docker network
+      # instead of via this published port.
+      - "127.0.0.1:8080:8080"
     volumes:
       - trustissues_data:/app/data
     environment:
-      # Required secrets: the server refuses to start without them.
-      # Generate with: openssl rand -hex 32
+      # Required secrets: the server refuses to start without them, and rejects
+      # the .env.example placeholder values. Generate with: openssl rand -hex 32
       - TRUSTISSUES_JWT_SECRET=${TRUSTISSUES_JWT_SECRET}
       - TRUSTISSUES_VAULT_KEY=${TRUSTISSUES_VAULT_KEY}
       - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
+      - TRUSTISSUES_TRUSTED_PROXY_HOPS=${TRUSTISSUES_TRUSTED_PROXY_HOPS:-1}
       - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}
 
 volumes:

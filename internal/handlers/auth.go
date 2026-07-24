@@ -95,10 +95,24 @@ func (h *AuthHandler) MigrateTOTPSecrets() error {
 		if stored == "" {
 			continue
 		}
-		if _, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey); derr == nil {
-			continue // already encrypted
+		// Already at-rest encrypted (marked): NEVER re-encrypt. A decrypt failure
+		// here is a key mismatch or corruption, not plaintext; re-encrypting would
+		// make a recoverable mismatch permanent. Log and leave untouched.
+		if columncrypto.IsEncrypted(stored) {
+			if _, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey); derr != nil {
+				slog.Error("totp.migrate: marked secret failed to decrypt under current key, leaving untouched", "user_id", row.ID, "error", derr)
+			}
+			continue
 		}
-		enc, eerr := columncrypto.EncryptString(stored, h.cfg.VaultKey)
+		// Unmarked. Legacy binaries wrote bare-base64 ciphertext without a marker;
+		// if it still decrypts under the current key it is already encrypted (just
+		// missing the marker) and we recover the seed, otherwise it is genuine
+		// plaintext to be encrypted now.
+		seed := stored
+		if dec, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey); derr == nil {
+			seed = dec
+		}
+		enc, eerr := columncrypto.EncryptString(seed, h.cfg.VaultKey)
 		if eerr != nil {
 			slog.Error("totp.migrate: encrypt failed", "user_id", row.ID, "error", eerr)
 			continue
@@ -135,6 +149,7 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 // exists the endpoint is permanently disabled and all further accounts come
 // from admin-created users or invitations.
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	count, err := h.queries.CountUsers(r.Context())
 	if err != nil {
 		logError(r, "register: failed to count users", "error", err)
@@ -214,6 +229,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 // Login handles POST /api/auth/login - user authentication with lockout
 // (5 failed attempts per email / 15 min, 20 per IP) and optional TOTP 2FA.
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid request body")
@@ -284,6 +300,11 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		}); dbErr != nil {
 			logError(r, "login: failed to record failed attempt", "error", dbErr)
 		}
+		// Surface failures in the audit trail alongside successful logins.
+		// Attributed to the resolved account with the attempted email + source
+		// IP in the detail so admins can spot targeted or brute-force attempts.
+		LogActivity(h.queries, &row.ID, "auth.login_failed",
+			fmt.Sprintf("Failed login for %s from %s", req.Email, ip))
 	}
 
 	ok, verifyErr := passwordhash.Verify(req.Password, row.PasswordHash)
@@ -382,10 +403,17 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
 }
 
-// Logout handles POST /api/auth/logout - clears the session cookie. JWTs are
-// stateless, so the bearer token itself stays valid until expiry; clients
-// must discard it. Cookie-based browser sessions end here.
+// Logout handles POST /api/auth/logout - revokes the current session
+// server-side and clears the session cookie. Revocation marks the session row
+// so the JWT (bearer token or cookie) stops authenticating immediately on the
+// next request, even if it was captured; it does not merely rely on the client
+// discarding the token.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	if sessionID := middleware.GetSessionID(r.Context()); sessionID != "" {
+		if err := h.queries.RevokeSession(r.Context(), sessionID); err != nil {
+			logError(r, "logout: failed to revoke session", "error", err)
+		}
+	}
 	if userID := middleware.GetUserID(r.Context()); userID != "" {
 		LogActivity(h.queries, &userID, "auth.logout", "")
 	}
@@ -393,9 +421,17 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})
 }
 
+// setNoStore marks a response as non-cacheable. Applied to every
+// credential-bearing auth response (login, register, change-password, me) so a
+// token or profile never lands in a shared or on-disk HTTP cache.
+func setNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+}
+
 // Me handles GET /api/auth/me - returns the current authenticated user as
 // {id, email, name, role} plus 2FA state.
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	userID := middleware.GetUserID(r.Context())
 	if userID == "" {
 		writeUnauthorized(w, r, "not authenticated")
@@ -474,6 +510,7 @@ func (h *AuthHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 
 // ChangePassword handles POST /api/auth/change-password.
 func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	userID := middleware.GetUserID(r.Context())
 	if userID == "" {
 		writeUnauthorized(w, r, "not authenticated")
@@ -538,6 +575,12 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		ID:                 userID,
 	}); err != nil {
 		logError(r, "change-password: failed to invalidate sessions", "error", err, "user_id", userID)
+	}
+	// Also revoke the server-side session rows so tokens minted before the
+	// change die immediately, independent of the iat-based cutoff above. The
+	// fresh token minted below gets a new, non-revoked session row.
+	if err := h.queries.RevokeUserSessions(r.Context(), userID); err != nil {
+		logError(r, "change-password: failed to revoke sessions", "error", err, "user_id", userID)
 	}
 
 	LogActivityFromRequest(h.queries, r, "auth.password_changed", "Password changed")
@@ -769,8 +812,12 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "2FA disabled"})
 }
 
-// generateToken creates a signed JWT for the given user ID. Expiry is
-// configurable via the session_duration_hours setting (default 7 days).
+// generateToken creates a signed JWT for the given user ID and a matching
+// server-side session record. Expiry is configurable via the
+// session_duration_hours setting (default 7 days). The JWT carries the session
+// id as its jti claim; the auth middleware rejects any token whose session row
+// is missing, revoked (logout), or idle past the window, so a leaked token
+// stops working the moment the user logs out.
 func (h *AuthHandler) generateToken(userID string) (string, error) {
 	sessionDuration := 7 * 24 * time.Hour
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -783,10 +830,23 @@ func (h *AuthHandler) generateToken(userID string) (string, error) {
 		}
 	}
 
+	now := time.Now()
+	expiresAt := now.Add(sessionDuration)
+
+	jti := generateID()
+	if err := h.queries.CreateSession(ctx, db.CreateSessionParams{
+		ID:        jti,
+		UserID:    userID,
+		ExpiresAt: sql.NullTime{Time: expiresAt, Valid: true},
+	}); err != nil {
+		return "", fmt.Errorf("create session: %w", err)
+	}
+
 	claims := jwt.MapClaims{
 		"sub": userID,
-		"exp": time.Now().Add(sessionDuration).Unix(),
-		"iat": time.Now().Unix(),
+		"jti": jti,
+		"exp": expiresAt.Unix(),
+		"iat": now.Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(h.cfg.JWTSecret))

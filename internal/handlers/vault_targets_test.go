@@ -31,14 +31,14 @@ func swapProviderHTTP(t *testing.T) {
 }
 
 func TestParseRotationTargets(t *testing.T) {
-	if got := ParseRotationTargets(""); got != nil {
-		t.Fatalf("empty input should parse to nil, got %v", got)
+	if got := ParseRotationTargets(""); len(got) != 0 {
+		t.Fatalf("empty input should parse to empty slice, got %v", got)
 	}
-	if got := ParseRotationTargets("[]"); got != nil {
-		t.Fatalf("empty array should parse to nil, got %v", got)
+	if got := ParseRotationTargets("[]"); len(got) != 0 {
+		t.Fatalf("empty array should parse to empty slice, got %v", got)
 	}
-	if got := ParseRotationTargets("not json"); got != nil {
-		t.Fatalf("invalid JSON should parse to nil, got %v", got)
+	if got := ParseRotationTargets("not json"); len(got) != 0 {
+		t.Fatalf("invalid JSON should parse to empty slice, got %v", got)
 	}
 
 	raw := `[{"type":"webhook","webhook_url":"https://example.com/hook","label":"ci"},{"type":"notify"}]`

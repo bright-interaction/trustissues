@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -131,6 +132,19 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 	// so operators can see "service asked for X but vault has no X".
 	secrets := make(map[string]string, len(allowed))
 	missing := make([]string, 0)
+	// Defense-in-depth: the decrypted values are copied into `secrets` as
+	// strings for the JSON response, but the []byte plaintext slices returned
+	// by DecryptValue linger on the heap until GC. Zero their backing arrays
+	// once the response has been written (deferred, so it runs after writeJSON
+	// below). Best-effort: the string copies cannot be wiped, only the slices.
+	var plaintexts [][]byte
+	defer func() {
+		for _, p := range plaintexts {
+			for i := range p {
+				p[i] = 0
+			}
+		}
+	}()
 	for _, name := range allowed {
 		row, qerr := h.queries.GetVaultEntryForServiceFetch(r.Context(), db.GetVaultEntryForServiceFetchParams{
 			Name:   name,
@@ -164,6 +178,7 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 			return
 		}
 		secrets[name] = string(plaintext)
+		plaintexts = append(plaintexts, plaintext)
 	}
 
 	// Touch last_used_at (fire-and-forget; failure here is not fatal).
@@ -296,6 +311,11 @@ func (h *ServiceSecretsHandler) CreateServiceIdentity(w http.ResponseWriter, r *
 		return
 	}
 
+	// Activity-log the mint (actor from request context, target identity,
+	// event). The plaintext key is NEVER logged; only name + id + scope size.
+	LogActivityFromRequest(h.queries, r, "service_identity.created",
+		fmt.Sprintf("Service identity minted: %s (id: %s, allowed_secrets: %d)", req.Name, id, len(req.AllowedSecrets)))
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	writeJSON(w, http.StatusCreated, serviceIdentityCreateResponse{
 		serviceIdentityListResponse: serviceIdentityListResponse{
@@ -394,6 +414,8 @@ func (h *ServiceSecretsHandler) RevokeServiceIdentity(w http.ResponseWriter, r *
 	}
 
 	h.audit(id, identity.Name, "admin_revoked", nil, "", requestRemoteIP(r))
+	LogActivityFromRequest(h.queries, r, "service_identity.revoked",
+		fmt.Sprintf("Service identity revoked: %s (id: %s)", identity.Name, id))
 	w.WriteHeader(http.StatusNoContent)
 }
 

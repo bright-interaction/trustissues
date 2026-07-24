@@ -40,8 +40,8 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- ============================================================================
 
 -- name: CreateVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
+INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 
 -- name: GetVaultEntryMeta :one
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
@@ -74,10 +74,10 @@ UPDATE vault_entries SET rotation_interval_days = ?, updated_at = CURRENT_TIMEST
 UPDATE vault_entries SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryURL :exec
-UPDATE vault_entries SET url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+UPDATE vault_entries SET url = ?, url_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryAliasURL :exec
-UPDATE vault_entries SET alias_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+UPDATE vault_entries SET alias_url = ?, alias_url_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryUsername :exec
 UPDATE vault_entries SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
@@ -118,8 +118,12 @@ UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2,
 -- ============================================================================
 
 -- name: MatchVaultEntriesByURL :many
+-- Autofill lookup by blind index. url/alias_url are encrypted at rest and cannot
+-- be LIKE-matched, so the handler computes HMAC-SHA256(normalized_host) from the
+-- requested url (see vault.go urlBlindIndex) and matches it against the stored
+-- url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? AND (url LIKE ? OR alias_url LIKE ?) ORDER BY name ASC;
+FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY name ASC;
 
 -- ============================================================================
 -- Resolve {{vault:NAME}} references (scoped to requesting user's vault)
@@ -141,8 +145,8 @@ SELECT name FROM vault_entries WHERE user_id = ?;
 -- ============================================================================
 
 -- name: ImportVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
+INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
 
 -- ============================================================================
 -- Provider integration (API key rotation)
@@ -156,6 +160,20 @@ UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE
 
 -- name: ListVaultEntriesForMetaBackfill :many
 SELECT id, provider_meta, rotation_targets FROM vault_entries;
+
+-- ============================================================================
+-- Metadata-at-rest backfill (encrypt url/alias_url/username/category/notes,
+-- compute url_bidx/alias_url_bidx). Runs once at boot via
+-- VaultHandler.BackfillMetadataAtRest; idempotent (enc:v1: prefix guards it).
+-- ============================================================================
+
+-- name: ListVaultEntriesForMetaAtRestBackfill :many
+SELECT id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries;
+
+-- name: UpdateVaultEntryMetaAtRest :exec
+UPDATE vault_entries
+SET url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?
+WHERE id = ?;
 
 -- name: UpdateVaultEntryRotationError :exec
 UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;

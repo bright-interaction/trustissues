@@ -4,12 +4,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +58,54 @@ func bodyLimits(next http.Handler) http.Handler {
 	})
 }
 
+// randomRequestID assigns each request a random id stored under chi's
+// RequestIDKey (so chimiddleware.Logger and handlers pick it up via
+// middleware.GetReqID). Unlike chimiddleware.RequestID it derives no part of
+// the id from os.Hostname(), and it ignores any inbound X-Request-Id so a
+// client cannot reflect chosen content back through the logs.
+func randomRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqID string
+		b := make([]byte, 12)
+		if _, err := rand.Read(b); err != nil {
+			reqID = strconv.FormatInt(time.Now().UnixNano(), 36)
+		} else {
+			reqID = base64.RawURLEncoding.EncodeToString(b)
+		}
+		ctx := context.WithValue(r.Context(), chimiddleware.RequestIDKey, reqID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// secureDataDir best-effort tightens the data directory to 0700 and every
+// regular file inside it to 0600. The directory holds the SQLite database and
+// its WAL/SHM sidecars, which contain encrypted secrets; nothing but the
+// service user should read them. Errors are logged, not fatal: a running
+// instance with slightly loose perms is better than a boot loop, and the umask
+// set in main already covers freshly created files.
+func secureDataDir(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Warn("could not create data dir", "dir", dir, "error", err)
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		slog.Warn("could not chmod data dir", "dir", dir, "error", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Warn("could not read data dir", "dir", dir, "error", err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if err := os.Chmod(filepath.Join(dir, e.Name()), 0o600); err != nil {
+			slog.Warn("could not chmod data file", "name", e.Name(), "error", err)
+		}
+	}
+}
+
 func main() {
 	// Load configuration. This hard-fails when TRUSTISSUES_JWT_SECRET or
 	// TRUSTISSUES_VAULT_KEY is missing: auth and at-rest encryption are
@@ -71,6 +123,19 @@ func main() {
 	slog.SetDefault(logger)
 	cfg.WarnWeakConfig()
 
+	// Everything this process creates (the SQLite DB, its WAL/SHM sidecars,
+	// any temp files) holds secrets, so force user-only permissions on
+	// creation. umask 0o077 makes new files 0600 and new dirs 0700.
+	syscall.Umask(0o077)
+
+	// Derive rate-limit client IPs from the configured trusted-proxy hop count
+	// so X-Forwarded-For cannot be spoofed to evade limits.
+	timw.ConfigureProxy(cfg.TrustedProxyHops, false)
+
+	// Ensure the data dir is 0700 and tighten any pre-existing files to 0600
+	// (older deploys may have created the DB before umask hardening).
+	secureDataDir(cfg.DataDir)
+
 	// Open SQLite (WAL) and run embedded migrations.
 	dbConn, err := database.Connect(cfg.DataDir)
 	if err != nil {
@@ -84,6 +149,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Re-tighten after Connect/migrations in case the DB and its WAL/SHM were
+	// just created (belt-and-suspenders alongside the umask above).
+	secureDataDir(cfg.DataDir)
+
 	queries := db.New(dbConn)
 
 	// appCtx scopes background workers and dispatcher work to the server's
@@ -96,6 +165,7 @@ func main() {
 	userHandler := handlers.NewUserHandler(queries, cfg)
 	settingsHandler := handlers.NewSettingsHandler(queries)
 	activityHandler := handlers.NewActivityHandler(queries)
+	apiKeyHandler := handlers.NewAPIKeyHandler(queries)
 
 	// Encrypt any plaintext TOTP seeds at rest (idempotent).
 	if err := authHandler.MigrateTOTPSecrets(); err != nil {
@@ -112,6 +182,12 @@ func main() {
 	}
 	if _, err := vaultHandler.BackfillMetadataEncryption(); err != nil {
 		slog.Error("vault metadata backfill failed", "error", err)
+	}
+	// Encrypt free-text metadata (url/alias_url/username/category/notes) at rest
+	// and (re)compute the URL blind indexes. Best-effort and idempotent (the
+	// enc:v1: prefix guards it), retried next boot on failure.
+	if _, err := vaultHandler.BackfillMetadataAtRest(); err != nil {
+		slog.Error("vault metadata-at-rest backfill failed", "error", err)
 	}
 	vaultImportHandler := handlers.NewVaultImportHandler(dbConn, vaultHandler)
 
@@ -159,8 +235,10 @@ func main() {
 	// Build router.
 	r := chi.NewRouter()
 
-	// Global middleware.
-	r.Use(chimiddleware.RequestID)
+	// Global middleware. randomRequestID replaces chimiddleware.RequestID,
+	// whose default id prefix embeds os.Hostname() and would leak the host
+	// name into logs and any echoed request id.
+	r.Use(randomRequestID)
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Compress(5))
@@ -226,6 +304,15 @@ func main() {
 					r.Put("/smtp", settingsHandler.UpdateSMTP)
 					r.Post("/smtp/test", settingsHandler.TestSMTP)
 				})
+			})
+
+			// API keys for programmatic clients (the browser extension).
+			// Per-user and available to every authenticated role, since a
+			// vault_only teammate also needs to connect the extension.
+			r.Route("/api-keys", func(r chi.Router) {
+				r.Get("/", apiKeyHandler.List)
+				r.Post("/", apiKeyHandler.Create)
+				r.Delete("/{keyId}", apiKeyHandler.Delete)
 			})
 
 			// Activity log + exports (admin only).
@@ -326,7 +413,7 @@ func main() {
 
 	// Start server.
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Addr:              fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
 		Handler:           r,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,

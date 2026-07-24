@@ -33,8 +33,13 @@ COPY --from=frontend /app/frontend/dist /app/frontend/dist
 RUN mkdir -p /app/data && chown -R trustissues:trustissues /app
 USER trustissues
 
+# Bind 0.0.0.0 INSIDE the container only. The container network namespace
+# isolates this listener; reachability is still controlled at publish time
+# (docker-compose publishes to host loopback only) or via the internal Docker
+# network. On bare metal the app defaults to 127.0.0.1 instead.
 ENV TRUSTISSUES_DATA_DIR=/app/data \
     TRUSTISSUES_FRONTEND_DIR=/app/frontend/dist \
+    TRUSTISSUES_BIND_HOST=0.0.0.0 \
     TRUSTISSUES_PORT=8080
 
 EXPOSE 8080

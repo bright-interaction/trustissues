@@ -7,18 +7,20 @@ import {
   Check,
   Clock,
   Copy,
+  KeyRound,
   Loader2,
   Mail,
   ShieldCheck,
+  Trash2,
   User as UserIcon,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
 import { api, ApiError } from '@/lib/api';
 import { queryKeys } from '@/lib/query-keys';
 import { useAuth } from '@/hooks/useAuth';
-import type { SMTPConfig, VaultPolicy } from '@/lib/types';
+import type { SMTPConfig, VaultPolicy, ApiKeyCreated } from '@/lib/types';
 
-type SettingsTab = 'account' | 'policy' | 'session' | 'email';
+type SettingsTab = 'account' | 'policy' | 'session' | 'email' | 'apikeys';
 
 function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.message;
@@ -466,9 +468,9 @@ function PolicyTab() {
             type="number"
             min={1}
             max={480}
-            value={form.auto_lock_minutes}
+            value={form.auto_lock_max_minutes}
             onChange={(e) =>
-              setForm({ ...form, auto_lock_minutes: Number(e.target.value) })
+              setForm({ ...form, auto_lock_max_minutes: Number(e.target.value) })
             }
             className={inputClass}
           />
@@ -740,12 +742,153 @@ function EmailTab() {
   );
 }
 
+function ApiKeysTab() {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState('');
+  const [created, setCreated] = useState<ApiKeyCreated | null>(null);
+
+  const keysQuery = useQuery({
+    queryKey: queryKeys.apiKeys.list(),
+    queryFn: () => api.apiKeys.list(),
+  });
+
+  const createMutation = useMutation({
+    mutationFn: () => api.apiKeys.create({ name: name.trim() }),
+    onSuccess: (key) => {
+      setCreated(key);
+      setName('');
+      queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => api.apiKeys.delete(id),
+    onSuccess: () => {
+      toast.success('API key revoked');
+      queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const keys = keysQuery.data ?? [];
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className={cardClass}>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Browser extension and API access
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Create a key to connect the Trustissues browser extension or any
+          programmatic client. In the extension settings, enter this server's
+          address and paste the key. The key is shown once, so copy it now.
+        </p>
+
+        <form
+          onSubmit={(e: FormEvent) => {
+            e.preventDefault();
+            if (name.trim()) createMutation.mutate();
+          }}
+          className="mt-4 flex items-end gap-3"
+        >
+          <div className="flex-1">
+            <label className={labelClass} htmlFor="apikey-name">
+              Key name
+            </label>
+            <input
+              id="apikey-name"
+              className={inputClass}
+              placeholder="e.g. My laptop extension"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <button
+            type="submit"
+            className={primaryButtonClass}
+            disabled={!name.trim() || createMutation.isPending}
+          >
+            {createMutation.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <KeyRound className="h-4 w-4" />
+            )}
+            Create key
+          </button>
+        </form>
+
+        {created && (
+          <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <p className="text-sm font-medium text-amber-900">
+              Copy your new key now. You will not see it again.
+            </p>
+            <div className="mt-2 flex items-center gap-2">
+              <code className="flex-1 overflow-x-auto rounded-md bg-white px-3 py-2 font-mono text-xs text-slate-800">
+                {created.key}
+              </code>
+              <CopyButton text={created.key} />
+            </div>
+            <button
+              type="button"
+              onClick={() => setCreated(null)}
+              className="mt-3 text-xs font-medium text-amber-800 hover:text-amber-950"
+            >
+              I have copied it, dismiss
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className={cardClass}>
+        <h2 className="text-sm font-semibold text-slate-900">Your API keys</h2>
+        {keysQuery.isLoading ? (
+          <div className="mt-4 flex justify-center">
+            <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+          </div>
+        ) : keys.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">No API keys yet.</p>
+        ) : (
+          <ul className="mt-3 divide-y divide-slate-100">
+            {keys.map((k) => (
+              <li
+                key={k.id}
+                className="flex items-center justify-between py-3"
+              >
+                <div>
+                  <p className="text-sm font-medium text-slate-900">{k.name}</p>
+                  <p className="font-mono text-xs text-slate-400">
+                    ti_{k.key_prefix}...
+                    {k.last_used_at
+                      ? ` last used ${new Date(k.last_used_at).toLocaleDateString()}`
+                      : ' never used'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => deleteMutation.mutate(k.id)}
+                  disabled={deleteMutation.isPending}
+                  className="text-slate-400 transition-colors hover:text-red-600"
+                  title="Revoke key"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const { isAdmin } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const tabs: { id: SettingsTab; label: string; icon: typeof UserIcon }[] = [
     { id: 'account', label: 'Account', icon: UserIcon },
+    { id: 'apikeys', label: 'API keys', icon: KeyRound },
     ...(isAdmin
       ? ([
           { id: 'policy', label: 'Vault policy', icon: ShieldCheck },
@@ -791,6 +934,7 @@ export default function Settings() {
       </div>
 
       {activeTab === 'account' && <AccountTab />}
+      {activeTab === 'apikeys' && <ApiKeysTab />}
       {activeTab === 'policy' && isAdmin && <PolicyTab />}
       {activeTab === 'session' && isAdmin && <SessionTab />}
       {activeTab === 'email' && isAdmin && <EmailTab />}

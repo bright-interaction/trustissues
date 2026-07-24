@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 )
 
 const countRecentFailedLoginAttemptsByEmail = `-- name: CountRecentFailedLoginAttemptsByEmail :one
@@ -51,6 +52,27 @@ func (q *Queries) CreateLoginAttempt(ctx context.Context, arg CreateLoginAttempt
 	return err
 }
 
+const createSession = `-- name: CreateSession :exec
+
+INSERT INTO sessions (id, user_id, expires_at)
+VALUES (?, ?, ?)
+`
+
+type CreateSessionParams struct {
+	ID        string       `json:"id"`
+	UserID    string       `json:"user_id"`
+	ExpiresAt sql.NullTime `json:"expires_at"`
+}
+
+// Server-side session records. A JWT carries the session id as its jti claim;
+// the auth middleware rejects any token whose session row is missing, revoked,
+// or idle past the configured window. This turns stateless JWTs into revocable
+// sessions so logout and inactivity kill a leaked token immediately.
+func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) error {
+	_, err := q.db.ExecContext(ctx, createSession, arg.ID, arg.UserID, arg.ExpiresAt)
+	return err
+}
+
 const listRecentLoginAttemptsByEmail = `-- name: ListRecentLoginAttemptsByEmail :many
 SELECT id, email, ip_address, success, created_at
 FROM login_attempts
@@ -86,4 +108,24 @@ func (q *Queries) ListRecentLoginAttemptsByEmail(ctx context.Context, email stri
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeSession = `-- name: RevokeSession :exec
+UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+WHERE id = ? AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeSession(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, revokeSession, id)
+	return err
+}
+
+const revokeUserSessions = `-- name: RevokeUserSessions :exec
+UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+WHERE user_id = ? AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeUserSessions(ctx context.Context, userID string) error {
+	_, err := q.db.ExecContext(ctx, revokeUserSessions, userID)
+	return err
 }
