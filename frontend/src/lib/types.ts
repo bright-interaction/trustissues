@@ -123,3 +123,30 @@ export interface ApiKeyCreated {
   expires_at: string | null;
   created_at: string;
 }
+
+// Role a user holds on a shared-team-vault collection. viewer is read-only,
+// editor can add/move entries, manager can also manage members and the
+// collection itself.
+export type CollectionRole = 'viewer' | 'editor' | 'manager';
+
+// A shared-team-vault collection. The `role` is the CURRENT user's role on it.
+// Admins get every collection with role "manager"; others only get theirs.
+export interface Collection {
+  id: string;
+  name: string;
+  description: string;
+  role: CollectionRole;
+  member_count?: number;
+  entry_count?: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+// A member of a collection, as returned by GET /collections/{id}/members.
+export interface CollectionMember {
+  user_id: string;
+  email: string;
+  name: string;
+  role: CollectionRole;
+  added_at: string | null;
+}

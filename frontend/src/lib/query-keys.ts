@@ -29,4 +29,10 @@ export const queryKeys = {
     entry: (id: string) => ['vault', 'entry', id] as const,
     targets: (id: string) => ['vault', 'targets', id] as const,
   },
+  // Shared-team-vault collections and their members.
+  collections: {
+    all: ['collections'] as const,
+    list: () => ['collections', 'list'] as const,
+    members: (id: string) => ['collections', 'members', id] as const,
+  },
 };

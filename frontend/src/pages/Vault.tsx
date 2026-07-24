@@ -22,12 +22,15 @@ import {
   Ban,
   ScrollText,
   ShieldCheck,
+  Folder,
+  FolderPlus,
+  Users,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
-import { request } from '@/lib/api';
+import { api, request } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import Layout from '@/components/Layout';
 import VaultImportModal from '@/components/VaultImportModal';
@@ -38,6 +41,7 @@ import {
   serviceIdentityKeys,
 } from '@/lib/vault-types';
 import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey } from '@/lib/vault-types';
+import type { Collection, CollectionMember, CollectionRole } from '@/lib/types';
 
 // Seconds after which a copied secret is cleared from the clipboard, matching
 // the behaviour of dedicated password managers so a secret does not linger.
@@ -581,6 +585,291 @@ function ServiceIdentitiesCard() {
   );
 }
 
+const COLLECTION_ROLES: CollectionRole[] = ['viewer', 'editor', 'manager'];
+
+// Manager-only surface for a single collection: rename/delete the collection
+// and manage its members. The members query only fires while this modal is
+// mounted, so no conditional hooks. Server-side guards (409 last-manager, 404
+// unknown email) surface through the mutation error toasts.
+function CollectionManageModal({
+  collection,
+  onClose,
+  onDeleted,
+}: {
+  collection: Collection;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [addForm, setAddForm] = useState<{ email: string; role: CollectionRole }>({
+    email: '',
+    role: 'viewer',
+  });
+  const [details, setDetails] = useState({
+    name: collection.name,
+    description: collection.description,
+  });
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const { data: members = [], isLoading } = useQuery<CollectionMember[]>({
+    queryKey: queryKeys.collections.members(collection.id),
+    queryFn: () => api.collections.listMembers(collection.id),
+  });
+
+  function invalidateMembers() {
+    queryClient.invalidateQueries({ queryKey: queryKeys.collections.members(collection.id) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+  }
+
+  const addMemberMutation = useMutation({
+    mutationFn: (data: { email: string; role: CollectionRole }) =>
+      api.collections.addMember(collection.id, data),
+    onSuccess: () => {
+      toast.success('Member saved');
+      setAddForm({ email: '', role: 'viewer' });
+      invalidateMembers();
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const removeMemberMutation = useMutation({
+    mutationFn: (userId: string) => api.collections.removeMember(collection.id, userId),
+    onSuccess: () => {
+      toast.success('Member removed');
+      invalidateMembers();
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const updateCollectionMutation = useMutation({
+    mutationFn: (data: { name: string; description: string }) =>
+      api.collections.update(collection.id, data),
+    onSuccess: () => {
+      toast.success('Collection updated');
+      queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const deleteCollectionMutation = useMutation({
+    mutationFn: () => api.collections.remove(collection.id),
+    onSuccess: () => {
+      toast.success('Collection deleted');
+      queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+      onDeleted();
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[85vh] w-full max-w-2xl overflow-hidden rounded-xl bg-white shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <div className="flex items-center gap-2">
+            <Users className="h-4 w-4 text-slate-500" />
+            <h3 className="text-sm font-semibold text-slate-900">
+              Manage collection: {collection.name}
+            </h3>
+          </div>
+          <button onClick={onClose} className="rounded p-1 text-slate-400 hover:text-slate-600">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="max-h-[74vh] space-y-5 overflow-y-auto p-5">
+          {/* Collection details: rename + description + delete */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              updateCollectionMutation.mutate({
+                name: details.name.trim(),
+                description: details.description.trim(),
+              });
+            }}
+            className="space-y-3 rounded-lg border border-slate-100 bg-slate-50 p-4"
+          >
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-600">Name</label>
+                <input
+                  value={details.name}
+                  onChange={(e) => setDetails((d) => ({ ...d, name: e.target.value }))}
+                  required
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-600">Description</label>
+                <input
+                  value={details.description}
+                  onChange={(e) => setDetails((d) => ({ ...d, description: e.target.value }))}
+                  placeholder="Optional"
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <button
+                type="submit"
+                disabled={updateCollectionMutation.isPending || !details.name.trim()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+              >
+                {updateCollectionMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Save className="h-3.5 w-3.5" />
+                )}
+                Save details
+              </button>
+              {confirmDelete ? (
+                <span className="flex items-center gap-2">
+                  <span className="text-xs text-slate-500">Delete and all its entries?</span>
+                  <button
+                    type="button"
+                    onClick={() => deleteCollectionMutation.mutate()}
+                    disabled={deleteCollectionMutation.isPending}
+                    className="rounded-lg bg-rose-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+                  >
+                    Confirm delete
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(false)}
+                    className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:text-slate-700"
+                  >
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-rose-50 hover:text-rose-600"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete collection
+                </button>
+              )}
+            </div>
+          </form>
+
+          {/* Members list */}
+          <div>
+            <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Members
+            </h4>
+            {isLoading ? (
+              <div className="flex items-center justify-center py-6 text-slate-400">
+                <Loader2 className="h-5 w-5 animate-spin" />
+              </div>
+            ) : members.length === 0 ? (
+              <p className="py-4 text-center text-sm text-slate-400">No members yet.</p>
+            ) : (
+              <ul className="divide-y divide-slate-100 rounded-lg border border-slate-100">
+                {members.map((m) => (
+                  <li key={m.user_id} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-slate-900">{m.name || m.email}</p>
+                      <p className="truncate text-xs text-slate-400">{m.email}</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={m.role}
+                        onChange={(e) =>
+                          addMemberMutation.mutate({
+                            email: m.email,
+                            role: e.target.value as CollectionRole,
+                          })
+                        }
+                        disabled={addMemberMutation.isPending}
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs outline-none focus:border-slate-400 disabled:opacity-50"
+                      >
+                        {COLLECTION_ROLES.map((r) => (
+                          <option key={r} value={r}>
+                            {r}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => removeMemberMutation.mutate(m.user_id)}
+                        disabled={removeMemberMutation.isPending}
+                        title="Remove member"
+                        className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {/* Add member */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (addForm.email.trim()) {
+                addMemberMutation.mutate({
+                  email: addForm.email.trim(),
+                  role: addForm.role,
+                });
+              }
+            }}
+            className="space-y-2 rounded-lg border border-slate-100 bg-slate-50 p-4"
+          >
+            <label className="block text-xs font-medium text-slate-600">
+              Add a member by email
+            </label>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <input
+                type="email"
+                value={addForm.email}
+                onChange={(e) => setAddForm((f) => ({ ...f, email: e.target.value }))}
+                placeholder="teammate@example.com"
+                className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+              />
+              <select
+                value={addForm.role}
+                onChange={(e) => setAddForm((f) => ({ ...f, role: e.target.value as CollectionRole }))}
+                className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm outline-none focus:border-slate-400"
+              >
+                {COLLECTION_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="submit"
+                disabled={addMemberMutation.isPending || !addForm.email.trim()}
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+              >
+                {addMemberMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
+                Add
+              </button>
+            </div>
+            <p className="text-xs text-slate-400">
+              The person must already have a Trustissues account.
+            </p>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Vault() {
   const queryClient = useQueryClient();
 
@@ -594,18 +883,29 @@ export default function Vault() {
   const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
   const [showAddSecret, setShowAddSecret] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
-  const [newSecret, setNewSecret] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '' });
+  const [newSecret, setNewSecret] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
   const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
   const [rotatedValue, setRotatedValue] = useState<{ id: string; value: string } | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [rotatingEntryId, setRotatingEntryId] = useState<string | null>(null);
   const [rotationPanelId, setRotationPanelId] = useState<string | null>(null);
   const [rotatePassword, setRotatePassword] = useState('');
-  const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '' });
+  const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+
+  // Collection filter: 'all' | 'personal' | a collection id.
+  const [collectionFilter, setCollectionFilter] = useState<string>('all');
+  const [showNewCollection, setShowNewCollection] = useState(false);
+  const [newCollection, setNewCollection] = useState({ name: '', description: '' });
+  const [manageCollectionId, setManageCollectionId] = useState<string | null>(null);
 
   const { data: vaultList = [], isLoading: vaultLoading } = useQuery<VaultEntry[]>({
     queryKey: queryKeys.vault.list(),
     queryFn: vaultApi.list,
+  });
+
+  const { data: collections = [] } = useQuery<Collection[]>({
+    queryKey: queryKeys.collections.list(),
+    queryFn: api.collections.list,
   });
 
   // Auto-lock: drop the decrypted entries after the policy's
@@ -639,7 +939,7 @@ export default function Vault() {
     mutationFn: vaultApi.create,
     onSuccess: () => {
       toast.success('Secret added to vault');
-      setNewSecret({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '' });
+      setNewSecret({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
       setShowAddSecret(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       setVaultUnlocked(false);
@@ -682,6 +982,73 @@ export default function Vault() {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  const createCollectionMutation = useMutation({
+    mutationFn: (data: { name: string; description: string }) => api.collections.create(data),
+    onSuccess: () => {
+      toast.success('Collection created');
+      setShowNewCollection(false);
+      setNewCollection({ name: '', description: '' });
+      queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  // Moving an entry is a dedicated endpoint, not part of the entry update. We
+  // patch the in-memory unlocked list so the badge updates without re-locking.
+  const moveToCollectionMutation = useMutation({
+    mutationFn: ({ id, collectionId }: { id: string; collectionId: string | null }) =>
+      vaultApi.moveToCollection(id, collectionId),
+    onSuccess: (_data, variables) => {
+      toast.success(variables.collectionId ? 'Moved to collection' : 'Moved to personal');
+      setVaultEntries((prev) =>
+        prev.map((e) => (e.id === variables.id ? { ...e, collection_id: variables.collectionId } : e))
+      );
+      setEditForm((f) => ({ ...f, collection_id: variables.collectionId ?? '' }));
+      queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  // Collections the user can write into (add or move entries).
+  const writableCollections = collections.filter(
+    (c) => c.role === 'editor' || c.role === 'manager'
+  );
+
+  const collectionById = (id: string | null): Collection | undefined =>
+    id ? collections.find((c) => c.id === id) : undefined;
+
+  // Name for a collection badge; falls back to a generic label when the entry
+  // points at a collection not in our list (no crash, read-only treatment).
+  const collectionName = (id: string | null): string => collectionById(id)?.name ?? 'Shared';
+
+  // Whether the current user may edit/move/delete this entry. Personal entries
+  // are always the owner's. Collection entries need editor/manager; an unknown
+  // collection is treated as read-only.
+  function canEditEntry(entry: VaultEntry): boolean {
+    if (!entry.collection_id) return true;
+    const c = collectionById(entry.collection_id);
+    if (!c) return false;
+    return c.role === 'editor' || c.role === 'manager';
+  }
+
+  function matchesFilter(entry: VaultEntry): boolean {
+    if (collectionFilter === 'all') return true;
+    if (collectionFilter === 'personal') return !entry.collection_id;
+    return entry.collection_id === collectionFilter;
+  }
+
+  // The collection currently selected in the filter, if the user manages it,
+  // drives the contextual Manage button.
+  const selectedFilterCollection =
+    collectionFilter !== 'all' && collectionFilter !== 'personal'
+      ? collectionById(collectionFilter)
+      : undefined;
+  const manageCollection = manageCollectionId ? collectionById(manageCollectionId) : undefined;
+
+  const filteredEntries = vaultEntries.filter(matchesFilter);
+  const filteredVaultList = vaultList.filter(matchesFilter);
+
   function startEditing(entry: VaultEntry) {
     setEditingEntryId(entry.id);
     setEditForm({
@@ -694,6 +1061,7 @@ export default function Vault() {
       notes: entry.notes || '',
       rotation_interval_days: entry.rotation_interval_days?.toString() || '',
       expires_at: entry.expires_at ? entry.expires_at.split('T')[0] : '',
+      collection_id: entry.collection_id ?? '',
     });
   }
 
@@ -724,6 +1092,82 @@ export default function Vault() {
         {/* Service identities: machine credentials that fetch a scoped set
             of vault secrets at boot. Admin-only; renders null otherwise. */}
         <ServiceIdentitiesCard />
+
+        {/* Collection filter: All / Personal / each shared collection. Filters
+            the entries shown below and hosts the create + manage affordances. */}
+        <div className="rounded-xl border border-slate-200 bg-white p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Folder className="h-4 w-4 text-slate-500" />
+              <h3 className="text-sm font-semibold text-slate-900">Collections</h3>
+            </div>
+            <div className="flex items-center gap-2">
+              {selectedFilterCollection?.role === 'manager' && (
+                <button
+                  onClick={() => setManageCollectionId(selectedFilterCollection.id)}
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <Users className="h-3.5 w-3.5" />
+                  Manage
+                </button>
+              )}
+              <button
+                onClick={() => setShowNewCollection(true)}
+                className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <FolderPlus className="h-3.5 w-3.5" />
+                New collection
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              { key: 'all', label: 'All' },
+              { key: 'personal', label: 'Personal' },
+            ].map((f) => (
+              <button
+                key={f.key}
+                onClick={() => setCollectionFilter(f.key)}
+                className={clsx(
+                  'rounded-full border px-3 py-1 text-xs font-medium transition-colors',
+                  collectionFilter === f.key
+                    ? 'border-slate-900 bg-slate-900 text-white'
+                    : 'border-slate-300 bg-white text-slate-600 hover:border-slate-400'
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+            {collections.map((c) => {
+              const active = collectionFilter === c.id;
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => setCollectionFilter(c.id)}
+                  title={`Your role: ${c.role}`}
+                  className={clsx(
+                    'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors',
+                    active
+                      ? 'border-slate-900 bg-slate-900 text-white'
+                      : 'border-slate-300 bg-white text-slate-600 hover:border-slate-400'
+                  )}
+                >
+                  {c.name}
+                  {typeof c.entry_count === 'number' && (
+                    <span
+                      className={clsx(
+                        'rounded-full px-1.5 py-0.5 text-[10px] leading-none',
+                        active ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
+                      )}
+                    >
+                      {c.entry_count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
         {/* Unlock / Lock bar */}
         {!vaultUnlocked ? (
@@ -860,6 +1304,7 @@ export default function Vault() {
                     notes: newSecret.notes || undefined,
                     rotation_interval_days: newSecret.rotation_interval_days ? Number(newSecret.rotation_interval_days) : undefined,
                     expires_at: newSecret.expires_at || undefined,
+                    collection_id: newSecret.collection_id || undefined,
                   });
                 }}
                 className="mb-4 space-y-3 rounded-lg border border-slate-100 bg-slate-50 p-4"
@@ -894,6 +1339,25 @@ export default function Vault() {
                       <option value="database">Database</option>
                       <option value="certificate">Certificate</option>
                       <option value="other">Other</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-600">
+                      Collection
+                    </label>
+                    <select
+                      value={newSecret.collection_id}
+                      onChange={(e) => setNewSecret({ ...newSecret, collection_id: e.target.value })}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                    >
+                      <option value="">Personal</option>
+                      {writableCollections.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
                     </select>
                   </div>
                 </div>
@@ -1011,13 +1475,15 @@ export default function Vault() {
             )}
 
             {/* Secrets list (unlocked with values) */}
-            {vaultEntries.length === 0 ? (
+            {filteredEntries.length === 0 ? (
               <p className="py-4 text-center text-sm text-slate-500">
-                No secrets in the vault yet. Add one to get started.
+                {vaultEntries.length === 0
+                  ? 'No secrets in the vault yet. Add one to get started.'
+                  : 'No secrets in this view. Try a different collection filter.'}
               </p>
             ) : (
               <div className="space-y-2">
-                {vaultEntries.map((entry) => (
+                {filteredEntries.map((entry) => (
                   <div
                     key={entry.id}
                     className="rounded-lg border border-slate-100 bg-slate-50 p-3"
@@ -1058,6 +1524,37 @@ export default function Vault() {
                               <option value="other">Other</option>
                             </select>
                           </div>
+                        </div>
+                        <div>
+                          <label className="mb-1 block text-xs font-medium text-slate-600">
+                            Collection{' '}
+                            <span className="font-normal text-slate-400">(moves the entry when changed)</span>
+                          </label>
+                          <select
+                            value={editForm.collection_id}
+                            onChange={(e) => {
+                              const next = e.target.value || null;
+                              setEditForm((f) => ({ ...f, collection_id: next ?? '' }));
+                              moveToCollectionMutation.mutate({ id: entry.id, collectionId: next });
+                            }}
+                            disabled={moveToCollectionMutation.isPending}
+                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400 disabled:opacity-50"
+                          >
+                            <option value="">Personal</option>
+                            {writableCollections.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                            {/* Keep the current collection selectable even if it
+                                is not in the writable set (avoids a blank select). */}
+                            {editForm.collection_id &&
+                              !writableCollections.some((c) => c.id === editForm.collection_id) && (
+                                <option value={editForm.collection_id}>
+                                  {collectionName(editForm.collection_id)}
+                                </option>
+                              )}
+                          </select>
                         </div>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <div>
@@ -1171,6 +1668,15 @@ export default function Vault() {
                                 {entry.category}
                               </span>
                             )}
+                            {entry.collection_id && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600"
+                                title="Shared collection"
+                              >
+                                <Folder className="h-3 w-3" />
+                                {collectionName(entry.collection_id)}
+                              </span>
+                            )}
                             <span
                               className={clsx(
                                 'rounded-full px-2 py-0.5 text-xs font-medium',
@@ -1263,6 +1769,7 @@ export default function Vault() {
                             )}
                           </div>
                         </div>
+                        {canEditEntry(entry) ? (
                         <div className="ml-2 flex items-center gap-1">
                           <button
                             onClick={() => startEditing(entry)}
@@ -1305,6 +1812,15 @@ export default function Vault() {
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
                         </div>
+                        ) : (
+                          <span
+                            className="ml-2 inline-flex flex-shrink-0 items-center gap-1 self-start rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500"
+                            title="You have viewer access to this collection"
+                          >
+                            <Lock className="h-3 w-3" />
+                            View only
+                          </span>
+                        )}
                       </div>
                     )}
                     {rotatingEntryId === entry.id && (
@@ -1364,9 +1880,11 @@ export default function Vault() {
               <div className="flex items-center justify-center py-6">
                 <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
               </div>
-            ) : vaultList.length === 0 ? (
+            ) : filteredVaultList.length === 0 ? (
               <p className="py-4 text-center text-sm text-slate-500">
-                No secrets stored. Unlock the vault and add your first secret.
+                {vaultList.length === 0
+                  ? 'No secrets stored. Unlock the vault and add your first secret.'
+                  : 'No secrets in this view. Try a different collection filter.'}
               </p>
             ) : (
               <div className="overflow-hidden rounded-lg border border-slate-100">
@@ -1375,15 +1893,19 @@ export default function Vault() {
                     <tr className="border-b border-slate-100 bg-slate-50">
                       <th className="px-3 py-2 text-xs font-medium text-slate-500">Name</th>
                       <th className="px-3 py-2 text-xs font-medium text-slate-500">Category</th>
+                      <th className="px-3 py-2 text-xs font-medium text-slate-500">Collection</th>
                       <th className="px-3 py-2 text-xs font-medium text-slate-500">Status</th>
                       <th className="px-3 py-2 text-xs font-medium text-slate-500">Last rotated</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {vaultList.map((entry) => (
+                    {filteredVaultList.map((entry) => (
                       <tr key={entry.id} className="border-b border-slate-50 last:border-0">
                         <td className="px-3 py-2 text-sm font-medium text-slate-900">{entry.name}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">{entry.category || '-'}</td>
+                        <td className="px-3 py-2 text-xs text-slate-500">
+                          {entry.collection_id ? collectionName(entry.collection_id) : 'Personal'}
+                        </td>
                         <td className="px-3 py-2">
                           <span
                             className={clsx(
@@ -1421,6 +1943,98 @@ export default function Vault() {
           queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
         }}
       />
+
+      {/* New collection modal */}
+      {showNewCollection && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
+          onClick={() => setShowNewCollection(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center gap-2">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900">
+                <FolderPlus className="h-4 w-4 text-white" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">New collection</h3>
+                <p className="text-xs text-slate-500">You become its manager.</p>
+              </div>
+            </div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (newCollection.name.trim()) {
+                  createCollectionMutation.mutate({
+                    name: newCollection.name.trim(),
+                    description: newCollection.description.trim(),
+                  });
+                }
+              }}
+              className="space-y-3"
+            >
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-600">Name</label>
+                <input
+                  value={newCollection.name}
+                  onChange={(e) => setNewCollection((c) => ({ ...c, name: e.target.value }))}
+                  placeholder="e.g. Payments team"
+                  required
+                  autoFocus
+                  className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-600">
+                  Description (optional)
+                </label>
+                <input
+                  value={newCollection.description}
+                  onChange={(e) => setNewCollection((c) => ({ ...c, description: e.target.value }))}
+                  placeholder="What this collection holds"
+                  className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowNewCollection(false)}
+                  className="rounded-lg px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={createCollectionMutation.isPending || !newCollection.name.trim()}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {createCollectionMutation.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <FolderPlus className="h-3.5 w-3.5" />
+                  )}
+                  Create
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Manage collection modal (managers only; the button that opens it is
+          gated on role === 'manager'). */}
+      {manageCollection && (
+        <CollectionManageModal
+          collection={manageCollection}
+          onClose={() => setManageCollectionId(null)}
+          onDeleted={() => {
+            setManageCollectionId(null);
+            setCollectionFilter('all');
+          }}
+        />
+      )}
     </Layout>
   );
 }

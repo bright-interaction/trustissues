@@ -22,6 +22,8 @@ export interface VaultEntry {
   provider_meta?: string;
   auto_rotate?: boolean;
   last_rotation_error?: string;
+  // Which shared collection the entry lives in, or null for a personal entry.
+  collection_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -117,6 +119,9 @@ export const vaultApi = {
     notes?: string;
     rotation_interval_days?: number;
     expires_at?: string;
+    // Optional destination collection. Requires editor/manager on it; omit or
+    // null for a personal entry.
+    collection_id?: string | null;
   }) =>
     request<VaultEntry>('/vault', {
       method: 'POST',
@@ -150,6 +155,13 @@ export const vaultApi = {
     request<VaultEntry & { value: string }>(`/vault/${id}/rotate`, {
       method: 'POST',
       body: JSON.stringify({ password }),
+    }),
+  // Move an entry into a collection (editor/manager on the destination) or back
+  // to personal (pass null). Requires write access to the entry itself.
+  moveToCollection: (id: string, collectionId: string | null) =>
+    request<void>(`/vault/${id}/collection`, {
+      method: 'PUT',
+      body: JSON.stringify({ collection_id: collectionId }),
     }),
   // Rotation delivery targets (where a rotated secret is pushed).
   getTargets: (id: string) => request<RotationTarget[]>(`/vault/${id}/targets`),

@@ -15,6 +15,9 @@ import type {
   Role,
   ApiKey,
   ApiKeyCreated,
+  Collection,
+  CollectionMember,
+  CollectionRole,
 } from './types';
 
 export class ApiError extends Error {
@@ -225,6 +228,37 @@ export const api = {
       }),
     delete: (id: string) =>
       request<void>(`/api-keys/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
+  },
+
+  // Shared-team-vault collections with per-collection RBAC. The vault entry
+  // move endpoint lives on vaultApi (src/lib/vault-types.ts) beside the other
+  // vault wrappers.
+  collections: {
+    list: () => request<Collection[]>('/collections'),
+    get: (id: string) => request<Collection>(`/collections/${id}`),
+    create: (data: { name: string; description: string }) =>
+      request<Collection>('/collections', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, data: { name: string; description: string }) =>
+      request<Collection>(`/collections/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    remove: (id: string) =>
+      request<void>(`/collections/${id}`, { method: 'DELETE' }),
+    listMembers: (id: string) =>
+      request<CollectionMember[]>(`/collections/${id}/members`),
+    addMember: (id: string, data: { email: string; role: CollectionRole }) =>
+      request<CollectionMember>(`/collections/${id}/members`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    removeMember: (id: string, userId: string) =>
+      request<void>(`/collections/${id}/members/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
       }),
   },
