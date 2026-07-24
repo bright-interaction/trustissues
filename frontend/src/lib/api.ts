@@ -11,6 +11,7 @@ import type {
   Invitation,
   SMTPConfig,
   SessionDurationConfig,
+  AIConfig,
   VaultPolicy,
   Role,
   ApiKey,
@@ -215,6 +216,20 @@ export const api = {
       request<SessionDurationConfig>('/settings/session-duration'),
     updateSessionDuration: (data: { duration_hours: number }) =>
       request<SessionDurationConfig>('/settings/session-duration', {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+  },
+
+  // AI + MCP settings. Reading is open to any signed-in user (they need the
+  // connection URLs); updating provider keys is admin-only server-side (403).
+  ai: {
+    getConfig: () => request<AIConfig>('/settings/ai'),
+    updateConfig: (data: {
+      anthropic_entry_id?: string | null;
+      openai_entry_id?: string | null;
+    }) =>
+      request<AIConfig>('/settings/ai', {
         method: 'PUT',
         body: JSON.stringify(data),
       }),

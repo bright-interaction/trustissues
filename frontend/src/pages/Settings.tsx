@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { QRCodeSVG } from 'qrcode.react';
 import toast from 'react-hot-toast';
 import {
+  Bot,
   Check,
   Clock,
   Copy,
@@ -16,11 +17,12 @@ import {
 } from 'lucide-react';
 import Layout from '@/components/Layout';
 import { api, ApiError } from '@/lib/api';
+import { vaultApi } from '@/lib/vault-types';
 import { queryKeys } from '@/lib/query-keys';
 import { useAuth } from '@/hooks/useAuth';
-import type { SMTPConfig, VaultPolicy, ApiKeyCreated } from '@/lib/types';
+import type { SMTPConfig, VaultPolicy, ApiKeyCreated, AIConfig } from '@/lib/types';
 
-type SettingsTab = 'account' | 'policy' | 'session' | 'email' | 'apikeys';
+type SettingsTab = 'account' | 'policy' | 'session' | 'email' | 'apikeys' | 'ai';
 
 function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.message;
@@ -882,6 +884,284 @@ function ApiKeysTab() {
   );
 }
 
+function StatusPill({
+  on,
+  onLabel,
+  offLabel,
+}: {
+  on: boolean;
+  onLabel: string;
+  offLabel: string;
+}) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
+        on ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'
+      }`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          on ? 'bg-emerald-500' : 'bg-slate-400'
+        }`}
+      />
+      {on ? onLabel : offLabel}
+    </span>
+  );
+}
+
+function CodeBox({ value }: { value: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <code className="flex-1 overflow-x-auto rounded-md bg-slate-50 px-3 py-2 font-mono text-xs text-slate-800">
+        {value}
+      </code>
+      <CopyButton text={value} />
+    </div>
+  );
+}
+
+function AITab() {
+  const { isAdmin } = useAuth();
+  const queryClient = useQueryClient();
+
+  const { data: config, isLoading } = useQuery<AIConfig>({
+    queryKey: queryKeys.ai.config(),
+    queryFn: api.ai.getConfig,
+  });
+
+  // The vault list backs the provider-key dropdowns. Only admins can change the
+  // keys, so only they need the list.
+  const vaultQuery = useQuery({
+    queryKey: queryKeys.vault.list(),
+    queryFn: () => vaultApi.list(),
+    enabled: isAdmin,
+  });
+
+  const [form, setForm] = useState<{
+    anthropic_entry_id: string;
+    openai_entry_id: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (config && !form) {
+      setForm({
+        anthropic_entry_id: config.anthropic_entry_id,
+        openai_entry_id: config.openai_entry_id,
+      });
+    }
+  }, [config, form]);
+
+  const saveMutation = useMutation({
+    mutationFn: (data: {
+      anthropic_entry_id?: string | null;
+      openai_entry_id?: string | null;
+    }) => api.ai.updateConfig(data),
+    onSuccess: (saved) => {
+      toast.success('Provider keys saved');
+      queryClient.setQueryData(queryKeys.ai.config(), saved);
+      setForm({
+        anthropic_entry_id: saved.anthropic_entry_id,
+        openai_entry_id: saved.openai_entry_id,
+      });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  if (isLoading || !config || (isAdmin && (!form || vaultQuery.isLoading))) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+      </div>
+    );
+  }
+
+  const apiKeyEntries = (vaultQuery.data ?? []).filter(
+    (entry) => entry.category === 'api_key'
+  );
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className={cardClass}>
+        <h2 className="mb-1 text-base font-semibold text-slate-900">
+          Provider keys
+        </h2>
+        <p className="mb-4 text-sm text-slate-500">
+          The team key each provider uses. It stays in the vault and is injected
+          server-side, so no one pastes a raw key into an AI client.
+        </p>
+
+        {isAdmin && form ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveMutation.mutate({
+                anthropic_entry_id: form.anthropic_entry_id,
+                openai_entry_id: form.openai_entry_id,
+              });
+            }}
+            className="space-y-4"
+          >
+            <div>
+              <div className="mb-1.5 flex items-center gap-2">
+                <label className="text-sm font-medium text-slate-700">
+                  Anthropic
+                </label>
+                <StatusPill
+                  on={config.anthropic_configured}
+                  onLabel="Configured"
+                  offLabel="Not set"
+                />
+              </div>
+              <select
+                className={inputClass}
+                value={form.anthropic_entry_id}
+                onChange={(e) =>
+                  setForm({ ...form, anthropic_entry_id: e.target.value })
+                }
+              >
+                <option value="">Not configured</option>
+                {apiKeyEntries.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <div className="mb-1.5 flex items-center gap-2">
+                <label className="text-sm font-medium text-slate-700">
+                  OpenAI
+                </label>
+                <StatusPill
+                  on={config.openai_configured}
+                  onLabel="Configured"
+                  offLabel="Not set"
+                />
+              </div>
+              <select
+                className={inputClass}
+                value={form.openai_entry_id}
+                onChange={(e) =>
+                  setForm({ ...form, openai_entry_id: e.target.value })
+                }
+              >
+                <option value="">Not configured</option>
+                {apiKeyEntries.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {apiKeyEntries.length === 0 && (
+              <p className="text-xs text-slate-400">
+                No vault entries in the api_key category yet. Add one in the
+                vault, then pick it here.
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={saveMutation.isPending}
+              className={primaryButtonClass}
+            >
+              {saveMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              Save provider keys
+            </button>
+          </form>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm text-slate-700">
+              <span className="w-20">Anthropic</span>
+              <StatusPill
+                on={config.anthropic_configured}
+                onLabel="Configured"
+                offLabel="Not set"
+              />
+            </div>
+            <div className="flex items-center gap-2 text-sm text-slate-700">
+              <span className="w-20">OpenAI</span>
+              <StatusPill
+                on={config.openai_configured}
+                onLabel="Configured"
+                offLabel="Not set"
+              />
+            </div>
+            <p className="text-xs text-slate-400">
+              An admin configures the provider keys for the team.
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div className={cardClass}>
+        <div className="mb-1 flex items-center gap-2">
+          <h2 className="text-base font-semibold text-slate-900">
+            Shield (PII protection)
+          </h2>
+          <StatusPill on={config.shield_enabled} onLabel="On" offLabel="Off" />
+        </div>
+        {config.shield_enabled ? (
+          <p className="text-sm text-slate-500">
+            PII in prompts and tool results is tokenized before it reaches the
+            model, so names, emails, and secrets never leave your server in the
+            clear. Hint level:{' '}
+            <span className="font-medium text-slate-700">
+              {config.shield_hint_level}
+            </span>
+            .
+          </p>
+        ) : (
+          <p className="text-sm text-slate-500">
+            Shield is off. An operator turns it on by setting the
+            TRUSTISSUES_SHIELD_KEY environment variable. When on, PII in prompts
+            and tool results is tokenized before it reaches the model.
+          </p>
+        )}
+      </div>
+
+      <div className={cardClass}>
+        <h2 className="mb-1 text-base font-semibold text-slate-900">
+          Connect an AI assistant (MCP)
+        </h2>
+        <p className="mb-3 text-sm text-slate-500">
+          Add this as a remote MCP or connector in Claude or ChatGPT and
+          authenticate with an API key from the API keys tab (header X-API-Key).
+        </p>
+        <CodeBox value={config.mcp_url} />
+        <p className="mt-3 text-sm text-slate-500">
+          It exposes two tools: list_secrets returns the names of the vault
+          entries you can reach, and use_secret injects a chosen secret into the
+          request without ever revealing its value.
+        </p>
+      </div>
+
+      <div className={cardClass}>
+        <h2 className="mb-1 text-base font-semibold text-slate-900">
+          Use AI through the gateway
+        </h2>
+        <p className="mb-3 text-sm text-slate-500">
+          Point your Anthropic or OpenAI SDK base URL at{' '}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-slate-700">
+            {config.gateway_base_url}/anthropic
+          </code>{' '}
+          or{' '}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-slate-700">
+            {config.gateway_base_url}/openai
+          </code>
+          , and authenticate with an API key (header X-API-Key). The team key is
+          injected server-side and PII is tokenized. Non-streaming only.
+        </p>
+        <CodeBox value={config.gateway_base_url} />
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const { isAdmin } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -889,6 +1169,7 @@ export default function Settings() {
   const tabs: { id: SettingsTab; label: string; icon: typeof UserIcon }[] = [
     { id: 'account', label: 'Account', icon: UserIcon },
     { id: 'apikeys', label: 'API keys', icon: KeyRound },
+    { id: 'ai', label: 'AI & MCP', icon: Bot },
     ...(isAdmin
       ? ([
           { id: 'policy', label: 'Vault policy', icon: ShieldCheck },
@@ -935,6 +1216,7 @@ export default function Settings() {
 
       {activeTab === 'account' && <AccountTab />}
       {activeTab === 'apikeys' && <ApiKeysTab />}
+      {activeTab === 'ai' && <AITab />}
       {activeTab === 'policy' && isAdmin && <PolicyTab />}
       {activeTab === 'session' && isAdmin && <SessionTab />}
       {activeTab === 'email' && isAdmin && <EmailTab />}

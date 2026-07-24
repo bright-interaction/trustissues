@@ -96,6 +96,20 @@ export interface SessionDurationConfig {
   duration_hours: number;
 }
 
+// AI + MCP settings. Provider keys point at vault entries by id; Shield is
+// operator-configured through an environment variable and reported read-only.
+// The gateway and MCP URLs are what a client points at to connect.
+export interface AIConfig {
+  anthropic_configured: boolean;
+  openai_configured: boolean;
+  anthropic_entry_id: string;
+  openai_entry_id: string;
+  shield_enabled: boolean;
+  shield_hint_level: string;
+  gateway_base_url: string;
+  mcp_url: string;
+}
+
 // Team-wide vault policy, editable by admins in Settings.
 export interface VaultPolicy {
   min_password_length: number;

@@ -22,6 +22,9 @@ export const queryKeys = {
     all: ['api-keys'] as const,
     list: () => ['api-keys', 'list'] as const,
   },
+  ai: {
+    config: () => ['ai', 'config'] as const,
+  },
   // Reserved for the vault module (src/pages/Vault.tsx and friends).
   vault: {
     all: ['vault'] as const,
