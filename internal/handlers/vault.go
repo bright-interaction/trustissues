@@ -111,6 +111,52 @@ func (h *VaultHandler) urlBlindIndex(raw string) string {
 // for at-rest storage using the enc:v1: column scheme. Empty values pass through
 // unchanged (encryptColumn skips them), and already-encrypted values are not
 // double-wrapped, so callers may pass either cleartext or stored ciphertext.
+// maxCustomFields caps how many custom fields an entry may carry.
+const maxCustomFields = 50
+
+// validateCustomFields enforces sane limits before storage.
+func validateCustomFields(fields []CustomField) error {
+	if len(fields) > maxCustomFields {
+		return fmt.Errorf("too many custom fields (max %d)", maxCustomFields)
+	}
+	for _, f := range fields {
+		if len(f.Label) > 255 {
+			return fmt.Errorf("custom field label too long (max 255)")
+		}
+		if len(f.Value) > 10000 {
+			return fmt.Errorf("custom field value too long (max 10000)")
+		}
+	}
+	return nil
+}
+
+// encryptCustomFields marshals the fields to JSON and encrypts the blob at rest.
+// An empty set stores as a plaintext "[]" so a never-touched entry is cheap.
+func (h *VaultHandler) encryptCustomFields(fields []CustomField) (string, error) {
+	if len(fields) == 0 {
+		return "[]", nil
+	}
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	return h.encryptColumn(string(raw))
+}
+
+// decryptCustomFields decrypts and parses the stored blob, returning an empty
+// slice on any error (a corrupt field must never break loading an entry).
+func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
+	dec := h.decryptColumnOrLog(stored, "[]", "custom_fields")
+	if dec == "" {
+		return nil
+	}
+	var fields []CustomField
+	if err := json.Unmarshal([]byte(dec), &fields); err != nil {
+		return nil
+	}
+	return fields
+}
+
 func (h *VaultHandler) encryptMetaColumns(rawURL, aliasURL, username, category, notes string) (encURL, encAlias, encUser, encCat, encNotes string, err error) {
 	if encURL, err = h.encryptColumn(rawURL); err != nil {
 		return
@@ -297,26 +343,37 @@ func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 
 // vaultEntryMeta is the JSON response for vault entries (metadata only, no secret value).
 type vaultEntryMeta struct {
-	ID                   string  `json:"id"`
-	UserID               string  `json:"user_id,omitempty"`
-	CollectionID         *string `json:"collection_id"`
-	Name                 string  `json:"name"`
-	URL                  string  `json:"url"`
-	AliasURL             string  `json:"alias_url"`
-	Username             string  `json:"username"`
-	Category             string  `json:"category"`
-	Notes                string  `json:"notes"`
-	AutoLogin            bool    `json:"auto_login"`
-	RotationIntervalDays *int    `json:"rotation_interval_days"`
-	ExpiresAt            *string `json:"expires_at"`
-	LastRotatedAt        *string `json:"last_rotated_at"`
-	RotationStatus       string  `json:"rotation_status"`
-	Provider             string  `json:"provider"`
-	ProviderMeta         string  `json:"provider_meta"`
-	AutoRotate           bool    `json:"auto_rotate"`
-	LastRotationError    string  `json:"last_rotation_error"`
-	CreatedAt            *string `json:"created_at"`
-	UpdatedAt            *string `json:"updated_at"`
+	ID                   string        `json:"id"`
+	UserID               string        `json:"user_id,omitempty"`
+	CollectionID         *string       `json:"collection_id"`
+	Name                 string        `json:"name"`
+	URL                  string        `json:"url"`
+	AliasURL             string        `json:"alias_url"`
+	Username             string        `json:"username"`
+	Category             string        `json:"category"`
+	Notes                string        `json:"notes"`
+	AutoLogin            bool          `json:"auto_login"`
+	RotationIntervalDays *int          `json:"rotation_interval_days"`
+	ExpiresAt            *string       `json:"expires_at"`
+	LastRotatedAt        *string       `json:"last_rotated_at"`
+	RotationStatus       string        `json:"rotation_status"`
+	Provider             string        `json:"provider"`
+	ProviderMeta         string        `json:"provider_meta"`
+	AutoRotate           bool          `json:"auto_rotate"`
+	LastRotationError    string        `json:"last_rotation_error"`
+	CustomFields         []CustomField `json:"custom_fields,omitempty"`
+	CreatedAt            *string       `json:"created_at"`
+	UpdatedAt            *string       `json:"updated_at"`
+}
+
+// CustomField is an arbitrary user-defined field on an entry (Bitwarden-style):
+// a label, a value, and a secret flag that tells the UI to mask the value by
+// default. The whole set is encrypted at rest, so a secret field is protected
+// the same way regardless of the flag; the flag is only a display hint.
+type CustomField struct {
+	Label  string `json:"label"`
+	Value  string `json:"value"`
+	Secret bool   `json:"secret"`
 }
 
 // vaultEntryFull includes the decrypted secret value (only returned on explicit unlock).
@@ -345,6 +402,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		CustomFields:         h.decryptCustomFields(row.CustomFields),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -725,23 +783,28 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var req struct {
-		Name                 string  `json:"name"`
-		Value                string  `json:"value"`
-		URL                  string  `json:"url"`
-		AliasURL             string  `json:"alias_url"`
-		Username             string  `json:"username"`
-		Category             string  `json:"category"`
-		Notes                string  `json:"notes"`
-		AutoLogin            bool    `json:"auto_login"`
-		RotationIntervalDays *int    `json:"rotation_interval_days"`
-		ExpiresAt            *string `json:"expires_at"`
-		Provider             string  `json:"provider"`
-		ProviderMeta         string  `json:"provider_meta"`
-		AutoRotate           bool    `json:"auto_rotate"`
-		CollectionID         *string `json:"collection_id"`
+		Name                 string        `json:"name"`
+		Value                string        `json:"value"`
+		URL                  string        `json:"url"`
+		AliasURL             string        `json:"alias_url"`
+		Username             string        `json:"username"`
+		Category             string        `json:"category"`
+		Notes                string        `json:"notes"`
+		AutoLogin            bool          `json:"auto_login"`
+		RotationIntervalDays *int          `json:"rotation_interval_days"`
+		ExpiresAt            *string       `json:"expires_at"`
+		Provider             string        `json:"provider"`
+		ProviderMeta         string        `json:"provider_meta"`
+		AutoRotate           bool          `json:"auto_rotate"`
+		CollectionID         *string       `json:"collection_id"`
+		CustomFields         []CustomField `json:"custom_fields"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid JSON")
+		return
+	}
+	if err := validateCustomFields(req.CustomFields); err != nil {
+		writeBadRequest(w, r, err.Error())
 		return
 	}
 
@@ -890,6 +953,23 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Persist custom fields (encrypted at rest) when present.
+	if len(req.CustomFields) > 0 {
+		enc, cfErr := h.encryptCustomFields(req.CustomFields)
+		if cfErr != nil {
+			logError(r, "vault.create: custom fields encrypt failed", "error", cfErr)
+			writeInternalError(w, r, "failed to store secret")
+			return
+		}
+		if cfErr := h.queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
+			CustomFields: enc, ID: entryID,
+		}); cfErr != nil {
+			logError(r, "vault.create: custom fields save failed", "error", cfErr)
+			writeInternalError(w, r, "failed to store secret")
+			return
+		}
+	}
+
 	row, err := h.queries.GetVaultEntryMeta(ctx, entryID)
 	if err != nil {
 		logError(r, "vault.create: select after insert failed", "error", err)
@@ -989,23 +1069,40 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name                 *string `json:"name"`
-		Value                *string `json:"value"`
-		URL                  *string `json:"url"`
-		AliasURL             *string `json:"alias_url"`
-		Username             *string `json:"username"`
-		Category             *string `json:"category"`
-		Notes                *string `json:"notes"`
-		AutoLogin            *bool   `json:"auto_login"`
-		RotationIntervalDays *int    `json:"rotation_interval_days"`
-		ExpiresAt            *string `json:"expires_at"`
-		Provider             *string `json:"provider"`
-		ProviderMeta         *string `json:"provider_meta"`
-		AutoRotate           *bool   `json:"auto_rotate"`
+		Name                 *string        `json:"name"`
+		Value                *string        `json:"value"`
+		URL                  *string        `json:"url"`
+		AliasURL             *string        `json:"alias_url"`
+		Username             *string        `json:"username"`
+		Category             *string        `json:"category"`
+		Notes                *string        `json:"notes"`
+		AutoLogin            *bool          `json:"auto_login"`
+		RotationIntervalDays *int           `json:"rotation_interval_days"`
+		ExpiresAt            *string        `json:"expires_at"`
+		Provider             *string        `json:"provider"`
+		ProviderMeta         *string        `json:"provider_meta"`
+		AutoRotate           *bool          `json:"auto_rotate"`
+		CustomFields         *[]CustomField `json:"custom_fields"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid JSON")
 		return
+	}
+
+	// Custom fields: nil means "unchanged"; a present (even empty) array replaces
+	// the set. Encrypted at rest.
+	if req.CustomFields != nil {
+		if err := validateCustomFields(*req.CustomFields); err != nil {
+			writeBadRequest(w, r, err.Error())
+			return
+		}
+		if enc, cfErr := h.encryptCustomFields(*req.CustomFields); cfErr != nil {
+			logError(r, "vault.update: custom fields encrypt failed", "error", cfErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		} else if err := h.queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{CustomFields: enc, ID: id}); err != nil {
+			logError(r, "vault.update: update custom fields failed", "error", err)
+		}
 	}
 
 	// If value is provided and non-empty, re-encrypt and update last_rotated_at
@@ -1282,6 +1379,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
+				CustomFields:         h.decryptCustomFields(row.CustomFields),
 				CreatedAt:            nullTimePtr(row.CreatedAt),
 				UpdatedAt:            nullTimePtr(row.UpdatedAt),
 			},

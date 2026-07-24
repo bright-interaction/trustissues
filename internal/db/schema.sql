@@ -138,6 +138,7 @@ CREATE TABLE vault_entries (
   url_bidx TEXT NOT NULL DEFAULT '',
   alias_url_bidx TEXT NOT NULL DEFAULT '',
   collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
+  custom_fields TEXT NOT NULL DEFAULT '[]',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, name)

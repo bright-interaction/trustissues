@@ -44,8 +44,11 @@ INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 
 -- name: GetVaultEntryMeta :one
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at
 FROM vault_entries WHERE id = ?;
+
+-- name: UpdateVaultEntryCustomFields :exec
+UPDATE vault_entries SET custom_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- ============================================================================
 -- Update entry - encrypted value (re-encrypt + rotate timestamp)
@@ -103,7 +106,7 @@ DELETE FROM vault_entries WHERE id = ?;
 SELECT password_hash FROM users WHERE id = ?;
 
 -- name: ListVaultEntriesWithSecrets :many
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at, encrypted_value, nonce
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at, encrypted_value, nonce
 FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 
 -- ============================================================================

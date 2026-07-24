@@ -226,6 +226,7 @@ type Querier interface {
 	UpdateVaultEntryAliasURL(ctx context.Context, arg UpdateVaultEntryAliasURLParams) error
 	UpdateVaultEntryAutoLogin(ctx context.Context, arg UpdateVaultEntryAutoLoginParams) error
 	UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error
+	UpdateVaultEntryCustomFields(ctx context.Context, arg UpdateVaultEntryCustomFieldsParams) error
 	UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVaultEntryExpiresAtParams) error
 	UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error
 	// ============================================================================
