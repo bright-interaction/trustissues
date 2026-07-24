@@ -25,6 +25,7 @@ import {
   Folder,
   FolderPlus,
   Users,
+  Database,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
@@ -40,7 +41,7 @@ import {
   serviceIdentitiesApi,
   serviceIdentityKeys,
 } from '@/lib/vault-types';
-import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey } from '@/lib/vault-types';
+import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey, CustomField } from '@/lib/vault-types';
 import type { Collection, CollectionMember, CollectionRole } from '@/lib/types';
 
 // Seconds after which a copied secret is cleared from the clipboard, matching
@@ -101,6 +102,207 @@ function CopyButton({ text }: { text: string }) {
     >
       {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
     </button>
+  );
+}
+
+// Labels a "database" entry gets pre-filled with, so DB credentials use the
+// same custom-fields mechanism as everything else but arrive structured.
+const DB_PRESET_LABELS = ['Host', 'Port', 'Database', 'SSL mode'];
+
+// Drop rows with no label and trim what remains, so blank editor rows never
+// reach the API. The value is kept as typed (may be intentionally empty).
+function cleanCustomFields(fields: CustomField[]): CustomField[] {
+  return fields
+    .filter((f) => f.label.trim() !== '')
+    .map((f) => ({ label: f.label.trim(), value: f.value, secret: f.secret }));
+}
+
+// Editable list of custom fields used inside both the add and edit forms. Each
+// row is a label + value + a "secret" masking flag. Secret values render as a
+// password input with a per-row show/hide toggle. The "Add database fields"
+// button only shows for the database category and never duplicates a label.
+function CustomFieldsEditor({
+  fields,
+  onChange,
+  category,
+}: {
+  fields: CustomField[];
+  onChange: (fields: CustomField[]) => void;
+  category: string;
+}) {
+  const [shown, setShown] = useState<Set<number>>(new Set());
+
+  function toggleShown(index: number) {
+    setShown((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  }
+
+  function updateField(index: number, patch: Partial<CustomField>) {
+    onChange(fields.map((f, i) => (i === index ? { ...f, ...patch } : f)));
+  }
+
+  function addField() {
+    onChange([...fields, { label: '', value: '', secret: false }]);
+  }
+
+  function removeField(index: number) {
+    onChange(fields.filter((_, i) => i !== index));
+    // Reindex the local show/hide set so later rows keep their visibility.
+    setShown((prev) => {
+      const next = new Set<number>();
+      prev.forEach((i) => {
+        if (i < index) next.add(i);
+        else if (i > index) next.add(i - 1);
+      });
+      return next;
+    });
+  }
+
+  function addDatabaseFields() {
+    const existing = new Set(fields.map((f) => f.label.trim().toLowerCase()));
+    const additions = DB_PRESET_LABELS.filter(
+      (label) => !existing.has(label.toLowerCase())
+    ).map((label) => ({ label, value: '', secret: false }));
+    if (additions.length > 0) onChange([...fields, ...additions]);
+  }
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <label className="block text-xs font-medium text-slate-600">Custom fields</label>
+        {category === 'database' && (
+          <button
+            type="button"
+            onClick={addDatabaseFields}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+          >
+            <Database className="h-3 w-3" />
+            Add database fields
+          </button>
+        )}
+      </div>
+      {fields.length > 0 && (
+        <div className="space-y-2">
+          {fields.map((field, index) => {
+            const visible = !field.secret || shown.has(index);
+            return (
+              <div key={index} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={field.label}
+                  onChange={(e) => updateField(index, { label: e.target.value })}
+                  placeholder="Label"
+                  className="w-1/3 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
+                />
+                <div className="relative flex-1">
+                  <input
+                    type={field.secret && !visible ? 'password' : 'text'}
+                    value={field.value}
+                    onChange={(e) => updateField(index, { value: e.target.value })}
+                    placeholder="Value"
+                    className={clsx(
+                      'w-full rounded-lg border border-slate-200 bg-white py-1.5 pl-3 text-sm outline-none focus:border-slate-400',
+                      field.secret ? 'pr-9 font-mono' : 'pr-3'
+                    )}
+                  />
+                  {field.secret && (
+                    <button
+                      type="button"
+                      onClick={() => toggleShown(index)}
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-600"
+                      title={visible ? 'Hide value' : 'Show value'}
+                    >
+                      {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => updateField(index, { secret: !field.secret })}
+                  className={clsx(
+                    'rounded-lg border p-1.5 transition-colors',
+                    field.secret
+                      ? 'border-slate-900 bg-slate-900 text-white'
+                      : 'border-slate-200 text-slate-400 hover:text-slate-600'
+                  )}
+                  title={field.secret ? 'Value is hidden (click to show as a plain field)' : 'Hide this value'}
+                >
+                  {field.secret ? <Lock className="h-3.5 w-3.5" /> : <Unlock className="h-3.5 w-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => removeField(index)}
+                  className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white hover:text-red-500"
+                  title="Remove field"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={addField}
+        className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+      >
+        <Plus className="h-3.5 w-3.5" />
+        Add field
+      </button>
+    </div>
+  );
+}
+
+// Read-only render of an unlocked entry's custom fields. Secret values stay
+// masked behind a per-row show/hide toggle; every value gets a CopyButton with
+// the same auto-clear behaviour as the main secret value.
+function CustomFieldsDisplay({ fields }: { fields: CustomField[] }) {
+  const [shown, setShown] = useState<Set<number>>(new Set());
+  if (fields.length === 0) return null;
+
+  function toggleShown(index: number) {
+    setShown((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  }
+
+  return (
+    <div className="mt-2 space-y-1.5">
+      {fields.map((field, index) => {
+        const visible = !field.secret || shown.has(index);
+        return (
+          <div key={index} className="flex items-center gap-2 text-xs">
+            <span
+              className="w-1/4 min-w-[72px] flex-shrink-0 truncate font-medium text-slate-500"
+              title={field.label}
+            >
+              {field.label}
+            </span>
+            <div className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-slate-700">
+              {visible ? field.value : '••••••••••••'}
+            </div>
+            {field.secret && (
+              <button
+                onClick={() => toggleShown(index)}
+                className="rounded p-1 text-slate-400 hover:text-slate-600"
+                title={visible ? 'Hide' : 'Reveal'}
+              >
+                {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            )}
+            <CopyButton text={field.value} />
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -884,6 +1086,7 @@ export default function Vault() {
   const [showAddSecret, setShowAddSecret] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [newSecret, setNewSecret] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+  const [newCustomFields, setNewCustomFields] = useState<CustomField[]>([]);
   const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
   const [rotatedValue, setRotatedValue] = useState<{ id: string; value: string } | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
@@ -891,6 +1094,7 @@ export default function Vault() {
   const [rotationPanelId, setRotationPanelId] = useState<string | null>(null);
   const [rotatePassword, setRotatePassword] = useState('');
   const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+  const [editCustomFields, setEditCustomFields] = useState<CustomField[]>([]);
 
   // Collection filter: 'all' | 'personal' | a collection id.
   const [collectionFilter, setCollectionFilter] = useState<string>('all');
@@ -940,6 +1144,7 @@ export default function Vault() {
     onSuccess: () => {
       toast.success('Secret added to vault');
       setNewSecret({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+      setNewCustomFields([]);
       setShowAddSecret(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       setVaultUnlocked(false);
@@ -1063,6 +1268,7 @@ export default function Vault() {
       expires_at: entry.expires_at ? entry.expires_at.split('T')[0] : '',
       collection_id: entry.collection_id ?? '',
     });
+    setEditCustomFields((entry.custom_fields ?? []).map((f) => ({ ...f })));
   }
 
   function submitEdit(entryId: string) {
@@ -1076,6 +1282,9 @@ export default function Vault() {
     data.notes = editForm.notes;
     data.rotation_interval_days = editForm.rotation_interval_days ? Number(editForm.rotation_interval_days) : null;
     data.expires_at = editForm.expires_at || null;
+    // Always send the array: it replaces the whole set, so removing every row
+    // clears the entry's custom fields.
+    data.custom_fields = cleanCustomFields(editCustomFields);
     updateSecretMutation.mutate({ id: entryId, data });
   }
 
@@ -1305,6 +1514,7 @@ export default function Vault() {
                     rotation_interval_days: newSecret.rotation_interval_days ? Number(newSecret.rotation_interval_days) : undefined,
                     expires_at: newSecret.expires_at || undefined,
                     collection_id: newSecret.collection_id || undefined,
+                    custom_fields: cleanCustomFields(newCustomFields),
                   });
                 }}
                 className="mb-4 space-y-3 rounded-lg border border-slate-100 bg-slate-50 p-4"
@@ -1450,6 +1660,11 @@ export default function Vault() {
                     />
                   </div>
                 </div>
+                <CustomFieldsEditor
+                  fields={newCustomFields}
+                  onChange={setNewCustomFields}
+                  category={newSecret.category}
+                />
                 <div className="flex gap-2">
                   <button
                     type="submit"
@@ -1632,6 +1847,11 @@ export default function Vault() {
                             />
                           </div>
                         </div>
+                        <CustomFieldsEditor
+                          fields={editCustomFields}
+                          onChange={setEditCustomFields}
+                          category={editForm.category}
+                        />
                         <div className="flex gap-2">
                           <button
                             type="submit"
@@ -1756,6 +1976,9 @@ export default function Vault() {
                             </button>
                             {entry.value && <CopyButton text={entry.value} />}
                           </div>
+                          {entry.custom_fields && entry.custom_fields.length > 0 && (
+                            <CustomFieldsDisplay fields={entry.custom_fields} />
+                          )}
                           <div className="mt-1.5 flex items-center gap-3 text-xs text-slate-400">
                             <span className="flex items-center gap-1">
                               <Clock className="h-3 w-3" />
