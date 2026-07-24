@@ -1,0 +1,10 @@
+.git
+frontend/node_modules
+frontend/dist
+data
+*.db
+*.db-shm
+*.db-wal
+bin
+server
+notes
