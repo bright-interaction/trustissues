@@ -299,6 +299,7 @@ func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 type vaultEntryMeta struct {
 	ID                   string  `json:"id"`
 	UserID               string  `json:"user_id,omitempty"`
+	CollectionID         *string `json:"collection_id"`
 	Name                 string  `json:"name"`
 	URL                  string  `json:"url"`
 	AliasURL             string  `json:"alias_url"`
@@ -403,6 +404,58 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) vaultEntryMeta {
 	return vaultEntryMeta{
 		ID:                   row.ID,
+		Name:                 row.Name,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		AutoLogin:            row.AutoLogin != 0,
+		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
+		ExpiresAt:            nullTimePtr(row.ExpiresAt),
+		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
+		Provider:             row.Provider.String,
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		AutoRotate:           row.AutoRotate.Int64 != 0,
+		LastRotationError:    row.LastRotationError.String,
+		CreatedAt:            nullTimePtr(row.CreatedAt),
+		UpdatedAt:            nullTimePtr(row.UpdatedAt),
+	}
+}
+
+// vaultMetaFromAccessibleRow converts a db.ListAccessibleVaultEntriesRow (the
+// collection-aware listing that returns personal + collection entries) to a
+// vaultEntryMeta, including which collection the entry belongs to.
+func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntriesRow) vaultEntryMeta {
+	return vaultEntryMeta{
+		ID:                   row.ID,
+		UserID:               row.UserID,
+		CollectionID:         nullStringPtr(row.CollectionID),
+		Name:                 row.Name,
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		AutoLogin:            row.AutoLogin != 0,
+		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
+		ExpiresAt:            nullTimePtr(row.ExpiresAt),
+		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
+		Provider:             row.Provider.String,
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		AutoRotate:           row.AutoRotate.Int64 != 0,
+		LastRotationError:    row.LastRotationError.String,
+		CreatedAt:            nullTimePtr(row.CreatedAt),
+		UpdatedAt:            nullTimePtr(row.UpdatedAt),
+	}
+}
+
+// vaultMetaFromMatchAccessibleRow converts a collection-aware autofill match row
+// to a vaultEntryMeta.
+func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVaultEntriesByURLRow) vaultEntryMeta {
+	return vaultEntryMeta{
+		ID:                   row.ID,
+		CollectionID:         nullStringPtr(row.CollectionID),
 		Name:                 row.Name,
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
@@ -528,20 +581,67 @@ func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *
 	return "fresh"
 }
 
-// ownsEntry checks if the authenticated user owns the given vault entry.
-// Admins own all entries. Returns the entry's user_id or empty string if not found.
-func (h *VaultHandler) ownsEntry(r *http.Request, entryID string) (string, bool) {
+// Collection membership roles (per-collection, distinct from the account-level
+// admin/user/vault_only roles).
+const (
+	collRoleViewer  = "viewer"
+	collRoleEditor  = "editor"
+	collRoleManager = "manager"
+)
+
+// entryAccess resolves whether the authenticated user may read and/or write a
+// vault entry. Personal entries (no collection) are owner-only, with instance
+// admins seeing everything. Collection entries are governed by the caller's
+// membership role: viewer can read, editor and manager can also write; a
+// non-member gets nothing. Returns (false, false) for a missing entry so callers
+// 404 uniformly. This is the single authorization point for every single-entry
+// operation; do not bypass it with a raw owner check.
+func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, canWrite bool) {
 	userID := middleware.GetUserID(r.Context())
 	isAdmin := middleware.IsAdmin(r.Context())
 
-	entryUserID, err := h.queries.GetVaultEntryOwner(r.Context(), entryID)
+	info, err := h.queries.GetVaultEntryAccess(r.Context(), entryID)
 	if err != nil {
-		return "", false
+		return false, false
 	}
-	if isAdmin || entryUserID == userID {
-		return entryUserID, true
+	if isAdmin {
+		return true, true
 	}
-	return entryUserID, false
+	if info.CollectionID.Valid && info.CollectionID.String != "" {
+		role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+			CollectionID: info.CollectionID.String,
+			UserID:       userID,
+		})
+		if err != nil {
+			return false, false
+		}
+		switch role {
+		case collRoleManager, collRoleEditor:
+			return true, true
+		case collRoleViewer:
+			return true, false
+		default:
+			return false, false
+		}
+	}
+	owns := info.UserID == userID
+	return owns, owns
+}
+
+// canWriteCollection reports whether the caller may add or modify entries in a
+// collection: an instance admin, or a member with the editor or manager role.
+func (h *VaultHandler) canWriteCollection(r *http.Request, collectionID string) bool {
+	if middleware.IsAdmin(r.Context()) {
+		return true
+	}
+	role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+		CollectionID: collectionID,
+		UserID:       middleware.GetUserID(r.Context()),
+	})
+	if err != nil {
+		return false
+	}
+	return role == collRoleEditor || role == collRoleManager
 }
 
 // List handles GET /api/vault and returns vault entries (metadata only, no secret values).
@@ -563,6 +663,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			e := h.vaultMetaFromListAllRow(row)
+			e.CollectionID = nullStringPtr(row.CollectionID)
 			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
 			entries = append(entries, e)
 		}
@@ -579,14 +680,19 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, e)
 		}
 	} else {
-		rows, err := h.queries.ListVaultEntriesByUser(ctx, userID)
+		// Non-admin: personal entries plus entries in collections the user
+		// belongs to. Access is enforced in the query itself.
+		rows, err := h.queries.ListAccessibleVaultEntries(ctx, db.ListAccessibleVaultEntriesParams{
+			UserID:   userID,
+			UserID_2: userID,
+		})
 		if err != nil {
 			logError(r, "vault.list: query failed", "error", err)
 			writeInternalError(w, r, "internal server error")
 			return
 		}
 		for _, row := range rows {
-			e := h.vaultMetaFromListByUserRow(row)
+			e := h.vaultMetaFromAccessibleRow(row)
 			e.UserID = "" // omitempty will exclude it
 			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
 			entries = append(entries, e)
@@ -615,10 +721,23 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Provider             string  `json:"provider"`
 		ProviderMeta         string  `json:"provider_meta"`
 		AutoRotate           bool    `json:"auto_rotate"`
+		CollectionID         *string `json:"collection_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid JSON")
 		return
+	}
+
+	// If the entry is being created inside a shared collection, the caller must
+	// be an editor or manager of it (or an instance admin). Authorize before we
+	// do any work so a non-member cannot even probe collection ids.
+	var collectionID sql.NullString
+	if req.CollectionID != nil && *req.CollectionID != "" {
+		if !h.canWriteCollection(r, *req.CollectionID) {
+			writeForbidden(w, r, "you do not have write access to that collection")
+			return
+		}
+		collectionID = sql.NullString{String: *req.CollectionID, Valid: true}
 	}
 
 	req.Name = strings.TrimSpace(req.Name)
@@ -740,6 +859,20 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Place the entry in its collection (CreateVaultEntry always inserts a
+	// personal row; a shared entry is moved into its collection here, after the
+	// caller was authorized above).
+	if collectionID.Valid {
+		if err := h.queries.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
+			CollectionID: collectionID,
+			ID:           entryID,
+		}); err != nil {
+			logError(r, "vault.create: set collection failed", "error", err)
+			writeInternalError(w, r, "failed to store secret")
+			return
+		}
+	}
+
 	row, err := h.queries.GetVaultEntryMeta(ctx, entryID)
 	if err != nil {
 		logError(r, "vault.create: select after insert failed", "error", err)
@@ -748,6 +881,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := h.vaultMetaFromGetRow(row)
+	entry.CollectionID = nullStringPtr(collectionID)
 
 	// Seed the capability-bridge columns from the provider's defaults so the
 	// secret is immediately usable through /secrets/issue + /proxy (dockyard
@@ -757,6 +891,43 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", req.Name, userID))
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// MoveToCollection handles PUT /api/vault/{id}/collection and moves an entry
+// into a shared collection, or back to personal with a null/empty id. Requires
+// write access to the entry and, for a non-empty target, editor/manager on the
+// destination collection.
+func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	var req struct {
+		CollectionID *string `json:"collection_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, r, "invalid JSON")
+		return
+	}
+	var target sql.NullString
+	if req.CollectionID != nil && *req.CollectionID != "" {
+		if !h.canWriteCollection(r, *req.CollectionID) {
+			writeForbidden(w, r, "you do not have write access to that collection")
+			return
+		}
+		target = sql.NullString{String: *req.CollectionID, Valid: true}
+	}
+	if err := h.queries.SetVaultEntryCollection(r.Context(), db.SetVaultEntryCollectionParams{
+		CollectionID: target,
+		ID:           id,
+	}); err != nil {
+		logError(r, "vault.move: set collection failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf("Vault entry moved to collection (id: %s)", id))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // seedCapabilityDefaults fills destination_patterns + injection_spec from the
@@ -794,8 +965,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
 
-	// Check ownership
-	if _, ok := h.ownsEntry(r, id); !ok {
+	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -963,8 +1134,8 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
 
-	// Check ownership
-	if _, ok := h.ownsEntry(r, id); !ok {
+	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1063,8 +1234,11 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query only this user's vault entries
-	rows, err := h.queries.ListVaultEntriesWithSecrets(ctx, userID)
+	// Reveal spans personal entries plus entries in the user's collections.
+	rows, err := h.queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
+		UserID:   userID,
+		UserID_2: userID,
+	})
 	if err != nil {
 		logError(r, "vault.unlock: query failed", "error", err)
 		writeInternalError(w, r, "internal server error")
@@ -1076,6 +1250,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 		e := vaultEntryFull{
 			vaultEntryMeta: vaultEntryMeta{
 				ID:                   row.ID,
+				CollectionID:         nullStringPtr(row.CollectionID),
 				Name:                 row.Name,
 				URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
 				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
@@ -1154,8 +1329,8 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check ownership
-	if _, ok := h.ownsEntry(r, id); !ok {
+	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1386,7 +1561,7 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := h.ownsEntry(r, id); !ok {
+	if canRead, _ := h.entryAccess(r, id); !canRead {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1443,7 +1618,7 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 // GetTargets handles GET /api/vault/{id}/targets - returns rotation targets for an entry.
 func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, ok := h.ownsEntry(r, id); !ok {
+	if canRead, _ := h.entryAccess(r, id); !canRead {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1463,7 +1638,7 @@ func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 // reload_endpoint) are cut.
 func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, ok := h.ownsEntry(r, id); !ok {
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1521,7 +1696,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 // UpdateSchedule handles PUT /api/vault/{id}/schedule - sets rotation interval and auto-rotate.
 func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, ok := h.ownsEntry(r, id); !ok {
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1601,8 +1776,10 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid URL")
 		return
 	}
-	rows, err := h.queries.MatchVaultEntriesByURL(ctx, db.MatchVaultEntriesByURLParams{
+	// Autofill spans personal entries plus entries in the user's collections.
+	rows, err := h.queries.MatchAccessibleVaultEntriesByURL(ctx, db.MatchAccessibleVaultEntriesByURLParams{
 		UserID:       userID,
+		UserID_2:     userID,
 		UrlBidx:      bidx,
 		AliasUrlBidx: bidx,
 	})
@@ -1614,7 +1791,7 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 
 	entries := []vaultEntryMeta{}
 	for _, row := range rows {
-		e := h.vaultMetaFromMatchRow(row)
+		e := h.vaultMetaFromMatchAccessibleRow(row)
 		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
 		entries = append(entries, e)
 	}

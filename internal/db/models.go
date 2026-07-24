@@ -58,6 +58,22 @@ type CapabilitySpentNonce struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+type Collection struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	CreatedBy   sql.NullString `json:"created_by"`
+	CreatedAt   sql.NullTime   `json:"created_at"`
+	UpdatedAt   sql.NullTime   `json:"updated_at"`
+}
+
+type CollectionMember struct {
+	CollectionID string       `json:"collection_id"`
+	UserID       string       `json:"user_id"`
+	Role         string       `json:"role"`
+	AddedAt      sql.NullTime `json:"added_at"`
+}
+
 type Invitation struct {
 	ID         string         `json:"id"`
 	Code       string         `json:"code"`
@@ -174,6 +190,7 @@ type VaultEntry struct {
 	InjectionSpec        string         `json:"injection_spec"`
 	UrlBidx              string         `json:"url_bidx"`
 	AliasUrlBidx         string         `json:"alias_url_bidx"`
+	CollectionID         sql.NullString `json:"collection_id"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }

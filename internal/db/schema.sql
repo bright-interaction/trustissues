@@ -90,6 +90,26 @@ CREATE TABLE notification_channels (
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 00023_collections.sql (shared team vaults; defined before vault_entries for
+-- the collection_id foreign key).
+CREATE TABLE collections (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE collection_members (
+  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'editor', 'manager')),
+  added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (collection_id, user_id)
+);
+CREATE INDEX idx_collection_members_user ON collection_members(user_id);
+
 -- 00010_vault.sql
 CREATE TABLE vault_entries (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -117,6 +137,7 @@ CREATE TABLE vault_entries (
   injection_spec TEXT NOT NULL DEFAULT '{}',
   url_bidx TEXT NOT NULL DEFAULT '',
   alias_url_bidx TEXT NOT NULL DEFAULT '',
+  collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, name)
@@ -124,6 +145,7 @@ CREATE TABLE vault_entries (
 
 CREATE INDEX idx_vault_entries_url ON vault_entries(url) WHERE url != '';
 CREATE INDEX idx_vault_entries_user ON vault_entries(user_id);
+CREATE INDEX idx_vault_entries_collection ON vault_entries(collection_id) WHERE collection_id IS NOT NULL;
 
 -- 00011_metadata_at_rest.sql (url/alias_url/username/category/notes encrypted at
 -- rest; url_bidx/alias_url_bidx hold the keyed HMAC blind index for autofill).
