@@ -115,6 +115,8 @@ CREATE TABLE vault_entries (
   rotation_targets TEXT DEFAULT '[]',
   destination_patterns TEXT NOT NULL DEFAULT '[]',
   injection_spec TEXT NOT NULL DEFAULT '{}',
+  url_bidx TEXT NOT NULL DEFAULT '',
+  alias_url_bidx TEXT NOT NULL DEFAULT '',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, name)
@@ -122,6 +124,11 @@ CREATE TABLE vault_entries (
 
 CREATE INDEX idx_vault_entries_url ON vault_entries(url) WHERE url != '';
 CREATE INDEX idx_vault_entries_user ON vault_entries(user_id);
+
+-- 00011_metadata_at_rest.sql (url/alias_url/username/category/notes encrypted at
+-- rest; url_bidx/alias_url_bidx hold the keyed HMAC blind index for autofill).
+CREATE INDEX idx_vault_entries_url_bidx ON vault_entries(url_bidx) WHERE url_bidx != '';
+CREATE INDEX idx_vault_entries_alias_url_bidx ON vault_entries(alias_url_bidx) WHERE alias_url_bidx != '';
 
 -- 00020_capability.sql (accessed via raw parameterized SQL in
 -- internal/handlers/capability.go; mirrored here to keep this file a
@@ -189,3 +196,18 @@ CREATE TABLE service_secret_audit (
 );
 CREATE INDEX idx_service_secret_audit_identity ON service_secret_audit(service_identity_id, occurred_at DESC);
 CREATE INDEX idx_service_secret_audit_event ON service_secret_audit(event, occurred_at DESC);
+
+-- 00022_sessions.sql
+-- Per-token server-side session records. A JWT carries its session id as the jti
+-- claim; the auth middleware rejects any token whose session row is missing,
+-- revoked, or idle past the configured window. expires_at is nullable so sqlc
+-- types CreateSessionParams.ExpiresAt as sql.NullTime.
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at DATETIME,
+  revoked_at DATETIME
+);
+CREATE INDEX idx_sessions_user ON sessions(user_id);

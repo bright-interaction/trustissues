@@ -100,6 +100,26 @@ export interface SessionDurationConfig {
 export interface VaultPolicy {
   min_password_length: number;
   require_totp: boolean;
-  auto_lock_minutes: number;
+  auto_lock_max_minutes: number;
   rotation_reminder_days: number;
+}
+
+// An API key as listed (prefix only, never the secret).
+export interface ApiKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+  created_at: string;
+}
+
+// Returned once, at creation. `key` is the full secret and is never shown again.
+export interface ApiKeyCreated {
+  id: string;
+  name: string;
+  key: string;
+  key_prefix: string;
+  expires_at: string | null;
+  created_at: string;
 }

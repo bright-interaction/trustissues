@@ -51,9 +51,12 @@ type DeliveryResult struct {
 	Error   string         `json:"error,omitempty"`
 }
 
-// ParseRotationTargets parses the rotation_targets JSON column.
+// ParseRotationTargets parses the rotation_targets JSON column. It always
+// returns a non-nil slice so callers that marshal the result straight into a
+// JSON response (GET /api/vault/{id}/targets) emit `[]` for an entry with no
+// targets, never `null`.
 func ParseRotationTargets(raw string) []RotationTarget {
-	var targets []RotationTarget
+	targets := make([]RotationTarget, 0)
 	if raw != "" && raw != "[]" {
 		_ = json.Unmarshal([]byte(raw), &targets)
 	}
@@ -86,7 +89,12 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 
 		result := DeliveryResult{Target: target, Success: err == nil}
 		if err != nil {
-			result.Error = err.Error()
+			// summarizeDelivery folds result.Error into last_rotation_error,
+			// which is API-visible. A transport failure is a *url.Error whose
+			// Error() embeds the full target URL (internal IPs for an
+			// SSRF-blocked webhook, plus any query/userinfo); redact it before
+			// it can be persisted. The unredacted cause stays in the slog line.
+			result.Error = redactUpstreamError(err)
 			slog.Error("vault delivery: target failed",
 				"type", target.Type,
 				"entry", entryName,

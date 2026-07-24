@@ -347,16 +347,26 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		}
 		entryID := fmt.Sprintf("%x", idBytes)
 
+		// Encrypt the free-text metadata at rest and compute the URL blind index,
+		// exactly as Create does, so imported rows are never stored in cleartext.
+		// (Imports carry no alias_url, so that column is left empty.)
+		encURL, _, encUser, encCat, encNotes, encErr := h.handler.encryptMetaColumns(entry.URL, "", entry.Username, category, entry.Notes)
+		if encErr != nil {
+			slog.Error("failed to encrypt entry metadata", "name", entry.Name, "error", encErr)
+			continue
+		}
+
 		err = qtx.ImportVaultEntry(r.Context(), db.ImportVaultEntryParams{
 			ID:             entryID,
 			UserID:         userID,
 			Name:           entry.Name,
 			EncryptedValue: encrypted,
 			Nonce:          nonce,
-			Url:            toNullString(entry.URL),
-			Username:       toNullString(entry.Username),
-			Category:       toNullString(category),
-			Notes:          toNullString(entry.Notes),
+			Url:            toNullString(encURL),
+			Username:       toNullString(encUser),
+			Category:       toNullString(encCat),
+			Notes:          toNullString(encNotes),
+			UrlBidx:        h.handler.urlBlindIndex(entry.URL),
 		})
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {

@@ -39,6 +39,10 @@ import {
 } from '@/lib/vault-types';
 import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey } from '@/lib/vault-types';
 
+// Seconds after which a copied secret is cleared from the clipboard, matching
+// the behaviour of dedicated password managers so a secret does not linger.
+const CLIPBOARD_CLEAR_SECONDS = 20;
+
 function copyToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).catch(() => {});
@@ -54,6 +58,21 @@ function copyToClipboard(text: string) {
     document.body.removeChild(textarea);
   } catch {
     // ignore
+  }
+
+  // Auto-clear: only wipe if the clipboard still holds the value we wrote, so we
+  // never clobber something the user copied elsewhere in the meantime.
+  if (navigator.clipboard?.writeText && navigator.clipboard?.readText) {
+    window.setTimeout(() => {
+      navigator.clipboard
+        .readText()
+        .then((current) => {
+          if (current === text) {
+            navigator.clipboard.writeText('').catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }, CLIPBOARD_CLEAR_SECONDS * 1000);
   }
 }
 
@@ -569,7 +588,7 @@ export default function Vault() {
   // Team vault policy drives the auto-lock timer below.
   const { data: vaultPolicy } = useQuery({
     queryKey: queryKeys.settings.vaultPolicy(),
-    queryFn: () => request<{ auto_lock_minutes: number }>('/settings/vault-policy'),
+    queryFn: () => request<{ auto_lock_max_minutes: number }>('/settings/vault-policy'),
   });
   const [vaultPassword, setVaultPassword] = useState('');
   const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
@@ -590,11 +609,11 @@ export default function Vault() {
   });
 
   // Auto-lock: drop the decrypted entries after the policy's
-  // auto_lock_minutes (GET /api/settings/vault-policy). The values only live
+  // auto_lock_max_minutes (GET /api/settings/vault-policy). The values only live
   // in memory, so re-locking is just clearing state.
   useEffect(() => {
     if (!vaultUnlocked) return;
-    const minutes = vaultPolicy?.auto_lock_minutes ?? 15;
+    const minutes = vaultPolicy?.auto_lock_max_minutes ?? 15;
     const timer = setTimeout(() => {
       setVaultUnlocked(false);
       setVaultEntries([]);
@@ -603,7 +622,7 @@ export default function Vault() {
       toast('Vault locked automatically', { icon: '🔒' });
     }, minutes * 60_000);
     return () => clearTimeout(timer);
-  }, [vaultUnlocked, vaultPolicy?.auto_lock_minutes]);
+  }, [vaultUnlocked, vaultPolicy?.auto_lock_max_minutes]);
 
   const unlockVaultMutation = useMutation({
     mutationFn: (password: string) => vaultApi.unlock(password),

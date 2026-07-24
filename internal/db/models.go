@@ -118,6 +118,15 @@ type ServiceSecretAudit struct {
 	OccurredAt        time.Time      `json:"occurred_at"`
 }
 
+type Session struct {
+	ID         string       `json:"id"`
+	UserID     string       `json:"user_id"`
+	CreatedAt  time.Time    `json:"created_at"`
+	LastUsedAt time.Time    `json:"last_used_at"`
+	ExpiresAt  sql.NullTime `json:"expires_at"`
+	RevokedAt  sql.NullTime `json:"revoked_at"`
+}
+
 type Setting struct {
 	Key       string       `json:"key"`
 	Value     string       `json:"value"`
@@ -163,6 +172,8 @@ type VaultEntry struct {
 	RotationTargets      sql.NullString `json:"rotation_targets"`
 	DestinationPatterns  string         `json:"destination_patterns"`
 	InjectionSpec        string         `json:"injection_spec"`
+	UrlBidx              string         `json:"url_bidx"`
+	AliasUrlBidx         string         `json:"alias_url_bidx"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }

@@ -10,7 +10,15 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-XSS-Protection", "0")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' wss:; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		// CSP for the self-hosted Vite SPA. style-src keeps 'unsafe-inline'
+		// because the Vite/Tailwind build injects runtime <style> tags and
+		// inline style attributes that no nonce covers; script-src is strict
+		// 'self' (no inline/eval). img-src is 'self' data: only (the app bundles
+		// its own provider icons and loads no remote images), and connect-src is
+		// 'self' (no WebSocket/wss; the SPA talks only to its own origin over
+		// HTTP). Narrowing img-src/connect-src off the previous https:/wss:
+		// wildcards removes a data-exfiltration channel.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}

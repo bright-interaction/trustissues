@@ -143,7 +143,7 @@ Assumed, please confirm or adjust (see notes/frontend-platform.md):
   and create accepts `{ email, name, role, send_email? }` (role includes
   vault_only)
 - `GET/PUT /api/settings/vault-policy` with
-  `{ min_password_length, require_totp, auto_lock_minutes, rotation_reminder_days }`
+  `{ min_password_length, require_totp, auto_lock_max_minutes, rotation_reminder_days }`
 - `GET/PUT /api/settings/session-duration` `{ duration_hours }`
 - `GET/PUT /api/settings/smtp` (+ `POST /api/settings/smtp/test`) shaped like
   dockyard's `{ host, port, from, username, password_set, use_tls }`

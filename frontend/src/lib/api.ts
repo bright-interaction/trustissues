@@ -13,6 +13,8 @@ import type {
   SessionDurationConfig,
   VaultPolicy,
   Role,
+  ApiKey,
+  ApiKeyCreated,
 } from './types';
 
 export class ApiError extends Error {
@@ -212,6 +214,18 @@ export const api = {
       request<SessionDurationConfig>('/settings/session-duration', {
         method: 'PUT',
         body: JSON.stringify(data),
+      }),
+  },
+  apiKeys: {
+    list: () => request<ApiKey[]>('/api-keys'),
+    create: (data: { name: string; expires_in_days?: number }) =>
+      request<ApiKeyCreated>('/api-keys', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string) =>
+      request<void>(`/api-keys/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
       }),
   },
 };

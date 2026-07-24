@@ -170,7 +170,7 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		var allowed []string
 		for _, d := range req.Dests {
 			host, path := splitHostPath(d)
-			if capability.DestMatches(capability.Token{Dests: ceiling}, host, path) {
+			if destMatches(ceiling, host, path) {
 				allowed = append(allowed, d)
 			}
 		}
@@ -264,7 +264,7 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !capability.DestMatches(tok, host, upstreamPath) {
+	if !destMatches(tok.Dests, host, upstreamPath) {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_mismatch", tok.Nonce)
 		writeError(w, r, http.StatusForbidden, "destination_mismatch", "token does not authorise this destination")
 		return
@@ -275,7 +275,7 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	// issue-time only) to the current policy. Skipped when the secret has no
 	// allow-list (nothing to tighten against).
 	if patterns := h.currentDestinationPatterns(ctx, tok.SecretID); len(patterns) > 0 {
-		if !capability.DestMatches(capability.Token{Dests: patterns}, host, upstreamPath) {
+		if !destMatches(patterns, host, upstreamPath) {
 			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_not_in_current_allowlist", tok.Nonce)
 			writeError(w, r, http.StatusForbidden, "destination_mismatch", "destination is not in the secret's current allow-list")
 			return
@@ -570,7 +570,7 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 			return capabilityEntryRow{}, err
 		}
 		patterns := parseDestinationPatterns(e.DestinationPatterns)
-		if capability.DestMatches(capability.Token{Dests: patterns}, host, path) {
+		if destMatches(patterns, host, path) {
 			matched = append(matched, e)
 		}
 	}
@@ -604,6 +604,55 @@ func splitHostPath(dest string) (host, path string) {
 		return dest[:i], dest[i:]
 	}
 	return dest, ""
+}
+
+// destMatches reports whether host+path is allowed by at least one of the
+// given destination patterns. It is a superset of capability.DestMatches: the
+// package matcher understands exact and trailing "/*" path globs but NOT a
+// leading "*." host wildcard, so provider presets like "*.grafana.net/*",
+// "*.auth0.com/*", and "*.supabase.co/*" would never match their per-tenant
+// hosts. Every production destination check routes through here so those
+// presets work; the exact/trailing-glob cases still delegate to the audited
+// package matcher to avoid re-implementing (and diverging from) its grammar.
+func destMatches(dests []string, host, path string) bool {
+	if capability.DestMatches(capability.Token{Dests: dests}, host, path) {
+		return true
+	}
+	dest := strings.ToLower(host + path)
+	for _, pat := range dests {
+		if leadingWildcardMatch(strings.ToLower(pat), dest) {
+			return true
+		}
+	}
+	return false
+}
+
+// leadingWildcardMatch matches a "*."-prefixed host preset such as
+// "*.grafana.net/*" against a concrete "host/path" dest. The wildcard covers
+// one or more subdomain labels: it matches "stack.grafana.net/..." and
+// "eu.stack.grafana.net/..." but never the apex "grafana.net", nor a sibling
+// suffix like "notgrafana.net", nor "grafana.net.evil.com". A pattern without a
+// leading "*." returns false here (handled by capability.DestMatches instead).
+// The path portion is matched with the same trailing-"/*" grammar the package
+// matcher uses, so "*.host/*" and "*.host/v1" behave like their non-wildcard
+// counterparts.
+func leadingWildcardMatch(pat, dest string) bool {
+	if !strings.HasPrefix(pat, "*.") {
+		return false
+	}
+	patHost, patPath := splitHostPath(pat)
+	destHost, destPath := splitHostPath(dest)
+	suffix := patHost[1:] // ".grafana.net"
+	// Require at least one non-empty label before the suffix so the apex and
+	// bare-suffix impostors ("notgrafana.net") do not match.
+	if len(destHost) <= len(suffix) || !strings.HasSuffix(destHost, suffix) {
+		return false
+	}
+	if strings.HasSuffix(patPath, "/*") {
+		prefix := strings.TrimSuffix(patPath, "/*")
+		return destPath == prefix || strings.HasPrefix(destPath, prefix+"/")
+	}
+	return destPath == patPath || strings.HasPrefix(destPath, patPath+"/")
 }
 
 func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID string) ([]byte, InjectionSpec, error) {

@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+// Proxy trust configuration for clientIP. Set once at startup via
+// ConfigureProxy before the server starts serving. Defaults match the
+// intended deploy: one trusted Caddy hop, X-Real-IP ignored.
+var (
+	trustedProxyHops = 1
+	trustXRealIP     = false
+)
+
+// ConfigureProxy sets how the rate limiter derives the client IP from the
+// forwarding chain. hops is the number of trusted reverse-proxy hops in front
+// of the server (0 means trust only the direct socket peer). trustRealIP
+// enables honoring a single X-Real-IP header; it stays false unless the
+// operator explicitly opts in, because X-Real-IP is client-controlled.
+func ConfigureProxy(hops int, trustRealIP bool) {
+	if hops < 0 {
+		hops = 0
+	}
+	trustedProxyHops = hops
+	trustXRealIP = trustRealIP
+}
+
 // visitor tracks the request count and window start time for a single IP.
 type visitor struct {
 	mu       sync.Mutex
@@ -112,27 +133,53 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 	}
 }
 
-// clientIP extracts the client's IP address from the request. It only trusts
-// X-Forwarded-For and X-Real-IP headers when the direct connection comes from
-// a loopback or private address (i.e. a trusted reverse proxy).
+// clientIP extracts the client's IP address from the request for rate
+// limiting. It derives the client from the RIGHTMOST untrusted hop of the
+// forwarding chain, never the client-controlled leftmost X-Forwarded-For entry
+// and never a bare X-Real-IP. Proxy headers are honored only when the direct
+// socket peer is loopback/private (i.e. our own reverse proxy) AND a positive
+// trusted-hop count is configured; otherwise the socket peer is the client.
+//
+// The full hop chain, closest-to-us last, is [xff..., RemoteAddr]. RemoteAddr
+// is trusted hop #1, so stripping trustedProxyHops trusted hops from the right
+// puts the client at xff[len(xff)-trustedProxyHops]. Any entries an attacker
+// prepends to X-Forwarded-For land left of that index and are ignored. This
+// mirrors the rightmost-hop reasoning in
+// internal/handlers/service_secrets.go requestRemoteIP.
 func clientIP(r *http.Request) string {
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteIP = r.RemoteAddr
 	}
 
-	// Only trust proxy headers when the direct peer is a private/loopback address
-	if parsed := net.ParseIP(remoteIP); parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate()) {
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i > 0 {
-				return strings.TrimSpace(xff[:i])
-			}
-			return strings.TrimSpace(xff)
+	parsed := net.ParseIP(remoteIP)
+	trustedPeer := parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate())
+	if trustedProxyHops <= 0 || !trustedPeer {
+		// Not behind a configured trusted proxy: the socket peer is the client.
+		return remoteIP
+	}
+
+	// X-Real-IP is client-controlled; honor it only when explicitly enabled.
+	if trustXRealIP {
+		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+			return xri
 		}
 	}
 
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return remoteIP
+	}
+	parts := strings.Split(xff, ",")
+	idx := len(parts) - trustedProxyHops
+	if idx < 0 || idx >= len(parts) {
+		// More trusted hops configured than entries present: the chain is
+		// shorter than expected (misconfig or spoof attempt). Fall back to the
+		// direct socket peer, which is never attacker-controlled.
+		return remoteIP
+	}
+	if ip := strings.TrimSpace(parts[idx]); ip != "" {
+		return ip
+	}
 	return remoteIP
 }

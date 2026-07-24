@@ -32,8 +32,8 @@ func (q *Queries) CountVaultEntriesV1(ctx context.Context) (int64, error) {
 
 const createVaultEntry = `-- name: CreateVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
 `
 
 type CreateVaultEntryParams struct {
@@ -53,6 +53,8 @@ type CreateVaultEntryParams struct {
 	Provider             sql.NullString `json:"provider"`
 	ProviderMeta         sql.NullString `json:"provider_meta"`
 	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
+	UrlBidx              string         `json:"url_bidx"`
+	AliasUrlBidx         string         `json:"alias_url_bidx"`
 }
 
 // ============================================================================
@@ -76,6 +78,8 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 		arg.Provider,
 		arg.ProviderMeta,
 		arg.AutoRotate,
+		arg.UrlBidx,
+		arg.AliasUrlBidx,
 	)
 	return err
 }
@@ -245,8 +249,8 @@ func (q *Queries) GetVaultEntryTargets(ctx context.Context, id string) (sql.Null
 
 const importVaultEntry = `-- name: ImportVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
+INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
 `
 
 type ImportVaultEntryParams struct {
@@ -259,6 +263,7 @@ type ImportVaultEntryParams struct {
 	Username       sql.NullString `json:"username"`
 	Category       sql.NullString `json:"category"`
 	Notes          sql.NullString `json:"notes"`
+	UrlBidx        string         `json:"url_bidx"`
 }
 
 // ============================================================================
@@ -275,6 +280,7 @@ func (q *Queries) ImportVaultEntry(ctx context.Context, arg ImportVaultEntryPara
 		arg.Username,
 		arg.Category,
 		arg.Notes,
+		arg.UrlBidx,
 	)
 	return err
 }
@@ -465,6 +471,59 @@ func (q *Queries) ListVaultEntriesByUser(ctx context.Context, userID string) ([]
 			&i.LastRotationError,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listVaultEntriesForMetaAtRestBackfill = `-- name: ListVaultEntriesForMetaAtRestBackfill :many
+
+SELECT id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries
+`
+
+type ListVaultEntriesForMetaAtRestBackfillRow struct {
+	ID           string         `json:"id"`
+	Url          sql.NullString `json:"url"`
+	AliasUrl     sql.NullString `json:"alias_url"`
+	Username     sql.NullString `json:"username"`
+	Category     sql.NullString `json:"category"`
+	Notes        sql.NullString `json:"notes"`
+	UrlBidx      string         `json:"url_bidx"`
+	AliasUrlBidx string         `json:"alias_url_bidx"`
+}
+
+// ============================================================================
+// Metadata-at-rest backfill (encrypt url/alias_url/username/category/notes,
+// compute url_bidx/alias_url_bidx). Runs once at boot via
+// VaultHandler.BackfillMetadataAtRest; idempotent (enc:v1: prefix guards it).
+// ============================================================================
+func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error) {
+	rows, err := q.db.QueryContext(ctx, listVaultEntriesForMetaAtRestBackfill)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListVaultEntriesForMetaAtRestBackfillRow{}
+	for rows.Next() {
+		var i ListVaultEntriesForMetaAtRestBackfillRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Url,
+			&i.AliasUrl,
+			&i.Username,
+			&i.Category,
+			&i.Notes,
+			&i.UrlBidx,
+			&i.AliasUrlBidx,
 		); err != nil {
 			return nil, err
 		}
@@ -713,13 +772,13 @@ func (q *Queries) ListVaultEntryNamesByUser(ctx context.Context, userID string) 
 const matchVaultEntriesByURL = `-- name: MatchVaultEntriesByURL :many
 
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? AND (url LIKE ? OR alias_url LIKE ?) ORDER BY name ASC
+FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY name ASC
 `
 
 type MatchVaultEntriesByURLParams struct {
-	UserID   string         `json:"user_id"`
-	Url      sql.NullString `json:"url"`
-	AliasUrl sql.NullString `json:"alias_url"`
+	UserID       string `json:"user_id"`
+	UrlBidx      string `json:"url_bidx"`
+	AliasUrlBidx string `json:"alias_url_bidx"`
 }
 
 type MatchVaultEntriesByURLRow struct {
@@ -745,8 +804,12 @@ type MatchVaultEntriesByURLRow struct {
 // ============================================================================
 // URL matching (browser extension autofill)
 // ============================================================================
+// Autofill lookup by blind index. url/alias_url are encrypted at rest and cannot
+// be LIKE-matched, so the handler computes HMAC-SHA256(normalized_host) from the
+// requested url (see vault.go urlBlindIndex) and matches it against the stored
+// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 func (q *Queries) MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error) {
-	rows, err := q.db.QueryContext(ctx, matchVaultEntriesByURL, arg.UserID, arg.Url, arg.AliasUrl)
+	rows, err := q.db.QueryContext(ctx, matchVaultEntriesByURL, arg.UserID, arg.UrlBidx, arg.AliasUrlBidx)
 	if err != nil {
 		return nil, err
 	}
@@ -846,16 +909,17 @@ func (q *Queries) RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntr
 }
 
 const updateVaultEntryAliasURL = `-- name: UpdateVaultEntryAliasURL :exec
-UPDATE vault_entries SET alias_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET alias_url = ?, alias_url_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type UpdateVaultEntryAliasURLParams struct {
-	AliasUrl sql.NullString `json:"alias_url"`
-	ID       string         `json:"id"`
+	AliasUrl     sql.NullString `json:"alias_url"`
+	AliasUrlBidx string         `json:"alias_url_bidx"`
+	ID           string         `json:"id"`
 }
 
 func (q *Queries) UpdateVaultEntryAliasURL(ctx context.Context, arg UpdateVaultEntryAliasURLParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryAliasURL, arg.AliasUrl, arg.ID)
+	_, err := q.db.ExecContext(ctx, updateVaultEntryAliasURL, arg.AliasUrl, arg.AliasUrlBidx, arg.ID)
 	return err
 }
 
@@ -898,6 +962,37 @@ type UpdateVaultEntryExpiresAtParams struct {
 
 func (q *Queries) UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVaultEntryExpiresAtParams) error {
 	_, err := q.db.ExecContext(ctx, updateVaultEntryExpiresAt, arg.ExpiresAt, arg.ID)
+	return err
+}
+
+const updateVaultEntryMetaAtRest = `-- name: UpdateVaultEntryMetaAtRest :exec
+UPDATE vault_entries
+SET url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?
+WHERE id = ?
+`
+
+type UpdateVaultEntryMetaAtRestParams struct {
+	Url          sql.NullString `json:"url"`
+	AliasUrl     sql.NullString `json:"alias_url"`
+	Username     sql.NullString `json:"username"`
+	Category     sql.NullString `json:"category"`
+	Notes        sql.NullString `json:"notes"`
+	UrlBidx      string         `json:"url_bidx"`
+	AliasUrlBidx string         `json:"alias_url_bidx"`
+	ID           string         `json:"id"`
+}
+
+func (q *Queries) UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error {
+	_, err := q.db.ExecContext(ctx, updateVaultEntryMetaAtRest,
+		arg.Url,
+		arg.AliasUrl,
+		arg.Username,
+		arg.Category,
+		arg.Notes,
+		arg.UrlBidx,
+		arg.AliasUrlBidx,
+		arg.ID,
+	)
 	return err
 }
 
@@ -1029,16 +1124,17 @@ func (q *Queries) UpdateVaultEntryRotationTargets(ctx context.Context, arg Updat
 }
 
 const updateVaultEntryURL = `-- name: UpdateVaultEntryURL :exec
-UPDATE vault_entries SET url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET url = ?, url_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type UpdateVaultEntryURLParams struct {
-	Url sql.NullString `json:"url"`
-	ID  string         `json:"id"`
+	Url     sql.NullString `json:"url"`
+	UrlBidx string         `json:"url_bidx"`
+	ID      string         `json:"id"`
 }
 
 func (q *Queries) UpdateVaultEntryURL(ctx context.Context, arg UpdateVaultEntryURLParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryURL, arg.Url, arg.ID)
+	_, err := q.db.ExecContext(ctx, updateVaultEntryURL, arg.Url, arg.UrlBidx, arg.ID)
 	return err
 }
 
