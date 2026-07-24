@@ -49,6 +49,16 @@ type Config struct {
 	// LogLevel is one of debug, info, warn, error.
 	// Env: TRUSTISSUES_LOG_LEVEL (default info).
 	LogLevel string
+	// ShieldKey enables LLM-boundary tokenization (Shield). When set (32+ hex
+	// chars, its own key so a leak does not touch the vault), PII crossing to an
+	// external LLM through the AI gateway or MCP boundary is tokenized and
+	// resolved server-side. Empty = Shield off (data passes through unchanged).
+	// Env: TRUSTISSUES_SHIELD_KEY (optional).
+	ShieldKey string
+	// ShieldHintLevel dials how much value-derived metadata a marker exposes to
+	// the model: full | bucketed | minimal | none. Default full.
+	// Env: TRUSTISSUES_SHIELD_HINT_LEVEL (default full).
+	ShieldHintLevel string
 }
 
 // Load reads configuration from TRUSTISSUES_* environment variables.
@@ -66,6 +76,8 @@ func Load() (*Config, error) {
 		DataDir:          envStr("TRUSTISSUES_DATA_DIR", "./data"),
 		FrontendDir:      envStr("TRUSTISSUES_FRONTEND_DIR", "./frontend/dist"),
 		LogLevel:         envStr("TRUSTISSUES_LOG_LEVEL", "info"),
+		ShieldKey:        os.Getenv("TRUSTISSUES_SHIELD_KEY"),
+		ShieldHintLevel:  envStr("TRUSTISSUES_SHIELD_HINT_LEVEL", "full"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -73,6 +85,9 @@ func Load() (*Config, error) {
 	}
 	return cfg, nil
 }
+
+// ShieldEnabled reports whether LLM-boundary tokenization is configured.
+func (c *Config) ShieldEnabled() bool { return c.ShieldKey != "" }
 
 // SlogLevel converts the string log level to a slog.Level.
 func (c *Config) SlogLevel() slog.Level {
@@ -116,6 +131,18 @@ func (c *Config) Validate() error {
 		errs = append(errs, "TRUSTISSUES_VAULT_KEY must be at least 32 characters")
 	} else if isWeakSecret(c.VaultKey) {
 		errs = append(errs, "TRUSTISSUES_VAULT_KEY looks like a placeholder or low-entropy value (generate a real one: openssl rand -hex 32)")
+	}
+
+	// Shield is optional, but if enabled its key must be a real AES-256 key. It
+	// is used directly (not derived), so it must be EXACTLY 32 bytes. Fail closed
+	// rather than silently disabling: an operator who set the key expects PII to
+	// be tokenized, and a silently-off shield would leak it.
+	if c.ShieldKey != "" {
+		if len(c.ShieldKey) != 32 {
+			errs = append(errs, fmt.Sprintf("TRUSTISSUES_SHIELD_KEY must be exactly 32 bytes for AES-256 (got %d); generate one with: openssl rand -hex 16", len(c.ShieldKey)))
+		} else if isWeakSecret(c.ShieldKey) {
+			errs = append(errs, "TRUSTISSUES_SHIELD_KEY looks like a placeholder or low-entropy value")
+		}
 	}
 
 	if c.BindHost == "" {
