@@ -157,7 +157,7 @@ func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetV
 }
 
 const getVaultEntryMeta = `-- name: GetVaultEntryMeta :one
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at
 FROM vault_entries WHERE id = ?
 `
 
@@ -177,6 +177,7 @@ type GetVaultEntryMetaRow struct {
 	ProviderMeta         sql.NullString `json:"provider_meta"`
 	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
 	LastRotationError    sql.NullString `json:"last_rotation_error"`
+	CustomFields         string         `json:"custom_fields"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
@@ -200,6 +201,7 @@ func (q *Queries) GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEnt
 		&i.ProviderMeta,
 		&i.AutoRotate,
 		&i.LastRotationError,
+		&i.CustomFields,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -671,7 +673,7 @@ func (q *Queries) ListVaultEntriesV1(ctx context.Context) ([]ListVaultEntriesV1R
 }
 
 const listVaultEntriesWithSecrets = `-- name: ListVaultEntriesWithSecrets :many
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at, encrypted_value, nonce
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at, encrypted_value, nonce
 FROM vault_entries WHERE user_id = ? ORDER BY name ASC
 `
 
@@ -691,6 +693,7 @@ type ListVaultEntriesWithSecretsRow struct {
 	ProviderMeta         sql.NullString `json:"provider_meta"`
 	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
 	LastRotationError    sql.NullString `json:"last_rotation_error"`
+	CustomFields         string         `json:"custom_fields"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 	EncryptedValue       []byte         `json:"encrypted_value"`
@@ -722,6 +725,7 @@ func (q *Queries) ListVaultEntriesWithSecrets(ctx context.Context, userID string
 			&i.ProviderMeta,
 			&i.AutoRotate,
 			&i.LastRotationError,
+			&i.CustomFields,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.EncryptedValue,
@@ -950,6 +954,20 @@ type UpdateVaultEntryCategoryParams struct {
 
 func (q *Queries) UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error {
 	_, err := q.db.ExecContext(ctx, updateVaultEntryCategory, arg.Category, arg.ID)
+	return err
+}
+
+const updateVaultEntryCustomFields = `-- name: UpdateVaultEntryCustomFields :exec
+UPDATE vault_entries SET custom_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+`
+
+type UpdateVaultEntryCustomFieldsParams struct {
+	CustomFields string `json:"custom_fields"`
+	ID           string `json:"id"`
+}
+
+func (q *Queries) UpdateVaultEntryCustomFields(ctx context.Context, arg UpdateVaultEntryCustomFieldsParams) error {
+	_, err := q.db.ExecContext(ctx, updateVaultEntryCustomFields, arg.CustomFields, arg.ID)
 	return err
 }
 
