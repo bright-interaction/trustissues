@@ -406,6 +406,11 @@ func main() {
 			// itself is never exposed. Non-streaming only in v1.
 			r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
 
+			// AI gateway + MCP config: any user reads status + connection URLs;
+			// only an admin points a provider at a key.
+			r.Get("/settings/ai", aiGatewayHandler.GetConfig)
+			r.With(timw.AdminOnly()).Put("/settings/ai", aiGatewayHandler.UpdateConfig)
+
 			// Remote HTTP MCP endpoint (JSON-RPC) for Claude/ChatGPT connectors:
 			// list_secrets + use_secret, with Shield tokenizing tool results.
 			r.Post("/mcp", mcpHandler.Handle)
