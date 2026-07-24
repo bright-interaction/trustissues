@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/brightinteraction/trustissues/internal/config"
@@ -232,4 +233,76 @@ func randSessionID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// aiConfigResponse is the operator-facing status of the AI surface: which
+// provider keys are wired, whether Shield is on, and the connection URLs a user
+// needs to point a client (SDK, extension, or MCP connector) at this instance.
+type aiConfigResponse struct {
+	AnthropicConfigured bool   `json:"anthropic_configured"`
+	OpenAIConfigured    bool   `json:"openai_configured"`
+	AnthropicEntryID    string `json:"anthropic_entry_id"`
+	OpenAIEntryID       string `json:"openai_entry_id"`
+	ShieldEnabled       bool   `json:"shield_enabled"`
+	ShieldHintLevel     string `json:"shield_hint_level"`
+	GatewayBaseURL      string `json:"gateway_base_url"`
+	MCPURL              string `json:"mcp_url"`
+}
+
+// GetConfig handles GET /api/settings/ai for any authenticated user (they need
+// the connection URLs + status to wire a client). It never returns key values.
+func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	anth, _ := h.queries.GetSetting(ctx, "ai_key_anthropic")
+	oai, _ := h.queries.GetSetting(ctx, "ai_key_openai")
+	writeJSON(w, http.StatusOK, aiConfigResponse{
+		AnthropicConfigured: anth != "",
+		OpenAIConfigured:    oai != "",
+		AnthropicEntryID:    anth,
+		OpenAIEntryID:       oai,
+		ShieldEnabled:       h.cfg.ShieldEnabled(),
+		ShieldHintLevel:     h.cfg.ShieldHintLevel,
+		GatewayBaseURL:      strings.TrimRight(h.cfg.BaseURL, "/") + "/api/ai",
+		MCPURL:              strings.TrimRight(h.cfg.BaseURL, "/") + "/api/mcp",
+	})
+}
+
+// UpdateConfig handles PUT /api/settings/ai (admin only, enforced by the route).
+// It points a provider at a vault entry that holds its key. An empty id clears
+// the provider. A non-empty id must reference an existing vault entry.
+func (h *AIGatewayHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var req struct {
+		AnthropicEntryID *string `json:"anthropic_entry_id"`
+		OpenAIEntryID    *string `json:"openai_entry_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeBadRequest(w, r, "invalid JSON")
+		return
+	}
+	set := func(settingKey string, id *string) bool {
+		if id == nil {
+			return true
+		}
+		if *id != "" {
+			if _, err := h.queries.GetVaultEntryForRotation(ctx, *id); err != nil {
+				writeBadRequest(w, r, "the selected vault entry does not exist")
+				return false
+			}
+		}
+		if err := h.queries.UpsertSetting(ctx, db.UpsertSettingParams{Key: settingKey, Value: *id}); err != nil {
+			logError(r, "ai_gateway: setting update failed", "key", settingKey, "error", err)
+			writeInternalError(w, r, "internal server error")
+			return false
+		}
+		return true
+	}
+	if !set("ai_key_anthropic", req.AnthropicEntryID) {
+		return
+	}
+	if !set("ai_key_openai", req.OpenAIEntryID) {
+		return
+	}
+	LogActivityFromRequest(h.queries, r, "ai.config_updated", "AI gateway provider keys updated")
+	h.GetConfig(w, r)
 }
