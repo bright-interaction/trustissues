@@ -118,8 +118,15 @@ If you need the property that even the operator cannot read secrets
   forces everyone to log in again; it does NOT threaten stored data.
 - Optional TOTP 2FA, with hashed single-use recovery codes. Admins can require
   2FA team-wide in the vault policy.
-- Roles: `admin` (full control), `user` (own entries + own profile),
+- Account roles: `admin` (full control), `user` (own entries + own profile),
   `vault_only` (browser-extension role, authenticates with an API key).
+- Shared team vaults ("collections") with per-collection roles: `viewer`
+  (read + reveal), `editor` (also create/update/delete entries), `manager`
+  (also manage members and rename/delete the collection). A personal entry is
+  owner-only (admins see all); a collection entry is governed by the caller's
+  membership role. Access is enforced server-side on every read and write path
+  (`entryAccess` in `internal/handlers/vault.go`), not just hidden in the UI.
+  Sharing is an authorization layer only; the encryption model is unchanged.
 
 ## The vault "lock" is a client-side convenience, not a server control
 
@@ -140,11 +147,11 @@ mitigation until the code-side fix ships.
 |---|------|--------|---------------------|
 | R1 | **No master-key rotation path.** Changing `TRUSTISSUES_VAULT_KEY` silently orphans all data. | Total data loss on a naive rotation. | Deferred to Phase 2 (dual-key read + re-encrypt sweep; see `DEFERRED.md` (a)). Until then never rotate by editing env; use the export/re-import procedure in SECURITY.md. Guard the key like a root password. |
 | R2 | **Backups are manual.** A hand-copied `.db` in WAL mode can be torn/stale. | Silent backup corruption; unrecoverable if paired with key loss. | Resolved for correctness: use `scripts/backup.sh` (SQLite online `.backup`, WAL-safe, mode 0600) per `docs/BACKUP.md`. Store the key separately. Scheduling is deferred (`DEFERRED.md` (d)); run it from cron/systemd. |
-| R3 | **DB file is mode 0644** (world-readable within a 0700 dir). | Local users / shared bind-mounts can read hashes + ciphertext. | Keep `TRUSTISSUES_DATA_DIR` at 0700 (default), do not bind-mount it to a shared path, `chmod 600` the db + `-wal`/`-shm` after first boot (a chmod-on-boot fix is tracked). |
+| R3 | ~~DB file world-readable.~~ **Resolved.** The server now sets umask 0o077 and chmods the db + `-wal`/`-shm` to 0600 (dir 0700) on boot. | Was: local users could read hashes + ciphertext. | Keep `TRUSTISSUES_DATA_DIR` on a non-shared path; the 0600 mode is enforced automatically. |
 | R4 | **Bind host is configurable; default must be loopback.** Publishing 0.0.0.0 in plain HTTP exposes the API. | On a VPS this exposes the API to the internet in cleartext. | Set `TRUSTISSUES_BIND_HOST=127.0.0.1` (the safe default) and bind the compose port to `127.0.0.1:8080:8080` behind a TLS proxy. See README deploy section. Mandatory, not optional. |
 | R5 | **X-Forwarded-For trust must be bounded.** Trusting XFF from any private/loopback peer lets a neighbor spoof the source IP. | A neighboring container can spoof source IP for rate-limit + audit. | Set `TRUSTISSUES_TRUSTED_PROXY_HOPS` to the exact number of proxies in front (1 for a single Caddy) so only that many hops are trusted; run behind that one proxy on an isolated network and do not co-locate untrusted containers on the same bridge. |
-| R6 | **Extension API key is issued but never shown in the UI** (see below). | vault_only users cannot connect the extension without it. | Until fixed, an admin must capture the key from the redeem HTTP response. Reported as a shipping gap. |
-| R7 | **Secrets only length-checked, not entropy-checked.** The shipped placeholder boots. | A lazy operator runs with a publicly-known key/secret. | Always generate both with `openssl rand -hex 32`. Never ship the `.env.example` placeholder. |
+| R6 | ~~Extension API key never shown in the UI.~~ **Resolved.** Settings has an "API keys" tab where any user mints a key, sees it once, and copies it to connect the extension. | Was: users could not self-serve an extension key. | None needed; issue keys from Settings. |
+| R7 | ~~Secrets only length-checked.~~ **Resolved.** The server refuses to boot on a low-entropy or placeholder `TRUSTISSUES_VAULT_KEY`/`JWT_SECRET`, on top of the 32-char minimum. | Was: a lazy operator could run with a known key. | Generate both with `openssl rand -hex 32`. |
 
 ## Deployment assumptions (non-negotiable)
 
@@ -157,8 +164,10 @@ mitigation until the code-side fix ships.
    per `docs/BACKUP.md`), with the key stored separately from the backup.
 5. The host is trusted and access-controlled. The operator is trusted with all
    secrets, because server-side crypto gives them that access by design.
-6. **Single team, no organizations, no multi-tenancy.** One vault, one set of
-   users, roles `admin` / `user` / `vault_only`. There is no tenant isolation to
-   enforce, which is why several Phase 2 items (tamper-evident agent audit,
-   post-deletion attribution) are safe to defer. See `DEFERRED.md`. Do not run
-   one instance as a shared vault for mutually-distrusting teams.
+6. **Single team, no organizations, no multi-tenancy.** One instance serves one
+   team. Within it, personal vaults plus shared collections with per-collection
+   roles (viewer/editor/manager) give intra-team access control, but there is no
+   tenant isolation between mutually-distrusting groups: an instance admin can
+   see everything by design. This is why several Phase 2 items (tamper-evident
+   agent audit, post-deletion attribution) are safe to defer. See `DEFERRED.md`.
+   Do not run one instance as a shared vault for mutually-distrusting teams.

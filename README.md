@@ -1,10 +1,11 @@
 # Trustissues
 
 Self-hosted, single-team password manager and API-key rotation service.
-Extracted from the audited Dockyard vault engine: per-user entry ownership,
-encrypted-at-rest secrets, TOTP 2FA, invitation-based onboarding for a
-vault-only browser-extension role, and rotation delivery to webhooks,
-Forgejo Actions secrets, and notification channels.
+Extracted from the audited Dockyard vault engine: personal vaults plus shared
+team collections with per-collection roles (viewer / editor / manager),
+encrypted-at-rest secrets (values and metadata), TOTP 2FA, invitation-based
+onboarding for a vault-only browser-extension role, and rotation delivery to
+webhooks, Forgejo Actions secrets, and notification channels.
 
 Stack: Go (chi + slog + sqlc), SQLite (WAL, embedded goose migrations),
 React frontend served by the same binary. One container, one volume, no
