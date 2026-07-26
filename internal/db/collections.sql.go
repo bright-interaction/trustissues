@@ -10,23 +10,47 @@ import (
 	"database/sql"
 )
 
+const acceptCollectionInvite = `-- name: AcceptCollectionInvite :execresult
+UPDATE collection_members SET accepted_at = CURRENT_TIMESTAMP
+WHERE collection_id = ? AND user_id = ? AND accepted_at IS NULL
+`
+
+type AcceptCollectionInviteParams struct {
+	CollectionID string `json:"collection_id"`
+	UserID       string `json:"user_id"`
+}
+
+func (q *Queries) AcceptCollectionInvite(ctx context.Context, arg AcceptCollectionInviteParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, acceptCollectionInvite, arg.CollectionID, arg.UserID)
+}
+
 const addCollectionMember = `-- name: AddCollectionMember :exec
 
-INSERT INTO collection_members (collection_id, user_id, role) VALUES (?, ?, ?)
+INSERT INTO collection_members (collection_id, user_id, role, accepted_at) VALUES (?, ?, ?, ?)
 ON CONFLICT(collection_id, user_id) DO UPDATE SET role = excluded.role
 `
 
 type AddCollectionMemberParams struct {
-	CollectionID string `json:"collection_id"`
-	UserID       string `json:"user_id"`
-	Role         string `json:"role"`
+	CollectionID string       `json:"collection_id"`
+	UserID       string       `json:"user_id"`
+	Role         string       `json:"role"`
+	AcceptedAt   sql.NullTime `json:"accepted_at"`
 }
 
 // ============================================================================
 // Membership
 // ============================================================================
+// accepted_at is passed explicitly: NULL for an invitation another user must
+// accept, set for a self-membership (the creator of a collection). On conflict
+// only the role changes, so re-inviting never silently re-grants access and a
+// role change never revokes an existing acceptance.
 func (q *Queries) AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error {
-	_, err := q.db.ExecContext(ctx, addCollectionMember, arg.CollectionID, arg.UserID, arg.Role)
+	_, err := q.db.ExecContext(ctx, addCollectionMember,
+		arg.CollectionID,
+		arg.UserID,
+		arg.Role,
+		arg.AcceptedAt,
+	)
 	return err
 }
 
@@ -42,9 +66,12 @@ func (q *Queries) CountCollectionEntries(ctx context.Context, collectionID sql.N
 }
 
 const countCollectionManagers = `-- name: CountCollectionManagers :one
-SELECT COUNT(*) FROM collection_members WHERE collection_id = ? AND role = 'manager'
+SELECT COUNT(*) FROM collection_members
+WHERE collection_id = ? AND role = 'manager' AND accepted_at IS NOT NULL
 `
 
+// Accepted managers only: a pending invitee cannot be the manager that keeps a
+// collection from being orphaned.
 func (q *Queries) CountCollectionManagers(ctx context.Context, collectionID string) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countCollectionManagers, collectionID)
 	var count int64
@@ -109,7 +136,8 @@ func (q *Queries) GetCollection(ctx context.Context, id string) (Collection, err
 }
 
 const getCollectionMemberRole = `-- name: GetCollectionMemberRole :one
-SELECT role FROM collection_members WHERE collection_id = ? AND user_id = ?
+SELECT role FROM collection_members
+WHERE collection_id = ? AND user_id = ? AND accepted_at IS NOT NULL
 `
 
 type GetCollectionMemberRoleParams struct {
@@ -117,6 +145,8 @@ type GetCollectionMemberRoleParams struct {
 	UserID       string `json:"user_id"`
 }
 
+// Authorization lookup: a PENDING membership returns no row, so it grants
+// neither read nor write anywhere entryAccess or canWriteCollection is used.
 func (q *Queries) GetCollectionMemberRole(ctx context.Context, arg GetCollectionMemberRoleParams) (string, error) {
 	row := q.db.QueryRowContext(ctx, getCollectionMemberRole, arg.CollectionID, arg.UserID)
 	var role string
@@ -150,7 +180,7 @@ const listAccessibleVaultEntries = `-- name: ListAccessibleVaultEntries :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
 ORDER BY e.name ASC
 `
 
@@ -228,7 +258,7 @@ const listAccessibleVaultEntriesWithSecrets = `-- name: ListAccessibleVaultEntri
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.created_at, e.updated_at, e.encrypted_value, e.nonce
 FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
 ORDER BY e.name ASC
 `
 
@@ -311,7 +341,7 @@ func (q *Queries) ListAccessibleVaultEntriesWithSecrets(ctx context.Context, arg
 const listAccessibleVaultEntryNames = `-- name: ListAccessibleVaultEntryNames :many
 SELECT e.name FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
 `
 
 type ListAccessibleVaultEntryNamesParams struct {
@@ -378,7 +408,7 @@ func (q *Queries) ListAllCollections(ctx context.Context) ([]Collection, error) 
 }
 
 const listCollectionMembers = `-- name: ListCollectionMembers :many
-SELECT cm.user_id, cm.role, cm.added_at, u.email, u.name
+SELECT cm.user_id, cm.role, cm.added_at, cm.accepted_at, u.email, u.name
 FROM collection_members cm
 JOIN users u ON u.id = cm.user_id
 WHERE cm.collection_id = ?
@@ -386,11 +416,12 @@ ORDER BY u.email ASC
 `
 
 type ListCollectionMembersRow struct {
-	UserID  string         `json:"user_id"`
-	Role    string         `json:"role"`
-	AddedAt sql.NullTime   `json:"added_at"`
-	Email   string         `json:"email"`
-	Name    sql.NullString `json:"name"`
+	UserID     string         `json:"user_id"`
+	Role       string         `json:"role"`
+	AddedAt    sql.NullTime   `json:"added_at"`
+	AcceptedAt sql.NullTime   `json:"accepted_at"`
+	Email      string         `json:"email"`
+	Name       sql.NullString `json:"name"`
 }
 
 func (q *Queries) ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error) {
@@ -406,6 +437,7 @@ func (q *Queries) ListCollectionMembers(ctx context.Context, collectionID string
 			&i.UserID,
 			&i.Role,
 			&i.AddedAt,
+			&i.AcceptedAt,
 			&i.Email,
 			&i.Name,
 		); err != nil {
@@ -426,7 +458,7 @@ const listCollectionsForUser = `-- name: ListCollectionsForUser :many
 SELECT c.id, c.name, c.description, c.created_by, c.created_at, c.updated_at, cm.role
 FROM collections c
 JOIN collection_members cm ON cm.collection_id = c.id
-WHERE cm.user_id = ?
+WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL
 ORDER BY c.name ASC
 `
 
@@ -440,6 +472,8 @@ type ListCollectionsForUserRow struct {
 	Role        string         `json:"role"`
 }
 
+// Accepted memberships only. A pending invitation must not surface the
+// collection (or its entries) until the invitee opts in.
 func (q *Queries) ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error) {
 	rows, err := q.db.QueryContext(ctx, listCollectionsForUser, userID)
 	if err != nil {
@@ -471,11 +505,60 @@ func (q *Queries) ListCollectionsForUser(ctx context.Context, userID string) ([]
 	return items, nil
 }
 
+const listPendingCollectionInvitesForUser = `-- name: ListPendingCollectionInvitesForUser :many
+SELECT c.id, c.name, c.description, cm.role, cm.added_at, u.email AS invited_by_email
+FROM collections c
+JOIN collection_members cm ON cm.collection_id = c.id
+LEFT JOIN users u ON u.id = c.created_by
+WHERE cm.user_id = ? AND cm.accepted_at IS NULL
+ORDER BY cm.added_at DESC
+`
+
+type ListPendingCollectionInvitesForUserRow struct {
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Description    string         `json:"description"`
+	Role           string         `json:"role"`
+	AddedAt        sql.NullTime   `json:"added_at"`
+	InvitedByEmail sql.NullString `json:"invited_by_email"`
+}
+
+// Invitations awaiting the user's decision. These grant no access.
+func (q *Queries) ListPendingCollectionInvitesForUser(ctx context.Context, userID string) ([]ListPendingCollectionInvitesForUserRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingCollectionInvitesForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPendingCollectionInvitesForUserRow{}
+	for rows.Next() {
+		var i ListPendingCollectionInvitesForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.Role,
+			&i.AddedAt,
+			&i.InvitedByEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const matchAccessibleVaultEntriesByURL = `-- name: MatchAccessibleVaultEntriesByURL :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
 WHERE ((e.collection_id IS NULL AND e.user_id = ?)
-       OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ?))
+       OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
   AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
 ORDER BY e.name ASC
 `

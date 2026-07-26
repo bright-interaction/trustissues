@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/brightinteraction/trustissues/internal/columncrypto"
+	"github.com/brightinteraction/trustissues/internal/config"
 	"github.com/brightinteraction/trustissues/internal/db"
 	"github.com/brightinteraction/trustissues/internal/middleware"
 )
@@ -15,11 +17,12 @@ import (
 // SettingsHandler handles global settings endpoints.
 type SettingsHandler struct {
 	queries *db.Queries
+	cfg     *config.Config
 }
 
 // NewSettingsHandler creates a new SettingsHandler.
-func NewSettingsHandler(queries *db.Queries) *SettingsHandler {
-	return &SettingsHandler{queries: queries}
+func NewSettingsHandler(queries *db.Queries, cfg *config.Config) *SettingsHandler {
+	return &SettingsHandler{queries: queries, cfg: cfg}
 }
 
 // Defaults when the setting rows are missing.
@@ -268,7 +271,16 @@ func (h *SettingsHandler) UpdateSMTP(w http.ResponseWriter, r *http.Request) {
 		updates["smtp_use_tls"] = &useTLS
 	}
 	if req.Password != nil && *req.Password != "" {
-		updates["smtp_password"] = req.Password
+		// Encrypt at rest. This is a live relay credential and was the lone
+		// setting stored in cleartext, so it survived into every DB backup while
+		// every other secret in the product was ciphertext.
+		enc, encErr := columncrypto.EncryptString(*req.Password, h.cfg.VaultKey)
+		if encErr != nil {
+			logError(r, "settings.smtp: password encrypt failed", "error", encErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		updates["smtp_password"] = &enc
 	}
 
 	for key, value := range updates {

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -72,10 +73,15 @@ func mustCollection(t *testing.T, queries *db.Queries, id, creator string, membe
 		t.Fatalf("create collection %s: %v", id, err)
 	}
 	for userID, role := range members {
+		// Established members: accepted immediately. Membership is an invitation
+		// now, and a pending row grants nothing, so a test that wants a real
+		// member has to accept on their behalf. The pending path has its own
+		// coverage in the collection-consent tests.
 		if err := queries.AddCollectionMember(ctx, db.AddCollectionMemberParams{
 			CollectionID: id,
 			UserID:       userID,
 			Role:         role,
+			AcceptedAt:   sql.NullTime{Time: time.Now().UTC(), Valid: true},
 		}); err != nil {
 			t.Fatalf("add member %s to %s: %v", userID, id, err)
 		}

@@ -259,7 +259,7 @@ func main() {
 	// Handlers owned by the platform.
 	authHandler := handlers.NewAuthHandler(queries, cfg)
 	userHandler := handlers.NewUserHandler(queries, cfg)
-	settingsHandler := handlers.NewSettingsHandler(queries)
+	settingsHandler := handlers.NewSettingsHandler(queries, cfg)
 	activityHandler := handlers.NewActivityHandler(queries)
 	apiKeyHandler := handlers.NewAPIKeyHandler(queries)
 	collectionHandler := handlers.NewCollectionHandler(queries)
@@ -509,6 +509,9 @@ func main() {
 			r.Route("/collections", func(r chi.Router) {
 				r.Get("/", collectionHandler.List)
 				r.Post("/", collectionHandler.Create)
+				// Membership is an invitation: a pending row grants nothing
+				// until the invitee accepts here.
+				r.Get("/invitations", collectionHandler.ListPendingInvites)
 				r.Route("/{id}", func(r chi.Router) {
 					r.Get("/", collectionHandler.Get)
 					r.Put("/", collectionHandler.Update)
@@ -516,6 +519,8 @@ func main() {
 					r.Get("/members", collectionHandler.ListMembers)
 					r.Post("/members", collectionHandler.AddMember)
 					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
+					r.Post("/accept", collectionHandler.AcceptInvite)
+					r.Post("/decline", collectionHandler.DeclineInvite)
 				})
 			})
 

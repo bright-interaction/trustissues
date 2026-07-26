@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/brightinteraction/trustissues/internal/db"
 	"github.com/brightinteraction/trustissues/internal/middleware"
@@ -136,9 +137,12 @@ func (h *CollectionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to create collection")
 		return
 	}
-	// The creator is the first manager.
+	// The creator is the first manager. Self-membership needs no consent step,
+	// so it is accepted immediately; otherwise the creator would be locked out
+	// of the collection they just made.
 	if err := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
 		CollectionID: id, UserID: userID, Role: collRoleManager,
+		AcceptedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
 	}); err != nil {
 		logError(r, "collections.create: seed manager failed", "error", err)
 		writeInternalError(w, r, "failed to create collection")
@@ -235,6 +239,82 @@ type memberResponse struct {
 	Name    string  `json:"name"`
 	Role    string  `json:"role"`
 	AddedAt *string `json:"added_at"`
+	// Nil until the invitee accepts. A pending member has no access at all;
+	// surfacing it lets a manager see who has not opted in yet.
+	AcceptedAt *string `json:"accepted_at"`
+	Pending    bool    `json:"pending"`
+}
+
+type pendingInviteResponse struct {
+	CollectionID   string  `json:"collection_id"`
+	Name           string  `json:"name"`
+	Description    string  `json:"description"`
+	Role           string  `json:"role"`
+	InvitedAt      *string `json:"invited_at"`
+	InvitedByEmail string  `json:"invited_by_email"`
+}
+
+// ListPendingInvites handles GET /api/collections/invitations and returns the
+// collections the caller has been invited to but has not accepted. These grant
+// no access until accepted, so this is the only place they surface.
+func (h *CollectionHandler) ListPendingInvites(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.queries.ListPendingCollectionInvitesForUser(r.Context(), middleware.GetUserID(r.Context()))
+	if err != nil {
+		logError(r, "collections.pending: query failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	out := make([]pendingInviteResponse, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, pendingInviteResponse{
+			CollectionID: p.ID, Name: p.Name, Description: p.Description, Role: p.Role,
+			InvitedAt: nullTimePtr(p.AddedAt), InvitedByEmail: nullStringToString(p.InvitedByEmail),
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// AcceptInvite handles POST /api/collections/{id}/accept. Only the invitee can
+// call it, and only their own pending row is affected, so accepting can never
+// grant access to anyone else.
+func (h *CollectionHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	res, err := h.queries.AcceptCollectionInvite(r.Context(), db.AcceptCollectionInviteParams{
+		CollectionID: id, UserID: middleware.GetUserID(r.Context()),
+	})
+	if err != nil {
+		logError(r, "collections.accept: failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeNotFound(w, r, "no pending invitation for this collection")
+		return
+	}
+	LogActivityFromRequest(h.queries, r, "collection.invite_accepted", fmt.Sprintf("Accepted invitation to collection %s", id))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeclineInvite handles POST /api/collections/{id}/decline and removes the
+// caller's own pending membership. Declining is deliberately the same operation
+// as leaving, so a user is never stuck in a collection someone else created.
+func (h *CollectionHandler) DeclineInvite(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	userID := middleware.GetUserID(r.Context())
+	res, err := h.queries.RemoveCollectionMember(r.Context(), db.RemoveCollectionMemberParams{
+		CollectionID: id, UserID: userID,
+	})
+	if err != nil {
+		logError(r, "collections.decline: failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeNotFound(w, r, "no invitation or membership for this collection")
+		return
+	}
+	LogActivityFromRequest(h.queries, r, "collection.invite_declined", fmt.Sprintf("Declined or left collection %s", id))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ListMembers handles GET /api/collections/{id}/members for any member.
@@ -255,6 +335,7 @@ func (h *CollectionHandler) ListMembers(w http.ResponseWriter, r *http.Request) 
 		out = append(out, memberResponse{
 			UserID: m.UserID, Email: m.Email, Name: nullStringToString(m.Name),
 			Role: m.Role, AddedAt: nullTimePtr(m.AddedAt),
+			AcceptedAt: nullTimePtr(m.AcceptedAt), Pending: !m.AcceptedAt.Valid,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -294,21 +375,35 @@ func (h *CollectionHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "role must be viewer, editor, or manager")
 		return
 	}
+	// Invite, do not grant. The membership row is created PENDING
+	// (accepted_at NULL) and confers nothing until the invitee accepts: without
+	// that step any user could push entries into a colleague's vault list and
+	// browser autofill, e.g. a fake SSO credential for a real company domain.
+	//
+	// The response is deliberately identical whether or not the email matches an
+	// account, and never echoes the target's user id or display name. Otherwise
+	// this endpoint is an account-enumeration and directory-disclosure oracle for
+	// any authenticated user (create a throwaway collection, probe addresses).
+	// The invitee learns of the invitation through their own pending list.
 	user, err := h.queries.GetUserByEmail(r.Context(), req.Email)
-	if err != nil {
-		writeNotFound(w, r, "no user with that email (they must have an account first)")
-		return
+	if err == nil {
+		if addErr := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
+			CollectionID: id, UserID: user.ID, Role: req.Role,
+			AcceptedAt: sql.NullTime{}, // pending until the invitee accepts
+		}); addErr != nil {
+			logError(r, "collections.addmember: failed", "error", addErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		LogActivityFromRequest(h.queries, r, "collection.member_invited",
+			fmt.Sprintf("Invited %s to collection %s as %s (pending acceptance)", req.Email, id, req.Role))
+	} else {
+		// Log the miss server-side for the operator without telling the caller.
+		logError(r, "collections.addmember: no account for invited email", "collection", id)
 	}
-	if err := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
-		CollectionID: id, UserID: user.ID, Role: req.Role,
-	}); err != nil {
-		logError(r, "collections.addmember: failed", "error", err)
-		writeInternalError(w, r, "internal server error")
-		return
-	}
-	LogActivityFromRequest(h.queries, r, "collection.member_added", fmt.Sprintf("Member %s added to collection %s as %s", req.Email, id, req.Role))
-	writeJSON(w, http.StatusOK, memberResponse{
-		UserID: user.ID, Email: user.Email, Name: nullStringToString(user.Name), Role: req.Role,
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "invited",
+		"detail": "If that address belongs to an account, an invitation is now pending their acceptance.",
 	})
 }
 

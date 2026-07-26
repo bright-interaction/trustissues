@@ -108,6 +108,7 @@ CREATE TABLE collection_members (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'editor', 'manager')),
   added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  accepted_at TIMESTAMP,
   PRIMARY KEY (collection_id, user_id)
 );
 CREATE INDEX idx_collection_members_user ON collection_members(user_id);
