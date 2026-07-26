@@ -120,6 +120,14 @@ type Querier interface {
 	// name-only lookup would return whichever user's same-named secret SQLite
 	// returns first and decrypt it (cross-owner plaintext exfil). A service identity
 	// may only resolve secrets owned by its creating user.
+	//
+	// Also restricted to PERSONAL entries (collection_id IS NULL). A service
+	// identity's allowed_secrets is a NAME whitelist, and any editor of a shared
+	// collection can rewrite the value of an entry that lives in that collection
+	// even when the creating user still owns the row. Without this predicate an
+	// editor could therefore control what a machine identity fetches (or swap it for
+	// a value of their choosing) purely by editing a shared entry. Machine
+	// identities resolve only secrets their creator holds privately.
 	GetVaultEntryForServiceFetch(ctx context.Context, arg GetVaultEntryForServiceFetchParams) (GetVaultEntryForServiceFetchRow, error)
 	GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error)
 	// ============================================================================
