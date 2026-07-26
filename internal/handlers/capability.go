@@ -246,13 +246,16 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 // ──────────────────────────────────────────────────────────────────────
 
 // Proxy handles every method against /proxy/{host}/{path...}. The host
-// segment is the lowercased upstream host (e.g. api.cloudflare.com);
-// remaining path is forwarded as-is. Token comes in the
-// `Authorization: Capability <token>` request header; we strip it and
-// inject the secret-bound header before forwarding.
+// segment is the lowercased upstream host (e.g. api.cloudflare.com); the
+// remaining path must already be normalized and is forwarded unchanged.
+// Token comes in the `Authorization: Capability <token>` request header;
+// we strip it and inject the secret-bound header before forwarding.
 //
-// This is the heart of the bridge. Every branch logs to capability_log
-// so the audit trail is complete even when nothing user-visible happens.
+// This is the heart of the bridge. Every branch that is attributable to a
+// token we signed logs to capability_log, so the audit trail is complete even
+// when nothing user-visible happens. Requests that fail signature or format
+// verification are NOT persisted: the route is reachable anonymously, so an
+// audit row there would be an unauthenticated, attacker-controlled DB write.
 func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	host := chi.URLParam(r, "host")

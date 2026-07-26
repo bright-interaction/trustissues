@@ -123,6 +123,9 @@ export interface ApiKey {
   id: string;
   name: string;
   key_prefix: string;
+  // Set when the key has been cut off (password change, admin revoke). A
+  // revoked key is shown, not hidden, so the owner can see it existed.
+  revoked_at: string | null;
   last_used_at: string | null;
   expires_at: string | null;
   created_at: string;
