@@ -249,7 +249,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := middleware.ClientIP(r)
 
 	// Per-IP rate limit: block credential stuffing across many emails from one IP
 	ipFailCount, err := h.queries.CountRecentFailedLoginAttemptsByIP(r.Context(), ip)
@@ -680,7 +680,7 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limit TOTP verify attempts per user to prevent brute force
-	ip := clientIP(r)
+	ip := middleware.ClientIP(r)
 	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), userEmail)
 	if err != nil {
 		logError(r, "totp.verify: failed to query attempts", "error", err)
@@ -774,7 +774,7 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := middleware.ClientIP(r)
 	recordFailure := func() {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: userEmail, IpAddress: ip, Success: 0,

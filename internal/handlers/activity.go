@@ -6,10 +6,8 @@ import (
 	"encoding/csv"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -242,7 +240,7 @@ func LogActivityFromRequest(q *db.Queries, r *http.Request, action, detail strin
 	if userID != "" {
 		userPtr = &userID
 	}
-	logActivityInternal(q, userPtr, action, detail, clientIP(r), r.Header.Get("User-Agent"))
+	logActivityInternal(q, userPtr, action, detail, middleware.ClientIP(r), r.Header.Get("User-Agent"))
 }
 
 func logActivityInternal(q *db.Queries, userID *string, action, detail, ipAddress, userAgent string) {
@@ -258,28 +256,4 @@ func logActivityInternal(q *db.Queries, userID *string, action, detail, ipAddres
 	if err != nil {
 		slog.Error("failed to log activity", "error", err, "action", action)
 	}
-}
-
-// clientIP extracts the client IP address from the request. Only trusts
-// X-Real-IP / X-Forwarded-For when the direct peer is a loopback or private
-// address (i.e. behind a trusted reverse proxy). Otherwise uses RemoteAddr.
-func clientIP(r *http.Request) string {
-	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		remoteIP = r.RemoteAddr
-	}
-
-	if parsed := net.ParseIP(remoteIP); parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate()) {
-		if ip := r.Header.Get("X-Real-IP"); ip != "" {
-			return strings.TrimSpace(ip)
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i > 0 {
-				return strings.TrimSpace(xff[:i])
-			}
-			return strings.TrimSpace(xff)
-		}
-	}
-
-	return remoteIP
 }

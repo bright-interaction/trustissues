@@ -47,6 +47,9 @@ export interface VaultEntry {
 // notify (alert channels only, no delivery). The dockyard control-plane
 // types (env_var, file_write, reload_endpoint) are cut.
 export interface RotationTarget {
+  // Stamped server-side with the user who saved the target; the rotation
+  // engine resolves an auth_token reference as THAT identity.
+  configured_by?: string;
   type: 'webhook' | 'forgejo_secret' | 'notify';
   label?: string;
   // webhook

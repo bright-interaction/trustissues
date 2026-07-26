@@ -146,6 +146,15 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 // prepends to X-Forwarded-For land left of that index and are ignored. This
 // mirrors the rightmost-hop reasoning in
 // internal/handlers/service_secrets.go requestRemoteIP.
+// ClientIP is the exported form of clientIP. It is the SINGLE client-IP
+// derivation for the whole codebase: rate limiting, login lockouts, and every
+// audit row must agree on who the caller is, and must agree on a value the
+// caller cannot choose. Handlers call this rather than rolling their own, since
+// a second implementation that trusts the leftmost X-Forwarded-For entry (or
+// X-Real-IP unconditionally) lets an attacker reset their own throttle bucket
+// and write a forged source IP into the audit trail.
+func ClientIP(r *http.Request) string { return clientIP(r) }
+
 func clientIP(r *http.Request) string {
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

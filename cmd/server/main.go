@@ -458,6 +458,12 @@ func main() {
 					r.Patch("/{id}", userHandler.Update)
 					r.Delete("/{id}", userHandler.Delete)
 					r.Post("/{id}/reset-password", userHandler.ResetPassword)
+					// Incident response: an admin must be able to see and cut
+					// off another user's API keys (a stolen extension key
+					// otherwise survives every action the victim can take).
+					r.Get("/{id}/api-keys", apiKeyHandler.AdminList)
+					r.Post("/{id}/api-keys/revoke-all", apiKeyHandler.AdminRevokeAll)
+					r.Post("/{id}/api-keys/{keyId}/revoke", apiKeyHandler.AdminRevoke)
 				})
 
 				r.Route("/invitations", func(r chi.Router) {

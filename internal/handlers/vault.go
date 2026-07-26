@@ -1413,7 +1413,7 @@ func (h *VaultHandler) recordReauthFailure(ctx context.Context, r *http.Request,
 		return
 	}
 	if err := h.queries.CreateLoginAttempt(ctx, db.CreateLoginAttemptParams{
-		Email: email, IpAddress: clientIP(r), Success: 0,
+		Email: email, IpAddress: middleware.ClientIP(r), Success: 0,
 	}); err != nil {
 		logError(r, "vault.reauth: failed to record attempt", "error", err)
 	}
