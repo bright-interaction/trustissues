@@ -20,23 +20,34 @@ import (
 // (rotation_targets embeds webhook HMAC secrets; provider_meta embeds account
 // ids and key ids), so a raw DB-file leak should not expose them in cleartext.
 //
-// The prefix makes the two helpers below IDEMPOTENT, which is what makes the
-// column-wide sweep safe:
-//   - decryptColumn on an UNPREFIXED value returns it unchanged, so a read
-//     choke can be applied everywhere before the backfill has run and to rows
-//     that were written cleartext by an older binary.
-//   - encryptColumn on an ALREADY-PREFIXED value returns it unchanged, so a
-//     passthrough write that re-stores a column it never decrypted (e.g. the
-//     rotate-now handler copying current.ProviderMeta) never double-wraps it.
+// The prefix lets decryptColumn stay safe to apply at every read choke: an
+// UNPREFIXED value (pre-migration cleartext, or a row written by an older
+// binary) is returned unchanged.
+//
+// SECURITY: the prefix is a storage-format marker ONLY. It must NEVER be used
+// to decide whether to encrypt a value that came from a client. encryptColumn
+// used to pass through any input already carrying the prefix, which turned the
+// server into a universal decryption oracle: an attacker holding ciphertext
+// from an offline DB copy could POST "enc:v1:<base64 nonce||ct>" as a notes/url
+// field, have it stored verbatim, then read it back decrypted with the server's
+// vault key, defeating at-rest encryption for every user's secrets. User input
+// is now ALWAYS encrypted (encryptColumn); only the backfill, which reads values
+// out of the database, may skip already-encrypted values
+// (encryptColumnIfNeeded).
 const vaultColumnEncPrefix = "enc:v1:"
 
-// encryptColumn encrypts a cleartext metadata column into a single self-describing
+// encryptColumn encrypts a cleartext column into a single self-describing
 // string: prefix + base64(nonce || ciphertext) using the vault's AES-256-GCM key.
-// Empty, empty-default ("{}"/"[]"), and already-encrypted inputs pass through
-// unchanged (nothing to protect / no double-wrap).
+//
+// It ALWAYS encrypts a non-empty input, including one that happens to start with
+// the marker prefix. Never make this content-dependent: this function is on the
+// path from client input to storage, so a passthrough here is a decryption
+// oracle (see the note on vaultColumnEncPrefix). A caller that legitimately
+// holds an already-encrypted value from the database must not call this at all,
+// or must call encryptColumnIfNeeded.
 func (h *VaultHandler) encryptColumn(plaintext string) (string, error) {
-	if !metaColumnNeedsEncrypt(plaintext) {
-		return plaintext, nil
+	if plaintext == "" {
+		return "", nil
 	}
 	block, err := aes.NewCipher(h.encryptionKey[:])
 	if err != nil {
@@ -101,10 +112,26 @@ func (h *VaultHandler) decryptColumnOrLog(stored, fallback, field string) string
 	return out
 }
 
-// metaColumnNeedsEncrypt reports whether a metadata column value holds real
+// encryptColumnIfNeeded encrypts a value READ FROM THE DATABASE unless it is
+// already ciphertext or carries no data. This is the idempotent variant used by
+// the startup backfills and by internal re-store paths that copy a stored column
+// forward without ever decrypting it.
+//
+// It is safe ONLY because its input comes from storage, never from a client.
+// Do not call it on request data: deciding by content whether to encrypt is what
+// created the decryption oracle described on vaultColumnEncPrefix.
+func (h *VaultHandler) encryptColumnIfNeeded(stored string) (string, error) {
+	if !metaColumnNeedsEncrypt(stored) {
+		return stored, nil
+	}
+	return h.encryptColumn(stored)
+}
+
+// metaColumnNeedsEncrypt reports whether a STORED column value holds real
 // cleartext that should be encrypted at rest. Empty, the empty-JSON defaults,
 // and already-encrypted values are skipped so the backfill is idempotent and
-// does not churn rows that carry no data.
+// does not churn rows that carry no data. Storage-side only: never use this to
+// gate encryption of client input.
 func metaColumnNeedsEncrypt(v string) bool {
 	switch v {
 	case "", "{}", "[]":
@@ -129,7 +156,7 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 	updated := 0
 	for _, row := range rows {
 		if metaColumnNeedsEncrypt(row.ProviderMeta.String) {
-			enc, encErr := h.encryptColumn(row.ProviderMeta.String)
+			enc, encErr := h.encryptColumnIfNeeded(row.ProviderMeta.String)
 			if encErr != nil {
 				return updated, fmt.Errorf("encrypt provider_meta for %s: %w", row.ID, encErr)
 			}
@@ -142,7 +169,7 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 			updated++
 		}
 		if metaColumnNeedsEncrypt(row.RotationTargets.String) {
-			enc, encErr := h.encryptColumn(row.RotationTargets.String)
+			enc, encErr := h.encryptColumnIfNeeded(row.RotationTargets.String)
 			if encErr != nil {
 				return updated, fmt.Errorf("encrypt rotation_targets for %s: %w", row.ID, encErr)
 			}

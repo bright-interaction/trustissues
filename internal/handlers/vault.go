@@ -1191,20 +1191,23 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			if req.Provider != nil {
 				provider = *req.Provider
 			}
-			if req.ProviderMeta != nil {
-				providerMeta = *req.ProviderMeta
-			}
 			if req.AutoRotate != nil {
 				autoRotate = boolToInt64(*req.AutoRotate)
 			}
-			// Encrypt at rest. Idempotent: when provider_meta was NOT part of this
-			// update, providerMeta is the already-encrypted current value and
-			// encryptColumn passes it through unchanged (no double-wrap).
-			encMeta, encErr := h.encryptColumn(providerMeta)
-			if encErr != nil {
-				logError(r, "vault.update: provider_meta encrypt failed", "error", encErr)
-				writeInternalError(w, r, "internal server error")
-				return
+			// provider_meta at rest. The two cases are kept explicitly apart:
+			// client-supplied meta is ALWAYS encrypted, while an untouched column
+			// is carried forward exactly as stored. Never decide by content
+			// (a passthrough of client input that already looks encrypted is a
+			// decryption oracle; see vaultColumnEncPrefix).
+			encMeta := providerMeta // untouched: already-stored value, verbatim
+			if req.ProviderMeta != nil {
+				enc, encErr := h.encryptColumn(*req.ProviderMeta)
+				if encErr != nil {
+					logError(r, "vault.update: provider_meta encrypt failed", "error", encErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				encMeta = enc
 			}
 			if err := h.queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
 				Provider:     toNullString(provider),
