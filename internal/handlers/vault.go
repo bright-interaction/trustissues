@@ -97,13 +97,31 @@ func normalizeVaultHost(raw string) string {
 // normalized host. Empty/unparseable inputs yield "" (stored as an empty index
 // that the match query skips). The token is keyed by bidxKey, so it is stable
 // for equality lookups yet reveals nothing about the host to a DB reader.
-func (h *VaultHandler) urlBlindIndex(raw string) string {
+// bidxScope returns the blind-index scope an entry belongs to: its collection
+// when it lives in one, otherwise its owner. Keying the index per scope is what
+// keeps it unlinkable: two users with an entry on the same host produce
+// different index values, so a stolen database no longer reveals that they share
+// a site. Entries inside one collection still share a scope, which is exactly
+// what shared autofill needs.
+func bidxScope(userID string, collectionID sql.NullString) string {
+	if collectionID.Valid && collectionID.String != "" {
+		return "c:" + collectionID.String
+	}
+	return "u:" + userID
+}
+
+// urlBlindIndex derives the keyed lookup value for a URL within one scope.
+// The scope is mixed into the HMAC input (length-prefixed so a crafted user or
+// collection id cannot collide with another scope by shifting the separator).
+// An empty scope yields an empty index: an unscoped index would be linkable
+// across users, so it is never written.
+func (h *VaultHandler) urlBlindIndex(scope, raw string) string {
 	host := normalizeVaultHost(raw)
-	if host == "" {
+	if host == "" || scope == "" {
 		return ""
 	}
 	mac := hmac.New(sha256.New, h.bidxKey[:])
-	mac.Write([]byte(host))
+	fmt.Fprintf(mac, "%d:%s|%s", len(scope), scope, host)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -309,8 +327,9 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			slog.Error("vault: metadata backfill alias_url decrypt failed", "id", row.ID, "error", derr)
 			continue
 		}
-		wantURLBidx := h.urlBlindIndex(urlPlain)
-		wantAliasBidx := h.urlBlindIndex(aliasPlain)
+		scope := bidxScope(row.UserID, row.CollectionID)
+		wantURLBidx := h.urlBlindIndex(scope, urlPlain)
+		wantAliasBidx := h.urlBlindIndex(scope, aliasPlain)
 		needsBidx := wantURLBidx != row.UrlBidx || wantAliasBidx != row.AliasUrlBidx
 
 		if !needsMeta && !needsBidx {
@@ -533,6 +552,16 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
+}
+
+// vaultMetaFromMatchPersonalRow converts a personal-scope autofill match row.
+func (h *VaultHandler) vaultMetaFromMatchPersonalRow(row db.MatchPersonalVaultEntriesByURLRow) vaultEntryMeta {
+	return h.vaultMetaFromMatchAccessibleRow(db.MatchAccessibleVaultEntriesByURLRow(row))
+}
+
+// vaultMetaFromMatchCollectionRow converts a collection-scope autofill match row.
+func (h *VaultHandler) vaultMetaFromMatchCollectionRow(row db.MatchCollectionVaultEntriesByURLRow) vaultEntryMeta {
+	return h.vaultMetaFromMatchAccessibleRow(db.MatchAccessibleVaultEntriesByURLRow(row))
 }
 
 // vaultMetaFromMatchAccessibleRow converts a collection-aware autofill match row
@@ -964,8 +993,9 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	urlBidx := h.urlBlindIndex(req.URL)
-	aliasBidx := h.urlBlindIndex(req.AliasURL)
+	entryScope := bidxScope(userID, collectionID)
+	urlBidx := h.urlBlindIndex(entryScope, req.URL)
+	aliasBidx := h.urlBlindIndex(entryScope, req.AliasURL)
 
 	// Use separate INSERT + SELECT instead of RETURNING (mattn/go-sqlite3 has bugs with RETURNING)
 	err = h.queries.CreateVaultEntry(ctx, db.CreateVaultEntryParams{
@@ -1106,6 +1136,31 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+
+	// The blind index is keyed to the entry's scope, so a move invalidates it.
+	// Recompute both indexes under the new scope, otherwise the entry keeps an
+	// index nobody will ever compute again and autofill silently stops offering
+	// it. Recovering the cleartext host requires decrypting the stored url.
+	if meta, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr != nil {
+		logError(r, "vault.move: reindex lookup failed", "error", mErr)
+	} else {
+		newScope := bidxScope(info.UserID, target)
+		urlPlain := h.decryptColumnOrLog(meta.Url.String, "", "url")
+		aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", "alias_url")
+		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+			Url:          meta.Url,
+			AliasUrl:     meta.AliasUrl,
+			Username:     meta.Username,
+			Category:     meta.Category,
+			Notes:        meta.Notes,
+			UrlBidx:      h.urlBlindIndex(newScope, urlPlain),
+			AliasUrlBidx: h.urlBlindIndex(newScope, aliasPlain),
+			ID:           id,
+		}); err != nil {
+			logError(r, "vault.move: reindex failed", "error", err)
+		}
+	}
+
 	name, nameErr := h.queries.GetVaultEntryName(ctx, id)
 	if nameErr != nil {
 		name = "(unknown)"
@@ -1253,18 +1308,29 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.update: update expires_at failed", "error", err)
 		}
 	}
-	if req.URL != nil {
-		if enc, encErr := h.encryptColumn(*req.URL); encErr != nil {
-			logError(r, "vault.update: url encrypt failed", "error", encErr)
-		} else if err := h.queries.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(*req.URL), ID: id}); err != nil {
-			logError(r, "vault.update: update url failed", "error", err)
+	if req.URL != nil || req.AliasURL != nil {
+		// The blind index is scoped, so recomputing one needs the entry's CURRENT
+		// scope (its collection, or its owner when personal).
+		access, accErr := h.queries.GetVaultEntryAccess(ctx, id)
+		if accErr != nil {
+			logError(r, "vault.update: scope lookup failed", "error", accErr)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
-	}
-	if req.AliasURL != nil {
-		if enc, encErr := h.encryptColumn(*req.AliasURL); encErr != nil {
-			logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
-		} else if err := h.queries.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(*req.AliasURL), ID: id}); err != nil {
-			logError(r, "vault.update: update alias_url failed", "error", err)
+		scope := bidxScope(access.UserID, access.CollectionID)
+		if req.URL != nil {
+			if enc, encErr := h.encryptColumn(*req.URL); encErr != nil {
+				logError(r, "vault.update: url encrypt failed", "error", encErr)
+			} else if err := h.queries.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(scope, *req.URL), ID: id}); err != nil {
+				logError(r, "vault.update: update url failed", "error", err)
+			}
+		}
+		if req.AliasURL != nil {
+			if enc, encErr := h.encryptColumn(*req.AliasURL); encErr != nil {
+				logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
+			} else if err := h.queries.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(scope, *req.AliasURL), ID: id}); err != nil {
+				logError(r, "vault.update: update alias_url failed", "error", err)
+			}
 		}
 	}
 	if req.Username != nil {
@@ -2014,32 +2080,67 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// url/alias_url are encrypted at rest, so match by blind index rather than a
-	// LIKE on cleartext: compute the same HMAC over the requested URL's
-	// normalized host and look it up against url_bidx/alias_url_bidx. An
-	// unparseable or hostless URL yields an empty index (matches nothing).
-	bidx := h.urlBlindIndex(rawURL)
-	if bidx == "" {
+	// LIKE on cleartext. The index is keyed per SCOPE (see bidxScope), which is
+	// what keeps it unlinkable across users, so autofill has to look in every
+	// scope the caller can reach: their personal vault plus each collection they
+	// have ACCEPTED. Each lookup is a separate indexed query, and a single-team
+	// vault has few collections, so this stays cheap.
+	if normalizeVaultHost(rawURL) == "" {
 		writeBadRequest(w, r, "invalid URL")
-		return
-	}
-	// Autofill spans personal entries plus entries in the user's collections.
-	rows, err := h.queries.MatchAccessibleVaultEntriesByURL(ctx, db.MatchAccessibleVaultEntriesByURLParams{
-		UserID:       userID,
-		UserID_2:     userID,
-		UrlBidx:      bidx,
-		AliasUrlBidx: bidx,
-	})
-	if err != nil {
-		logError(r, "vault.match: query failed", "error", err)
-		writeInternalError(w, r, "internal server error")
 		return
 	}
 
 	entries := []vaultEntryMeta{}
-	for _, row := range rows {
-		e := h.vaultMetaFromMatchAccessibleRow(row)
+	seen := map[string]bool{}
+	appendRow := func(e vaultEntryMeta) {
+		if seen[e.ID] {
+			return
+		}
+		seen[e.ID] = true
 		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
 		entries = append(entries, e)
+	}
+
+	personalBidx := h.urlBlindIndex(bidxScope(userID, sql.NullString{}), rawURL)
+	personalRows, err := h.queries.MatchPersonalVaultEntriesByURL(ctx, db.MatchPersonalVaultEntriesByURLParams{
+		UserID:       userID,
+		UrlBidx:      personalBidx,
+		AliasUrlBidx: personalBidx,
+	})
+	if err != nil {
+		logError(r, "vault.match: personal query failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	for _, row := range personalRows {
+		appendRow(h.vaultMetaFromMatchPersonalRow(row))
+	}
+
+	// ListCollectionsForUser returns accepted memberships only, so a pending
+	// invitation contributes nothing to autofill.
+	cols, err := h.queries.ListCollectionsForUser(ctx, userID)
+	if err != nil {
+		logError(r, "vault.match: collection lookup failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	for _, c := range cols {
+		cb := h.urlBlindIndex(bidxScope("", sql.NullString{String: c.ID, Valid: true}), rawURL)
+		if cb == "" {
+			continue
+		}
+		rows, cErr := h.queries.MatchCollectionVaultEntriesByURL(ctx, db.MatchCollectionVaultEntriesByURLParams{
+			CollectionID: sql.NullString{String: c.ID, Valid: true},
+			UrlBidx:      cb,
+			AliasUrlBidx: cb,
+		})
+		if cErr != nil {
+			logError(r, "vault.match: collection query failed", "collection", c.ID, "error", cErr)
+			continue
+		}
+		for _, row := range rows {
+			appendRow(h.vaultMetaFromMatchCollectionRow(row))
+		}
 	}
 
 	writeJSON(w, http.StatusOK, entries)

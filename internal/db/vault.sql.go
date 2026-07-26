@@ -491,11 +491,13 @@ func (q *Queries) ListVaultEntriesByUser(ctx context.Context, userID string) ([]
 
 const listVaultEntriesForMetaAtRestBackfill = `-- name: ListVaultEntriesForMetaAtRestBackfill :many
 
-SELECT id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries
+SELECT id, user_id, collection_id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries
 `
 
 type ListVaultEntriesForMetaAtRestBackfillRow struct {
 	ID           string         `json:"id"`
+	UserID       string         `json:"user_id"`
+	CollectionID sql.NullString `json:"collection_id"`
 	Url          sql.NullString `json:"url"`
 	AliasUrl     sql.NullString `json:"alias_url"`
 	Username     sql.NullString `json:"username"`
@@ -510,6 +512,9 @@ type ListVaultEntriesForMetaAtRestBackfillRow struct {
 // compute url_bidx/alias_url_bidx). Runs once at boot via
 // VaultHandler.BackfillMetadataAtRest; idempotent (enc:v1: prefix guards it).
 // ============================================================================
+// user_id and collection_id are needed because the URL blind index is keyed per
+// SCOPE (personal vs a specific collection), so recomputing it requires knowing
+// which scope the row currently lives in.
 func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error) {
 	rows, err := q.db.QueryContext(ctx, listVaultEntriesForMetaAtRestBackfill)
 	if err != nil {
@@ -521,6 +526,8 @@ func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]
 		var i ListVaultEntriesForMetaAtRestBackfillRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.UserID,
+			&i.CollectionID,
 			&i.Url,
 			&i.AliasUrl,
 			&i.Username,
