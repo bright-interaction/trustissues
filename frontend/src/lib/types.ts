@@ -160,10 +160,36 @@ export interface Collection {
 }
 
 // A member of a collection, as returned by GET /collections/{id}/members.
+// Membership is consent based: a row with `pending: true` has been invited but
+// has not accepted yet and holds no access to the collection's entries.
 export interface CollectionMember {
   user_id: string;
   email: string;
   name: string;
   role: CollectionRole;
   added_at: string | null;
+  // When the invitation was accepted, or null while it is still pending.
+  accepted_at: string | null;
+  // True while the invitation is unanswered (no access granted).
+  pending: boolean;
+}
+
+// An invitation waiting on the CURRENT user, as returned by
+// GET /collections/invitations. It grants nothing: the collection and its
+// entries only reach the user's vault after POST /collections/{id}/accept.
+export interface PendingInvite {
+  collection_id: string;
+  name: string;
+  description: string;
+  role: CollectionRole;
+  invited_at: string | null;
+  invited_by_email: string;
+}
+
+// Response from POST /collections/{id}/members. Deliberately identical whether
+// or not the email matches an account, so the endpoint cannot be used to probe
+// which addresses are registered. It never confirms that a member was added.
+export interface CollectionInviteResult {
+  status: string;
+  detail: string;
 }
