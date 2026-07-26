@@ -198,6 +198,9 @@ type Querier interface {
 	// compute url_bidx/alias_url_bidx). Runs once at boot via
 	// VaultHandler.BackfillMetadataAtRest; idempotent (enc:v1: prefix guards it).
 	// ============================================================================
+	// user_id and collection_id are needed because the URL blind index is keyed per
+	// SCOPE (personal vs a specific collection), so recomputing it requires knowing
+	// which scope the row currently lives in.
 	ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error)
 	ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVaultEntriesForMetaBackfillRow, error)
 	ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVaultEntriesNeedingRotationRow, error)
@@ -209,6 +212,14 @@ type Querier interface {
 	ListVaultEntryNamesByUser(ctx context.Context, userID string) ([]string, error)
 	MarkInvitationRedeemed(ctx context.Context, arg MarkInvitationRedeemedParams) error
 	MatchAccessibleVaultEntriesByURL(ctx context.Context, arg MatchAccessibleVaultEntriesByURLParams) ([]MatchAccessibleVaultEntriesByURLRow, error)
+	// Autofill within one collection the caller has ACCEPTED. Callers must check
+	// membership before calling; the collection id is the index scope.
+	MatchCollectionVaultEntriesByURL(ctx context.Context, arg MatchCollectionVaultEntriesByURLParams) ([]MatchCollectionVaultEntriesByURLRow, error)
+	// Autofill within the caller's PERSONAL scope. The blind index is keyed per
+	// scope, so a personal entry and a collection entry for the same host produce
+	// different index values and a stolen database no longer reveals that two users
+	// hold entries for the same site.
+	MatchPersonalVaultEntriesByURL(ctx context.Context, arg MatchPersonalVaultEntriesByURLParams) ([]MatchPersonalVaultEntriesByURLRow, error)
 	// ============================================================================
 	// URL matching (browser extension autofill)
 	// ============================================================================

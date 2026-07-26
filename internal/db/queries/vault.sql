@@ -171,7 +171,10 @@ SELECT id, provider_meta, rotation_targets FROM vault_entries;
 -- ============================================================================
 
 -- name: ListVaultEntriesForMetaAtRestBackfill :many
-SELECT id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries;
+-- user_id and collection_id are needed because the URL blind index is keyed per
+-- SCOPE (personal vs a specific collection), so recomputing it requires knowing
+-- which scope the row currently lives in.
+SELECT id, user_id, collection_id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries;
 
 -- name: UpdateVaultEntryMetaAtRest :exec
 UPDATE vault_entries

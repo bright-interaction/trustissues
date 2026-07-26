@@ -640,6 +640,170 @@ func (q *Queries) MatchAccessibleVaultEntriesByURL(ctx context.Context, arg Matc
 	return items, nil
 }
 
+const matchCollectionVaultEntriesByURL = `-- name: MatchCollectionVaultEntriesByURL :many
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
+FROM vault_entries e
+WHERE e.collection_id = ?
+  AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
+ORDER BY e.name ASC
+`
+
+type MatchCollectionVaultEntriesByURLParams struct {
+	CollectionID sql.NullString `json:"collection_id"`
+	UrlBidx      string         `json:"url_bidx"`
+	AliasUrlBidx string         `json:"alias_url_bidx"`
+}
+
+type MatchCollectionVaultEntriesByURLRow struct {
+	ID                   string         `json:"id"`
+	UserID               string         `json:"user_id"`
+	CollectionID         sql.NullString `json:"collection_id"`
+	Name                 string         `json:"name"`
+	Url                  sql.NullString `json:"url"`
+	AliasUrl             sql.NullString `json:"alias_url"`
+	Username             sql.NullString `json:"username"`
+	Category             sql.NullString `json:"category"`
+	Notes                sql.NullString `json:"notes"`
+	AutoLogin            int64          `json:"auto_login"`
+	RotationIntervalDays sql.NullInt64  `json:"rotation_interval_days"`
+	ExpiresAt            sql.NullTime   `json:"expires_at"`
+	LastRotatedAt        sql.NullTime   `json:"last_rotated_at"`
+	Provider             sql.NullString `json:"provider"`
+	ProviderMeta         sql.NullString `json:"provider_meta"`
+	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
+	LastRotationError    sql.NullString `json:"last_rotation_error"`
+	CreatedAt            sql.NullTime   `json:"created_at"`
+	UpdatedAt            sql.NullTime   `json:"updated_at"`
+}
+
+// Autofill within one collection the caller has ACCEPTED. Callers must check
+// membership before calling; the collection id is the index scope.
+func (q *Queries) MatchCollectionVaultEntriesByURL(ctx context.Context, arg MatchCollectionVaultEntriesByURLParams) ([]MatchCollectionVaultEntriesByURLRow, error) {
+	rows, err := q.db.QueryContext(ctx, matchCollectionVaultEntriesByURL, arg.CollectionID, arg.UrlBidx, arg.AliasUrlBidx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MatchCollectionVaultEntriesByURLRow{}
+	for rows.Next() {
+		var i MatchCollectionVaultEntriesByURLRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.CollectionID,
+			&i.Name,
+			&i.Url,
+			&i.AliasUrl,
+			&i.Username,
+			&i.Category,
+			&i.Notes,
+			&i.AutoLogin,
+			&i.RotationIntervalDays,
+			&i.ExpiresAt,
+			&i.LastRotatedAt,
+			&i.Provider,
+			&i.ProviderMeta,
+			&i.AutoRotate,
+			&i.LastRotationError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const matchPersonalVaultEntriesByURL = `-- name: MatchPersonalVaultEntriesByURL :many
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
+FROM vault_entries e
+WHERE e.collection_id IS NULL AND e.user_id = ?
+  AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
+ORDER BY e.name ASC
+`
+
+type MatchPersonalVaultEntriesByURLParams struct {
+	UserID       string `json:"user_id"`
+	UrlBidx      string `json:"url_bidx"`
+	AliasUrlBidx string `json:"alias_url_bidx"`
+}
+
+type MatchPersonalVaultEntriesByURLRow struct {
+	ID                   string         `json:"id"`
+	UserID               string         `json:"user_id"`
+	CollectionID         sql.NullString `json:"collection_id"`
+	Name                 string         `json:"name"`
+	Url                  sql.NullString `json:"url"`
+	AliasUrl             sql.NullString `json:"alias_url"`
+	Username             sql.NullString `json:"username"`
+	Category             sql.NullString `json:"category"`
+	Notes                sql.NullString `json:"notes"`
+	AutoLogin            int64          `json:"auto_login"`
+	RotationIntervalDays sql.NullInt64  `json:"rotation_interval_days"`
+	ExpiresAt            sql.NullTime   `json:"expires_at"`
+	LastRotatedAt        sql.NullTime   `json:"last_rotated_at"`
+	Provider             sql.NullString `json:"provider"`
+	ProviderMeta         sql.NullString `json:"provider_meta"`
+	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
+	LastRotationError    sql.NullString `json:"last_rotation_error"`
+	CreatedAt            sql.NullTime   `json:"created_at"`
+	UpdatedAt            sql.NullTime   `json:"updated_at"`
+}
+
+// Autofill within the caller's PERSONAL scope. The blind index is keyed per
+// scope, so a personal entry and a collection entry for the same host produce
+// different index values and a stolen database no longer reveals that two users
+// hold entries for the same site.
+func (q *Queries) MatchPersonalVaultEntriesByURL(ctx context.Context, arg MatchPersonalVaultEntriesByURLParams) ([]MatchPersonalVaultEntriesByURLRow, error) {
+	rows, err := q.db.QueryContext(ctx, matchPersonalVaultEntriesByURL, arg.UserID, arg.UrlBidx, arg.AliasUrlBidx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MatchPersonalVaultEntriesByURLRow{}
+	for rows.Next() {
+		var i MatchPersonalVaultEntriesByURLRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.CollectionID,
+			&i.Name,
+			&i.Url,
+			&i.AliasUrl,
+			&i.Username,
+			&i.Category,
+			&i.Notes,
+			&i.AutoLogin,
+			&i.RotationIntervalDays,
+			&i.ExpiresAt,
+			&i.LastRotatedAt,
+			&i.Provider,
+			&i.ProviderMeta,
+			&i.AutoRotate,
+			&i.LastRotationError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const removeCollectionMember = `-- name: RemoveCollectionMember :execresult
 DELETE FROM collection_members WHERE collection_id = ? AND user_id = ?
 `

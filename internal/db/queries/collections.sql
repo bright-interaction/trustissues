@@ -114,6 +114,26 @@ WHERE ((e.collection_id IS NULL AND e.user_id = ?)
   AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
 ORDER BY e.name ASC;
 
+-- name: MatchPersonalVaultEntriesByURL :many
+-- Autofill within the caller's PERSONAL scope. The blind index is keyed per
+-- scope, so a personal entry and a collection entry for the same host produce
+-- different index values and a stolen database no longer reveals that two users
+-- hold entries for the same site.
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
+FROM vault_entries e
+WHERE e.collection_id IS NULL AND e.user_id = ?
+  AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
+ORDER BY e.name ASC;
+
+-- name: MatchCollectionVaultEntriesByURL :many
+-- Autofill within one collection the caller has ACCEPTED. Callers must check
+-- membership before calling; the collection id is the index scope.
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
+FROM vault_entries e
+WHERE e.collection_id = ?
+  AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
+ORDER BY e.name ASC;
+
 -- name: ListAccessibleVaultEntryNames :many
 -- Names visible to the user (personal + collections) for import conflict checks.
 SELECT e.name FROM vault_entries e

@@ -366,7 +366,9 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			Username:       toNullString(encUser),
 			Category:       toNullString(encCat),
 			Notes:          toNullString(encNotes),
-			UrlBidx:        h.handler.urlBlindIndex(entry.URL),
+			// Imported entries land in the user's PERSONAL vault, so the blind
+			// index is keyed to that scope.
+			UrlBidx: h.handler.urlBlindIndex(bidxScope(userID, sql.NullString{}), entry.URL),
 		})
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {
