@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -110,6 +111,22 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	if req.AgentID == "" {
 		writeBadRequest(w, r, "agent_id required")
 		return
+	}
+	// Same authorization-boundary rule the proxy applies: a destination whose
+	// path is not normalized would be matched against the secret's allow-list as
+	// one endpoint and resolve upstream as another, so it never gets minted into
+	// a token.
+	if req.Destination != "" && !destPathNormalized(req.Destination) {
+		writeError(w, r, http.StatusBadRequest, "invalid_destination",
+			"destination path must be normalized (no '.' or '..' segments, no duplicate slashes)")
+		return
+	}
+	for _, d := range req.Dests {
+		if !destPathNormalized(d) {
+			writeError(w, r, http.StatusBadRequest, "invalid_destination",
+				"destination path must be normalized (no '.' or '..' segments, no duplicate slashes)")
+			return
+		}
 	}
 
 	var entry capabilityEntryRow
@@ -240,7 +257,20 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	host := chi.URLParam(r, "host")
 	rest := chi.URLParam(r, "*")
-	upstreamPath := "/" + rest
+
+	// Normalize the path BEFORE it is matched against the token's dests and
+	// before it is forwarded, and reject instead of rewriting. chi hands us the
+	// raw wildcard, so "/v1/../../admin" matches an allow-listed "/v1/*" prefix
+	// here but resolves to a different endpoint upstream, and the real secret
+	// would be injected toward it. This is an authorization boundary, so a
+	// caller whose path is not already normalized gets a 400 rather than a
+	// silently re-pointed request.
+	upstreamPath, normalized := normalizePath("/" + rest)
+	if !normalized {
+		writeError(w, r, http.StatusBadRequest, "invalid_path",
+			"request path must be normalized (no '.' or '..' segments, no duplicate slashes)")
+		return
+	}
 
 	tokenStr := extractCapabilityToken(r.Header.Get("Authorization"))
 	if tokenStr == "" {
@@ -250,16 +280,17 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 
 	tok, err := capability.Verify(tokenStr, h.signingKey, time.Now())
 	if err != nil {
-		event := "denied"
-		switch {
-		case errors.Is(err, capability.ErrExpired):
-			event = "expired"
-		case errors.Is(err, capability.ErrBadSignature):
-			event = "denied"
-		case errors.Is(err, capability.ErrMalformed):
-			event = "denied"
+		// Only persist an audit row when the request is attributable to a token
+		// this server actually signed. These routes sit outside session auth, so
+		// a malformed or badly-signed token means an anonymous caller: writing a
+		// capability_log row for it would hand anyone an unauthenticated,
+		// attacker-controlled DB write (log flooding + audit-trail poisoning).
+		// An expired token still carries our signature, so it stays audited.
+		if errors.Is(err, capability.ErrExpired) {
+			h.logCapabilityEvent(ctx, "", nil, "", host+upstreamPath, r.Method, "expired", 0, err.Error(), "")
+		} else {
+			slog.Debug("capability.proxy: token verification failed", "error", err, "method", r.Method)
 		}
-		h.logCapabilityEvent(ctx, "", nil, "", host+upstreamPath, r.Method, event, 0, err.Error(), "")
 		writeError(w, r, http.StatusUnauthorized, "invalid_capability", err.Error())
 		return
 	}
@@ -386,31 +417,75 @@ func proxyBaseURL(r *http.Request) string {
 	return fmt.Sprintf("%s://%s/proxy", scheme, r.Host)
 }
 
-// copyForwardHeaders propagates safe-to-forward headers to the upstream
-// request. Strips Authorization (we set our own), Host (transport sets
-// it), Connection-control headers, and Forwarded* (we manage those).
+// forwardableHeaders is the ALLOW-list of caller headers the proxy relays to
+// the upstream. It is an allow-list, not a deny-list, because the upstream host
+// is chosen by the capability token: anything we forward blindly is handed to a
+// third party that may be hostile. A deny-list only ever blocks the names
+// somebody thought of, so the caller's own Trustissues credentials (session
+// Cookie, X-API-Key, X-Service-Key, any Authorization/Proxy-Authorization
+// variant) rode along to whatever host the token targeted and could be replayed
+// straight back at us. Only headers a plain API call genuinely needs are listed:
+// content negotiation, the client's user agent, request idempotency, and the
+// few provider protocol-version headers that carry no credential. The secret
+// itself is added afterwards by injectSecret (Proxy calls it after this copy),
+// so a spec-defined header/query is never affected by this filter.
+var forwardableHeaders = map[string]struct{}{
+	"Content-Type":    {},
+	"Accept":          {},
+	"Accept-Language": {},
+	"Accept-Encoding": {},
+	"User-Agent":      {},
+	"Idempotency-Key": {},
+	// Provider protocol selectors. Required by the upstream API, never a
+	// credential, and never meaningful to Trustissues itself.
+	"Anthropic-Version":    {},
+	"Anthropic-Beta":       {},
+	"Openai-Beta":          {},
+	"Openai-Organization":  {},
+	"X-Github-Api-Version": {},
+}
+
+// copyForwardHeaders relays only the headers in forwardableHeaders to the
+// upstream request. Everything else is dropped, including every credential the
+// caller used to reach us.
 func copyForwardHeaders(src, dst http.Header) {
-	skip := map[string]struct{}{
-		"Authorization":     {},
-		"Host":              {},
-		"Connection":        {},
-		"Proxy-Connection":  {},
-		"Keep-Alive":        {},
-		"Transfer-Encoding": {},
-		"Upgrade":           {},
-		"Te":                {},
-		"Trailer":           {},
-		"X-Forwarded-For":   {},
-		"X-Forwarded-Proto": {},
-		"X-Forwarded-Host":  {},
-		"X-Real-Ip":         {},
-	}
 	for k, v := range src {
-		if _, drop := skip[http.CanonicalHeaderKey(k)]; drop {
+		canonical := http.CanonicalHeaderKey(k)
+		if _, ok := forwardableHeaders[canonical]; !ok {
 			continue
 		}
-		dst[http.CanonicalHeaderKey(k)] = append([]string{}, v...)
+		dst[canonical] = append([]string{}, v...)
 	}
+}
+
+// normalizePath cleans an absolute path for an authorization decision and
+// reports whether the input was already normalized. path.Clean resolves "." and
+// ".." segments and collapses duplicate slashes, so when the cleaned form
+// differs from the input, the string an allow-list check sees is not the
+// resource the upstream resolves. Callers REJECT on a false second return
+// rather than quietly substituting the cleaned value: silently rewriting an
+// authorization boundary hides the mismatch from the caller and the audit
+// trail. A meaningful trailing slash is preserved (some APIs require one, and
+// it is not a traversal vector).
+func normalizePath(p string) (string, bool) {
+	if p == "" || p == "/" {
+		return p, true
+	}
+	cleaned := path.Clean(p)
+	if cleaned != "/" && strings.HasSuffix(p, "/") {
+		cleaned += "/"
+	}
+	return cleaned, cleaned == p
+}
+
+// destPathNormalized reports whether the path portion of a "host/path"
+// destination is already normalized. Used to reject a caller-supplied
+// destination before it is matched against a secret's allow-list, so a ".."
+// destination cannot be minted into a token in the first place.
+func destPathNormalized(dest string) bool {
+	_, p := splitHostPath(dest)
+	_, ok := normalizePath(p)
+	return ok
 }
 
 func copyResponseHeaders(src, dst http.Header) {

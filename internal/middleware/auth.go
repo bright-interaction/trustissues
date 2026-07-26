@@ -147,13 +147,23 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				hash := sha256.Sum256([]byte(apiKey))
 				keyHash := hex.EncodeToString(hash[:])
 
+				// Expiry and revocation are both evaluated in SQL, same idiom
+				// as validateSession below. The previous version parsed the
+				// stored DATETIME in Go and skipped the check when the parse
+				// failed, which is a fail-open branch: correct only for as long
+				// as every writer happens to produce RFC3339. datetime()
+				// normalizes every spelling SQLite accepts and both sides are
+				// UTC, so this compares correctly whatever wrote the row.
 				var userID string
-				var expiresAt sql.NullString
+				var expired, revoked bool
 				err := db.QueryRowContext(
 					r.Context(),
-					"SELECT user_id, expires_at FROM api_keys WHERE key_hash = ?",
+					`SELECT user_id,
+					        expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now'),
+					        revoked_at IS NOT NULL
+					 FROM api_keys WHERE key_hash = ?`,
 					keyHash,
-				).Scan(&userID, &expiresAt)
+				).Scan(&userID, &expired, &revoked)
 
 				if err != nil {
 					if err == sql.ErrNoRows {
@@ -165,13 +175,16 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 					return
 				}
 
-				// Check expiry
-				if expiresAt.Valid && expiresAt.String != "" {
-					exp, err := time.Parse(time.RFC3339, expiresAt.String)
-					if err == nil && time.Now().After(exp) {
-						http.Error(w, `{"error":"API key has expired"}`, http.StatusUnauthorized)
-						return
-					}
+				// Revoked on password change, admin password reset, or an admin
+				// revoke. Checked before expiry so an incident-response
+				// revocation is what the client is told about.
+				if revoked {
+					http.Error(w, `{"error":"API key has been revoked"}`, http.StatusUnauthorized)
+					return
+				}
+				if expired {
+					http.Error(w, `{"error":"API key has expired"}`, http.StatusUnauthorized)
+					return
 				}
 
 				// Update last_used_at (best effort)

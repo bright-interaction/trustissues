@@ -361,9 +361,21 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		logError(r, "users.reset_password: failed to invalidate sessions", "error", err)
 	}
+	// Also drop the server-side session rows, matching ChangePassword. The
+	// iat cutoff above only catches tokens that carry an iat claim, so this is
+	// what makes the reset unconditional.
+	if err := h.queries.RevokeUserSessions(r.Context(), targetID); err != nil {
+		logError(r, "users.reset_password: failed to revoke sessions", "error", err, "user_id", targetID)
+	}
+	// An admin resetting a compromised account's password has to be able to
+	// cut off the attacker completely, and API keys are a second credential
+	// that would otherwise survive the reset.
+	if err := h.queries.RevokeAPIKeysByUser(r.Context(), targetID); err != nil {
+		logError(r, "users.reset_password: failed to revoke api keys", "error", err, "user_id", targetID)
+	}
 
 	LogActivityFromRequest(h.queries, r, "admin.user_password_reset",
-		fmt.Sprintf("Password reset for %s", target.Email))
+		fmt.Sprintf("Password reset for %s; sessions and API keys revoked", target.Email))
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -408,10 +420,20 @@ type redeemInvitationRequest struct {
 	Password string `json:"password"`
 }
 
+// invitationAPIKeyTTL time-boxes the extension key minted by the PUBLIC redeem
+// endpoint. That key is bootstrapped from an invitation code rather than from a
+// session, so it is never permanent: it ages out on its own, it shows up in the
+// owner's GET /api/api-keys list like any other key, and an admin can revoke it
+// from the admin API-key routes at any time.
+const invitationAPIKeyTTL = 90 * 24 * time.Hour
+
 type redeemInvitationResponse struct {
-	APIKey    string `json:"api_key,omitempty"`
-	ServerURL string `json:"server_url"`
-	User      struct {
+	APIKey string `json:"api_key,omitempty"`
+	// When the bootstrapped key expires, so the extension can warn before it
+	// stops working and the user can mint a replacement.
+	APIKeyExpiresAt string `json:"api_key_expires_at,omitempty"`
+	ServerURL       string `json:"server_url"`
+	User            struct {
 		ID    string `json:"id"`
 		Email string `json:"email"`
 		Name  string `json:"name"`
@@ -621,7 +643,13 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 	password := req.Password
 	if password == "" {
 		pwBytes := make([]byte, 32)
-		rand.Read(pwBytes)
+		if _, err := rand.Read(pwBytes); err != nil {
+			// Never fall through with a zeroed buffer: that would be a known
+			// password on a real account.
+			logError(r, "invitations.redeem: failed to generate password", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
 		password = hex.EncodeToString(pwBytes)
 	} else if err := validatePasswordWithPolicy(ctx, h.queries, password); err != nil {
 		writeBadRequest(w, r, "password "+err.(*ValidationError).Message)
@@ -665,10 +693,18 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 	resp.User.Name = inv.Name
 	resp.User.Role = inv.TargetRole
 
-	// vault_only users get an API key for the browser extension.
+	// vault_only users get an API key for the browser extension. This is the
+	// one credential this server hands out over an unauthenticated endpoint,
+	// so it is deliberately time-boxed (invitationAPIKeyTTL) rather than
+	// permanent, and it is an ordinary api_keys row: it appears in the owner's
+	// key list, the owner can delete it, and an admin can revoke it.
 	if inv.TargetRole == "vault_only" {
 		keyBytes := make([]byte, 32)
-		rand.Read(keyBytes)
+		if _, err := rand.Read(keyBytes); err != nil {
+			logError(r, "invitations.redeem: failed to generate key", "error", err)
+			writeInternalError(w, r, "failed to create API key")
+			return
+		}
 		rawKey := hex.EncodeToString(keyBytes)
 		fullKey := "ti_" + rawKey
 
@@ -676,12 +712,14 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		keyHash := hex.EncodeToString(hash[:])
 
 		now := time.Now().UTC()
+		expiresAt := now.Add(invitationAPIKeyTTL)
 		err = h.queries.CreateAPIKeyForUser(ctx, db.CreateAPIKeyForUserParams{
 			ID:        generateID(),
 			UserID:    userID,
 			Name:      "Vault Extension",
 			KeyHash:   keyHash,
 			KeyPrefix: rawKey[:8],
+			ExpiresAt: sql.NullTime{Time: expiresAt, Valid: true},
 			CreatedAt: sql.NullTime{Time: now, Valid: true},
 		})
 		if err != nil {
@@ -690,6 +728,7 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp.APIKey = fullKey
+		resp.APIKeyExpiresAt = expiresAt.Format(time.RFC3339)
 	}
 
 	// Mark invitation as redeemed

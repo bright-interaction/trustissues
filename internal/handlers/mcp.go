@@ -28,10 +28,15 @@ type MCPHandler struct {
 	cfg         *config.Config
 	capability  *CapabilityHandler
 	shieldStore shield.Store // nil when Shield is disabled
+	// mintLimiter is the SAME sensitive-op limiter the HTTP mint route
+	// (/api/secrets/issue) is wrapped in. use_secret calls Issue in-process and
+	// would otherwise skip that middleware entirely, letting an agent mint
+	// unlimited capability tokens. nil disables the check (tests only).
+	mintLimiter *middleware.RateLimiter
 }
 
-func NewMCPHandler(queries *db.Queries, cfg *config.Config, capability *CapabilityHandler, store shield.Store) *MCPHandler {
-	return &MCPHandler{queries: queries, cfg: cfg, capability: capability, shieldStore: store}
+func NewMCPHandler(queries *db.Queries, cfg *config.Config, capability *CapabilityHandler, store shield.Store, mintLimiter *middleware.RateLimiter) *MCPHandler {
+	return &MCPHandler{queries: queries, cfg: cfg, capability: capability, shieldStore: store, mintLimiter: mintLimiter}
 }
 
 const mcpProtocolVersion = "2024-11-05"
@@ -182,15 +187,28 @@ func (h *MCPHandler) toolUseSecret(r *http.Request, userID string, args json.Raw
 	if a.Name == "" {
 		return "the 'name' argument is required", true
 	}
+	if !h.mintAllowed(r) {
+		return "rate limited: too many capability tokens minted, try again later", true
+	}
 
 	// Reuse the audited capability Issue path in-process. A synthetic request
 	// carries the authenticated context so the same auth, ACL, and destination-
 	// ceiling checks run; a capture writer collects the JSON response.
-	reqBody, _ := json.Marshal(issueRequest{
+	issue := issueRequest{
 		Secret:      a.Name,
 		AgentID:     "mcp:" + userID,
 		Destination: a.Destination,
-	})
+	}
+	// A caller-supplied destination must actually NARROW the token. Dests is
+	// what drives the ceiling logic in Issue (which can only narrow the secret's
+	// allow-list, never widen it); leaving it unset meant an assistant asking
+	// for a single endpoint silently received a token carrying the secret's full
+	// destination ceiling and every method. A destination outside the ceiling
+	// now comes back as an error tool-result instead of a wider token.
+	if a.Destination != "" {
+		issue.Dests = []string{a.Destination}
+	}
+	reqBody, _ := json.Marshal(issue)
 	subReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/api/secrets/issue", bytes.NewReader(reqBody))
 	if err != nil {
 		return "internal error", true
@@ -203,15 +221,39 @@ func (h *MCPHandler) toolUseSecret(r *http.Request, userID string, args json.Raw
 	if cw.status != http.StatusCreated {
 		var e struct {
 			Error string `json:"error"`
+			Code  string `json:"code"`
 		}
 		_ = json.Unmarshal(cw.body.Bytes(), &e)
 		if e.Error == "" {
 			e.Error = "could not mint a capability token"
 		}
+		// Surface the machine-readable code (dests_exceed_ceiling,
+		// agent_not_granted, ...) so the model can tell "ask for less" apart
+		// from "you have no access".
+		if e.Code != "" {
+			return e.Code + ": " + e.Error, true
+		}
 		return e.Error, true
 	}
 	// Pass the token response straight through; it contains no secret value.
 	return cw.body.String(), false
+}
+
+// mintAllowed spends one unit of the sensitive-op rate-limit budget and reports
+// whether this request may mint a capability token. It runs the real request
+// through the SAME limiter instance the /api/secrets/issue route is wrapped in,
+// so the HTTP and MCP entry points share one budget instead of the in-process
+// call bypassing the middleware. Keying matches that route exactly (the
+// limiter's own trusted-hop client-IP derivation), so a caller cannot get a
+// second allowance simply by switching entry point.
+func (h *MCPHandler) mintAllowed(r *http.Request) bool {
+	if h.mintLimiter == nil {
+		return true
+	}
+	cw := &captureWriter{header: http.Header{}}
+	limited := middleware.RateLimit(h.mintLimiter)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	limited.ServeHTTP(cw, r)
+	return cw.status != http.StatusTooManyRequests
 }
 
 func schemeOf(r *http.Request) string {

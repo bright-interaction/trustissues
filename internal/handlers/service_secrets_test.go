@@ -50,6 +50,7 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 			encryption_version INTEGER DEFAULT 2,
 			destination_patterns TEXT NOT NULL DEFAULT '[]',
 			injection_spec TEXT NOT NULL DEFAULT '{}',
+			collection_id TEXT,
 			UNIQUE(user_id, name)
 		)`,
 		`CREATE TABLE service_identities (

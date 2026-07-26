@@ -165,27 +165,35 @@ func TestInjectSecret_Query(t *testing.T) {
 	}
 }
 
+// TestCopyForwardHeaders_StripsAuthAndHopByHop locks the forwarding filter to
+// an ALLOW-list. The upstream host is chosen by the capability token, so any
+// header we relay blindly is handed to a possibly hostile third party: the
+// caller's own Trustissues credentials must never make the trip, and neither
+// must an unknown header nobody thought to deny.
 func TestCopyForwardHeaders_StripsAuthAndHopByHop(t *testing.T) {
 	src := map[string][]string{
-		"Authorization":   {"Bearer secret-from-client"},
-		"Connection":      {"keep-alive"},
-		"X-Forwarded-For": {"10.0.0.1"},
-		"Content-Type":    {"application/json"},
-		"X-Custom-Pass":   {"keep-me"},
+		"Authorization":       {"Bearer secret-from-client"},
+		"Proxy-Authorization": {"Basic secret"},
+		"Cookie":              {"trustissues_session=live-session-jwt"},
+		"X-Api-Key":           {"tik_live_caller_key"},
+		"X-Service-Key":       {"svc_live_key"},
+		"Connection":          {"keep-alive"},
+		"X-Forwarded-For":     {"10.0.0.1"},
+		"Content-Type":        {"application/json"},
+		"X-Custom-Pass":       {"not-on-the-allowlist"},
 	}
 	dst := map[string][]string{}
 	copyForwardHeaders(src, dst)
-	if _, ok := dst["Authorization"]; ok {
-		t.Fatal("Authorization should be stripped (we set our own)")
+	for _, banned := range []string{
+		"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key",
+		"X-Service-Key", "Connection", "X-Forwarded-For", "X-Custom-Pass",
+	} {
+		if _, ok := dst[banned]; ok {
+			t.Fatalf("%s must not be forwarded upstream, got %v", banned, dst)
+		}
 	}
-	if _, ok := dst["Connection"]; ok {
-		t.Fatal("Connection should be stripped")
-	}
-	if _, ok := dst["X-Forwarded-For"]; ok {
-		t.Fatal("X-Forwarded-For should be stripped")
-	}
-	if dst["Content-Type"][0] != "application/json" || dst["X-Custom-Pass"][0] != "keep-me" {
-		t.Fatalf("expected pass-through headers preserved, got %v", dst)
+	if dst["Content-Type"][0] != "application/json" {
+		t.Fatalf("allow-listed headers must survive, got %v", dst)
 	}
 }
 
