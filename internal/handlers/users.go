@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/columncrypto"
 	"github.com/brightinteraction/trustissues/internal/config"
 	"github.com/brightinteraction/trustissues/internal/db"
 	"github.com/brightinteraction/trustissues/internal/middleware"
@@ -761,16 +760,12 @@ func (h *UserHandler) trySendInvitationEmail(toEmail, name, code string) {
 	port := scanSetting("smtp_port")
 	from := scanSetting("smtp_from")
 	username := scanSetting("smtp_username")
-	// Stored encrypted at rest; a row written before that change is still
-	// cleartext, so decrypt only when it carries the ciphertext marker.
-	password := scanSetting("smtp_password")
-	if columncrypto.IsEncrypted(password) {
-		if dec, decErr := columncrypto.DecryptString(password, h.cfg.VaultKey); decErr == nil {
-			password = dec
-		} else {
-			slog.Error("invitations: smtp password decrypt failed", "error", decErr)
-			return
-		}
+	// Stored encrypted at rest. Shared with the "send test email" path so both
+	// resolve the credential identically; they used to disagree.
+	password, pwErr := resolveSMTPPassword(scanSetting("smtp_password"), h.cfg.VaultKey)
+	if pwErr != nil {
+		slog.Error("invitations: smtp password decrypt failed", "error", pwErr)
+		return
 	}
 	useTLS := scanSetting("smtp_use_tls")
 

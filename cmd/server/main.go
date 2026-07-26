@@ -251,6 +251,13 @@ func main() {
 
 	queries := db.New(dbConn)
 
+	// Prove the configured vault key actually matches this data directory BEFORE
+	// anything rewrites a row under it. Without this, a wrong-but-valid key boots
+	// "healthy", shows every entry as blank, and the first UI save overwrites
+	// still-recoverable ciphertext with NULL. Self-heals on first boot by writing
+	// the sentinel. Exits on mismatch unless TRUSTISSUES_ALLOW_KEY_MISMATCH=1.
+	handlers.EnforceVaultKey(context.Background(), queries, cfg.VaultKey)
+
 	// appCtx scopes background workers and dispatcher work to the server's
 	// lifetime; cancelled on shutdown.
 	appCtx, appCancel := context.WithCancel(context.Background())

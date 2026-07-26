@@ -71,13 +71,20 @@ export default function App() {
               </AuthGuard>
             }
           />
+          {/*
+            Deliberately NOT wrapped in VaultOnlyRedirect. vault_only is the
+            browser-extension role, and Settings holds the only UI that mints an
+            extension API key. Redirecting them here meant an invited teammate
+            finished onboarding with no key and no way to get one. The server
+            already permits their role on POST /api/api-keys, and every
+            admin-only surface behind this page is enforced server-side with
+            AdminOnly, so the tab list below is presentation, not a boundary.
+          */}
           <Route
             path="/settings"
             element={
               <AuthGuard>
-                <VaultOnlyRedirect>
-                  <SettingsPage />
-                </VaultOnlyRedirect>
+                <SettingsPage />
               </AuthGuard>
             }
           />

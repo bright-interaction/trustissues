@@ -27,8 +27,11 @@ const navItems: NavItem[] = [
 export default function Sidebar() {
   const { user, isAdmin, isVaultOnly, logout } = useAuth();
 
+  // vault_only keeps a minimal nav, but Settings has to be reachable: it is the
+  // only place to mint the browser-extension API key, which is the whole point
+  // of the role.
   const items = isVaultOnly
-    ? navItems.filter((item) => item.to === '/vault')
+    ? navItems.filter((item) => item.to === '/vault' || item.to === '/settings')
     : navItems.filter((item) => !item.adminOnly || isAdmin);
 
   return (

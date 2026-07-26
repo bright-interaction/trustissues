@@ -1163,13 +1163,16 @@ function AITab() {
 }
 
 export default function Settings() {
-  const { isAdmin } = useAuth();
+  const { isAdmin, isVaultOnly } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  // vault_only reaches this page solely to mint an extension API key, so it sees
+  // Account and API keys and nothing else. This is presentation only: every
+  // admin surface is enforced server-side with AdminOnly.
   const tabs: { id: SettingsTab; label: string; icon: typeof UserIcon }[] = [
     { id: 'account', label: 'Account', icon: UserIcon },
     { id: 'apikeys', label: 'API keys', icon: KeyRound },
-    { id: 'ai', label: 'AI & MCP', icon: Bot },
+    ...(isVaultOnly ? [] : ([{ id: 'ai', label: 'AI & MCP', icon: Bot }] as const)),
     ...(isAdmin
       ? ([
           { id: 'policy', label: 'Vault policy', icon: ShieldCheck },

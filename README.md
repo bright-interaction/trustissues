@@ -225,15 +225,15 @@ The key is minted when a `vault_only` invitation is redeemed:
    and the `server_url`.
 3. They paste the server URL and the API key into the extension.
 
-> **Known gap (tracked):** the invite redemption UI does not currently display
-> the returned `api_key` or `server_url`; it logs the user straight into the web
-> vault and discards them. The key is stored only as a hash, so it cannot be
-> recovered later, and there is no reissue endpoint yet. Until this is fixed, an
-> admin must capture the `api_key` from the `POST /api/invitations/redeem`
-> response (visible in the browser dev-tools Network tab at redemption time) and
-> hand it to the user over a secure channel. This is a shipping blocker for a
-> no-help extension setup and is called out in `THREAT-MODEL.md` (R6) and
-> `SECURITY.md`.
+If the redemption screen's one-time key is missed, the user mints another one
+themselves: **Settings > API keys > Create**. The key is shown once and stored
+only as a hash, so a lost key is replaced rather than recovered. This works for
+every role, including `vault_only`, which is the role the extension is for.
+
+> Previously the redemption UI discarded the returned `api_key`, and the router
+> redirected `vault_only` users away from `/settings`, so the one role that needs
+> an extension key could not reach the only UI that mints one. `POST /api/api-keys`
+> always permitted their role; the block was entirely client-side. Fixed 2026-07-26.
 
 ## License
 
