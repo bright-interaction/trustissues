@@ -38,7 +38,11 @@ type apiKeyResponse struct {
 	KeyPrefix  string  `json:"key_prefix"`
 	LastUsedAt *string `json:"last_used_at"`
 	ExpiresAt  *string `json:"expires_at"`
-	CreatedAt  string  `json:"created_at"`
+	// RevokedAt is nil while the key is live. Revoked keys stay in the list
+	// (marked, not hidden) so the owner can see that a key existed and when it
+	// was cut off; the auth path rejects them.
+	RevokedAt *string `json:"revoked_at"`
+	CreatedAt string  `json:"created_at"`
 }
 
 // apiKeyCreateResponse carries the full key. The plaintext key is returned
@@ -68,6 +72,12 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, apiKeyResponses(rows))
+}
+
+// apiKeyResponses maps key rows to the wire shape shared by the per-user and
+// admin list endpoints. It never carries the secret, only the prefix.
+func apiKeyResponses(rows []db.ListAPIKeysByUserRow) []apiKeyResponse {
 	keys := make([]apiKeyResponse, 0, len(rows))
 	for _, row := range rows {
 		k := apiKeyResponse{ID: row.ID, Name: row.Name, KeyPrefix: row.KeyPrefix}
@@ -79,13 +89,16 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 			s := row.ExpiresAt.Time.Format(time.RFC3339)
 			k.ExpiresAt = &s
 		}
+		if row.RevokedAt.Valid {
+			s := row.RevokedAt.Time.Format(time.RFC3339)
+			k.RevokedAt = &s
+		}
 		if row.CreatedAt.Valid {
 			k.CreatedAt = row.CreatedAt.Time.Format(time.RFC3339)
 		}
 		keys = append(keys, k)
 	}
-
-	writeJSON(w, http.StatusOK, keys)
+	return keys
 }
 
 // Create handles POST /api/api-keys and mints a new key for the browser
@@ -193,5 +206,84 @@ func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	LogActivityFromRequest(h.queries, r, "api_key.delete", fmt.Sprintf("API key deleted: %s", keyID))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Admin incident response -------------------------------------------------
+//
+// A leaked key belonging to someone else has to be killable without waiting for
+// that person to log in, and vault_only users cannot reach the settings UI at
+// all. These handlers are wired under the admin route group; the IsAdmin check
+// is repeated here as defense in depth so a future re-wire cannot silently
+// expose another user's keys.
+
+// AdminList handles GET /api/admin/users/{id}/api-keys and returns the target
+// user's keys (prefixes only, never the secret), including revoked ones.
+func (h *APIKeyHandler) AdminList(w http.ResponseWriter, r *http.Request) {
+	if !middleware.IsAdmin(r.Context()) {
+		writeForbidden(w, r, "admin access required")
+		return
+	}
+
+	targetID := chi.URLParam(r, "id")
+	rows, err := h.queries.ListAPIKeysByUser(r.Context(), targetID)
+	if err != nil {
+		logError(r, "apikeys.admin_list: query failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiKeyResponses(rows))
+}
+
+// AdminRevoke handles POST /api/admin/users/{id}/api-keys/{keyId}/revoke and
+// revokes one key belonging to the target user. Revoking rather than deleting
+// keeps the row for the audit trail. Idempotent: revoking an already-revoked
+// key succeeds without moving its timestamp.
+func (h *APIKeyHandler) AdminRevoke(w http.ResponseWriter, r *http.Request) {
+	if !middleware.IsAdmin(r.Context()) {
+		writeForbidden(w, r, "admin access required")
+		return
+	}
+
+	targetID := chi.URLParam(r, "id")
+	keyID := chi.URLParam(r, "keyId")
+	result, err := h.queries.RevokeAPIKey(r.Context(), db.RevokeAPIKeyParams{
+		ID:     keyID,
+		UserID: targetID,
+	})
+	if err != nil {
+		logError(r, "apikeys.admin_revoke: revoke failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		writeNotFound(w, r, "API key not found")
+		return
+	}
+
+	LogActivityFromRequest(h.queries, r, "admin.api_key_revoked",
+		fmt.Sprintf("API key %s revoked for user %s", keyID, targetID))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AdminRevokeAll handles POST /api/admin/users/{id}/api-keys/revoke-all and
+// cuts off every live key for the target user in one step, which is what an
+// admin actually needs when an account is compromised.
+func (h *APIKeyHandler) AdminRevokeAll(w http.ResponseWriter, r *http.Request) {
+	if !middleware.IsAdmin(r.Context()) {
+		writeForbidden(w, r, "admin access required")
+		return
+	}
+
+	targetID := chi.URLParam(r, "id")
+	if err := h.queries.RevokeAPIKeysByUser(r.Context(), targetID); err != nil {
+		logError(r, "apikeys.admin_revoke_all: revoke failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	LogActivityFromRequest(h.queries, r, "admin.api_keys_revoked",
+		fmt.Sprintf("All API keys revoked for user %s", targetID))
 	w.WriteHeader(http.StatusNoContent)
 }

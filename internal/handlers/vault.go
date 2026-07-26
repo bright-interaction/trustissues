@@ -157,6 +157,29 @@ func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
 	return fields
 }
 
+// encryptMetaColumnsIfNeeded is the STORAGE-side variant of encryptMetaColumns:
+// each column may already be ciphertext (it was read out of the database), so it
+// routes through encryptColumnIfNeeded and leaves already-encrypted values
+// untouched. Use this from backfills and other paths that carry stored values
+// forward. Never use it on client input: deciding by content whether to encrypt
+// is what created the decryption oracle (see vaultColumnEncPrefix).
+func (h *VaultHandler) encryptMetaColumnsIfNeeded(rawURL, aliasURL, username, category, notes string) (encURL, encAlias, encUser, encCat, encNotes string, err error) {
+	if encURL, err = h.encryptColumnIfNeeded(rawURL); err != nil {
+		return
+	}
+	if encAlias, err = h.encryptColumnIfNeeded(aliasURL); err != nil {
+		return
+	}
+	if encUser, err = h.encryptColumnIfNeeded(username); err != nil {
+		return
+	}
+	if encCat, err = h.encryptColumnIfNeeded(category); err != nil {
+		return
+	}
+	encNotes, err = h.encryptColumnIfNeeded(notes)
+	return
+}
+
 func (h *VaultHandler) encryptMetaColumns(rawURL, aliasURL, username, category, notes string) (encURL, encAlias, encUser, encCat, encNotes string, err error) {
 	if encURL, err = h.encryptColumn(rawURL); err != nil {
 		return
@@ -294,9 +317,13 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			continue
 		}
 
-		// encryptColumn is idempotent, so passing the stored value (cleartext or
-		// already-encrypted) never double-wraps it.
-		encURL, encAlias, encUser, encCat, encNotes, encErr := h.encryptMetaColumns(
+		// Storage-side caller: these values come out of the database and may
+		// ALREADY be ciphertext, so this must use the idempotent variant.
+		// encryptMetaColumns routes to encryptColumn, which always encrypts
+		// (that is what closes the decryption oracle) and would therefore
+		// double-wrap an already-encrypted column, permanently corrupting the
+		// user's saved url/username/notes on the next boot.
+		encURL, encAlias, encUser, encCat, encNotes, encErr := h.encryptMetaColumnsIfNeeded(
 			row.Url.String, row.AliasUrl.String, row.Username.String, row.Category.String, row.Notes.String)
 		if encErr != nil {
 			return updated, fmt.Errorf("encrypt metadata for %s: %w", row.ID, encErr)
@@ -667,10 +694,12 @@ const (
 // entryAccess resolves whether the authenticated user may read and/or write a
 // vault entry. Personal entries (no collection) are owner-only, with instance
 // admins seeing everything. Collection entries are governed by the caller's
-// membership role: viewer can read, editor and manager can also write; a
-// non-member gets nothing. Returns (false, false) for a missing entry so callers
-// 404 uniformly. This is the single authorization point for every single-entry
-// operation; do not bypass it with a raw owner check.
+// membership role OR'd with the creating owner's residual right: viewer can
+// read, editor and manager can also write, and the user recorded in user_id
+// keeps read+write on an entry they created even after it is placed in a
+// collection; a non-member non-owner gets nothing. Returns (false, false) for a
+// missing entry so callers 404 uniformly. This is the single authorization point
+// for every single-entry operation; do not bypass it with a raw owner check.
 func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, canWrite bool) {
 	userID := middleware.GetUserID(r.Context())
 	isAdmin := middleware.IsAdmin(r.Context())
@@ -683,6 +712,12 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 		return true, true
 	}
 	if info.CollectionID.Valid && info.CollectionID.String != "" {
+		// Residual owner right. Without it a collection member could move the
+		// entry into a collection the creator is not a member of and the
+		// creator would lose their own secret permanently.
+		if userID != "" && info.UserID == userID {
+			return true, true
+		}
 		role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
 			CollectionID: info.CollectionID.String,
 			UserID:       userID,
@@ -701,6 +736,30 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 	}
 	owns := info.UserID == userID
 	return owns, owns
+}
+
+// canMoveEntryOutOfCollection reports whether the caller may move an entry that
+// currently lives in collectionID somewhere else. Moving it out revokes access
+// for everyone who reached it through that collection, including the manager who
+// can no longer get it back, so the editor role is deliberately NOT enough here:
+// only the entry's creating owner, an instance admin, or a manager of the source
+// collection.
+func (h *VaultHandler) canMoveEntryOutOfCollection(r *http.Request, ownerID, collectionID string) bool {
+	if middleware.IsAdmin(r.Context()) {
+		return true
+	}
+	userID := middleware.GetUserID(r.Context())
+	if userID != "" && userID == ownerID {
+		return true
+	}
+	role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+		CollectionID: collectionID,
+		UserID:       userID,
+	})
+	if err != nil {
+		return false
+	}
+	return role == collRoleManager
 }
 
 // canWriteCollection reports whether the caller may add or modify entries in a
@@ -991,12 +1050,24 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 // MoveToCollection handles PUT /api/vault/{id}/collection and moves an entry
-// into a shared collection, or back to personal with a null/empty id. Requires
-// write access to the entry and, for a non-empty target, editor/manager on the
-// destination collection.
+// into a shared collection, or back to personal with a null/empty id.
+//
+// Two separate authorizations apply. Taking an entry OUT of the collection it
+// currently sits in is a dispossessing operation (everyone else who reached it
+// through that collection loses it, permanently, and only the new holder can
+// give it back), so it needs the entry owner, an instance admin, or a manager of
+// the SOURCE collection: write access alone, which every editor has, is not
+// enough. Putting it INTO a destination collection separately needs
+// editor/manager there.
 func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	ctx := r.Context()
 	if _, canWrite := h.entryAccess(r, id); !canWrite {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	info, err := h.queries.GetVaultEntryAccess(ctx, id)
+	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -1007,15 +1078,27 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		writeBadRequest(w, r, "invalid JSON")
 		return
 	}
+
+	source := ""
+	if info.CollectionID.Valid {
+		source = info.CollectionID.String
+	}
+	if source != "" && !h.canMoveEntryOutOfCollection(r, info.UserID, source) {
+		writeForbidden(w, r, "only the entry owner, a manager of the current collection, or an admin can move this entry out of it")
+		return
+	}
+
 	var target sql.NullString
+	destination := ""
 	if req.CollectionID != nil && *req.CollectionID != "" {
 		if !h.canWriteCollection(r, *req.CollectionID) {
 			writeForbidden(w, r, "you do not have write access to that collection")
 			return
 		}
-		target = sql.NullString{String: *req.CollectionID, Valid: true}
+		destination = *req.CollectionID
+		target = sql.NullString{String: destination, Valid: true}
 	}
-	if err := h.queries.SetVaultEntryCollection(r.Context(), db.SetVaultEntryCollectionParams{
+	if err := h.queries.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
 		CollectionID: target,
 		ID:           id,
 	}); err != nil {
@@ -1023,8 +1106,23 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf("Vault entry moved to collection (id: %s)", id))
+	name, nameErr := h.queries.GetVaultEntryName(ctx, id)
+	if nameErr != nil {
+		name = "(unknown)"
+	}
+	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf(
+		"Vault entry moved: %s (id: %s, from: %s, to: %s)",
+		name, id, collectionLabel(source), collectionLabel(destination)))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// collectionLabel renders a collection id for the activity log, naming the
+// personal vault explicitly so a move out of a collection is unambiguous.
+func collectionLabel(collectionID string) string {
+	if collectionID == "" {
+		return "personal"
+	}
+	return collectionID
 }
 
 // seedCapabilityDefaults fills destination_patterns + injection_spec from the
@@ -1490,46 +1588,68 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		if ok && provider.CanAutoRotate() {
 			providerMeta := ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
 			rotatedValue, rotErr := provider.Rotate(ctx, oldValue, providerMeta)
-			if rotErr == nil {
-				newValue = rotatedValue
-				rotationMethod = "auto"
-				// Rotate mutated providerMeta with the NEW provider-side key id;
-				// persist it (encrypted) so the NEXT rotation revokes THIS key
-				// instead of a stale predecessor id. Strip the transient revoke
-				// flag first (never persisted); a failed old-key revoke is
-				// surfaced as a rotation error.
-				revokeWarn := providerMeta["last_revoke_error"]
-				delete(providerMeta, "last_revoke_error")
-				if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
-					if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
-						_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-							ProviderMeta: toNullString(encMeta),
-							ID:           id,
-						})
-					}
-				}
-				if revokeWarn != "" {
-					logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
-					_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-						LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
-						ID:                id,
+			if rotErr != nil {
+				// Do NOT fall through to a locally generated value. The upstream
+				// credential is untouched, so storing a random string here would
+				// destroy the live credential from the user's point of view while
+				// reporting success. Mirror the scheduled sweep instead: leave the
+				// stored value alone, record the failure, and fail the request.
+				// The persisted message is static because a provider Rotate error
+				// can embed the raw upstream response body (tokens, internal
+				// topology) and last_rotation_error is API-visible; the detail is
+				// in the log line.
+				logError(r, "vault.rotate: provider rotation failed", "provider", providerName, "entry", id, "error", rotErr)
+				const rotateFailed = "provider rotation failed (details in server logs)"
+				_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+					LastRotationError: toNullString(rotateFailed),
+					ID:                id,
+				})
+				updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
+					Timestamp: time.Now().UTC().Format(time.RFC3339),
+					Status:    "error",
+					Provider:  providerName,
+					Error:     rotateFailed,
+					Method:    rotationMethod,
+				})
+				_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
+					RotationLog: toNullString(updatedLog),
+					ID:          id,
+				})
+				writeError(w, r, http.StatusBadGateway, "upstream_error",
+					"the provider rejected the rotation; the stored secret was left unchanged")
+				return
+			}
+			newValue = rotatedValue
+			rotationMethod = "auto"
+			// Rotate mutated providerMeta with the NEW provider-side key id;
+			// persist it (encrypted) so the NEXT rotation revokes THIS key
+			// instead of a stale predecessor id. Strip the transient revoke
+			// flag first (never persisted); a failed old-key revoke is
+			// surfaced as a rotation error.
+			revokeWarn := providerMeta["last_revoke_error"]
+			delete(providerMeta, "last_revoke_error")
+			if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
+				if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
+					_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+						ProviderMeta: toNullString(encMeta),
+						ID:           id,
 					})
 				}
-			} else {
-				// Log the error but fall through to manual rotation
-				slog.Warn("vault.rotate: provider rotation failed, falling back to manual", "provider", providerName, "error", rotErr)
-				// Redact before persisting: a provider/transport *url.Error embeds
-				// the request URL, which can carry a query-injected secret in
-				// cleartext. redactUpstreamError strips the query + userinfo.
+			}
+			if revokeWarn != "" {
+				logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
 				_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-					LastRotationError: toNullString(redactUpstreamError(rotErr)),
+					LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
 					ID:                id,
 				})
 			}
 		}
 	}
 
-	// Fallback: generate a random value if provider rotation didn't produce one
+	// Fallback: generate a random value when no provider produced one. This is
+	// the legitimate local-password path (no provider, or a reminder-only
+	// provider the user rotates upstream by hand); a FAILED auto-rotating
+	// provider never reaches here, it returned 502 above.
 	if newValue == "" {
 		newValue, err = generateToken(32)
 		if err != nil {
@@ -1760,11 +1880,20 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	userID := middleware.GetUserID(r.Context())
 
 	var targets []RotationTarget
 	if err := json.NewDecoder(r.Body).Decode(&targets); err != nil {
 		writeBadRequest(w, r, "invalid JSON array of targets")
 		return
+	}
+
+	// Stamp the configuring identity server-side, overwriting anything the
+	// client sent. A target's auth_token resolves against THIS id at delivery
+	// time, so on a shared entry an editor can only reference their own
+	// secrets, never the entry owner's unrelated ones.
+	for i := range targets {
+		targets[i].ConfiguredBy = userID
 	}
 
 	// Validate targets
@@ -1805,7 +1934,6 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetUserID(r.Context())
 	LogActivityFromRequest(h.queries, r, "vault.targets_updated", fmt.Sprintf("Rotation targets updated for vault entry %s (user: %s, targets: %d)", id, userID, len(targets)))
 
 	writeJSON(w, http.StatusOK, targets)

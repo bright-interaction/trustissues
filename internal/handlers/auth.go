@@ -582,8 +582,16 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	if err := h.queries.RevokeUserSessions(r.Context(), userID); err != nil {
 		logError(r, "change-password: failed to revoke sessions", "error", err, "user_id", userID)
 	}
+	// API keys are a separate credential and outlive sessions unless we cut
+	// them too. Changing the password is the incident-response action a user
+	// takes after a compromise, so a stolen extension key must not survive it.
+	// The owner mints a replacement from POST /api/api-keys afterwards.
+	if err := h.queries.RevokeAPIKeysByUser(r.Context(), userID); err != nil {
+		logError(r, "change-password: failed to revoke api keys", "error", err, "user_id", userID)
+	}
 
-	LogActivityFromRequest(h.queries, r, "auth.password_changed", "Password changed")
+	LogActivityFromRequest(h.queries, r, "auth.password_changed",
+		"Password changed; sessions and API keys revoked")
 
 	resp := map[string]string{"message": "password changed successfully"}
 	if token, terr := h.generateToken(userID); terr == nil {

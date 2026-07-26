@@ -210,6 +210,12 @@ type Querier interface {
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 	// ============================================================================
 	ResolveVaultReference(ctx context.Context, arg ResolveVaultReferenceParams) (ResolveVaultReferenceRow, error)
+	// Revocation by flag, not by DELETE, so the audit trail survives the incident.
+	// COALESCE keeps the call idempotent: revoking an already-revoked key does not
+	// move its timestamp and still reports a row, so a repeated incident-response
+	// click cannot come back as a confusing 404.
+	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (sql.Result, error)
+	RevokeAPIKeysByUser(ctx context.Context, userID string) error
 	RevokeServiceIdentity(ctx context.Context, id string) (sql.Result, error)
 	RevokeSession(ctx context.Context, id string) error
 	RevokeUserSessions(ctx context.Context, userID string) error

@@ -27,6 +27,7 @@ type ApiKey struct {
 	KeyPrefix  string       `json:"key_prefix"`
 	LastUsedAt sql.NullTime `json:"last_used_at"`
 	ExpiresAt  sql.NullTime `json:"expires_at"`
+	RevokedAt  sql.NullTime `json:"revoked_at"`
 	CreatedAt  sql.NullTime `json:"created_at"`
 }
 

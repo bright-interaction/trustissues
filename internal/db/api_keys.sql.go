@@ -61,7 +61,7 @@ func (q *Queries) DeleteAPIKeysByUser(ctx context.Context, userID string) error 
 }
 
 const listAPIKeysByUser = `-- name: ListAPIKeysByUser :many
-SELECT id, name, key_prefix, last_used_at, expires_at, created_at
+SELECT id, name, key_prefix, last_used_at, expires_at, revoked_at, created_at
 FROM api_keys
 WHERE user_id = ?
 ORDER BY created_at DESC
@@ -73,6 +73,7 @@ type ListAPIKeysByUserRow struct {
 	KeyPrefix  string       `json:"key_prefix"`
 	LastUsedAt sql.NullTime `json:"last_used_at"`
 	ExpiresAt  sql.NullTime `json:"expires_at"`
+	RevokedAt  sql.NullTime `json:"revoked_at"`
 	CreatedAt  sql.NullTime `json:"created_at"`
 }
 
@@ -91,6 +92,7 @@ func (q *Queries) ListAPIKeysByUser(ctx context.Context, userID string) ([]ListA
 			&i.KeyPrefix,
 			&i.LastUsedAt,
 			&i.ExpiresAt,
+			&i.RevokedAt,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -104,4 +106,35 @@ func (q *Queries) ListAPIKeysByUser(ctx context.Context, userID string) ([]ListA
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeAPIKey = `-- name: RevokeAPIKey :execresult
+
+UPDATE api_keys
+SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP)
+WHERE id = ? AND user_id = ?
+`
+
+type RevokeAPIKeyParams struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+}
+
+// Revocation by flag, not by DELETE, so the audit trail survives the incident.
+// COALESCE keeps the call idempotent: revoking an already-revoked key does not
+// move its timestamp and still reports a row, so a repeated incident-response
+// click cannot come back as a confusing 404.
+func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, revokeAPIKey, arg.ID, arg.UserID)
+}
+
+const revokeAPIKeysByUser = `-- name: RevokeAPIKeysByUser :exec
+UPDATE api_keys
+SET revoked_at = CURRENT_TIMESTAMP
+WHERE user_id = ? AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeAPIKeysByUser(ctx context.Context, userID string) error {
+	_, err := q.db.ExecContext(ctx, revokeAPIKeysByUser, userID)
+	return err
 }

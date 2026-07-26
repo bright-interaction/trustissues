@@ -42,6 +42,16 @@ type RotationTarget struct {
 
 	// Label for display
 	Label string `json:"label,omitempty"`
+
+	// ConfiguredBy is the user id that last wrote this target. AuthToken names
+	// another vault entry, and it MUST be resolved against the identity that
+	// CONFIGURED the target, never against the entry's owner: on a shared
+	// collection entry any editor can add a target, so resolving as the owner
+	// lets that editor name one of the owner's unrelated personal secrets and
+	// have it delivered to a destination the editor controls. UpdateTargets
+	// stamps this server-side on every write and overwrites whatever the client
+	// sent, so it cannot be forged.
+	ConfiguredBy string `json:"configured_by,omitempty"`
 }
 
 // DeliveryResult records the outcome of delivering a key to a target.
@@ -70,6 +80,10 @@ func ParseRotationTargets(raw string) []RotationTarget {
 // consume it (only the cut reload_endpoint grace flow did), but the parameter
 // is kept so callers ported from dockyard, which always have it in hand, need
 // no signature change.
+//
+// userID is the ENTRY OWNER and is used for logging context only. Vault
+// references inside a target (forgejo_secret's auth_token) resolve as
+// target.ConfiguredBy instead; see the RotationTarget doc comment for why.
 func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryName string, oldValue string, newValue string, targets []RotationTarget, userID string) []DeliveryResult {
 	results := make([]DeliveryResult, 0, len(targets))
 
@@ -160,13 +174,28 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 		return fmt.Errorf("auth_token (vault entry name for Forgejo access) is required")
 	}
 
+	// Resolve the auth token as the user who CONFIGURED this target, never as
+	// the entry owner. ResolveVaultReference is scoped to entries that identity
+	// owns, so a collection editor can only ever reach their OWN secrets here.
+	// Targets written before ConfiguredBy existed carry no identity and are
+	// refused rather than falling back to the owner, which is the exact
+	// exfiltration path this closes.
+	if target.ConfiguredBy == "" {
+		return fmt.Errorf("target has no recorded configuring user; re-save this entry's rotation targets to authorize the auth_token lookup")
+	}
+
 	// Resolve the auth token from vault
 	row, err := queries.ResolveVaultReference(ctx, db.ResolveVaultReferenceParams{
 		Name:   authToken,
-		UserID: userID,
+		UserID: target.ConfiguredBy,
 	})
 	if err != nil {
-		return fmt.Errorf("resolve Forgejo auth token %q from vault: %w", authToken, err)
+		slog.Error("vault delivery: auth_token resolve failed",
+			"auth_token", authToken,
+			"configured_by", target.ConfiguredBy,
+			"entry_owner", userID,
+			"error", err)
+		return fmt.Errorf("resolve Forgejo auth token %q from the configuring user's vault: %w", authToken, err)
 	}
 
 	tokenPlaintext, err := vault.DecryptValue(row.EncryptedValue, row.Nonce, 2)

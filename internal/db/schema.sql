@@ -40,6 +40,8 @@ CREATE TABLE api_keys (
   key_prefix TEXT NOT NULL,
   last_used_at DATETIME,
   expires_at DATETIME,
+  -- 00026_api_key_revocation.sql
+  revoked_at DATETIME,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

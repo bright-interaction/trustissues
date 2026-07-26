@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -57,6 +58,100 @@ func bodyLimits(next http.Handler) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// csrfOriginCheck rejects cross-site state-changing requests as defense in
+// depth behind the session cookie's SameSite=Strict attribute. SameSite is a
+// single browser-side control: a browser that does not enforce it, or any
+// future need to relax it, leaves every cookie-authenticated POST/PUT/PATCH/
+// DELETE (first-run register included) open to a blind cross-site submit.
+//
+// The check is deliberately fail-open for non-browser clients. A browser always
+// attaches at least one of Origin, Referer, or Sec-Fetch-Site to a
+// state-changing request, so their absence means the caller is not a browser
+// and cannot be a CSRF vector; requiring them would break the CLI, the MCP
+// connector, and service containers for no gain. When one IS present it must
+// point at us.
+//
+// An accepted origin is either the configured BaseURL host or the host the
+// request was actually addressed to. The second is what keeps a stale or unset
+// TRUSTISSUES_BASE_URL from breaking the SPA: a browser sets Origin itself and
+// a cross-site page can never make it equal our own Host.
+func csrfOriginCheck(baseURL string) func(http.Handler) http.Handler {
+	configuredHost := hostOfURL(baseURL)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			default:
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Header-authenticated callers (browser extension, CLI, MCP,
+			// service containers) are exempt: a cross-site page cannot attach
+			// X-API-Key or X-Service-Key without a CORS preflight we never
+			// approve, and these callers carry no ambient cookie to ride on.
+			// The exemption requires that no session cookie is present, so it
+			// can never be used to launder a cookie-authenticated request.
+			if _, err := r.Cookie(timw.SessionCookieName); err != nil {
+				if r.Header.Get("X-API-Key") != "" || r.Header.Get("X-Service-Key") != "" {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !csrfHostAllowed(hostOfURL(origin), configuredHost, r) {
+					rejectCrossSite(w, r, "origin")
+					return
+				}
+			} else if referer := r.Header.Get("Referer"); referer != "" {
+				if !csrfHostAllowed(hostOfURL(referer), configuredHost, r) {
+					rejectCrossSite(w, r, "referer")
+					return
+				}
+			}
+
+			// Sec-Fetch-Site is set by the browser and cannot be forged from a
+			// page. "none" is a user-initiated request (typed URL, bookmark),
+			// which is not cross-site. "same-site" is NOT accepted: a
+			// neighbouring subdomain is a different trust boundary here.
+			switch r.Header.Get("Sec-Fetch-Site") {
+			case "", "same-origin", "none":
+			default:
+				rejectCrossSite(w, r, "sec-fetch-site")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// hostOfURL reduces a URL (or an Origin header) to its lowercased host:port.
+// Returns an empty string for anything unparseable or host-less, including the
+// literal "null" origin, which callers then treat as not allowed.
+func hostOfURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+// csrfHostAllowed reports whether a request-supplied host is one of ours.
+func csrfHostAllowed(got, configuredHost string, r *http.Request) bool {
+	if got == "" {
+		return false
+	}
+	return got == configuredHost || got == strings.ToLower(r.Host)
+}
+
+func rejectCrossSite(w http.ResponseWriter, r *http.Request, source string) {
+	slog.Warn("cross-site state-changing request blocked",
+		"source", source, "path", r.URL.Path, "method", r.Method)
+	http.Error(w, `{"error":"cross-site request blocked"}`, http.StatusForbidden)
 }
 
 // randomRequestID assigns each request a random id stored under chi's
@@ -210,7 +305,6 @@ func main() {
 		slog.Info("shield enabled", "hint_level", cfg.ShieldHintLevel)
 	}
 	aiGatewayHandler := handlers.NewAIGatewayHandler(queries, cfg, vaultHandler, shieldStore)
-	mcpHandler := handlers.NewMCPHandler(queries, cfg, capabilityHandler, shieldStore)
 
 	// Alert channel dispatcher + notification-channel admin CRUD.
 	dispatcher := alerts.NewChannelDispatcher(appCtx, queries, vaultHandler)
@@ -243,6 +337,17 @@ func main() {
 	apiLimiter := timw.NewRateLimiter(500, 1*time.Minute)
 	sensitiveOpLimiter := timw.NewRateLimiter(5, 15*time.Minute)
 	unlockLimiter := timw.NewRateLimiter(30, 15*time.Minute)
+	// The capability proxy is mounted on the root router, outside /api and its
+	// apiLimiter, because it authenticates with a capability token instead of a
+	// session. That left it with no limiter at all, so it gets its own budget:
+	// one token is single-use, so an agent's real traffic is bounded by minting,
+	// and anything above this is flooding.
+	proxyLimiter := timw.NewRateLimiter(120, 1*time.Minute)
+
+	// MCP shares the sensitive-op budget with POST /api/secrets/issue: its
+	// use_secret tool mints capability tokens by calling the Issue handler
+	// in-process, which would otherwise skip the route's rate-limit middleware.
+	mcpHandler := handlers.NewMCPHandler(queries, cfg, capabilityHandler, shieldStore, sensitiveOpLimiter)
 
 	// Build router.
 	r := chi.NewRouter()
@@ -267,13 +372,21 @@ func main() {
 	// with `Authorization: Capability <token>`. Auth is the signed token
 	// (verified inside the handler); mounted on the root router OUTSIDE /api
 	// and outside session middleware so external HTTP clients reach it
-	// directly (dockyard main.go:668-669 pattern).
-	r.HandleFunc("/proxy/{host}/*", capabilityHandler.Proxy)
-	r.HandleFunc("/proxy/{host}", capabilityHandler.Proxy)
+	// directly (dockyard main.go:668-669 pattern). Being outside /api also puts
+	// it outside apiLimiter, hence the dedicated proxyLimiter: these routes are
+	// reachable anonymously, so they need a budget of their own.
+	r.With(timw.RateLimit(proxyLimiter)).HandleFunc("/proxy/{host}/*", capabilityHandler.Proxy)
+	r.With(timw.RateLimit(proxyLimiter)).HandleFunc("/proxy/{host}", capabilityHandler.Proxy)
 
 	// API routes.
 	r.Route("/api", func(r chi.Router) {
 		r.Use(timw.RateLimit(apiLimiter))
+		// CSRF defense in depth for every state-changing /api route, including
+		// the public ones (first-run register is the sharpest case). Applied
+		// here rather than globally so the capability proxy, which is not
+		// cookie-authenticated and is called by non-browser agents, is
+		// untouched.
+		r.Use(csrfOriginCheck(cfg.BaseURL))
 
 		// Public routes (no auth), tightly rate limited.
 		r.With(timw.RateLimit(loginLimiter)).Get("/auth/status", authHandler.Status)

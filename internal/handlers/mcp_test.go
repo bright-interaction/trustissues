@@ -44,7 +44,9 @@ func newMCPHandler(t *testing.T, conn *sql.DB) *MCPHandler {
 	t.Helper()
 	queries := db.New(conn)
 	cfg := &config.Config{VaultKey: "test-vault-key"}
-	return NewMCPHandler(queries, cfg, nil, nil)
+	// nil mint limiter: these tests exercise the protocol surface, not the
+	// capability-minting rate limit (covered separately).
+	return NewMCPHandler(queries, cfg, nil, nil, nil)
 }
 
 func doMCP(t *testing.T, h *MCPHandler, userID, method string, params any) jsonrpcResponse {
