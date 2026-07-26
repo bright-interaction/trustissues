@@ -10,15 +10,22 @@ import (
 )
 
 type Querier interface {
+	AcceptCollectionInvite(ctx context.Context, arg AcceptCollectionInviteParams) (sql.Result, error)
 	// ============================================================================
 	// Membership
 	// ============================================================================
+	// accepted_at is passed explicitly: NULL for an invitation another user must
+	// accept, set for a self-membership (the creator of a collection). On conflict
+	// only the role changes, so re-inviting never silently re-grants access and a
+	// role change never revokes an existing acceptance.
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	CountActivityEntriesByUser(ctx context.Context, userID sql.NullString) (int64, error)
 	CountAdmins(ctx context.Context) (int64, error)
 	CountCollectionEntries(ctx context.Context, collectionID sql.NullString) (int64, error)
+	// Accepted managers only: a pending invitee cannot be the manager that keeps a
+	// collection from being orphaned.
 	CountCollectionManagers(ctx context.Context, collectionID string) (int64, error)
 	CountRecentFailedLoginAttemptsByEmail(ctx context.Context, email string) (int64, error)
 	CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddress string) (int64, error)
@@ -71,6 +78,8 @@ type Querier interface {
 	// CONTRACT.md rule (new queries go in new files).
 	ExportActivityEntries(ctx context.Context, arg ExportActivityEntriesParams) ([]ExportActivityEntriesRow, error)
 	GetCollection(ctx context.Context, id string) (Collection, error)
+	// Authorization lookup: a PENDING membership returns no row, so it grants
+	// neither read nor write anywhere entryAccess or canWriteCollection is used.
 	GetCollectionMemberRole(ctx context.Context, arg GetCollectionMemberRoleParams) (string, error)
 	GetInvitationForResend(ctx context.Context, id string) (GetInvitationForResendRow, error)
 	GetNotificationChannel(ctx context.Context, id string) (GetNotificationChannelRow, error)
@@ -164,11 +173,15 @@ type Querier interface {
 	ListAllVaultEntries(ctx context.Context) ([]ListAllVaultEntriesRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
 	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
+	// Accepted memberships only. A pending invitation must not surface the
+	// collection (or its entries) until the invitee opts in.
 	ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error)
 	ListEnabledNotificationChannels(ctx context.Context) ([]ListEnabledNotificationChannelsRow, error)
 	ListExpiringVaultEntries(ctx context.Context, windowDays string) ([]ListExpiringVaultEntriesRow, error)
 	ListInvitations(ctx context.Context) ([]ListInvitationsRow, error)
 	ListNotificationChannels(ctx context.Context) ([]ListNotificationChannelsRow, error)
+	// Invitations awaiting the user's decision. These grant no access.
+	ListPendingCollectionInvitesForUser(ctx context.Context, userID string) ([]ListPendingCollectionInvitesForUserRow, error)
 	ListProviderEntries(ctx context.Context) ([]ListProviderEntriesRow, error)
 	ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]LoginAttempt, error)
 	ListRecentServiceSecretAudit(ctx context.Context, limit int64) ([]ServiceSecretAudit, error)

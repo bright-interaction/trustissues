@@ -165,9 +165,11 @@ func (h *MCPHandler) callTool(w http.ResponseWriter, r *http.Request, req jsonrp
 }
 
 func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string, bool) {
-	names, err := h.queries.ListAccessibleVaultEntryNames(ctx, db.ListAccessibleVaultEntryNamesParams{
-		UserID: userID, UserID_2: userID,
-	})
+	// Scope note: the capability minting path (lookupSecretByName) resolves only
+	// the caller's OWN entries, so advertising collection secrets here would list
+	// names the agent can never obtain a token for, and would leak the names of
+	// shared secrets to a model for no benefit. Keep the list to what is usable.
+	names, err := h.queries.ListVaultEntryNamesByUser(ctx, userID)
 	if err != nil {
 		return "could not list secrets", true
 	}

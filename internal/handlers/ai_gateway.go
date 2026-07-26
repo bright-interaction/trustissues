@@ -255,11 +255,19 @@ func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	anth, _ := h.queries.GetSetting(ctx, "ai_key_anthropic")
 	oai, _ := h.queries.GetSetting(ctx, "ai_key_openai")
+	// The entry ids point at the vault entries holding the team LLM keys. Every
+	// authenticated user needs the connection URLs and the configured flags to
+	// wire a client, but only an admin needs (or should see) which entry holds
+	// the key: it is a pointer straight at the most valuable secret in the vault.
+	entryAnth, entryOAI := "", ""
+	if middleware.IsAdmin(ctx) {
+		entryAnth, entryOAI = anth, oai
+	}
 	writeJSON(w, http.StatusOK, aiConfigResponse{
 		AnthropicConfigured: anth != "",
 		OpenAIConfigured:    oai != "",
-		AnthropicEntryID:    anth,
-		OpenAIEntryID:       oai,
+		AnthropicEntryID:    entryAnth,
+		OpenAIEntryID:       entryOAI,
 		ShieldEnabled:       h.cfg.ShieldEnabled(),
 		ShieldHintLevel:     h.cfg.ShieldHintLevel,
 		GatewayBaseURL:      strings.TrimRight(h.cfg.BaseURL, "/") + "/api/ai",

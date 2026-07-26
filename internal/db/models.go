@@ -73,6 +73,7 @@ type CollectionMember struct {
 	UserID       string       `json:"user_id"`
 	Role         string       `json:"role"`
 	AddedAt      sql.NullTime `json:"added_at"`
+	AcceptedAt   sql.NullTime `json:"accepted_at"`
 }
 
 type Invitation struct {
