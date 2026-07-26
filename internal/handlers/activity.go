@@ -161,16 +161,36 @@ func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		_ = cw.Write([]string{
 			strconv.FormatInt(row.ID, 10),
-			nullStringToString(row.UserID),
-			nullStringToString(row.UserEmail),
-			row.Action,
-			nullStringToString(row.Detail),
-			nullStringToString(row.IpAddress),
-			nullStringToString(row.UserAgent),
+			csvSafe(nullStringToString(row.UserID)),
+			csvSafe(nullStringToString(row.UserEmail)),
+			csvSafe(row.Action),
+			csvSafe(nullStringToString(row.Detail)),
+			csvSafe(nullStringToString(row.IpAddress)),
+			csvSafe(nullStringToString(row.UserAgent)),
 			nullTimeRFC3339(row.CreatedAt),
 		})
 	}
 	cw.Flush()
+}
+
+// csvSafe neutralises spreadsheet formula injection in an exported CSV field.
+//
+// Activity rows carry attacker-influenced text: any user picks their own
+// User-Agent, and detail/email embed user-supplied names. Excel, LibreOffice and
+// Sheets execute a cell that begins with =, +, -, @, or a leading tab/CR as a
+// formula, so a low-privileged user could plant a payload that runs on the
+// ADMIN's workstation when they open the export. Prefixing a single quote makes
+// the spreadsheet treat the cell as literal text; it is the standard OWASP
+// mitigation and leaves ordinary values untouched.
+func csvSafe(v string) string {
+	if v == "" {
+		return v
+	}
+	switch v[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + v
+	}
+	return v
 }
 
 // ExportJSON handles GET /api/activity/export/json (admin only). Streams all
