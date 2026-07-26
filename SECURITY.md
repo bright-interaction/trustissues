@@ -96,10 +96,14 @@ Trustissues is pre-1.0. Security fixes land on `main`. Run a recent build.
 
 See THREAT-MODEL.md "Residual risks" (R1 through R7) and DEFERRED.md. The
 operator-visible ones: backups are manual (WAL-safe `scripts/backup.sh`, see
-docs/BACKUP.md; scheduling is deferred), the DB file is 0644 (keep the data dir
-0700, do not share-mount it), the app must bind loopback
+docs/BACKUP.md; scheduling is deferred), the DB file and its `-wal`/`-shm` are
+chmodded to 0600 on boot with the data dir 0700 (still, keep
+`TRUSTISSUES_DATA_DIR` off a shared mount), the app must bind loopback
 (`TRUSTISSUES_BIND_HOST=127.0.0.1`) behind TLS with
-`TRUSTISSUES_TRUSTED_PROXY_HOPS` set to the real proxy count, and the
-browser-extension API key is currently not shown in the UI after invite
-redemption (an admin must capture it from the redeem response until the fix
-ships).
+`TRUSTISSUES_TRUSTED_PROXY_HOPS` set to the real proxy count, and a wrong
+`TRUSTISSUES_VAULT_KEY` now stops the server at boot rather than serving blank
+entries (override with `TRUSTISSUES_ALLOW_KEY_MISMATCH=1` only when the original
+key is gone for good and losing every secret is accepted).
+
+Any user, including `vault_only`, mints their own browser-extension API key from
+Settings > API keys. It is displayed once and stored only as a hash.
