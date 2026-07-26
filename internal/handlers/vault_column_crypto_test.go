@@ -33,10 +33,16 @@ func TestColumnCryptoRoundTrip(t *testing.T) {
 		if strings.Contains(enc, "s3cr3t-hmac") || strings.Contains(enc, "key_id") {
 			t.Fatalf("cleartext leaked into ciphertext: %q", enc)
 		}
-		// Idempotent encrypt: already-encrypted passes through unchanged.
+		// encryptColumn is deliberately NOT content-idempotent: re-encrypting a
+		// ciphertext wraps it again. See TestEncryptColumnIsNotADecryptionOracle.
 		enc2, err := vh.encryptColumn(enc)
-		if err != nil || enc2 != enc {
-			t.Fatalf("encryptColumn not idempotent: %q -> %q (err %v)", enc, enc2, err)
+		if err != nil || enc2 == enc {
+			t.Fatalf("encryptColumn must re-encrypt, not pass through: %q -> %q (err %v)", enc, enc2, err)
+		}
+		// The storage-side variant IS idempotent (backfill safety).
+		encIf, err := vh.encryptColumnIfNeeded(enc)
+		if err != nil || encIf != enc {
+			t.Fatalf("encryptColumnIfNeeded not idempotent: %q -> %q (err %v)", enc, encIf, err)
 		}
 		dec, err := vh.decryptColumn(enc)
 		if err != nil {
@@ -51,11 +57,60 @@ func TestColumnCryptoRoundTrip(t *testing.T) {
 	if out, err := vh.decryptColumn(`{"still":"cleartext"}`); err != nil || out != `{"still":"cleartext"}` {
 		t.Fatalf("decrypt cleartext passthrough failed: %q (err %v)", out, err)
 	}
-	// Empty + empty-default values pass through both directions untouched.
+	// Empty input has nothing to protect and passes through; the empty-JSON
+	// defaults are only skipped on the STORAGE side (encryptColumnIfNeeded).
+	if out, _ := vh.encryptColumn(""); out != "" {
+		t.Fatalf("encryptColumn should skip empty, got %q", out)
+	}
 	for _, empty := range []string{"", "{}", "[]"} {
-		if out, _ := vh.encryptColumn(empty); out != empty {
-			t.Fatalf("encryptColumn should skip %q, got %q", empty, out)
+		if out, _ := vh.encryptColumnIfNeeded(empty); out != empty {
+			t.Fatalf("encryptColumnIfNeeded should skip %q, got %q", empty, out)
 		}
+	}
+}
+
+// TestEncryptColumnIsNotADecryptionOracle is the regression lock for the
+// critical flaw where encryptColumn passed through any input that already
+// carried the enc:v1 prefix. That let an attacker who held ciphertext from an
+// offline DB copy submit it as a notes/url field and read back the plaintext,
+// decrypted with the server's vault key: a universal decryption oracle that
+// defeated at-rest encryption for every user's secrets.
+//
+// The invariant: a client-supplied string that LOOKS like ciphertext must be
+// treated as opaque data and encrypted, so reading it back yields the attacker's
+// own literal string, never the plaintext of the ciphertext they injected.
+func TestEncryptColumnIsNotADecryptionOracle(t *testing.T) {
+	vh := NewVaultHandler(nil, nil, &config.Config{VaultKey: "test-vault-key"})
+
+	// A victim secret encrypted under the server key, as it sits in the DB.
+	victim := "TOP_SECRET_ADMIN_ROOT_PW_9f3a"
+	stolen, err := vh.encryptColumn(victim)
+	if err != nil {
+		t.Fatalf("seed victim ciphertext: %v", err)
+	}
+
+	// The attacker submits that ciphertext verbatim as their own field value.
+	stored, err := vh.encryptColumn(stolen)
+	if err != nil {
+		t.Fatalf("encrypt attacker input: %v", err)
+	}
+	if stored == stolen {
+		t.Fatal("ORACLE: attacker ciphertext was stored verbatim instead of being encrypted")
+	}
+
+	// Reading it back must yield the attacker's own input, not the victim secret.
+	out, err := vh.decryptColumn(stored)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if out == victim {
+		t.Fatalf("ORACLE: server decrypted injected ciphertext and leaked %q", out)
+	}
+	if out != stolen {
+		t.Fatalf("round-trip mismatch: got %q want the attacker's literal input", out)
+	}
+	if strings.Contains(out, victim) {
+		t.Fatalf("ORACLE: victim plaintext surfaced in %q", out)
 	}
 }
 
