@@ -25,13 +25,15 @@ import {
   Folder,
   FolderPlus,
   Users,
+  UserPlus,
+  LogOut,
   Database,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
-import { api, request } from '@/lib/api';
+import { api, request, ApiError } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import Layout from '@/components/Layout';
 import VaultImportModal from '@/components/VaultImportModal';
@@ -42,11 +44,24 @@ import {
   serviceIdentityKeys,
 } from '@/lib/vault-types';
 import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey, CustomField } from '@/lib/vault-types';
-import type { Collection, CollectionMember, CollectionRole } from '@/lib/types';
+import type {
+  Collection,
+  CollectionMember,
+  CollectionRole,
+  PendingInvite,
+} from '@/lib/types';
 
 // Seconds after which a copied secret is cleared from the clipboard, matching
 // the behaviour of dedicated password managers so a secret does not linger.
 const CLIPBOARD_CLEAR_SECONDS = 20;
+
+// Same helper the other pages use: prefer the server's error text (ApiError
+// carries the parsed body), fall back to a neutral message.
+function errorMessage(err: unknown): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return 'Something went wrong';
+}
 
 function copyToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
@@ -789,6 +804,131 @@ function ServiceIdentitiesCard() {
 
 const COLLECTION_ROLES: CollectionRole[] = ['viewer', 'editor', 'manager'];
 
+// Invitations waiting on the current user. Collection membership is consent
+// based: being added grants nothing until the invitee accepts, so without this
+// card an invited user would never see the collection at all. Renders null when
+// there is nothing pending, so it never nags.
+function PendingInvitesCard() {
+  const queryClient = useQueryClient();
+
+  const { data: invites = [] } = useQuery<PendingInvite[]>({
+    queryKey: queryKeys.collections.pendingInvites(),
+    queryFn: api.collections.listPendingInvites,
+  });
+
+  // Accepting adds a collection and its entries to the vault; declining keeps
+  // them out. Both change every list on this page, so refresh all three.
+  function refreshAfterAnswer() {
+    queryClient.invalidateQueries({ queryKey: queryKeys.collections.pendingInvites() });
+    queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+    queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+  }
+
+  const acceptMutation = useMutation({
+    mutationFn: (collectionId: string) => api.collections.acceptInvite(collectionId),
+    onSuccess: () => {
+      toast.success('Invitation accepted');
+      refreshAfterAnswer();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const declineMutation = useMutation({
+    mutationFn: (collectionId: string) => api.collections.declineInvite(collectionId),
+    onSuccess: () => {
+      toast.success('Invitation declined');
+      refreshAfterAnswer();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  if (invites.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+      <div className="flex items-start gap-3">
+        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-amber-100">
+          <UserPlus className="h-4 w-4 text-amber-700" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-semibold text-amber-900">
+            {invites.length === 1
+              ? 'Collection invitation'
+              : `${invites.length} collection invitations`}
+          </h3>
+          <p className="mt-0.5 max-w-2xl text-xs leading-relaxed text-amber-800">
+            Someone shared a collection with you. Its entries will not appear in your vault or
+            autofill until you accept.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {invites.map((invite) => {
+              const accepting =
+                acceptMutation.isPending && acceptMutation.variables === invite.collection_id;
+              const declining =
+                declineMutation.isPending && declineMutation.variables === invite.collection_id;
+              const busy = accepting || declining;
+              return (
+                <li
+                  key={invite.collection_id}
+                  className="flex flex-col gap-2 rounded-lg border border-amber-200 bg-white px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Folder className="h-3.5 w-3.5 flex-shrink-0 text-slate-400" />
+                      <span className="truncate text-sm font-medium text-slate-900">
+                        {invite.name}
+                      </span>
+                      <span
+                        className="flex-shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600"
+                        title={`You are being offered the ${invite.role} role`}
+                      >
+                        {invite.role}
+                      </span>
+                    </div>
+                    {invite.description && (
+                      <p className="mt-0.5 truncate text-xs text-slate-500">{invite.description}</p>
+                    )}
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      Invited by {invite.invited_by_email}
+                      {invite.invited_at ? ` · ${timeAgo(invite.invited_at)}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex flex-shrink-0 items-center gap-2">
+                    <button
+                      onClick={() => acceptMutation.mutate(invite.collection_id)}
+                      disabled={busy}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      {accepting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Check className="h-3.5 w-3.5" />
+                      )}
+                      Accept
+                    </button>
+                    <button
+                      onClick={() => declineMutation.mutate(invite.collection_id)}
+                      disabled={busy}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
+                    >
+                      {declining ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <X className="h-3.5 w-3.5" />
+                      )}
+                      Decline
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Manager-only surface for a single collection: rename/delete the collection
 // and manage its members. The members query only fires while this modal is
 // mounted, so no conditional hooks. Server-side guards (409 last-manager, 404
@@ -823,15 +963,23 @@ function CollectionManageModal({
     queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
   }
 
+  // One endpoint covers both "invite this address" and "change this member's
+  // role". `existing` is a UI-only flag so the toast tells the truth: an invite
+  // gets the server's neutral wording (it never confirms whether the address
+  // has an account), a role change gets a plain confirmation.
   const addMemberMutation = useMutation({
-    mutationFn: (data: { email: string; role: CollectionRole }) =>
-      api.collections.addMember(collection.id, data),
-    onSuccess: () => {
-      toast.success('Member saved');
-      setAddForm({ email: '', role: 'viewer' });
+    mutationFn: ({ email, role }: { email: string; role: CollectionRole; existing?: boolean }) =>
+      api.collections.addMember(collection.id, { email, role }),
+    onSuccess: (result, variables) => {
+      if (variables.existing) {
+        toast.success('Role updated');
+      } else {
+        toast.success(result?.detail || 'Invitation sent if that address has an account');
+        setAddForm({ email: '', role: 'viewer' });
+      }
       invalidateMembers();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err) => toast.error(errorMessage(err)),
   });
 
   const removeMemberMutation = useMutation({
@@ -840,7 +988,7 @@ function CollectionManageModal({
       toast.success('Member removed');
       invalidateMembers();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err) => toast.error(errorMessage(err)),
   });
 
   const updateCollectionMutation = useMutation({
@@ -850,7 +998,7 @@ function CollectionManageModal({
       toast.success('Collection updated');
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err) => toast.error(errorMessage(err)),
   });
 
   const deleteCollectionMutation = useMutation({
@@ -861,7 +1009,7 @@ function CollectionManageModal({
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       onDeleted();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err) => toast.error(errorMessage(err)),
   });
 
   return (
@@ -976,9 +1124,25 @@ function CollectionManageModal({
             ) : (
               <ul className="divide-y divide-slate-100 rounded-lg border border-slate-100">
                 {members.map((m) => (
-                  <li key={m.user_id} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                  <li
+                    key={m.user_id || m.email}
+                    className="flex items-center justify-between gap-3 px-3 py-2.5"
+                  >
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-medium text-slate-900">{m.name || m.email}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="truncate text-sm font-medium text-slate-900">
+                          {m.name || m.email}
+                        </p>
+                        {m.pending && (
+                          <span
+                            className="inline-flex flex-shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700"
+                            title="Invited but has not accepted yet. No access to this collection until they do."
+                          >
+                            <Clock className="h-3 w-3" />
+                            Pending
+                          </span>
+                        )}
+                      </div>
                       <p className="truncate text-xs text-slate-400">{m.email}</p>
                     </div>
                     <div className="flex items-center gap-2">
@@ -988,6 +1152,7 @@ function CollectionManageModal({
                           addMemberMutation.mutate({
                             email: m.email,
                             role: e.target.value as CollectionRole,
+                            existing: true,
                           })
                         }
                         disabled={addMemberMutation.isPending}
@@ -1028,7 +1193,7 @@ function CollectionManageModal({
             className="space-y-2 rounded-lg border border-slate-100 bg-slate-50 p-4"
           >
             <label className="block text-xs font-medium text-slate-600">
-              Add a member by email
+              Invite a member by email
             </label>
             <div className="flex flex-col gap-2 sm:flex-row">
               <input
@@ -1059,11 +1224,12 @@ function CollectionManageModal({
                 ) : (
                   <Plus className="h-3.5 w-3.5" />
                 )}
-                Add
+                Invite
               </button>
             </div>
             <p className="text-xs text-slate-400">
-              The person must already have a Trustissues account.
+              They show up as Pending and get no access until they accept the invitation. We do not
+              report back whether the address has a Trustissues account.
             </p>
           </form>
         </div>
@@ -1101,6 +1267,8 @@ export default function Vault() {
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [newCollection, setNewCollection] = useState({ name: '', description: '' });
   const [manageCollectionId, setManageCollectionId] = useState<string | null>(null);
+  // Id of the collection whose "Leave" button is waiting on confirmation.
+  const [confirmLeaveId, setConfirmLeaveId] = useState<string | null>(null);
 
   const { data: vaultList = [], isLoading: vaultLoading } = useQuery<VaultEntry[]>({
     queryKey: queryKeys.vault.list(),
@@ -1127,6 +1295,12 @@ export default function Vault() {
     }, minutes * 60_000);
     return () => clearTimeout(timer);
   }, [vaultUnlocked, vaultPolicy?.auto_lock_max_minutes]);
+
+  // Drop a half-finished "Leave" confirmation when the filter moves elsewhere,
+  // so the confirm never reappears attached to a different collection.
+  useEffect(() => {
+    setConfirmLeaveId((id) => (id && id !== collectionFilter ? null : id));
+  }, [collectionFilter]);
 
   const unlockVaultMutation = useMutation({
     mutationFn: (password: string) => vaultApi.unlock(password),
@@ -1215,6 +1389,25 @@ export default function Vault() {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  // Leaving drops your own membership. It is the same endpoint that declines an
+  // invitation, so nobody is stuck in a collection someone else created. The
+  // server refuses (409) when you are the last manager; that message is shown
+  // as-is rather than second-guessed here.
+  const leaveCollectionMutation = useMutation({
+    mutationFn: (collectionId: string) => api.collections.declineInvite(collectionId),
+    onSuccess: (_data, collectionId) => {
+      toast.success('You left the collection');
+      setConfirmLeaveId(null);
+      setCollectionFilter('all');
+      // Drop the collection's entries from the decrypted in-memory list so the
+      // view matches the new access without forcing a re-unlock.
+      setVaultEntries((prev) => prev.filter((e) => e.collection_id !== collectionId));
+      queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   // Collections the user can write into (add or move entries).
   const writableCollections = collections.filter(
     (c) => c.role === 'editor' || c.role === 'manager'
@@ -1298,6 +1491,11 @@ export default function Vault() {
       </div>
 
       <div className="space-y-6">
+        {/* Collection invitations waiting on this user. Membership is consent
+            based, so nothing is shared until one of these is accepted. Renders
+            null when there is nothing pending. */}
+        <PendingInvitesCard />
+
         {/* Service identities: machine credentials that fetch a scoped set
             of vault secrets at boot. Admin-only; renders null otherwise. */}
         <ServiceIdentitiesCard />
@@ -1310,7 +1508,7 @@ export default function Vault() {
               <Folder className="h-4 w-4 text-slate-500" />
               <h3 className="text-sm font-semibold text-slate-900">Collections</h3>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {selectedFilterCollection?.role === 'manager' && (
                 <button
                   onClick={() => setManageCollectionId(selectedFilterCollection.id)}
@@ -1320,6 +1518,41 @@ export default function Vault() {
                   Manage
                 </button>
               )}
+              {/* Leave: available on any collection you are a member of, at any
+                  role, so nobody is stuck in someone else's collection. */}
+              {selectedFilterCollection &&
+                (confirmLeaveId === selectedFilterCollection.id ? (
+                  <span className="flex items-center gap-2">
+                    <span className="text-xs text-slate-500">
+                      Leave {selectedFilterCollection.name}? Its entries disappear from your vault.
+                    </span>
+                    <button
+                      onClick={() => leaveCollectionMutation.mutate(selectedFilterCollection.id)}
+                      disabled={leaveCollectionMutation.isPending}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+                    >
+                      {leaveCollectionMutation.isPending && (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      )}
+                      Confirm leave
+                    </button>
+                    <button
+                      onClick={() => setConfirmLeaveId(null)}
+                      className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:text-slate-700"
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => setConfirmLeaveId(selectedFilterCollection.id)}
+                    title="Give up your own access to this collection"
+                    className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-rose-50 hover:text-rose-600"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Leave
+                  </button>
+                ))}
               <button
                 onClick={() => setShowNewCollection(true)}
                 className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"

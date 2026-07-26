@@ -19,6 +19,8 @@ import type {
   Collection,
   CollectionMember,
   CollectionRole,
+  CollectionInviteResult,
+  PendingInvite,
 } from './types';
 
 export class ApiError extends Error {
@@ -267,8 +269,11 @@ export const api = {
       request<void>(`/collections/${id}`, { method: 'DELETE' }),
     listMembers: (id: string) =>
       request<CollectionMember[]>(`/collections/${id}/members`),
+    // Invites the address (or updates an existing member's role). The response
+    // is the same whether or not the address has an account, so it must not be
+    // read as "the member was added".
     addMember: (id: string, data: { email: string; role: CollectionRole }) =>
-      request<CollectionMember>(`/collections/${id}/members`, {
+      request<CollectionInviteResult>(`/collections/${id}/members`, {
         method: 'POST',
         body: JSON.stringify(data),
       }),
@@ -276,5 +281,17 @@ export const api = {
       request<void>(`/collections/${id}/members/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
       }),
+    // Invitations waiting on the current user. Empty array when there are none.
+    listPendingInvites: () =>
+      request<PendingInvite[]>('/collections/invitations'),
+    // Accept an invitation. Until this succeeds the collection grants nothing.
+    // 404 when there is no pending invitation for the caller.
+    acceptInvite: (id: string) =>
+      request<void>(`/collections/${id}/accept`, { method: 'POST' }),
+    // Decline an invitation, and also how you LEAVE a collection you already
+    // joined: the same endpoint drops your own membership either way. 409 when
+    // you are the last manager, 404 when there is nothing to drop.
+    declineInvite: (id: string) =>
+      request<void>(`/collections/${id}/decline`, { method: 'POST' }),
   },
 };
