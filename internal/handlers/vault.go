@@ -1797,10 +1797,42 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A REMINDER-ONLY provider must never reach the generator. Generating a
+	// random value locally does not rotate anything at GitHub, OpenAI, Stripe or
+	// AWS: it throws away the user's real credential, stores 32 bytes of hex that
+	// authenticates nowhere, reports "success", and leaves the actual credential
+	// live and unrotated at the provider. That is destruction dressed as
+	// rotation, and it is one button click away on an ordinary entry.
+	//
+	// The correct flow for these providers is the one the scheduled sweep
+	// already uses: tell the operator to rotate upstream, then paste the new
+	// value in via Edit. Only an entry with NO provider is a local secret this
+	// server is entitled to generate.
+	if newValue == "" && providerName != "" {
+		if provider, ok := ProviderRegistry[providerName]; ok && !provider.CanAutoRotate() {
+			updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Status:    "reminder",
+				Provider:  providerName,
+				Method:    rotationMethod,
+			})
+			_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
+				RotationLog: toNullString(updatedLog),
+				ID:          id,
+			})
+			LogActivityFromRequest(h.queries, r, "vault.rotation_reminder",
+				fmt.Sprintf("Rotation reminder for vault secret: %s (provider: %s cannot rotate automatically)", meta.Name, providerName))
+			writeError(w, r, http.StatusConflict, "manual_rotation_required",
+				"this provider cannot be rotated automatically; rotate the credential in the provider's own dashboard, then edit this entry and paste the new value. Nothing was changed.")
+			return
+		}
+	}
+
 	// Fallback: generate a random value when no provider produced one. This is
-	// the legitimate local-password path (no provider, or a reminder-only
-	// provider the user rotates upstream by hand); a FAILED auto-rotating
-	// provider never reaches here, it returned 502 above.
+	// the local-secret path (no provider configured), where this server owns the
+	// value and generating a fresh one IS the rotation. A FAILED auto-rotating
+	// provider never reaches here, it returned 502 above, and a reminder-only
+	// provider was refused just above.
 	if newValue == "" {
 		newValue, err = generateToken(32)
 		if err != nil {

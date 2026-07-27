@@ -19,6 +19,12 @@ type Querier interface {
 	// only the role changes, so re-inviting never silently re-grants access and a
 	// role change never revokes an existing acceptance.
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
+	// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
+	// test whether the configured key actually opens this database BEFORE writing
+	// the sentinel. Version 1 rows are excluded: they are sealed under the legacy
+	// SHA-256 key and would not decrypt under the current derivation even when the
+	// configured key is correct.
+	AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVaultEntryRow, error)
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	// Backs the "vault.*" style category filters. The UI has always offered them,

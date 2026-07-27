@@ -10,6 +10,29 @@ import (
 	"database/sql"
 )
 
+const anyEncryptedVaultEntry = `-- name: AnyEncryptedVaultEntry :one
+SELECT encrypted_value, nonce FROM vault_entries
+WHERE encryption_version = 2 AND length(encrypted_value) > 0
+LIMIT 1
+`
+
+type AnyEncryptedVaultEntryRow struct {
+	EncryptedValue []byte `json:"encrypted_value"`
+	Nonce          []byte `json:"nonce"`
+}
+
+// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
+// test whether the configured key actually opens this database BEFORE writing
+// the sentinel. Version 1 rows are excluded: they are sealed under the legacy
+// SHA-256 key and would not decrypt under the current derivation even when the
+// configured key is correct.
+func (q *Queries) AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVaultEntryRow, error) {
+	row := q.db.QueryRowContext(ctx, anyEncryptedVaultEntry)
+	var i AnyEncryptedVaultEntryRow
+	err := row.Scan(&i.EncryptedValue, &i.Nonce)
+	return i, err
+}
+
 const countVaultEntriesV1 = `-- name: CountVaultEntriesV1 :one
 
 
