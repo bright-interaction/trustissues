@@ -35,8 +35,11 @@ func sendInvitationEmail(host, port, from, username, password string, useTLS boo
 		return sendMailTLS(addr, host, auth, from, toEmail, msg)
 	}
 
-	// STARTTLS (port 587 or 25)
-	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg)
+	// STARTTLS (port 587 or 25). "Use TLS" on any port other than 465 used to be
+	// silently discarded: the toggle only ever selected implicit TLS, so an
+	// admin on 587 who ticked it got opportunistic STARTTLS that degraded to
+	// cleartext without complaint. Pass it through so the request is enforced.
+	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg, useTLS)
 }
 
 // sendTestEmail sends a short test message so admins can verify their SMTP
@@ -63,7 +66,10 @@ func sendTestEmail(host, port, from, username, password string, useTLS bool, toE
 	if useTLS && port == "465" {
 		return sendMailTLS(addr, host, auth, from, toEmail, msg)
 	}
-	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg)
+	// Same enforcement as the real send, so the Settings test button exercises
+	// the transport the invitation email will actually use rather than a more
+	// permissive one.
+	return sendMailSTARTTLS(addr, host, auth, from, toEmail, msg, useTLS)
 }
 
 func buildMIMEMessage(from, to, subject, htmlBody string) []byte {
@@ -116,19 +122,52 @@ func sendMailTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte)
 	return w.Close()
 }
 
-func sendMailSTARTTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
+// isLoopbackSMTPHost reports whether the relay is on this machine, where
+// unencrypted SMTP never crosses a network. Used only to allow a local mail
+// catcher or sidecar relay to keep working without TLS.
+func isLoopbackSMTPHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// sendMailSTARTTLS delivers over a plain connection upgraded with STARTTLS.
+//
+// requireTLS makes the upgrade mandatory. It used to be purely opportunistic:
+// if the relay did not advertise STARTTLS the client carried on in CLEARTEXT
+// and returned no error, so an invitation email (which carries the redemption
+// code that creates an account) could cross the network in the clear while the
+// admin had explicitly ticked "Use TLS". Go's PlainAuth refuses to hand
+// credentials to an unencrypted non-local server, so the SMTP password was
+// never the exposure; the message body was.
+func sendMailSTARTTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte, requireTLS bool) error {
 	client, err := smtp.Dial(addr)
 	if err != nil {
 		return fmt.Errorf("SMTP dial failed: %w", err)
 	}
 	defer client.Quit()
 
-	// Try STARTTLS
-	if ok, _ := client.Extension("STARTTLS"); ok {
+	ok, _ := client.Extension("STARTTLS")
+	switch {
+	case ok:
 		tlsConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 		if err := client.StartTLS(tlsConfig); err != nil {
 			return fmt.Errorf("STARTTLS failed: %w", err)
 		}
+	case requireTLS:
+		return fmt.Errorf("SMTP server at %s does not offer STARTTLS but TLS is required; "+
+			"use port 465 for implicit TLS, or untick \"Use TLS\" only if this relay is on a trusted network", addr)
+	case !isLoopbackSMTPHost(host):
+		// Even without an explicit TLS request, refuse to push an invitation
+		// code across a network in cleartext. A local relay or mail catcher is
+		// still allowed, since that traffic never leaves the host.
+		return fmt.Errorf("SMTP server at %s does not offer STARTTLS; refusing to send mail in cleartext "+
+			"(invitation emails carry an account-creation code). Use a relay that supports STARTTLS or implicit TLS on port 465", addr)
 	}
 
 	if auth != nil {

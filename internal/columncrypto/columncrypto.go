@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -27,10 +28,56 @@ import (
 // marker existed are bare base64; DecryptString still reads them.
 const marker = "tienc:v1:"
 
-// deriveKey derives a 32-byte key using PBKDF2-SHA256 with 600k iterations.
+// deriveCache memoizes the PBKDF2 result per configured secret.
+//
+// 600k iterations is deliberately expensive: it costs ~80ms per call, which is
+// the whole point when the input is a passphrase. But it is a PURE function of
+// the secret, and this process only ever uses one or two secrets for the whole
+// of its life, so paying it on every Encrypt/Decrypt bought nothing.
+//
+// It was not free either. MigrateTOTPSecrets runs on EVERY boot and decrypts
+// every already-migrated seed just to log the ones that fail, so startup cost
+// grew at ~80ms per user with TOTP before the server accepted a connection.
+// Every TOTP login, every SMTP send and every notification dispatch paid it
+// again.
+//
+// The map is keyed by sha256(secret) rather than the secret itself, so the
+// configured vault key is not sitting in a map key. The derived key lives in
+// process memory for the process lifetime, which is exactly where it already
+// lived: the vault key it comes from is held in config for the same duration,
+// so this adds no new exposure. It is bounded because deriveCacheMax caps it.
+var (
+	deriveCacheMu sync.RWMutex
+	deriveCache   = make(map[[32]byte][]byte)
+)
+
+// deriveCacheMax bounds the cache. Real deployments use one vault key; the cap
+// only exists so a caller that somehow passes many distinct secrets cannot grow
+// this without limit. Past the cap we simply stop memoizing and recompute.
+const deriveCacheMax = 16
+
+// deriveKey derives a 32-byte key using PBKDF2-SHA256 with 600k iterations,
+// memoized per secret. The KDF cost is unchanged for the first call with a
+// given secret; later calls reuse it.
 func deriveKey(secret string) []byte {
+	id := sha256.Sum256([]byte(secret))
+
+	deriveCacheMu.RLock()
+	cached, ok := deriveCache[id]
+	deriveCacheMu.RUnlock()
+	if ok {
+		return cached
+	}
+
 	salt := []byte("trustissues:column:v1")
-	return pbkdf2.Key([]byte(secret), salt, 600_000, 32, sha256.New)
+	derived := pbkdf2.Key([]byte(secret), salt, 600_000, 32, sha256.New)
+
+	deriveCacheMu.Lock()
+	if len(deriveCache) < deriveCacheMax {
+		deriveCache[id] = derived
+	}
+	deriveCacheMu.Unlock()
+	return derived
 }
 
 // IsEncrypted reports whether s carries this package's ciphertext marker.

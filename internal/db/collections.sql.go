@@ -154,6 +154,35 @@ func (q *Queries) GetCollectionMemberRole(ctx context.Context, arg GetCollection
 	return role, err
 }
 
+const getCollectionMembership = `-- name: GetCollectionMembership :one
+SELECT role, accepted_at FROM collection_members
+WHERE collection_id = ? AND user_id = ?
+`
+
+type GetCollectionMembershipParams struct {
+	CollectionID string `json:"collection_id"`
+	UserID       string `json:"user_id"`
+}
+
+type GetCollectionMembershipRow struct {
+	Role       string       `json:"role"`
+	AcceptedAt sql.NullTime `json:"accepted_at"`
+}
+
+// EXISTENCE lookup, acceptance-agnostic. Deliberately separate from
+// GetCollectionMemberRole: that one is the authorization gate and must keep
+// ignoring pending rows, but management operations need to see a pending
+// invitation too. RemoveMember used the authorization query as its existence
+// check, so rescinding an invitation that had not been accepted 404'd with
+// "member not found" and the invite stayed acceptable forever, with no way for
+// anyone to withdraw it. Never use this to decide access.
+func (q *Queries) GetCollectionMembership(ctx context.Context, arg GetCollectionMembershipParams) (GetCollectionMembershipRow, error) {
+	row := q.db.QueryRowContext(ctx, getCollectionMembership, arg.CollectionID, arg.UserID)
+	var i GetCollectionMembershipRow
+	err := row.Scan(&i.Role, &i.AcceptedAt)
+	return i, err
+}
+
 const getVaultEntryAccess = `-- name: GetVaultEntryAccess :one
 
 SELECT user_id, collection_id FROM vault_entries WHERE id = ?

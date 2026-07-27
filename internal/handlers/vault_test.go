@@ -222,21 +222,33 @@ func TestComputeRotationStatus(t *testing.T) {
 		days     *int
 		expires  *string
 		lastRot  *string
+		created  *string
 		expected string
 	}{
-		{"no interval no expiry", nil, nil, nil, "fresh"},
-		{"expired datetime", nil, fmtTime(now.Add(-24 * time.Hour)), nil, "expired"},
-		{"expired rfc3339", nil, strPtr(now.Add(-time.Hour).Format(time.RFC3339)), nil, "expired"},
-		{"future expiry", nil, fmtTime(now.Add(240 * time.Hour)), nil, "fresh"},
-		{"interval never rotated", intPtr(30), nil, nil, "fresh"},
-		{"interval recently rotated", intPtr(30), nil, fmtTime(now.Add(-24 * time.Hour)), "fresh"},
-		{"interval due soon", intPtr(30), nil, fmtTime(now.Add(-25 * 24 * time.Hour)), "due_soon"},
-		{"interval overdue", intPtr(30), nil, fmtTime(now.Add(-40 * 24 * time.Hour)), "overdue"},
-		{"zero interval", intPtr(0), nil, fmtTime(now.Add(-400 * 24 * time.Hour)), "fresh"},
-		{"unparseable last rotated", intPtr(30), nil, strPtr("not-a-time"), "fresh"},
+		{"no interval no expiry", nil, nil, nil, nil, "fresh"},
+		{"expired datetime", nil, fmtTime(now.Add(-24 * time.Hour)), nil, nil, "expired"},
+		{"expired rfc3339", nil, strPtr(now.Add(-time.Hour).Format(time.RFC3339)), nil, nil, "expired"},
+		{"future expiry", nil, fmtTime(now.Add(240 * time.Hour)), nil, nil, "fresh"},
+		{"interval never rotated, no created_at", intPtr(30), nil, nil, nil, "fresh"},
+		{"interval recently rotated", intPtr(30), nil, fmtTime(now.Add(-24 * time.Hour)), nil, "fresh"},
+		{"interval due soon", intPtr(30), nil, fmtTime(now.Add(-25 * 24 * time.Hour)), nil, "due_soon"},
+		{"interval overdue", intPtr(30), nil, fmtTime(now.Add(-40 * 24 * time.Hour)), nil, "overdue"},
+		{"zero interval", intPtr(0), nil, fmtTime(now.Add(-400 * 24 * time.Hour)), nil, "fresh"},
+		{"unparseable last rotated", intPtr(30), nil, strPtr("not-a-time"), nil, "fresh"},
+
+		// A never-rotated entry ages from created_at, matching the scheduler's
+		// COALESCE(last_rotated_at, created_at). Returning "fresh" here while the
+		// sweep treated the same NULL as "due now" is what let the UI call a key
+		// fresh in the hour the scheduler rotated it away.
+		{"never rotated, just enrolled", intPtr(30), nil, nil, fmtTime(now.Add(-1 * time.Hour)), "fresh"},
+		{"never rotated, enrolled long ago", intPtr(30), nil, nil, fmtTime(now.Add(-40 * 24 * time.Hour)), "overdue"},
+		{"never rotated, approaching interval", intPtr(30), nil, nil, fmtTime(now.Add(-26 * 24 * time.Hour)), "due_soon"},
+		// last_rotated_at still wins when both are present.
+		{"rotated recently despite old created_at", intPtr(30), nil, fmtTime(now.Add(-1 * time.Hour)), fmtTime(now.Add(-400 * 24 * time.Hour)), "fresh"},
 	}
 	for _, tc := range cases {
-		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot, nil); got != tc.expected {
+		// nil rotation error: these cases exercise the age/expiry paths only.
+		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot, tc.created, nil); got != tc.expected {
 			t.Errorf("%s: got %q want %q", tc.name, got, tc.expected)
 		}
 	}

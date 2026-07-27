@@ -110,6 +110,23 @@ func (h *SettingsHandler) UpdateVaultPolicy(w http.ResponseWriter, r *http.Reque
 	requireTOTP := "false"
 	if req.RequireTOTP {
 		requireTOTP = "true"
+		// Do not let an admin switch on a policy they would immediately fail.
+		// Enforcement lives on the TOTP-disable path and (for the operator) in
+		// the enrolment nudge, but an admin with no 2FA who enables this is
+		// asking every user including themselves to comply with something they
+		// have not set up, which reads as a working control while nobody is
+		// actually covered.
+		state, err := h.queries.GetUserTOTPState(r.Context(), middleware.GetUserID(r.Context()))
+		if err != nil {
+			logError(r, "settings.policy: could not read the acting admin's 2FA state", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if !nullInt64Is1(state.TotpEnabled) {
+			writeValidationError(w, r,
+				"set up two-factor authentication on your own account before requiring it for everyone, otherwise you would be enforcing a policy you do not meet")
+			return
+		}
 	}
 	updates := map[string]string{
 		"min_password_length":         strconv.Itoa(req.MinPasswordLength),
