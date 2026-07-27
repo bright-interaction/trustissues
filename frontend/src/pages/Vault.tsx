@@ -2363,20 +2363,46 @@ export default function Vault() {
                           {entry.collection_id ? collectionName(entry.collection_id) : 'Personal'}
                         </td>
                         <td className="px-3 py-2">
-                          <span
-                            className={clsx(
-                              'rounded-full px-2 py-0.5 text-xs font-medium',
-                              entry.rotation_status === 'fresh' && 'bg-emerald-100 text-emerald-700',
-                              entry.rotation_status === 'due_soon' && 'bg-amber-100 text-amber-700',
-                              entry.rotation_status === 'overdue' && 'bg-red-100 text-red-700',
-                              entry.rotation_status === 'expired' && 'bg-red-100 text-red-700'
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span
+                              className={clsx(
+                                'rounded-full px-2 py-0.5 text-xs font-medium',
+                                entry.rotation_status === 'fresh' && 'bg-emerald-100 text-emerald-700',
+                                entry.rotation_status === 'due_soon' && 'bg-amber-100 text-amber-700',
+                                entry.rotation_status === 'overdue' && 'bg-red-100 text-red-700',
+                                entry.rotation_status === 'expired' && 'bg-red-100 text-red-700'
+                              )}
+                            >
+                              {entry.rotation_status === 'fresh' && 'Fresh'}
+                              {entry.rotation_status === 'due_soon' && 'Due Soon'}
+                              {entry.rotation_status === 'overdue' && 'Overdue'}
+                              {entry.rotation_status === 'expired' && 'Expired'}
+                            </span>
+                            {/*
+                              This locked table is what a user sees WITHOUT
+                              unlocking, and it used to show only rotation_status.
+                              A rotation that failed outright leaves the status
+                              looking merely "overdue", so the failure was
+                              invisible unless you unlocked and opened the
+                              rotation panel. The reason is already API-visible
+                              and structural (never a raw upstream error), so it
+                              is safe to show here.
+                            */}
+                            {entry.last_rotation_error && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700"
+                                title={entry.last_rotation_error}
+                              >
+                                <AlertCircle className="h-3 w-3" />
+                                Failed
+                              </span>
                             )}
-                          >
-                            {entry.rotation_status === 'fresh' && 'Fresh'}
-                            {entry.rotation_status === 'due_soon' && 'Due Soon'}
-                            {entry.rotation_status === 'overdue' && 'Overdue'}
-                            {entry.rotation_status === 'expired' && 'Expired'}
-                          </span>
+                          </div>
+                          {entry.last_rotation_error && (
+                            <p className="mt-1 max-w-xs text-xs leading-snug text-red-600">
+                              {entry.last_rotation_error}
+                            </p>
+                          )}
                         </td>
                         <td className="px-3 py-2 text-xs text-slate-500">{timeAgo(entry.last_rotated_at)}</td>
                       </tr>

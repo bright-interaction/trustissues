@@ -13,6 +13,8 @@ import type {
   SessionDurationConfig,
   AIConfig,
   VaultPolicy,
+  NotificationChannel,
+  NotificationEvent,
   Role,
   ApiKey,
   ApiKeyCreated,
@@ -197,6 +199,34 @@ export const api = {
       request<void>(`/admin/invitations/${id}`, { method: 'DELETE' }),
     resendInvitation: (id: string) =>
       request<void>(`/admin/invitations/${id}/resend`, { method: 'POST' }),
+
+    listNotificationChannels: () =>
+      request<NotificationChannel[]>('/admin/notification-channels'),
+    // `events` goes out as an array even though the list response returns a
+    // comma-separated string; that asymmetry is in the server contract.
+    // `config` holds the webhook url + optional signing secret and is encrypted
+    // at rest, so it is write-only: no response ever returns it.
+    createNotificationChannel: (data: {
+      name: string;
+      type: 'webhook' | 'slog';
+      config?: { url?: string; secret?: string };
+      events?: NotificationEvent[];
+    }) =>
+      request<NotificationChannel>('/admin/notification-channels', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    setNotificationChannelEnabled: (id: string, enabled: boolean) =>
+      request<{ enabled: boolean }>(`/admin/notification-channels/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled }),
+      }),
+    deleteNotificationChannel: (id: string) =>
+      request<void>(`/admin/notification-channels/${id}`, { method: 'DELETE' }),
+    testNotificationChannel: (id: string) =>
+      request<void>(`/admin/notification-channels/${id}/test`, {
+        method: 'POST',
+      }),
   },
 
   settings: {

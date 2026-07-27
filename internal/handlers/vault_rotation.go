@@ -61,7 +61,15 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 
 	entries, err := queries.ListVaultEntriesNeedingRotation(ctx)
 	if err != nil {
+		// The whole pass is skipped, so no per-entry record is possible and
+		// nothing else would ever mention it. Log it as an activity row so a
+		// repeatedly broken scheduler is visible in the product rather than
+		// only in the container log.
 		slog.Error("vault rotation: query failed", "error", err)
+		LogActivity(queries, nil, "vault.rotation_failed",
+			"Auto-rotation pass skipped: could not list entries due for rotation (details in server logs)")
+		dispatchRotationFailure(ctx, queries, vaultHandler, "",
+			"auto-rotation pass skipped: could not list entries due for rotation (details in server logs)")
 		return
 	}
 
@@ -75,7 +83,12 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		providerName := entry.Provider.String
 		provider, ok := ProviderRegistry[providerName]
 		if !ok {
+			// An entry configured for a provider this build does not know will
+			// never rotate. Silently skipping it meant the secret quietly went
+			// stale forever.
 			slog.Warn("vault rotation: unknown provider", "provider", providerName, "entry", entry.Name)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailUnknownProvider, "auto", nil)
 			continue
 		}
 
@@ -100,10 +113,8 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		plaintext, err := vaultHandler.DecryptValue(entry.EncryptedValue, entry.Nonce, int(entry.EncryptionVersion.Int64))
 		if err != nil {
 			slog.Error("vault rotation: decrypt failed", "entry", entry.Name, "error", err)
-			_ = queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-				LastRotationError: sql.NullString{String: "decrypt failed (details in server logs)", Valid: true},
-				ID:                entry.ID,
-			})
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailDecrypt, "auto", nil)
 			continue
 		}
 
@@ -117,27 +128,13 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		}
 
 		if err != nil {
-			slog.Error("vault rotation: provider rotation failed", "provider", providerName, "entry", entry.Name, "error", err)
 			// Do NOT persist err.Error() here: a provider Rotate error can embed the
 			// raw upstream HTTP response body (tokens/secrets/internal topology), so
-			// last_rotation_error stores a static summary; the full error is in the
-			// slog line above.
-			_ = queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-				LastRotationError: sql.NullString{String: "provider rotation failed (details in server logs)", Valid: true},
-				ID:                entry.ID,
-			})
-			logEntry := RotationLogEntry{
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
-				Status:    "error",
-				Provider:  providerName,
-				Error:     "provider rotation failed (details in server logs)",
-				Method:    "auto",
-			}
-			updatedLog := AppendRotationLog(entry.RotationLog.String, logEntry)
-			_ = queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-				RotationLog: sql.NullString{String: updatedLog, Valid: true},
-				ID:          entry.ID,
-			})
+			// only the structural reason is recorded; the full error is in the slog
+			// line. upstreamHTTPError keeps the body slog-only for exactly this.
+			slog.Error("vault rotation: provider rotation failed", "provider", providerName, "entry", entry.Name, "error", err)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailProvider, "auto", nil)
 			continue
 		}
 
@@ -151,7 +148,13 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		// Encrypt the new value
 		encrypted, nonce, err := vaultHandler.EncryptValue([]byte(newValue))
 		if err != nil {
+			// The provider has ALREADY issued a replacement key upstream and we
+			// are about to throw it away. The old value stays in the vault, so
+			// the two are now out of sync and an operator has to reconcile at
+			// the provider. This must be loud.
 			slog.Error("vault rotation: encrypt failed", "entry", entry.Name, "error", err)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailEncrypt, "auto", nil)
 			continue
 		}
 
@@ -162,7 +165,11 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			ID:             entry.ID,
 		})
 		if err != nil {
+			// Same hazard as the encrypt failure above: the replacement key
+			// exists at the provider but the vault still holds the old value.
 			slog.Error("vault rotation: update failed", "entry", entry.Name, "error", err)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailPersist, "auto", nil)
 			continue
 		}
 

@@ -19,7 +19,9 @@ type NavItem = {
 
 const navItems: NavItem[] = [
   { to: '/vault', icon: Lock, label: 'Vault' },
-  { to: '/activity', icon: Activity, label: 'Activity' },
+  // GET /api/activity is wrapped in AdminOnly, so a non-admin who followed this
+  // link just got a failing query and an empty page.
+  { to: '/activity', icon: Activity, label: 'Activity', adminOnly: true },
   { to: '/users', icon: Users, label: 'Users', adminOnly: true },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];

@@ -21,6 +21,12 @@ type Querier interface {
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
+	// Backs the "vault.*" style category filters. The UI has always offered them,
+	// but the only filter query was an exact match, so every wildcard option
+	// returned zero rows and looked like "nothing ever happened".
+	// The caller passes the prefix WITHOUT the star (e.g. "vault."), and escapes
+	// any LIKE metacharacters in it.
+	CountActivityEntriesByActionPrefix(ctx context.Context, action string) (int64, error)
 	CountActivityEntriesByUser(ctx context.Context, userID sql.NullString) (int64, error)
 	CountAdmins(ctx context.Context) (int64, error)
 	CountCollectionEntries(ctx context.Context, collectionID sql.NullString) (int64, error)
@@ -165,6 +171,9 @@ type Querier interface {
 	ListAccessibleVaultEntryNames(ctx context.Context, arg ListAccessibleVaultEntryNamesParams) ([]string, error)
 	ListActivityEntries(ctx context.Context, arg ListActivityEntriesParams) ([]ListActivityEntriesRow, error)
 	ListActivityEntriesByAction(ctx context.Context, arg ListActivityEntriesByActionParams) ([]ListActivityEntriesByActionRow, error)
+	// See CountActivityEntriesByActionPrefix. Same ordering as the other list
+	// queries so paging behaves identically.
+	ListActivityEntriesByActionPrefix(ctx context.Context, arg ListActivityEntriesByActionPrefixParams) ([]ListActivityEntriesByActionPrefixRow, error)
 	ListActivityEntriesByUser(ctx context.Context, arg ListActivityEntriesByUserParams) ([]ListActivityEntriesByUserRow, error)
 	ListAllCollections(ctx context.Context) ([]Collection, error)
 	// ============================================================================

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -42,6 +43,20 @@ type activityListResponse struct {
 
 // List handles GET /api/activity (admin only) and returns recent activity log
 // entries. Optional query params: ?action=...&user_id=...&limit=50&offset=0
+// likePrefixPattern turns a literal prefix into a SQL LIKE pattern that matches
+// it and nothing cleverer.
+//
+// The filter value comes off the query string, so `_` and `%` in it would
+// otherwise act as wildcards and let a caller widen their own filter (`%` alone
+// matches every row). Escape them, and the escape character itself, and pair
+// this with `ESCAPE '\'` in the query. Not a privilege boundary here (the whole
+// endpoint is admin-only and the rows are already visible), but a filter that
+// silently means something other than what it says is a bug either way.
+func likePrefixPattern(prefix string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(prefix) + "%"
+}
+
 func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -84,6 +99,24 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 		if listErr == nil {
 			rows, err := h.queries.ListActivityEntriesByUser(ctx, db.ListActivityEntriesByUserParams{
 				UserID: toNullString(userFilter), Limit: int64(limit), Offset: int64(offset),
+			})
+			if err != nil {
+				listErr = err
+			} else {
+				for _, row := range rows {
+					appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
+				}
+			}
+		}
+	case strings.HasSuffix(actionFilter, ".*"):
+		// Category filter, e.g. "vault.*". The UI has always offered these, but
+		// the only filter query was an exact match, so every wildcard option
+		// silently returned zero rows and read as "nothing ever happened".
+		pattern := likePrefixPattern(strings.TrimSuffix(actionFilter, "*"))
+		total, listErr = h.queries.CountActivityEntriesByActionPrefix(ctx, pattern)
+		if listErr == nil {
+			rows, err := h.queries.ListActivityEntriesByActionPrefix(ctx, db.ListActivityEntriesByActionPrefixParams{
+				Action: pattern, Limit: int64(limit), Offset: int64(offset),
 			})
 			if err != nil {
 				listErr = err

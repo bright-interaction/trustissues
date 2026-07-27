@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { QRCodeSVG } from 'qrcode.react';
 import toast from 'react-hot-toast';
 import {
+  AlertTriangle,
+  Bell,
   Bot,
   Check,
   Clock,
@@ -11,6 +13,7 @@ import {
   KeyRound,
   Loader2,
   Mail,
+  Send,
   ShieldCheck,
   Trash2,
   User as UserIcon,
@@ -21,8 +24,16 @@ import { vaultApi } from '@/lib/vault-types';
 import { queryKeys } from '@/lib/query-keys';
 import { useAuth } from '@/hooks/useAuth';
 import type { SMTPConfig, VaultPolicy, ApiKeyCreated, AIConfig } from '@/lib/types';
+import { NOTIFICATION_EVENTS, type NotificationEvent } from '@/lib/types';
 
-type SettingsTab = 'account' | 'policy' | 'session' | 'email' | 'apikeys' | 'ai';
+type SettingsTab =
+  | 'account'
+  | 'policy'
+  | 'session'
+  | 'email'
+  | 'channels'
+  | 'apikeys'
+  | 'ai';
 
 function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.message;
@@ -744,6 +755,340 @@ function EmailTab() {
   );
 }
 
+// Human labels for the wire event names. Kept next to the tab so the union in
+// types.ts stays the single source of truth for what the server accepts.
+const EVENT_LABELS: Record<NotificationEvent, string> = {
+  'vault.rotation_failed': 'Rotation failed',
+  'vault.rotation_partial': 'Rotation did not fully deliver',
+  'vault.secret_expiring': 'Secret expiring soon',
+};
+
+const EVENT_HINTS: Record<NotificationEvent, string> = {
+  'vault.rotation_failed':
+    'An automatic rotation could not complete. The stored secret was left untouched.',
+  'vault.rotation_partial':
+    'The new value was stored but at least one delivery target did not accept it.',
+  'vault.secret_expiring':
+    'A secret is approaching its expiry date and needs attention.',
+};
+
+function ChannelsTab() {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState('');
+  const [type, setType] = useState<'webhook' | 'slog'>('webhook');
+  const [url, setUrl] = useState('');
+  const [secret, setSecret] = useState('');
+  const [events, setEvents] = useState<NotificationEvent[]>([
+    ...NOTIFICATION_EVENTS,
+  ]);
+
+  const channelsQuery = useQuery({
+    queryKey: queryKeys.admin.notificationChannels(),
+    queryFn: () => api.admin.listNotificationChannels(),
+  });
+
+  const invalidate = () =>
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.admin.notificationChannels(),
+    });
+
+  const createMutation = useMutation({
+    mutationFn: () =>
+      api.admin.createNotificationChannel({
+        name: name.trim(),
+        type,
+        config: type === 'webhook' ? { url: url.trim(), secret: secret.trim() || undefined } : undefined,
+        events,
+      }),
+    onSuccess: () => {
+      toast.success('Channel created');
+      setName('');
+      setUrl('');
+      setSecret('');
+      setEvents([...NOTIFICATION_EVENTS]);
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const toggleMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.admin.setNotificationChannelEnabled(id, enabled),
+    onSuccess: (_data, vars) => {
+      toast.success(vars.enabled ? 'Channel enabled' : 'Channel disabled');
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const testMutation = useMutation({
+    mutationFn: (id: string) => api.admin.testNotificationChannel(id),
+    onSuccess: () => toast.success('Test notification sent'),
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => api.admin.deleteNotificationChannel(id),
+    onSuccess: () => {
+      toast.success('Channel deleted');
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const channels = channelsQuery.data ?? [];
+  const enabledCount = channels.filter((c) => c.enabled).length;
+  const canSubmit =
+    name.trim() !== '' &&
+    events.length > 0 &&
+    (type !== 'webhook' || url.trim() !== '');
+
+  const toggleEvent = (e: NotificationEvent) =>
+    setEvents((prev) =>
+      prev.includes(e) ? prev.filter((x) => x !== e) : [...prev, e]
+    );
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      {/*
+        The whole point of this tab. Every alert the product can raise fans out
+        to enabled channels, so with none configured expiry reminders and
+        rotation alerts are silently discarded. Say so plainly rather than
+        showing an innocuous empty list.
+      */}
+      {!channelsQuery.isLoading && enabledCount === 0 && (
+        <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <div className="text-sm">
+            <p className="font-medium text-amber-900">
+              No alerts are being delivered
+            </p>
+            <p className="mt-0.5 text-amber-800">
+              {channels.length === 0
+                ? 'There are no notification channels, so rotation failures and expiry reminders are only written to the server log.'
+                : 'Every channel is disabled, so rotation failures and expiry reminders are only written to the server log.'}{' '}
+              Add a channel below to start receiving them.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className={cardClass}>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Add a notification channel
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Channels are where Trustissues sends alerts about your secrets. A
+          webhook posts a signed JSON payload to a URL you control; the server
+          log channel writes to this server's own log, which is useful for a
+          quick check that alerting works at all.
+        </p>
+
+        <form
+          onSubmit={(e: FormEvent) => {
+            e.preventDefault();
+            if (canSubmit) createMutation.mutate();
+          }}
+          className="mt-4 space-y-4"
+        >
+          <div>
+            <label className={labelClass} htmlFor="channel-name">
+              Name
+            </label>
+            <input
+              id="channel-name"
+              className={inputClass}
+              placeholder="e.g. Ops Slack"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className={labelClass} htmlFor="channel-type">
+              Type
+            </label>
+            <select
+              id="channel-type"
+              className={inputClass}
+              value={type}
+              onChange={(e) => setType(e.target.value as 'webhook' | 'slog')}
+            >
+              <option value="webhook">Webhook</option>
+              <option value="slog">Server log</option>
+            </select>
+          </div>
+
+          {type === 'webhook' && (
+            <>
+              <div>
+                <label className={labelClass} htmlFor="channel-url">
+                  Webhook URL
+                </label>
+                <input
+                  id="channel-url"
+                  className={inputClass}
+                  placeholder="https://hooks.example.com/services/..."
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className={labelClass} htmlFor="channel-secret">
+                  Signing secret{' '}
+                  <span className="font-normal text-slate-400">(optional)</span>
+                </label>
+                <input
+                  id="channel-secret"
+                  type="password"
+                  className={inputClass}
+                  placeholder="Used to HMAC-sign each payload"
+                  value={secret}
+                  onChange={(e) => setSecret(e.target.value)}
+                />
+                <p className="mt-1.5 text-xs text-slate-500">
+                  Stored encrypted and never shown again. To change the URL or
+                  secret later, delete this channel and create a new one.
+                </p>
+              </div>
+            </>
+          )}
+
+          <div>
+            <span className={labelClass}>Send on</span>
+            <div className="space-y-2">
+              {NOTIFICATION_EVENTS.map((e) => (
+                <label
+                  key={e}
+                  className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 transition-colors hover:border-slate-300"
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                    checked={events.includes(e)}
+                    onChange={() => toggleEvent(e)}
+                  />
+                  <span className="text-sm">
+                    <span className="font-medium text-slate-800">
+                      {EVENT_LABELS[e]}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-slate-500">
+                      {EVENT_HINTS[e]}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {events.length === 0 && (
+              <p className="mt-1.5 text-xs text-amber-600">
+                Pick at least one event, or this channel will never fire.
+              </p>
+            )}
+          </div>
+
+          <button
+            type="submit"
+            className={primaryButtonClass}
+            disabled={!canSubmit || createMutation.isPending}
+          >
+            {createMutation.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Bell className="h-4 w-4" />
+            )}
+            Add channel
+          </button>
+        </form>
+      </div>
+
+      <div className={cardClass}>
+        <h2 className="text-sm font-semibold text-slate-900">Channels</h2>
+        {channelsQuery.isLoading ? (
+          <div className="mt-4 flex justify-center">
+            <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+          </div>
+        ) : channels.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">
+            No channels yet. Add one above to start receiving alerts.
+          </p>
+        ) : (
+          <ul className="mt-3 divide-y divide-slate-100">
+            {channels.map((c) => (
+              <li key={c.id} className="py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm font-medium text-slate-800">
+                        {c.name}
+                      </span>
+                      <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">
+                        {c.type === 'slog' ? 'server log' : c.type}
+                      </span>
+                      {!c.enabled && (
+                        <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500">
+                          disabled
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 truncate text-xs text-slate-500">
+                      {c.events
+                        .split(',')
+                        .map(
+                          (e) =>
+                            EVENT_LABELS[e.trim() as NotificationEvent] ??
+                            e.trim()
+                        )
+                        .join(', ')}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => testMutation.mutate(c.id)}
+                      disabled={testMutation.isPending}
+                      title="Send a test notification"
+                      className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-50"
+                    >
+                      <Send className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        toggleMutation.mutate({ id: c.id, enabled: !c.enabled })
+                      }
+                      disabled={toggleMutation.isPending}
+                      className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {c.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (
+                          window.confirm(
+                            `Delete the channel "${c.name}"? Alerts will stop going to it immediately.`
+                          )
+                        ) {
+                          deleteMutation.mutate(c.id);
+                        }
+                      }}
+                      disabled={deleteMutation.isPending}
+                      title="Delete channel"
+                      className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ApiKeysTab() {
   const queryClient = useQueryClient();
   const [name, setName] = useState('');
@@ -1178,6 +1523,7 @@ export default function Settings() {
           { id: 'policy', label: 'Vault policy', icon: ShieldCheck },
           { id: 'session', label: 'Sessions', icon: Clock },
           { id: 'email', label: 'Email', icon: Mail },
+          { id: 'channels', label: 'Alerts', icon: Bell },
         ] as const)
       : []),
   ];
@@ -1223,6 +1569,7 @@ export default function Settings() {
       {activeTab === 'policy' && isAdmin && <PolicyTab />}
       {activeTab === 'session' && isAdmin && <SessionTab />}
       {activeTab === 'email' && isAdmin && <EmailTab />}
+      {activeTab === 'channels' && isAdmin && <ChannelsTab />}
     </Layout>
   );
 }

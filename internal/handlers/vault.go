@@ -1641,12 +1641,27 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to load secret for rotation")
 		return
 	}
-	if currentValue, decErr := h.decrypt(entryRow.EncryptedValue, entryRow.Nonce); decErr == nil {
-		oldValue = string(currentValue)
-		// Best-effort zero of the plaintext slice. oldValue copy outlives this.
-		for i := range currentValue {
-			currentValue[i] = 0
-		}
+	// Never rotate a value we could not read. This used to have no else branch:
+	// oldValue simply stayed empty and the handler carried on. For a provider
+	// entry that called Rotate with an empty current key; for a non-provider
+	// entry it generated a fresh random value, OVERWROTE the undecryptable
+	// ciphertext and returned 200, destroying a secret that was still
+	// recoverable (a row an older migration missed, bit rot, a partial write).
+	// Refuse instead, and leave the stored value untouched so it can be
+	// recovered once the underlying cause is fixed.
+	currentValue, decErr := h.decrypt(entryRow.EncryptedValue, entryRow.Nonce)
+	if decErr != nil {
+		logError(r, "vault.rotate: decrypt failed, refusing to rotate", "entry", id, "error", decErr)
+		recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+			entryRow.RotationLog.String, rotFailDecrypt, rotationMethod, &userID)
+		writeError(w, r, http.StatusConflict, "decrypt_failed",
+			"this secret could not be decrypted, so it was not rotated; rotating would have overwritten a value that is still recoverable")
+		return
+	}
+	oldValue = string(currentValue)
+	// Best-effort zero of the plaintext slice. oldValue copy outlives this.
+	for i := range currentValue {
+		currentValue[i] = 0
 	}
 
 	if providerName != "" {

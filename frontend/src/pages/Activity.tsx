@@ -78,12 +78,24 @@ function actionBadgeClasses(action: string): string {
 
 // Known action categories for the filter dropdown (static list so it does not
 // depend on current page data).
+// The category options, matched to the prefixes the server actually emits.
+//
+// These used to be decorative: the API filtered with an exact `action = ?`, so
+// every "*" option returned zero rows. The server now understands a trailing
+// ".*" as a prefix match, so they work. The list itself was also wrong,
+// offering `rotation.*` and `user.*` (nothing emits either; rotation actions
+// live under `vault.` and user administration under `admin.`) while omitting
+// six prefixes that do exist.
 const ACTION_CATEGORIES = [
+  { prefix: 'admin.', label: 'admin.*' },
+  { prefix: 'ai.', label: 'ai.*' },
+  { prefix: 'api_key.', label: 'api_key.*' },
   { prefix: 'auth.', label: 'auth.*' },
+  { prefix: 'collection.', label: 'collection.*' },
   { prefix: 'invitation.', label: 'invitation.*' },
-  { prefix: 'rotation.', label: 'rotation.*' },
+  { prefix: 'service_identity.', label: 'service_identity.*' },
   { prefix: 'settings.', label: 'settings.*' },
-  { prefix: 'user.', label: 'user.*' },
+  { prefix: 'totp.', label: 'totp.*' },
   { prefix: 'vault.', label: 'vault.*' },
 ];
 
