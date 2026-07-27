@@ -64,6 +64,11 @@ type userInfo struct {
 	Role        string `json:"role"`
 	TOTPEnabled bool   `json:"totp_enabled"`
 	CreatedAt   string `json:"created_at,omitempty"`
+	// TOTPEnrollmentRequired is true when the vault policy requires 2FA and
+	// this user has not set it up. Refusing the login instead would lock out
+	// everyone the moment an admin ticks the policy, so the account stays
+	// usable and the UI nags until they enrol.
+	TOTPEnrollmentRequired bool `json:"totp_enrollment_required,omitempty"`
 }
 
 // decryptTOTPSecret returns the usable TOTP seed from the stored column,
@@ -449,13 +454,15 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	enabled := nullInt64Is1(row.TotpEnabled)
 	writeJSON(w, http.StatusOK, userInfo{
-		ID:          row.ID,
-		Email:       row.Email,
-		Name:        nullStringToString(row.Name),
-		Role:        row.Role,
-		TOTPEnabled: nullInt64Is1(row.TotpEnabled),
-		CreatedAt:   nullTimeStr(row.CreatedAt),
+		ID:                     row.ID,
+		Email:                  row.Email,
+		Name:                   nullStringToString(row.Name),
+		Role:                   row.Role,
+		TOTPEnabled:            enabled,
+		CreatedAt:              nullTimeStr(row.CreatedAt),
+		TOTPEnrollmentRequired: !enabled && settingBool(r.Context(), h.queries, "require_totp", false),
 	})
 }
 
@@ -806,6 +813,18 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 	if !totp.ValidateCode(secret, req.Code) {
 		recordFailure()
 		writeUnauthorized(w, r, "invalid 2FA code")
+		return
+	}
+
+	// Honour the vault policy. "Require two-factor authentication for all users"
+	// was written to the settings table, read back to render the checkbox, and
+	// enforced nowhere: any user could switch 2FA straight off with the policy
+	// on, so an admin who ticked it got a compliance indicator rather than a
+	// control. Refusing here is the enforcement point that cannot lock anyone
+	// out, since the user demonstrably has a working code to reach this line.
+	if settingBool(r.Context(), h.queries, "require_totp", false) {
+		writeError(w, r, http.StatusConflict, "totp_required",
+			"two-factor authentication is required by the vault policy and cannot be disabled; ask an administrator to change the policy first")
 		return
 	}
 

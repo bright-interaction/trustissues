@@ -452,7 +452,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
-	e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+	e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 	return e
 }
 
@@ -668,7 +668,7 @@ func (h *VaultHandler) DecryptValue(ciphertext, nonce []byte, encVersion int) ([
 
 // computeRotationStatus determines the rotation status of a vault entry based
 // on its rotation interval, expiration date, and last rotation time.
-func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *string) string {
+func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *string, createdAt *string) string {
 	// If expires_at is set and past, return "expired"
 	if expiresAt != nil && *expiresAt != "" {
 		exp, err := time.Parse("2006-01-02 15:04:05", *expiresAt)
@@ -687,12 +687,21 @@ func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *
 		return "fresh"
 	}
 
-	if lastRotatedAt == nil || *lastRotatedAt == "" {
+	// A never-rotated entry ages from when it was enrolled, not "forever fresh".
+	// The scheduler uses the same COALESCE(last_rotated_at, created_at) fallback,
+	// and the two must agree: this used to return "fresh" unconditionally while
+	// the sweep treated the same NULL as "due now", so the UI told an operator
+	// their key was fresh in the same hour the scheduler rotated it away.
+	anchor := lastRotatedAt
+	if anchor == nil || *anchor == "" {
+		anchor = createdAt
+	}
+	if anchor == nil || *anchor == "" {
 		return "fresh"
 	}
 
 	// Calculate age
-	lastRotated, err := time.Parse("2006-01-02 15:04:05", *lastRotatedAt)
+	lastRotated, err := time.Parse("2006-01-02 15:04:05", *anchor)
 	if err != nil {
 		lastRotated, err = time.Parse(time.RFC3339, *lastRotatedAt)
 		if err != nil {
@@ -741,11 +750,39 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 		return true, true
 	}
 	if info.CollectionID.Valid && info.CollectionID.String != "" {
-		// Residual owner right. Without it a collection member could move the
-		// entry into a collection the creator is not a member of and the
-		// creator would lose their own secret permanently.
+		// Residual owner right, READ ONLY. Without any residual right a
+		// collection member could move the entry into a collection the creator
+		// is not a member of and the creator would lose their own secret
+		// permanently, so recovery has to stay possible.
+		//
+		// It must NOT carry write. When a membership row is deleted the creator
+		// is indistinguishable from someone who was never a member, so a
+		// residual write right meant removing a person from a collection did not
+		// revoke them: they kept delete and rotate on the shared secret, and
+		// could move it into their PERSONAL vault, where they would keep reading
+		// it even after the team rotated. Read-only leaves the correct property
+		// in place, which is that removing someone and then rotating the secret
+		// ends their access. It also cannot strand anyone, because recovery only
+		// ever needed read.
+		//
+		// A member of the collection still gets write below via their role; this
+		// branch only matters for a creator who is NOT currently a member.
 		if userID != "" && info.UserID == userID {
-			return true, true
+			role, roleErr := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+				CollectionID: info.CollectionID.String,
+				UserID:       userID,
+			})
+			if roleErr != nil {
+				// Not a member: recovery read only.
+				return true, false
+			}
+			switch role {
+			case collRoleManager, collRoleEditor:
+				return true, true
+			default:
+				// Viewer member who happens to be the creator: still a viewer.
+				return true, false
+			}
 		}
 		role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
 			CollectionID: info.CollectionID.String,
@@ -827,7 +864,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromListAllRow(row)
 			e.CollectionID = nullStringPtr(row.CollectionID)
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 			entries = append(entries, e)
 		}
 	} else if isAdmin && r.URL.Query().Get("user_id") != "" {
@@ -839,7 +876,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			e := h.vaultMetaFromListByUserRow(row)
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 			entries = append(entries, e)
 		}
 	} else {
@@ -857,7 +894,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromAccessibleRow(row)
 			e.UserID = "" // omitempty will exclude it
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 			entries = append(entries, e)
 		}
 	}
@@ -1260,21 +1297,54 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	// If value is provided and non-empty, re-encrypt and update last_rotated_at
 	if req.Value != nil && *req.Value != "" {
-		encrypted, nonce, err := h.encrypt([]byte(*req.Value))
-		if err != nil {
-			logError(r, "vault.update: encryption failed", "error", err)
-			writeInternalError(w, r, "failed to encrypt secret")
+		// Two guards before touching the stored secret, both learned the hard way.
+		//
+		// 1. Never overwrite something we could not read. The unlock response
+		//    renders an undecryptable entry as the literal "[decryption error]",
+		//    and the edit form submits whatever it was showing, so a single save
+		//    would persist that sentinel as the new secret and return 200,
+		//    destroying a value that was still recoverable. Mirror the Rotate
+		//    handler: refuse with 409 and leave the row alone.
+		//
+		// 2. Re-storing the SAME value is not a rotation. Writing the value
+		//    stamps last_rotated_at = now, so a client that echoes the current
+		//    secret back (the edit form used to pre-fill it) silently reset the
+		//    rotation clock and de-scheduled an overdue auto-rotation. If the
+		//    plaintext is unchanged, skip the write entirely.
+		current, curErr := h.queries.GetVaultEntryForRotation(ctx, id)
+		if curErr != nil {
+			logError(r, "vault.update: load current value failed", "entry", id, "error", curErr)
+			writeInternalError(w, r, "internal server error")
 			return
 		}
-
-		if err := h.queries.UpdateVaultEntryValue(ctx, db.UpdateVaultEntryValueParams{
-			EncryptedValue: encrypted,
-			Nonce:          nonce,
-			ID:             id,
-		}); err != nil {
-			logError(r, "vault.update: update value failed", "error", err)
-			writeInternalError(w, r, "failed to update secret value")
+		currentPlain, decErr := h.decrypt(current.EncryptedValue, current.Nonce)
+		if decErr != nil {
+			logError(r, "vault.update: refusing to overwrite an undecryptable secret", "entry", id, "error", decErr)
+			writeError(w, r, http.StatusConflict, "decrypt_failed",
+				"this secret could not be decrypted, so it was not changed; saving would have overwritten a value that is still recoverable")
 			return
+		}
+		unchanged := string(currentPlain) == *req.Value
+		for i := range currentPlain {
+			currentPlain[i] = 0
+		}
+
+		if !unchanged {
+			encrypted, nonce, err := h.encrypt([]byte(*req.Value))
+			if err != nil {
+				logError(r, "vault.update: encryption failed", "error", err)
+				writeInternalError(w, r, "failed to encrypt secret")
+				return
+			}
+			if err := h.queries.UpdateVaultEntryValue(ctx, db.UpdateVaultEntryValueParams{
+				EncryptedValue: encrypted,
+				Nonce:          nonce,
+				ID:             id,
+			}); err != nil {
+				logError(r, "vault.update: update value failed", "error", err)
+				writeInternalError(w, r, "failed to update secret value")
+				return
+			}
 		}
 	}
 
@@ -1564,7 +1634,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 		entries = append(entries, e)
 	}
 
@@ -2112,7 +2182,7 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[e.ID] = true
-		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt)
+		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
 		entries = append(entries, e)
 	}
 

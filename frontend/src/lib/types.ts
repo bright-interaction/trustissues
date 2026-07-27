@@ -10,6 +10,10 @@ export interface User {
   role: Role;
   totp_enabled: boolean;
   created_at: string;
+  // Set by the server when the vault policy requires 2FA and this account has
+  // not set it up. Login is not refused (ticking the policy would otherwise
+  // lock out every user at once), so the UI nags instead.
+  totp_enrollment_required?: boolean;
 }
 
 export interface ManagedUser {
