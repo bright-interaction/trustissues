@@ -196,11 +196,19 @@ FROM vault_entries
 WHERE auto_rotate = 1
   AND provider != ''
   AND rotation_interval_days > 0
-  AND (
-    last_rotated_at IS NULL
-    OR (julianday('now') - julianday(last_rotated_at)) >= rotation_interval_days
-  )
-ORDER BY last_rotated_at ASC;
+  -- Age from created_at when the entry has never been rotated, NOT "NULL means
+  -- due now". last_rotated_at has no DEFAULT and CreateVaultEntry never sets
+  -- it, so every newly enrolled secret was NULL and the old predicate made it
+  -- due on the very next pass (1 minute after boot, then hourly). An operator
+  -- who stored a Cloudflare token, ticked auto-rotate and chose 365 days had it
+  -- rolled at the provider within the hour, killing the value they had just
+  -- deployed, while the UI showed the entry as "fresh". created_at is always
+  -- populated (DEFAULT CURRENT_TIMESTAMP), so the clock starts at enrolment: a
+  -- genuinely old entry still comes due immediately, a fresh one waits out its
+  -- interval. computeRotationStatus uses the same fallback so the UI and the
+  -- scheduler agree.
+  AND (julianday('now') - julianday(COALESCE(last_rotated_at, created_at))) >= rotation_interval_days
+ORDER BY COALESCE(last_rotated_at, created_at) ASC;
 
 -- name: GetVaultEntryForRotation :one
 -- On-demand path: fetch a single entry (with its secret + rotation fields) by

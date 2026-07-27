@@ -1451,7 +1451,14 @@ export default function Vault() {
     setEditingEntryId(entry.id);
     setEditForm({
       name: entry.name,
-      value: entry.value || '',
+      // Deliberately NOT pre-filled with entry.value. The field's own label says
+      // "(leave blank to keep current)", and submitEdit only sends `value` when
+      // it is non-empty, so pre-filling made every metadata edit re-submit the
+      // secret. The backend treats a value write as a rotation and stamps
+      // last_rotated_at = now, so renaming an entry or fixing a typo in its
+      // notes silently reset the rotation clock and de-scheduled an overdue
+      // auto-rotation. Blank means "keep it", which is what the label promises.
+      value: '',
       url: entry.url || '',
       alias_url: entry.alias_url || '',
       username: entry.username || '',

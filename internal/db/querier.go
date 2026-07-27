@@ -87,6 +87,14 @@ type Querier interface {
 	// Authorization lookup: a PENDING membership returns no row, so it grants
 	// neither read nor write anywhere entryAccess or canWriteCollection is used.
 	GetCollectionMemberRole(ctx context.Context, arg GetCollectionMemberRoleParams) (string, error)
+	// EXISTENCE lookup, acceptance-agnostic. Deliberately separate from
+	// GetCollectionMemberRole: that one is the authorization gate and must keep
+	// ignoring pending rows, but management operations need to see a pending
+	// invitation too. RemoveMember used the authorization query as its existence
+	// check, so rescinding an invitation that had not been accepted 404'd with
+	// "member not found" and the invite stayed acceptable forever, with no way for
+	// anyone to withdraw it. Never use this to decide access.
+	GetCollectionMembership(ctx context.Context, arg GetCollectionMembershipParams) (GetCollectionMembershipRow, error)
 	GetInvitationForResend(ctx context.Context, id string) (GetInvitationForResendRow, error)
 	GetNotificationChannel(ctx context.Context, id string) (GetNotificationChannelRow, error)
 	GetPasswordHashByUserID(ctx context.Context, id string) (string, error)

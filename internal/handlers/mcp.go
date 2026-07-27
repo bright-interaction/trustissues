@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/brightinteraction/trustissues/internal/config"
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -27,7 +26,12 @@ type MCPHandler struct {
 	queries     *db.Queries
 	cfg         *config.Config
 	capability  *CapabilityHandler
-	shieldStore shield.Store // nil when Shield is disabled
+	// shieldStore is nil when Shield is disabled. It is deliberately unused on
+	// the tools/call path: see the comment in callTool for why a blanket redact
+	// there breaks the feature. Kept because any future field-level shielding of
+	// tool arguments would need it, and because the constructor is called from
+	// main.go and the tests.
+	shieldStore shield.Store
 	// mintLimiter is the SAME sensitive-op limiter the HTTP mint route
 	// (/api/secrets/issue) is wrapped in. use_secret calls Issue in-process and
 	// would otherwise skip that middleware entirely, letting an agent mint
@@ -151,16 +155,30 @@ func (h *MCPHandler) callTool(w http.ResponseWriter, r *http.Request, req jsonrp
 		return
 	}
 
-	// Shield: tokenize any PII in the result before it reaches the external model.
-	if h.shieldStore != nil && resultText != "" {
-		if session, err := shield.NewSession(ctx, h.shieldStore, randSessionID(),
-			[]byte(h.cfg.ShieldKey), 30*time.Minute, shield.ParseHintLevel(h.cfg.ShieldHintLevel)); err == nil {
-			if red, rErr := session.RedactString(ctx, resultText); rErr == nil && red != "" {
-				resultText = red
-			}
-		}
-	}
-
+	// Deliberately NOT Shield-redacted. This used to run RedactString over the
+	// whole tool result, which broke the feature outright in any deployment with
+	// TRUSTISSUES_SHIELD_KEY set (which is every real one, including prod).
+	//
+	// Why it was wrong here. Shield exists to keep third-party PII out of an
+	// external model. These two tools return no PII and no secret VALUE: that is
+	// the entire point of the capability bridge. list_secrets returns names of
+	// the caller's own entries, and use_secret returns
+	// {token, proxy_url, secret (the NAME), expires_at, nonce_length}. Every one
+	// of those fields has to survive verbatim for the feature to work.
+	//
+	// What it actually did. The redactor's catch-all FQDN pattern rewrote our
+	// own proxy_url into "https://[shield:hostname:tok_...]/proxy", so the agent
+	// had no address to send the request to, and it rewrote any secret whose
+	// name contains a dotted domain ("api.openai.com key") into a marker, so
+	// feeding that name back to use_secret returned secret_not_found. Worse, the
+	// session id was randSessionID() per call and discarded with the response,
+	// and callTool never unshields arguments on the way back in, so the markers
+	// were permanently unresolvable by anyone.
+	//
+	// If PII filtering is ever wanted on this path it has to be field-level on
+	// the JSON (never proxy_url, never the name), with a session id derived
+	// stably from the authenticated principal and an unshield pass over incoming
+	// arguments. A blanket string redact cannot work here.
 	h.reply(w, req.ID, mcpToolResult(resultText, isErr))
 }
 
