@@ -422,15 +422,24 @@ func (h *CollectionHandler) RemoveMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Guard against orphaning: do not remove the last manager.
-	targetRole, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+	// Existence check must be acceptance-agnostic. Using the authorization query
+	// here meant a PENDING invitation returned no row, so this 404'd with
+	// "member not found" and an invitation could never be withdrawn by anyone:
+	// it stayed acceptable forever, and the UI's Remove button simply failed.
+	// Authorization elsewhere still uses GetCollectionMemberRole, which
+	// correctly ignores pending rows.
+	membership, err := h.queries.GetCollectionMembership(r.Context(), db.GetCollectionMembershipParams{
 		CollectionID: id, UserID: targetUser,
 	})
 	if err != nil {
 		writeNotFound(w, r, "member not found")
 		return
 	}
-	if targetRole == collRoleManager {
+	targetRole := membership.Role
+	// The last-manager guard only applies to an ACCEPTED manager: a pending
+	// invitee is not holding the collection open, and CountCollectionManagers
+	// already counts accepted managers only.
+	if targetRole == collRoleManager && membership.AcceptedAt.Valid {
 		count, err := h.queries.CountCollectionManagers(r.Context(), id)
 		if err != nil {
 			logError(r, "collections.removemember: manager count failed", "error", err)

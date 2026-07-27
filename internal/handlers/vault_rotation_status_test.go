@@ -14,7 +14,7 @@ func rotIntP(i int) *int          { return &i }
 // rotation went unnoticed. A recorded failure must win over a healthy age.
 func TestRotationStatusFailingRotationIsNeverFresh(t *testing.T) {
 	// last rotated "now", 90 day interval -> age alone would say fresh
-	got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), rotStrPtr("identify token: token verification failed"))
+	got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), nil, rotStrPtr("identify token: token verification failed"))
 	if got == "fresh" {
 		t.Fatal("an entry with a recorded rotation error must never report fresh")
 	}
@@ -27,13 +27,13 @@ func TestRotationStatusFailingRotationIsNeverFresh(t *testing.T) {
 // fresh timestamp is not evidence rotation works. Same assertion from the other
 // direction: no error means age decides as before.
 func TestRotationStatusNoErrorFallsBackToAge(t *testing.T) {
-	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), nil); got != "fresh" {
+	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), nil, nil); got != "fresh" {
 		t.Errorf("no error + recent = %q, want fresh", got)
 	}
-	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), rotStrPtr("")); got != "fresh" {
+	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), nil, rotStrPtr("")); got != "fresh" {
 		t.Errorf("empty error string must be treated as no error, got %q", got)
 	}
-	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), rotStrPtr("   ")); got != "fresh" {
+	if got := computeRotationStatus(rotIntP(90), nil, rotStrPtr(rotNowStamp()), nil, rotStrPtr("   ")); got != "fresh" {
 		t.Errorf("whitespace-only error must be treated as no error, got %q", got)
 	}
 }
@@ -41,7 +41,7 @@ func TestRotationStatusNoErrorFallsBackToAge(t *testing.T) {
 // An already-expired credential is the worse fact, so expiry still outranks a
 // rotation failure.
 func TestRotationStatusExpiredOutranksError(t *testing.T) {
-	got := computeRotationStatus(rotIntP(90), rotStrPtr("2020-01-01 00:00:00"), rotStrPtr(rotNowStamp()), rotStrPtr("boom"))
+	got := computeRotationStatus(rotIntP(90), rotStrPtr("2020-01-01 00:00:00"), rotStrPtr(rotNowStamp()), nil, rotStrPtr("boom"))
 	if got != "expired" {
 		t.Errorf("status = %q, want expired to outrank error", got)
 	}
@@ -50,7 +50,7 @@ func TestRotationStatusExpiredOutranksError(t *testing.T) {
 // A failing rotation must surface even when there is no rotation interval set,
 // which previously short-circuited straight to fresh.
 func TestRotationStatusErrorSurfacesWithoutInterval(t *testing.T) {
-	if got := computeRotationStatus(nil, nil, rotStrPtr(rotNowStamp()), rotStrPtr("boom")); got == "fresh" {
+	if got := computeRotationStatus(nil, nil, rotStrPtr(rotNowStamp()), nil, rotStrPtr("boom")); got == "fresh" {
 		t.Error("no interval must not mask a recorded rotation failure")
 	}
 }

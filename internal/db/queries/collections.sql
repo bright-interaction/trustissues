@@ -67,6 +67,17 @@ DELETE FROM collection_members WHERE collection_id = ? AND user_id = ?;
 SELECT role FROM collection_members
 WHERE collection_id = ? AND user_id = ? AND accepted_at IS NOT NULL;
 
+-- name: GetCollectionMembership :one
+-- EXISTENCE lookup, acceptance-agnostic. Deliberately separate from
+-- GetCollectionMemberRole: that one is the authorization gate and must keep
+-- ignoring pending rows, but management operations need to see a pending
+-- invitation too. RemoveMember used the authorization query as its existence
+-- check, so rescinding an invitation that had not been accepted 404'd with
+-- "member not found" and the invite stayed acceptable forever, with no way for
+-- anyone to withdraw it. Never use this to decide access.
+SELECT role, accepted_at FROM collection_members
+WHERE collection_id = ? AND user_id = ?;
+
 -- name: ListCollectionMembers :many
 SELECT cm.user_id, cm.role, cm.added_at, cm.accepted_at, u.email, u.name
 FROM collection_members cm

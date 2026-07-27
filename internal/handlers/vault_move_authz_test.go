@@ -263,8 +263,15 @@ func TestMoveToCollectionRequiresOwnerAdminOrManager(t *testing.T) {
 }
 
 // TestOwnerRetainsAccessInsideCollection pins the residual owner right in
-// entryAccess: the creator keeps read+write on their entry even when it sits in
-// a collection they are not a member of, so they can always recover it.
+// entryAccess: the creator keeps READ on their entry even when it sits in a
+// collection they are not a member of, so they can always recover it.
+//
+// The right is deliberately read-only. It used to carry write, which meant
+// removing someone from a collection did not actually revoke them: a deleted
+// membership row is indistinguishable from never having been a member, so the
+// removed creator kept delete and rotate on the shared secret and could move it
+// into their personal vault, where they would keep reading it after the team
+// rotated. See TestRemovedMemberCannotRetainASharedSecret.
 func TestOwnerRetainsAccessInsideCollection(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 
@@ -289,7 +296,7 @@ func TestOwnerRetainsAccessInsideCollection(t *testing.T) {
 		role              string
 		wantRead, wantWri bool
 	}{
-		{"creating owner keeps read and write", owner, "user", true, true},
+		{"creating owner keeps read for recovery, but not write", owner, "user", true, false},
 		{"viewer member reads only", viewer, "user", true, false},
 		{"editor member reads and writes", editor, "user", true, true},
 		{"non-member gets nothing", stranger, "user", false, false},
