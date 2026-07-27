@@ -55,7 +55,7 @@ UPDATE vault_entries SET custom_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE
 -- ============================================================================
 
 -- name: UpdateVaultEntryValue :exec
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- ============================================================================
 -- Update entry - individual metadata fields
@@ -114,7 +114,7 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- ============================================================================
 
 -- name: RotateVaultEntryValue :execresult
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- ============================================================================
 -- URL matching (browser extension autofill)
