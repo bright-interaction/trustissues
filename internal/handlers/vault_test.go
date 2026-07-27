@@ -236,7 +236,7 @@ func TestComputeRotationStatus(t *testing.T) {
 		{"unparseable last rotated", intPtr(30), nil, strPtr("not-a-time"), "fresh"},
 	}
 	for _, tc := range cases {
-		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot); got != tc.expected {
+		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot, nil); got != tc.expected {
 			t.Errorf("%s: got %q want %q", tc.name, got, tc.expected)
 		}
 	}
