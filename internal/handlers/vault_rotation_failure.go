@@ -1,0 +1,112 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/brightinteraction/trustissues/internal/alerts"
+	"github.com/brightinteraction/trustissues/internal/db"
+)
+
+// Structural failure reasons. These strings are the ONLY thing an operator sees
+// for a failed rotation: they are persisted to last_rotation_error, appended to
+// rotation_log, written into the activity detail, and sent to notification
+// channels off-box. So they must describe the failure CLASS and never carry a
+// value, an upstream body, a URL, or an err.Error(). The cause always goes to
+// slog at the call site.
+const (
+	rotFailUnknownProvider = "rotation skipped: the configured provider is not registered in this build"
+	rotFailDecrypt         = "decrypt failed (details in server logs)"
+	rotFailProvider        = "provider rotation failed (details in server logs)"
+	rotFailEncrypt         = "new value could not be encrypted; the provider may have already issued a replacement key (details in server logs)"
+	rotFailPersist         = "new value could not be saved; the provider may have already issued a replacement key (details in server logs)"
+)
+
+// recordRotationFailure is the single exit for every hard failure in the
+// auto-rotation sweep.
+//
+// It exists because the sweep had six failure paths that each did something
+// different: four wrote nothing at all (unknown provider, encrypt failure,
+// persist failure, and the sweep-level query error), one wrote only
+// last_rotation_error, and one wrote last_rotation_error plus rotation_log.
+// None of them wrote an activity row and none dispatched a notification, so the
+// alerts.EventRotationFailed event was defined, documented and default-enabled
+// while being fired from nowhere. A rotation could fail forever and the only
+// evidence was a line in the container log.
+//
+// Every path that gives up on an entry calls this, so a failure cannot be
+// half-recorded again. It writes, in order:
+//
+//  1. last_rotation_error, which the vault list and RotationManager read
+//  2. a rotation_log entry with Status "error", so history keeps the attempt
+//  3. an activity_log row, so it lands on the Activity page
+//  4. alerts.EventRotationFailed, so configured channels actually get told
+//
+// Every step is best-effort and independent: a failure to record must never
+// abort the sweep or skip the remaining steps, because the whole point is that
+// the operator finds out.
+// method is "auto" for the scheduled sweep and "manual" for a user-triggered
+// rotation; actorID is the acting user for the manual path and nil for the
+// scheduler, which has none.
+func recordRotationFailure(
+	ctx context.Context,
+	queries *db.Queries,
+	decrypter alerts.ConfigDecrypter,
+	entryID, entryName, providerName, existingLog, reason string,
+	method string,
+	actorID *string,
+) {
+	if err := queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+		LastRotationError: sql.NullString{String: reason, Valid: true},
+		ID:                entryID,
+	}); err != nil {
+		slog.Error("vault rotation: persisting last_rotation_error failed", "entry", entryName, "error", err)
+	}
+
+	updatedLog := AppendRotationLog(existingLog, RotationLogEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Status:    "error",
+		Provider:  providerName,
+		Error:     reason,
+		Method:    method,
+	})
+	if err := queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
+		RotationLog: sql.NullString{String: updatedLog, Valid: true},
+		ID:          entryID,
+	}); err != nil {
+		slog.Error("vault rotation: persisting rotation_log failed", "entry", entryName, "error", err)
+	}
+
+	// A nil actorID (the scheduler) shows as system in the activity list. Only
+	// the secret NAME appears here, never its value.
+	kind := "Auto-rotation"
+	if method == "manual" {
+		kind = "Rotation"
+	}
+	LogActivity(queries, actorID, "vault.rotation_failed",
+		fmt.Sprintf("%s failed for vault secret: %s (provider: %s) - %s", kind, entryName, providerName, reason))
+
+	dispatchRotationFailure(ctx, queries, decrypter, entryName, reason)
+}
+
+// dispatchRotationFailure fires alerts.EventRotationFailed. It mirrors
+// dispatchRotationAlert (which fires EventRotationPartial for a rotation that
+// stored a value but did not fully reach its consumers); this one is for a
+// rotation that did not happen at all.
+//
+// Best-effort by design: a no-op when no channel subscribes, and it never
+// panics the sweep.
+func dispatchRotationFailure(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("vault rotation: failure alert dispatch panicked", "recover", r)
+		}
+	}()
+	alerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(
+		alerts.EventRotationFailed, "", "",
+		map[string]string{"secret": entryName, "detail": detail},
+	)
+}

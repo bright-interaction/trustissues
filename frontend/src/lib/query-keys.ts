@@ -11,6 +11,7 @@ export const queryKeys = {
   admin: {
     users: () => ['admin', 'users'] as const,
     invitations: () => ['admin', 'invitations'] as const,
+    notificationChannels: () => ['admin', 'notification-channels'] as const,
   },
   settings: {
     all: ['settings'] as const,

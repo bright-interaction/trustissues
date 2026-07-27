@@ -193,3 +193,32 @@ export interface CollectionInviteResult {
   status: string;
   detail: string;
 }
+
+// The events a notification channel can subscribe to. Must stay in sync with
+// validChannelEvents in internal/handlers/notifications.go; the server rejects
+// anything it does not recognise.
+export const NOTIFICATION_EVENTS = [
+  'vault.rotation_failed',
+  'vault.rotation_partial',
+  'vault.secret_expiring',
+] as const;
+
+export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
+
+// A notification channel as returned by GET /admin/notification-channels.
+//
+// NOTE the asymmetry with the create request: the server returns `events` as a
+// comma-separated STRING here but accepts an ARRAY on create. The config
+// (webhook URL and signing secret) is encrypted at rest and deliberately never
+// serialized into any response, so there is nothing to mask client-side and
+// nothing to pre-fill an edit form with. That is why a channel can only be
+// enabled, disabled or deleted, never edited: changing a URL means creating a
+// replacement channel.
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  type: 'webhook' | 'slog';
+  enabled: boolean;
+  events: string;
+  created_at: string;
+}

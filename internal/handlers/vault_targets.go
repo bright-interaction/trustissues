@@ -104,10 +104,20 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 		result := DeliveryResult{Target: target, Success: err == nil}
 		if err != nil {
 			// summarizeDelivery folds result.Error into last_rotation_error,
-			// which is API-visible. A transport failure is a *url.Error whose
-			// Error() embeds the full target URL (internal IPs for an
-			// SSRF-blocked webhook, plus any query/userinfo); redact it before
-			// it can be persisted. The unredacted cause stays in the slog line.
+			// which the API returns, the browser renders verbatim, AND
+			// dispatchRotationAlert ships to notification channels off-box. Two
+			// different leaks have to be closed here:
+			//
+			//   - a transport failure is a *url.Error whose Error() embeds the
+			//     full target URL (internal IPs for an SSRF-blocked webhook,
+			//     plus any query/userinfo). redactUpstreamError rewrites it.
+			//   - a non-2xx used to be built with fmt.Errorf including up to
+			//     200 bytes of the raw upstream body, which redactUpstreamError
+			//     does NOT touch (it only matches *url.Error), so the body went
+			//     straight through. Those sites now return upstreamHTTPError,
+			//     whose Error() is structural and whose body is slog-only.
+			//
+			// The unredacted cause stays in the slog line below.
 			result.Error = redactUpstreamError(err)
 			slog.Error("vault delivery: target failed",
 				"type", target.Type,
@@ -227,7 +237,7 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 
 	if resp.StatusCode != 201 && resp.StatusCode != 204 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return newUpstreamHTTPError(resp.StatusCode, body)
 	}
 
 	return nil
@@ -269,7 +279,7 @@ func deliverToWebhook(ctx context.Context, target RotationTarget, entryName stri
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return newUpstreamHTTPError(resp.StatusCode, body)
 	}
 
 	return nil

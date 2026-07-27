@@ -357,7 +357,7 @@ func (p *VercelTokenProvider) Rotate(ctx context.Context, currentKey string, met
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		BearerToken string `json:"bearerToken"`
@@ -405,7 +405,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		ID    string `json:"id"`
@@ -462,7 +462,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		APIKey   string `json:"api_key"`
@@ -525,7 +525,7 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Sid    string `json:"sid"`
@@ -588,7 +588,7 @@ func (p *LinodeProvider) Rotate(ctx context.Context, currentKey string, meta map
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Token string `json:"token"`
@@ -636,7 +636,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		ID  int64  `json:"id"`
@@ -702,7 +702,7 @@ func (p *DatadogProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Data struct {
@@ -775,7 +775,7 @@ func (p *GrafanaProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Key string `json:"key"`
@@ -825,7 +825,7 @@ func (p *FastlyProvider) Rotate(ctx context.Context, currentKey string, meta map
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		AccessToken string `json:"access_token"`
@@ -887,7 +887,7 @@ func (p *Auth0Provider) Rotate(ctx context.Context, currentKey string, meta map[
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		ClientSecret string `json:"client_secret"`
@@ -959,7 +959,7 @@ func (p *ZitadelProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Token string `json:"token"`
@@ -1018,7 +1018,7 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		ApplicationKey   string `json:"applicationKey"`
@@ -1155,7 +1155,7 @@ func (p *ForgejoProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
 	var result struct {
 		Sha1 string `json:"sha1"`

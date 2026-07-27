@@ -15,6 +15,8 @@ import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
+import { api } from '@/lib/api';
+import { useAuth } from '@/hooks/useAuth';
 import { vaultApi } from '@/lib/vault-types';
 import type { VaultEntry, RotationTarget } from '@/lib/vault-types';
 
@@ -45,6 +47,26 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
     queryKey: queryKeys.vault.targets(entry.id),
     queryFn: () => vaultApi.getTargets(entry.id),
   });
+
+  // A "notify" target fans out to the configured notification channels, so with
+  // none enabled it delivers nothing at all. Warn about that where the target is
+  // configured rather than letting it look like it works.
+  //
+  // GET /admin/notification-channels is AdminOnly, so only run it for an admin;
+  // a non-admin gets the same warning without the count and is pointed at an
+  // admin. `enabled: isAdmin` keeps a non-admin from firing a request that would
+  // 403 on every render of this panel.
+  const { isAdmin } = useAuth();
+  const channelsQuery = useQuery({
+    queryKey: queryKeys.admin.notificationChannels(),
+    queryFn: () => api.admin.listNotificationChannels(),
+    enabled: isAdmin,
+    staleTime: 60_000,
+  });
+  const channelsLoading = isAdmin && channelsQuery.isLoading;
+  const enabledChannelCount = isAdmin
+    ? (channelsQuery.data ?? []).filter((c) => c.enabled).length
+    : 0;
 
   // Seed local editable state once the server targets arrive.
   const serverTargets = targetsQuery.data;
@@ -198,6 +220,31 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
                   </div>
+                  {/*
+                    TARGET_TYPES carried a `hint` for every type that was never
+                    rendered anywhere, so "Notify only: send a notification, no
+                    delivery" was invisible and the option read as if it
+                    delivered something.
+                  */}
+                  <p className="mb-2 text-xs text-slate-500">
+                    {(TARGET_TYPES.find((x) => x.value === t.type) || TARGET_TYPES[0]).hint}
+                  </p>
+                  {t.type === 'notify' && !channelsLoading && enabledChannelCount === 0 && (
+                    <p className="mb-2 flex items-start gap-1.5 rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-700">
+                      <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span>
+                        This delivers nothing right now: no notification channel is
+                        enabled.{' '}
+                        {isAdmin ? (
+                          <a href="/settings?tab=channels" className="font-medium underline">
+                            Add one in Settings, Alerts
+                          </a>
+                        ) : (
+                          'Ask an admin to add one in Settings, Alerts.'
+                        )}
+                      </span>
+                    </p>
+                  )}
                   <div className="grid grid-cols-2 gap-2">
                     <Field label="Label" value={t.label} onChange={(v) => patch(i, { label: v })} placeholder="e.g. deploy hook" />
                     {t.type === 'webhook' && (

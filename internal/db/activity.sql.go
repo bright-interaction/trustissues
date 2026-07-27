@@ -32,6 +32,22 @@ func (q *Queries) CountActivityEntriesByAction(ctx context.Context, action strin
 	return count, err
 }
 
+const countActivityEntriesByActionPrefix = `-- name: CountActivityEntriesByActionPrefix :one
+SELECT COUNT(*) FROM activity_log WHERE action LIKE ? ESCAPE '\'
+`
+
+// Backs the "vault.*" style category filters. The UI has always offered them,
+// but the only filter query was an exact match, so every wildcard option
+// returned zero rows and looked like "nothing ever happened".
+// The caller passes the prefix WITHOUT the star (e.g. "vault."), and escapes
+// any LIKE metacharacters in it.
+func (q *Queries) CountActivityEntriesByActionPrefix(ctx context.Context, action string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActivityEntriesByActionPrefix, action)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countActivityEntriesByUser = `-- name: CountActivityEntriesByUser :one
 SELECT COUNT(*) FROM activity_log WHERE user_id = ?
 `
@@ -160,6 +176,67 @@ func (q *Queries) ListActivityEntriesByAction(ctx context.Context, arg ListActiv
 	items := []ListActivityEntriesByActionRow{}
 	for rows.Next() {
 		var i ListActivityEntriesByActionRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.UserEmail,
+			&i.Action,
+			&i.Detail,
+			&i.IpAddress,
+			&i.UserAgent,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActivityEntriesByActionPrefix = `-- name: ListActivityEntriesByActionPrefix :many
+SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
+       a.ip_address, a.user_agent, a.created_at
+FROM activity_log a
+LEFT JOIN users u ON a.user_id = u.id
+WHERE a.action LIKE ? ESCAPE '\'
+ORDER BY a.created_at DESC, a.id DESC
+LIMIT ? OFFSET ?
+`
+
+type ListActivityEntriesByActionPrefixParams struct {
+	Action string `json:"action"`
+	Limit  int64  `json:"limit"`
+	Offset int64  `json:"offset"`
+}
+
+type ListActivityEntriesByActionPrefixRow struct {
+	ID        int64          `json:"id"`
+	UserID    sql.NullString `json:"user_id"`
+	UserEmail sql.NullString `json:"user_email"`
+	Action    string         `json:"action"`
+	Detail    sql.NullString `json:"detail"`
+	IpAddress sql.NullString `json:"ip_address"`
+	UserAgent sql.NullString `json:"user_agent"`
+	CreatedAt sql.NullTime   `json:"created_at"`
+}
+
+// See CountActivityEntriesByActionPrefix. Same ordering as the other list
+// queries so paging behaves identically.
+func (q *Queries) ListActivityEntriesByActionPrefix(ctx context.Context, arg ListActivityEntriesByActionPrefixParams) ([]ListActivityEntriesByActionPrefixRow, error) {
+	rows, err := q.db.QueryContext(ctx, listActivityEntriesByActionPrefix, arg.Action, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActivityEntriesByActionPrefixRow{}
+	for rows.Next() {
+		var i ListActivityEntriesByActionPrefixRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
