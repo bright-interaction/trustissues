@@ -229,3 +229,13 @@ SELECT rotation_targets FROM vault_entries WHERE id = ?;
 -- name: ListProviderEntries :many
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
 FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC;
+
+-- name: AnyEncryptedVaultEntry :one
+-- Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
+-- test whether the configured key actually opens this database BEFORE writing
+-- the sentinel. Version 1 rows are excluded: they are sealed under the legacy
+-- SHA-256 key and would not decrypt under the current derivation even when the
+-- configured key is correct.
+SELECT encrypted_value, nonce FROM vault_entries
+WHERE encryption_version = 2 AND length(encrypted_value) > 0
+LIMIT 1;

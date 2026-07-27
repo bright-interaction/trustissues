@@ -2,11 +2,16 @@ package handlers
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+
+	"golang.org/x/crypto/pbkdf2"
 
 	"github.com/brightinteraction/trustissues/internal/columncrypto"
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -62,6 +67,26 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 	}
 
 	if errors.Is(err, sql.ErrNoRows) || stored == "" {
+		// No sentinel yet. This is the ONE boot where the gate does not exist,
+		// and it is exactly the boot where sealing blindly is dangerous: on an
+		// already-populated database (every deployment upgrading into this
+		// feature) booting under the WRONG key would stamp a sentinel for that
+		// wrong key, and from then on the CORRECT key would be rejected forever
+		// while the real data sat there undecryptable. The gate would have failed
+		// open on the only occasion it mattered, then locked out the fix.
+		//
+		// So probe the data first. Only seal when the configured key is either
+		// demonstrably correct, or there is nothing yet to be wrong about.
+		hasCiphertext, opens, probeErr := vaultKeyOpensExistingData(ctx, queries, vaultKey)
+		if probeErr != nil {
+			return fmt.Errorf("probe existing ciphertext: %w", probeErr)
+		}
+		if hasCiphertext && !opens {
+			// Deliberately do NOT write the sentinel: the data must stay
+			// recoverable under whatever key actually sealed it.
+			return ErrVaultKeyMismatch
+		}
+
 		sealed, encErr := columncrypto.EncryptString(vaultKeyCheckPlaintext, vaultKey)
 		if encErr != nil {
 			return fmt.Errorf("seal vault keycheck: %w", encErr)
@@ -71,7 +96,11 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 		}); upErr != nil {
 			return fmt.Errorf("persist vault keycheck: %w", upErr)
 		}
-		slog.Info("vault: key sentinel written; future boots will verify the vault key before touching data")
+		if hasCiphertext {
+			slog.Info("vault: key sentinel written after confirming the configured key opens existing data")
+		} else {
+			slog.Info("vault: key sentinel written on an empty database; future boots will verify the vault key before touching data")
+		}
 		return nil
 	}
 
@@ -80,6 +109,80 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 		return ErrVaultKeyMismatch
 	}
 	return nil
+}
+
+// vaultKeyOpensExistingData reports whether this database already holds
+// ciphertext, and if so whether the configured key opens any of it.
+//
+// It is the guard for the bootstrap boot. Two independent probes are used so a
+// deployment that happens to have one but not the other is still covered:
+//
+//   - a v2-sealed vault secret, opened with the same PBKDF2 derivation
+//     NewVaultHandler uses (salt "trustissues:vault:v2"). v1 rows are skipped
+//     because they are sealed under the legacy SHA-256 key and would fail to
+//     open even under the correct configured key.
+//   - a columncrypto-marked TOTP seed, opened with the columncrypto derivation.
+//
+// hasCiphertext false means there is genuinely nothing to protect yet, so
+// sealing is safe. Errors reading the database are returned rather than treated
+// as "no data": failing to read must never be mistaken for an empty vault, or
+// the guard silently degrades back into the fail-open it exists to prevent.
+func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKey string) (hasCiphertext, opens bool, err error) {
+	// Probe 1: a v2 vault secret.
+	row, vErr := queries.AnyEncryptedVaultEntry(ctx)
+	switch {
+	case vErr == nil:
+		hasCiphertext = true
+		if vaultSecretOpens(row.EncryptedValue, row.Nonce, vaultKey) {
+			return true, true, nil
+		}
+	case errors.Is(vErr, sql.ErrNoRows):
+		// No v2 secrets; fall through to the TOTP probe.
+	default:
+		return false, false, fmt.Errorf("read vault ciphertext: %w", vErr)
+	}
+
+	// Probe 2: a columncrypto-sealed TOTP seed.
+	seeds, sErr := queries.ListUsersWithTOTPSecret(ctx)
+	if sErr != nil {
+		return hasCiphertext, false, fmt.Errorf("read totp secrets: %w", sErr)
+	}
+	for _, s := range seeds {
+		v := nullStringToString(s.TotpSecret)
+		if !columncrypto.IsEncrypted(v) {
+			continue
+		}
+		hasCiphertext = true
+		if _, decErr := columncrypto.DecryptString(v, vaultKey); decErr == nil {
+			return true, true, nil
+		}
+	}
+
+	return hasCiphertext, false, nil
+}
+
+// vaultSecretOpens mirrors VaultHandler.decrypt for a v2 row without needing a
+// constructed handler (the key check runs before one exists).
+func vaultSecretOpens(ciphertext, nonce []byte, vaultKey string) bool {
+	if len(ciphertext) == 0 || len(nonce) == 0 {
+		return false
+	}
+	derived := pbkdf2.Key([]byte(vaultKey), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New)
+	defer func() {
+		for i := range derived {
+			derived[i] = 0
+		}
+	}()
+	block, err := aes.NewCipher(derived)
+	if err != nil {
+		return false
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(nonce) != gcm.NonceSize() {
+		return false
+	}
+	_, err = gcm.Open(nil, nonce, ciphertext, nil)
+	return err == nil
 }
 
 // EnforceVaultKey runs VerifyVaultKey and stops the process on a mismatch,
@@ -100,6 +203,21 @@ func EnforceVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) 
 	if os.Getenv(allowKeyMismatchEnv) == "1" {
 		slog.Warn("vault: KEY MISMATCH OVERRIDDEN via " + allowKeyMismatchEnv + "=1. " +
 			"Existing encrypted data will read as blank and the first edit will overwrite it permanently.")
+		// Re-seal under the key actually in use, so the override is a one-time
+		// deliberate act rather than a flag that has to stay set forever with
+		// the gate disabled. Leaving the old sentinel in place would mean every
+		// later boot needed the override too, and an operator who set it once in
+		// a compose file would silently keep running with no gate at all.
+		if sealed, encErr := columncrypto.EncryptString(vaultKeyCheckPlaintext, vaultKey); encErr == nil {
+			if upErr := queries.UpsertSetting(ctx, db.UpsertSettingParams{
+				Key: vaultKeyCheckSetting, Value: sealed,
+			}); upErr == nil {
+				slog.Warn("vault: key sentinel re-sealed under the current key; remove " +
+					allowKeyMismatchEnv + " from the environment so the gate is active again")
+			} else {
+				slog.Error("vault: could not re-seal the key sentinel", "error", upErr)
+			}
+		}
 		return
 	}
 
