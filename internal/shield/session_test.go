@@ -480,12 +480,18 @@ func TestHintLevelBucketedCoarsensDomain(t *testing.T) {
 		ctx := context.Background()
 		s, _ := NewSession(ctx, store, "session-bk", testKey(), time.Minute, HintBucketed)
 		// Personal-domain email -> "industry=personal" not "domain=gmail.com".
-		marker, _ := s.Tokenize(ctx, KindEmail, "user@example.com", "")
+		// A personal-domain address, and deliberately NOT a real one. The publish
+		// redaction rewrites the maintainer's own address (user@example.com ==>
+		// user@example.com in scripts/mirror-redactions.txt), and example.com is a
+		// BUSINESS domain to domainIndustry, so using a real personal address here
+		// made the PUBLISHED copy of this test assert the opposite of what it checks.
+		// Keep test fixtures synthetic so redaction cannot change their meaning.
+		marker, _ := s.Tokenize(ctx, KindEmail, "user@gmail.com", "")
 		// Tokenize is the low-level path; bucketed mode is applied
 		// in shieldField via buildHintAtLevel, so call Shield on a
 		// tagged struct instead.
 		_ = marker
-		c := contact{ID: "c", Email: "user@example.com", Name: "Tom"}
+		c := contact{ID: "c", Email: "user@gmail.com", Name: "Tom"}
 		if err := s.Shield(ctx, &c); err != nil {
 			t.Fatalf("Shield: %v", err)
 		}
