@@ -194,8 +194,13 @@ export const vaultApi = {
     }),
   // Rotation delivery targets (where a rotated secret is pushed).
   getTargets: (id: string) => request<RotationTarget[]>(`/vault/${id}/targets`),
-  updateTargets: (id: string, targets: RotationTarget[]) =>
-    request<RotationTarget[]>(`/vault/${id}/targets`, {
+  // `clear` must be set to send an EMPTY array. The server refuses a blind
+  // wipe of a non-empty target list, because a failed GET used to render
+  // identically to "no targets" and Save is a full replace, so an accidental []
+  // deleted real targets (webhook HMAC secrets included) with a success toast.
+  // Deleting the last target in the UI is a deliberate act, so the panel opts in.
+  updateTargets: (id: string, targets: RotationTarget[], opts?: { clear?: boolean }) =>
+    request<RotationTarget[]>(`/vault/${id}/targets${opts?.clear ? '?clear=1' : ''}`, {
       method: 'PUT',
       body: JSON.stringify(targets),
     }),
