@@ -88,6 +88,16 @@ type Querier interface {
 	// Integration-owned queries: activity export and admin user listing with
 	// vault entry counts. Kept out of the platform-owned query files per the
 	// CONTRACT.md rule (new queries go in new files).
+	// action_prefix carries a literal prefix such as "vault." for the UI's "vault.*"
+	// category options; action_filter carries an exact action. Exactly one is
+	// non-empty.
+	//
+	// The list endpoint learned the prefix form but this export twin did not, so
+	// selecting a category and clicking Export silently downloaded an EMPTY file:
+	// the exact-match comparison could never match the literal "vault.*". A filtered
+	// export that yields nothing, with no error, reads as "there is no such
+	// activity" rather than "the filter is broken", which is the worst possible
+	// failure for an audit surface.
 	ExportActivityEntries(ctx context.Context, arg ExportActivityEntriesParams) ([]ExportActivityEntriesRow, error)
 	GetCollection(ctx context.Context, id string) (Collection, error)
 	// Authorization lookup: a PENDING membership returns no row, so it grants

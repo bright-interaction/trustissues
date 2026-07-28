@@ -70,9 +70,25 @@ if [ "${MODE}" = "compose" ]; then
   docker compose cp "${SNAPSHOT}" "${SERVICE}:/app/data/trustissues.db"
   # Remove the sidecars WITHOUT starting the service: a one-shot container with
   # no entrypoint, sharing the same volume.
-  docker compose run --rm --no-deps --entrypoint sh "${SERVICE}" -c \
-    'rm -f /app/data/trustissues.db-wal /app/data/trustissues.db-shm && chmod 600 /app/data/trustissues.db' \
-    || { echo "error: could not clear WAL sidecars inside the volume" >&2; exit 2; }
+  # Run the cleanup as ROOT inside the one-shot container, because
+  # `docker compose cp` writes the file owned by the host user (root), and the
+  # service runs as the unprivileged `trustissues` user. Without the chown the
+  # restored database is readable but not writable by the app, so it starts and
+  # then crash-loops on the first write, right after a disaster recovery. chown
+  # needs root, which is why --user 0 is here and not just chmod.
+  docker compose run --rm --no-deps --user 0 --entrypoint sh "${SERVICE}" -c \
+    'rm -f /app/data/trustissues.db-wal /app/data/trustissues.db-shm \
+     && chown trustissues:trustissues /app/data/trustissues.db \
+     && chmod 600 /app/data/trustissues.db' \
+    || { echo "error: could not clear WAL sidecars or fix ownership inside the volume" >&2; exit 2; }
+
+  # Prove the service user can actually WRITE it, rather than assuming the chown
+  # landed. A restore that only looks right is how you find out at 3am.
+  if ! docker compose run --rm --no-deps --entrypoint sh "${SERVICE}" -c \
+      'test -w /app/data/trustissues.db'; then
+    echo "error: the restored database is not writable by the service user; the app would crash-loop" >&2
+    exit 2
+  fi
   echo "done. Start with: docker compose up -d ${SERVICE}"
 else
   DATA_DIR="${TRUSTISSUES_DATA_DIR:-./data}"

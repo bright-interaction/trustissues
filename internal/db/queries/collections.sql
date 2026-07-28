@@ -150,3 +150,4 @@ ORDER BY e.name ASC;
 SELECT e.name FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
    OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL);
+

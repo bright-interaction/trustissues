@@ -3,12 +3,27 @@
 -- CONTRACT.md rule (new queries go in new files).
 
 -- name: ExportActivityEntries :many
+-- action_prefix carries a literal prefix such as "vault." for the UI's "vault.*"
+-- category options; action_filter carries an exact action. Exactly one is
+-- non-empty.
+--
+-- The list endpoint learned the prefix form but this export twin did not, so
+-- selecting a category and clicking Export silently downloaded an EMPTY file:
+-- the exact-match comparison could never match the literal "vault.*". A filtered
+-- export that yields nothing, with no error, reads as "there is no such
+-- activity" rather than "the filter is broken", which is the worst possible
+-- failure for an audit surface.
 SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
        a.ip_address, a.user_agent, a.created_at
 FROM activity_log a
 LEFT JOIN users u ON u.id = a.user_id
 WHERE (CAST(@user_filter AS TEXT) = '' OR a.user_id = @user_filter)
-  AND (CAST(@action_filter AS TEXT) = '' OR a.action = @action_filter)
+  AND (
+        (CAST(@action_filter AS TEXT) = '' AND CAST(@action_prefix AS TEXT) = '')
+     OR (CAST(@action_prefix AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(@action_prefix AS TEXT))) = CAST(@action_prefix AS TEXT))
+     OR (CAST(@action_prefix AS TEXT) = '' AND a.action = @action_filter)
+  )
 ORDER BY a.created_at DESC;
 
 -- name: ListUsersWithEntryCount :many

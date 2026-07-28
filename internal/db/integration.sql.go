@@ -28,13 +28,19 @@ SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
 FROM activity_log a
 LEFT JOIN users u ON u.id = a.user_id
 WHERE (CAST(?1 AS TEXT) = '' OR a.user_id = ?1)
-  AND (CAST(?2 AS TEXT) = '' OR a.action = ?2)
+  AND (
+        (CAST(?2 AS TEXT) = '' AND CAST(?3 AS TEXT) = '')
+     OR (CAST(?3 AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(?3 AS TEXT))) = CAST(?3 AS TEXT))
+     OR (CAST(?3 AS TEXT) = '' AND a.action = ?2)
+  )
 ORDER BY a.created_at DESC
 `
 
 type ExportActivityEntriesParams struct {
 	UserFilter   string `json:"user_filter"`
 	ActionFilter string `json:"action_filter"`
+	ActionPrefix string `json:"action_prefix"`
 }
 
 type ExportActivityEntriesRow struct {
@@ -51,8 +57,18 @@ type ExportActivityEntriesRow struct {
 // Integration-owned queries: activity export and admin user listing with
 // vault entry counts. Kept out of the platform-owned query files per the
 // CONTRACT.md rule (new queries go in new files).
+// action_prefix carries a literal prefix such as "vault." for the UI's "vault.*"
+// category options; action_filter carries an exact action. Exactly one is
+// non-empty.
+//
+// The list endpoint learned the prefix form but this export twin did not, so
+// selecting a category and clicking Export silently downloaded an EMPTY file:
+// the exact-match comparison could never match the literal "vault.*". A filtered
+// export that yields nothing, with no error, reads as "there is no such
+// activity" rather than "the filter is broken", which is the worst possible
+// failure for an audit surface.
 func (q *Queries) ExportActivityEntries(ctx context.Context, arg ExportActivityEntriesParams) ([]ExportActivityEntriesRow, error) {
-	rows, err := q.db.QueryContext(ctx, exportActivityEntries, arg.UserFilter, arg.ActionFilter)
+	rows, err := q.db.QueryContext(ctx, exportActivityEntries, arg.UserFilter, arg.ActionFilter, arg.ActionPrefix)
 	if err != nil {
 		return nil, err
 	}

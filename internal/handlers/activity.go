@@ -174,7 +174,8 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
 		UserFilter:   r.URL.Query().Get("user_id"),
-		ActionFilter: r.URL.Query().Get("action"),
+		ActionFilter: exportExactAction(r.URL.Query().Get("action")),
+		ActionPrefix: exportPrefixAction(r.URL.Query().Get("action")),
 	})
 	if err != nil {
 		logError(r, "activity.export_csv: query failed", "error", err)
@@ -229,7 +230,8 @@ func csvSafe(v string) string {
 func (h *ActivityHandler) ExportJSON(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
 		UserFilter:   r.URL.Query().Get("user_id"),
-		ActionFilter: r.URL.Query().Get("action"),
+		ActionFilter: exportExactAction(r.URL.Query().Get("action")),
+		ActionPrefix: exportPrefixAction(r.URL.Query().Get("action")),
 	})
 	if err != nil {
 		logError(r, "activity.export_json: query failed", "error", err)
@@ -289,4 +291,23 @@ func logActivityInternal(q *db.Queries, userID *string, action, detail, ipAddres
 	if err != nil {
 		slog.Error("failed to log activity", "error", err, "action", action)
 	}
+}
+
+// exportPrefixAction / exportExactAction split a UI action filter into the two
+// bind params ExportActivityEntries takes. The list endpoint learned the
+// "vault.*" category convention; its export twin did not, so choosing a category
+// and clicking Export downloaded an EMPTY file with no error, which reads as
+// "no such activity" rather than "the filter is broken".
+func exportPrefixAction(filter string) string {
+	if strings.HasSuffix(filter, ".*") {
+		return strings.TrimSuffix(filter, "*")
+	}
+	return ""
+}
+
+func exportExactAction(filter string) string {
+	if strings.HasSuffix(filter, ".*") {
+		return ""
+	}
+	return filter
 }

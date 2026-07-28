@@ -628,10 +628,37 @@ type capabilityEntryRow struct {
 	DestinationPatterns string
 }
 
+// accessibleEntriesPredicate is the collection-aware scope every capability
+// lookup must use.
+//
+// These lookups previously matched on user_id alone, which bypassed
+// entryAccess entirely (vault.go says in as many words: "the single
+// authorization point for every single-entry operation; do not bypass it with a
+// raw owner check"). Two bugs fell out of that, in opposite directions:
+//
+//   - a member removed from a collection kept LIVE USE of the shared secret,
+//     because they were still its user_id. They vanished from the vault UI and
+//     from unlock, but could still mint a capability token and have the proxy
+//     inject the CURRENT, post-rotation value upstream. Rotation, the documented
+//     revocation step, did not revoke them. This is the third distinct door onto
+//     the same property (after the residual write right and the rotation
+//     webhook), which is why the scope now comes from one shared predicate.
+//   - a current viewer or editor of a collection could NOT mint for a shared
+//     secret they legitimately have access to, because they are not its user_id.
+//
+// Bind params: userID twice.
+const accessibleEntriesPredicate = `(
+	(collection_id IS NULL AND user_id = ?)
+	OR collection_id IN (
+		SELECT collection_id FROM collection_members
+		WHERE user_id = ? AND accepted_at IS NOT NULL
+	)
+)`
+
 func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name string) (capabilityEntryRow, error) {
 	row := h.db.QueryRowContext(ctx,
-		`SELECT id, name, destination_patterns FROM vault_entries WHERE user_id = ? AND name = ?`,
-		userID, name)
+		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+` AND name = ?`,
+		userID, userID, name)
 	var e capabilityEntryRow
 	if err := row.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
 		return capabilityEntryRow{}, err
@@ -641,8 +668,9 @@ func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name
 
 func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userID, dest string) (capabilityEntryRow, error) {
 	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, name, destination_patterns FROM vault_entries WHERE user_id = ? AND destination_patterns != '' AND destination_patterns != '[]'`,
-		userID)
+		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+
+			` AND destination_patterns != '' AND destination_patterns != '[]'`,
+		userID, userID)
 	if err != nil {
 		return capabilityEntryRow{}, err
 	}
