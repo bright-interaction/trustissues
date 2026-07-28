@@ -31,6 +31,12 @@ func mcpTestDB(t *testing.T) *sql.DB {
 	);
 	CREATE TABLE collection_members (
 		collection_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer',
+		-- accepted_at is REQUIRED by ListAccessibleVaultEntryNames, which filters
+		-- on "accepted_at IS NOT NULL" so a pending invitation grants nothing.
+		-- Omitting it made the query error, and toolListSecrets reported the
+		-- generic "could not list secrets" rather than surfacing the SQL fault.
+		-- Default to accepted so existing fixtures behave as before.
+		accepted_at TEXT DEFAULT (datetime('now')),
 		PRIMARY KEY (collection_id, user_id)
 	);
 	`

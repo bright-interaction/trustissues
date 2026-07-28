@@ -444,9 +444,14 @@ func newTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	stmts := []string{
+		// collection_id + collection_members mirror migration 00023. They are not
+		// optional decoration: capability lookups are collection-scoped, so a
+		// fixture without them fails at SQL level and would hide a regression in
+		// the offboarding rule. NULL collection_id means a personal entry.
 		`CREATE TABLE vault_entries (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
+			collection_id TEXT,
 			name TEXT NOT NULL,
 			encrypted_value BLOB NOT NULL,
 			nonce BLOB NOT NULL,
@@ -454,6 +459,14 @@ func newTestDB(t *testing.T) *sql.DB {
 			destination_patterns TEXT NOT NULL DEFAULT '[]',
 			injection_spec TEXT NOT NULL DEFAULT '{}',
 			UNIQUE(user_id, name)
+		)`,
+		`CREATE TABLE collection_members (
+			collection_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'viewer',
+			added_at TEXT NOT NULL DEFAULT (datetime('now')),
+			accepted_at TEXT,
+			PRIMARY KEY (collection_id, user_id)
 		)`,
 		`CREATE TABLE capability_grants (
 			agent_id TEXT NOT NULL,

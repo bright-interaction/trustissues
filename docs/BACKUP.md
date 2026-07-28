@@ -143,8 +143,15 @@ must never be recoverable from the same place.
    ```bash
    docker compose stop trustissues
    docker compose cp ./trustissues.db trustissues:/app/data/trustissues.db
-   docker compose run --rm --no-deps --entrypoint sh trustissues -c \
-     'rm -f /app/data/trustissues.db-wal /app/data/trustissues.db-shm && chmod 600 /app/data/trustissues.db'
+   # --user 0 is required: `docker compose cp` writes the file as root, while the
+   # service runs as the unprivileged `trustissues` user. Without the chown the
+   # app starts and then crash-loops on its first write.
+   docker compose run --rm --no-deps --user 0 --entrypoint sh trustissues -c \
+     'rm -f /app/data/trustissues.db-wal /app/data/trustissues.db-shm \
+      && chown trustissues:trustissues /app/data/trustissues.db \
+      && chmod 600 /app/data/trustissues.db'
+   # Confirm the service user can write it before starting:
+   docker compose run --rm --no-deps --entrypoint sh trustissues -c 'test -w /app/data/trustissues.db'
    docker compose up -d trustissues
    ```
 

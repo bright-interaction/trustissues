@@ -187,7 +187,13 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 	// the caller's OWN entries, so advertising collection secrets here would list
 	// names the agent can never obtain a token for, and would leak the names of
 	// shared secrets to a model for no benefit. Keep the list to what is usable.
-	names, err := h.queries.ListVaultEntryNamesByUser(ctx, userID)
+	// Accessible scope, not user_id alone: the advertised set must match what the
+	// capability bridge will actually mint for. Listing by owner meant a member
+	// removed from a collection still saw the shared entry offered to their agent
+	// (and, before the lookup fix, could still mint for it).
+	names, err := h.queries.ListAccessibleVaultEntryNames(ctx, db.ListAccessibleVaultEntryNamesParams{
+		UserID: userID, UserID_2: userID,
+	})
 	if err != nil {
 		return "could not list secrets", true
 	}
