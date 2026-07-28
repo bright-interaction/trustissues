@@ -318,7 +318,13 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 
 	qtx := h.handler.queries.WithTx(tx)
 
+	// Entries the import could not create. They used to be dropped with only a
+	// slog line, while the response reported just `imported` and the UI showed a
+	// success toast: a 200-entry export with 12 duplicate titles silently became
+	// 188 entries and the user had no way to know which 12 were missing until
+	// they needed one. Every drop is now named and returned.
 	imported := 0
+	skipped := []skippedEntry{}
 	for _, entry := range req.Entries {
 		// Skip if requested or unusable
 		if entry.Skip || entry.Name == "" || entry.Value == "" {
@@ -353,6 +359,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		encURL, _, encUser, encCat, encNotes, encErr := h.handler.encryptMetaColumns(entry.URL, "", entry.Username, category, entry.Notes)
 		if encErr != nil {
 			slog.Error("failed to encrypt entry metadata", "name", entry.Name, "error", encErr)
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be encrypted"})
 			continue
 		}
 
@@ -373,9 +380,14 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {
 				slog.Warn("skipping duplicate entry", "name", entry.Name)
+				skipped = append(skipped, skippedEntry{
+					Name:   entry.Name,
+					Reason: "a secret with this name already exists (names are unique per user)",
+				})
 				continue
 			}
 			slog.Error("failed to insert entry", "name", entry.Name, "error", err)
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be saved (details in server logs)"})
 			continue
 		}
 
@@ -389,10 +401,22 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Log activity
-	LogActivityFromRequest(h.handler.queries, r, "vault.imported", fmt.Sprintf("Imported %d vault entries", imported))
+	detail := fmt.Sprintf("Imported %d vault entries", imported)
+	if len(skipped) > 0 {
+		detail = fmt.Sprintf("Imported %d vault entries, skipped %d", imported, len(skipped))
+	}
+	LogActivityFromRequest(h.handler.queries, r, "vault.imported", detail)
 
 	writeJSON(w, http.StatusOK, map[string]any{
+		"skipped":  skipped,
 		"imported": imported,
 		"total":    len(req.Entries),
 	})
+}
+
+// skippedEntry names one entry the import could not create, and why. Returned
+// to the caller so a partial import is visible rather than silently partial.
+type skippedEntry struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }

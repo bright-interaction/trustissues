@@ -56,7 +56,24 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
     try {
       const entriesToImport = preview.entries.filter(entry => !entry.skip);
       const result = await vaultApi.importConfirm(entriesToImport);
-      toast.success(`Successfully imported ${result.imported} entries`);
+      const skipped = result.skipped ?? [];
+      if (skipped.length > 0) {
+        // A partial import used to report plain success: entries with a
+        // duplicate title were dropped server-side and the user only found out
+        // when they went looking for one. Name them, and keep the message up
+        // until dismissed rather than letting it flash past.
+        toast.error(
+          `Imported ${result.imported}, skipped ${skipped.length}: ` +
+            skipped
+              .slice(0, 5)
+              .map((s) => `"${s.name}" (${s.reason})`)
+              .join('; ') +
+            (skipped.length > 5 ? `, and ${skipped.length - 5} more` : ''),
+          { duration: 15000 }
+        );
+      } else {
+        toast.success(`Successfully imported ${result.imported} entries`);
+      }
       onImportComplete();
       reset();
     } catch (error: unknown) {

@@ -220,7 +220,7 @@ export const vaultApi = {
     });
   },
   importConfirm: (entries: ImportEntry[]) =>
-    request<{ imported: number }>('/vault/import/confirm', {
+    request<{ imported: number; skipped?: { name: string; reason: string }[] }>('/vault/import/confirm', {
       method: 'POST',
       body: JSON.stringify({ entries }),
     }),
