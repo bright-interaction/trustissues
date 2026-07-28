@@ -264,6 +264,11 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 // verification are NOT persisted: the route is reachable anonymously, so an
 // audit row there would be an unauthenticated, attacker-controlled DB write.
 func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
+	// Just above this client's 60s GuardedWebhookClient budget. The same global
+	// 30s write deadline silently truncated any upstream call taking 30-60s,
+	// including the OpenAI streaming case its 16 MiB body cap was sized for.
+	extendProxyDeadlines(w, 70*time.Second, time.Minute)
+
 	ctx := r.Context()
 	host := chi.URLParam(r, "host")
 	rest := chi.URLParam(r, "*")

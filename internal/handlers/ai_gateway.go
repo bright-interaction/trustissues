@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -89,6 +91,10 @@ func NewAIGatewayHandler(queries *db.Queries, cfg *config.Config, vault *VaultHa
 // Proxy handles /api/ai/{provider}/* for POST and GET, forwarding to the
 // provider with the stored key injected.
 func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
+	// Above the upstream client's own 5-minute budget, so the client's timeout
+	// is what bounds the call rather than the server cutting the socket.
+	extendProxyDeadlines(w, 6*time.Minute, time.Minute)
+
 	ctx := r.Context()
 	providerName := chi.URLParam(r, "provider")
 	p, ok := h.providers[providerName]
@@ -186,8 +192,6 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.logUsage(r, providerName, resp.StatusCode, respBody)
-
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {
@@ -195,7 +199,24 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(respBody)
+
+	// Log AFTER the write, with what actually happened. logUsage used to run
+	// before it, so a response the caller never received was recorded as a clean
+	// 200: an operator investigating "my calls keep failing" saw only successes,
+	// while the provider had been billed and the prompt had already egressed.
+	//
+	// The explicit Flush matters: a body under the 4 KB bufio buffer is not
+	// written to the socket until after the handler returns, so w.Write alone
+	// reports success even when the connection is already dead.
+	_, writeErr := w.Write(respBody)
+	if writeErr == nil {
+		if rc := http.NewResponseController(w); rc != nil {
+			if fErr := rc.Flush(); fErr != nil && !errors.Is(fErr, http.ErrNotSupported) {
+				writeErr = fErr
+			}
+		}
+	}
+	h.logUsage(r, providerName, resp.StatusCode, respBody, writeErr)
 }
 
 // requestsStreaming reports whether the JSON body sets "stream": true.
@@ -210,7 +231,7 @@ func requestsStreaming(body []byte) bool {
 // logUsage records an attributed, best-effort usage line in the activity log.
 // It extracts token counts from the provider response (Anthropic and OpenAI use
 // different field names) without logging any prompt or completion content.
-func (h *AIGatewayHandler) logUsage(r *http.Request, provider string, status int, respBody []byte) {
+func (h *AIGatewayHandler) logUsage(r *http.Request, provider string, status int, respBody []byte, writeErr error) {
 	var u struct {
 		Model string `json:"model"`
 		Usage struct {
@@ -224,9 +245,16 @@ func (h *AIGatewayHandler) logUsage(r *http.Request, provider string, status int
 	in := u.Usage.InputTokens + u.Usage.PromptTokens
 	out := u.Usage.OutputTokens + u.Usage.CompletionTokens
 	userID := middleware.GetUserID(r.Context())
+	delivered := "yes"
+	if writeErr != nil {
+		// The provider billed us and the prompt already left, but the caller got
+		// nothing. Record that distinctly so it is not read as a clean success.
+		delivered = "NO (response not delivered to the caller)"
+		logError(r, "ai_gateway: response could not be delivered", "provider", provider, "error", writeErr)
+	}
 	LogActivityFromRequest(h.queries, r, "ai.gateway_call",
-		fmt.Sprintf("AI call: provider=%s model=%s status=%d in=%d out=%d user=%s",
-			provider, u.Model, status, in, out, userID))
+		fmt.Sprintf("AI call: provider=%s model=%s status=%d in=%d out=%d user=%s delivered=%s",
+			provider, u.Model, status, in, out, userID, delivered))
 }
 
 func randSessionID() string {
@@ -313,4 +341,31 @@ func (h *AIGatewayHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	LogActivityFromRequest(h.queries, r, "ai.config_updated", "AI gateway provider keys updated")
 	h.GetConfig(w, r)
+}
+
+// extendProxyDeadlines lifts the server's global 30s write deadline for a single
+// long-running proxied request.
+//
+// http.Server applies WriteTimeout once, when the request headers are read, so
+// it bounds handler execution plus the response flush for the WHOLE request. The
+// shared server sets 30s, which is right for ordinary API calls but far below
+// what these two routes need: the AI gateway gives its upstream client a
+// 5-minute budget and rejects stream:true, so the only supported mode is the one
+// that blocks longest, and a 4000-token completion routinely exceeds 30s. The
+// caller then got a bare EOF with no status code and no JSON error body, which
+// an SDK treats as a transport failure and retries, doubling the spend on a
+// provider call that had already succeeded and already received the prompt.
+//
+// Raising the global value instead would hand every other route a multi-minute
+// slow-loris window, so the extension is per-handler and explicit. The read
+// deadline stays short: the request body is small and bounded, and only the
+// response is slow.
+func extendProxyDeadlines(w http.ResponseWriter, write, read time.Duration) {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(write)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.Warn("proxy: could not extend write deadline; long responses may be truncated", "error", err)
+	}
+	if err := rc.SetReadDeadline(time.Now().Add(read)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.Warn("proxy: could not extend read deadline", "error", err)
+	}
 }

@@ -92,6 +92,23 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 	if in == "" {
 		return in, nil
 	}
+	// Never tokenize inside an encoded binary blob. ShieldJSON recurses into
+	// every string leaf, so an image attachment (Anthropic's
+	// messages[].content[].source.data, OpenAI's data: URI) was scanned by the
+	// PII regexes. Base64 is a dense run of digits and letters, so the phone and
+	// personnummer patterns match by chance and a marker gets spliced into the
+	// payload: the provider then receives a corrupt image, and unshielding on the
+	// way back cannot restore it because the surrounding bytes shifted.
+	//
+	// Verified with a random 4000-byte blob: one run came back with a
+	// [shield:phone:...] marker at offset 4392. It is probabilistic, which is
+	// worse than deterministic, because it corrupts a fraction of uploads.
+	//
+	// Skipping loses nothing: base64 is opaque to the model as text, so any PII
+	// inside it was never legible to tokenize in the first place.
+	if looksLikeEncodedBlob(in) {
+		return in, nil
+	}
 	out := in
 	for _, p := range redactPatterns {
 		var firstErr error
@@ -106,7 +123,15 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 			if p.kind == KindHostname && looksLikeFilename(match) {
 				return match
 			}
-			hint := buildHint(p.kind, match, p.hint)
+			// Honour the session's configured level. This used to call
+			// buildHint, which hardcodes HintFull, so
+			// TRUSTISSUES_SHIELD_HINT_LEVEL was inert on the ONLY production
+			// tokenization path (the AI gateway): setting bucketed, minimal or
+			// none still egressed full value-derived metadata (email domain,
+			// exact length, personnummer century) to the LLM provider. The
+			// struct-tag path already did this correctly, which is how the two
+			// diverged unnoticed.
+			hint := buildHintAtLevel(p.kind, match, p.hint, s.hintLevel)
 			marker, err := s.Tokenize(ctx, p.kind, match, hint)
 			if err != nil {
 				if firstErr == nil {
@@ -162,4 +187,42 @@ func replaceOutsideMarkers(s string, re *regexp.Regexp, repl func(string) string
 	}
 	b.WriteString(re.ReplaceAllStringFunc(s[last:], repl))
 	return b.String()
+}
+
+// encodedBlobMinLen is the shortest string treated as an encoded binary blob.
+//
+// It has to sit well above any realistic PII value (the longest thing the
+// patterns match is an IBAN at ~34 characters) and well below a real attachment
+// (a 1x1 PNG is already ~100 bytes of base64, a real screenshot is tens of
+// kilobytes). 512 leaves a wide margin on both sides.
+const encodedBlobMinLen = 512
+
+// looksLikeEncodedBlob reports whether a string is an encoded binary payload
+// rather than human text, so RedactString can leave it alone.
+//
+// Deliberately conservative: it requires the string to be long AND to consist
+// entirely of the base64 alphabet (optionally behind a data: URI prefix). Prose
+// fails immediately on the first space or comma, so this cannot silently exempt
+// a paragraph that happens to contain an email address.
+func looksLikeEncodedBlob(s string) bool {
+	// A data: URI carries its payload after the comma; judge the payload.
+	if strings.HasPrefix(s, "data:") {
+		if i := strings.IndexByte(s, ','); i >= 0 && i+1 < len(s) {
+			s = s[i+1:]
+		}
+	}
+	if len(s) < encodedBlobMinLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '+', c == '/', c == '=', c == '-', c == '_':
+			// '-' and '_' cover base64url.
+		default:
+			return false
+		}
+	}
+	return true
 }
