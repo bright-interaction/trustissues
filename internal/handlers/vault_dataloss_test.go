@@ -169,3 +169,115 @@ func TestImportCarriesTOTPAndCustomFields(t *testing.T) {
 		t.Error("the LastPass TOTP column was dropped")
 	}
 }
+
+// TestGuardRunsBeforeEveryWrite is the test the first version of this guard
+// needed and did not have.
+//
+// The guard originally sat BELOW the custom_fields, destination_patterns and
+// value writes. For custom_fields that made it inert: it re-read the row after
+// that column had already been replaced, inspected its own fresh write, and
+// returned 200 with the recoverable ciphertext gone. For any other damaged
+// column it returned 409 "nothing was changed" having already wiped
+// custom_fields and the agent destination ceiling.
+//
+// TestUndecryptableMetadataIsNotOverwritten could not see either case, because
+// it damages `notes` and asserts on `notes` and `name`, both of which are
+// written AFTER the guard. A test whose request shape never includes the
+// columns written first cannot detect a guard that runs too late.
+func TestGuardRunsBeforeEveryWrite(t *testing.T) {
+	corrupt := func(t *testing.T, h *VaultHandler, plain string) string {
+		t.Helper()
+		sealed, err := h.encryptColumn(plain)
+		if err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+		b := []byte(sealed)
+		b[len(b)-3] ^= 0x01
+		if _, decErr := h.decryptColumn(string(b)); decErr == nil {
+			t.Fatal("ABORT: the corrupted blob still decrypts; the test would be vacuous")
+		}
+		return string(b)
+	}
+
+	// Case A: custom_fields IS the damaged column. The old guard read its own
+	// fresh write here and returned 200.
+	t.Run("damaged custom_fields is not silently replaced", func(t *testing.T) {
+		h, queries := newCollectionAuthzEnv(t)
+		ctx := context.Background()
+		owner := mustUser(t, queries, "guardA@example.com", "user", "")
+		mustEntry(t, h, queries, "entry-gA", owner, "A", "v")
+
+		bad := corrupt(t, h, `[{"label":"recovery_pin","value":"998877","secret":true}]`)
+		if err := queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
+			CustomFields: bad, ID: "entry-gA",
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		// Exactly what the shipped edit form sends: custom_fields always included.
+		rec := updateEntry(t, h, owner, "entry-gA", map[string]any{
+			"name": "A", "notes": "typo fixed", "custom_fields": []any{},
+		})
+		if rec.Code != http.StatusConflict {
+			t.Errorf("a save over damaged custom_fields returned %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+		meta, err := queries.GetVaultEntryMeta(ctx, "entry-gA")
+		if err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		if meta.CustomFields != bad {
+			t.Errorf("the damaged custom_fields blob was replaced with %q; TOTP seeds and recovery PINs in it are unrecoverable now", meta.CustomFields)
+		}
+	})
+
+	// Case B: a DIFFERENT column is damaged. The 409 must be literally true:
+	// custom_fields and destination_patterns must be untouched.
+	t.Run("409 nothing-was-changed is true for the columns written first", func(t *testing.T) {
+		h, queries := newCollectionAuthzEnv(t)
+		ctx := context.Background()
+		owner := mustUser(t, queries, "guardB@example.com", "user", "")
+		mustEntry(t, h, queries, "entry-gB", owner, "B", "v")
+
+		goodCF, err := h.encryptColumn(`[{"label":"pin","value":"1234","secret":true}]`)
+		if err != nil {
+			t.Fatalf("seal cf: %v", err)
+		}
+		if err := queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
+			CustomFields: goodCF, ID: "entry-gB",
+		}); err != nil {
+			t.Fatalf("seed cf: %v", err)
+		}
+		if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+			DestinationPatterns: `["api.stripe.com/v1/*"]`, ID: "entry-gB",
+		}); err != nil {
+			t.Fatalf("seed dp: %v", err)
+		}
+		badNotes := corrupt(t, h, "runbook")
+		if err := queries.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{
+			Notes: toNullString(badNotes), ID: "entry-gB",
+		}); err != nil {
+			t.Fatalf("seed notes: %v", err)
+		}
+
+		rec := updateEntry(t, h, owner, "entry-gB", map[string]any{
+			"name": "B", "notes": "", "custom_fields": []any{},
+			"destination_patterns": []any{"evil.example.com/*"},
+		})
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		meta, err := queries.GetVaultEntryMeta(ctx, "entry-gB")
+		if err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		if meta.CustomFields != goodCF {
+			t.Error(`the 409 said "nothing was changed" but custom_fields was already wiped`)
+		}
+		if meta.DestinationPatterns != `["api.stripe.com/v1/*"]` {
+			t.Errorf(`the 409 said "nothing was changed" but the agent destination ceiling became %q; `+
+				"an operator who saw the refusal has silently changed which hosts an agent token can reach",
+				meta.DestinationPatterns)
+		}
+	})
+}

@@ -1342,6 +1342,55 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse the whole request if any encrypted column on this entry cannot be
+	// opened, BEFORE writing anything.
+	//
+	// Placement is the whole fix. This guard first shipped below the
+	// custom_fields, destination_patterns and value writes, which made it worse
+	// than useless: for custom_fields it re-read the row AFTER that column had
+	// already been replaced, so it inspected its own fresh write, never fired,
+	// and returned 200 while the still-recoverable ciphertext was gone. When a
+	// different column was the damaged one it returned 409 "nothing was changed"
+	// having already wiped custom_fields and the agent destination ceiling. A
+	// guard that reports protection while destroying data is the worst shape
+	// available.
+	//
+	// The edit form always resubmits every metadata field, and an undecryptable
+	// column reads back as "" or [], so an ordinary save on a damaged entry
+	// would replace recoverable ciphertext with NULL. custom_fields can hold
+	// secret:true values (the importer parks TOTP seeds and recovery PINs
+	// there), so this is not merely metadata.
+	//
+	// Refusing the WHOLE request rather than skipping the damaged column is
+	// deliberate: a partial save on a damaged entry gives the operator no signal
+	// that anything was withheld.
+	if req.Name != nil || req.URL != nil || req.AliasURL != nil || req.Username != nil ||
+		req.Category != nil || req.Notes != nil || req.CustomFields != nil ||
+		req.DestinationPatterns != nil || req.Value != nil {
+		damaged, metaErr := h.queries.GetVaultEntryMeta(ctx, id)
+		if metaErr != nil {
+			// Fail closed. Skipping the check on a read error is how a guard
+			// quietly stops guarding.
+			logError(r, "vault.update: could not read the entry to check it is intact", "entry", id, "error", metaErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if field, broken := h.anyMetaColumnUndecryptable(map[string]string{
+			"url":           damaged.Url.String,
+			"alias_url":     damaged.AliasUrl.String,
+			"username":      damaged.Username.String,
+			"category":      damaged.Category.String,
+			"notes":         damaged.Notes.String,
+			"custom_fields": damaged.CustomFields,
+		}); broken {
+			logError(r, "vault.update: refusing to overwrite an undecryptable column", "entry", id, "field", field)
+			writeError(w, r, http.StatusConflict, "decrypt_failed",
+				"part of this entry ("+field+") could not be decrypted, so nothing was changed; saving would have overwritten data that is still recoverable with the correct key")
+			return
+		}
+	}
+
+
 	// Custom fields: nil means "unchanged"; a present (even empty) array replaces
 	// the set. Encrypted at rest.
 	if req.CustomFields != nil {
@@ -1434,31 +1483,6 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			}); err != nil {
 				logError(r, "vault.update: update value failed", "error", err)
 				writeInternalError(w, r, "failed to update secret value")
-				return
-			}
-		}
-	}
-
-	// Refuse the whole request if any encrypted column on this entry cannot be
-	// opened. The edit form always resubmits every metadata field, and an
-	// undecryptable column reads back as "", so an ordinary save would replace
-	// still-recoverable ciphertext with NULL. Refusing the WHOLE request rather
-	// than skipping the damaged column is deliberate: a partial save on a damaged
-	// entry gives the operator no signal that anything was withheld.
-	if req.Name != nil || req.URL != nil || req.AliasURL != nil || req.Username != nil ||
-		req.Category != nil || req.Notes != nil || req.CustomFields != nil {
-		if damaged, err := h.queries.GetVaultEntryMeta(ctx, id); err == nil {
-			if field, broken := h.anyMetaColumnUndecryptable(map[string]string{
-				"url":           damaged.Url.String,
-				"alias_url":     damaged.AliasUrl.String,
-				"username":      damaged.Username.String,
-				"category":      damaged.Category.String,
-				"notes":         damaged.Notes.String,
-				"custom_fields": damaged.CustomFields,
-			}); broken {
-				logError(r, "vault.update: refusing to overwrite an undecryptable column", "entry", id, "field", field)
-				writeError(w, r, http.StatusConflict, "decrypt_failed",
-					"part of this entry ("+field+") could not be decrypted, so nothing was changed; saving would have overwritten data that is still recoverable with the correct key")
 				return
 			}
 		}
@@ -2213,7 +2237,20 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 // GetTargets handles GET /api/vault/{id}/targets - returns rotation targets for an entry.
 func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if canRead, _ := h.entryAccess(r, id); !canRead {
+	// WRITE access, not read. Rotation targets are a management surface and
+	// they carry OTHER people's credentials: webhook HMAC signing secrets and
+	// forgejo auth_token references, configured by other members.
+	//
+	// Gating on read leaked them twice over. entryAccessFor deliberately grants
+	// a removed creator a residual READ so they can recover a secret they own
+	// (without it, a member could move the entry into a collection the creator
+	// is not in and strip them of their own secret permanently). That right is
+	// for recovering their own value; it is not a licence to keep reading the
+	// delivery configuration of a collection they were removed from. A plain
+	// viewer had the same reach for the same reason.
+	//
+	// Matching UpdateTargets means one rule covers both halves of the surface.
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -2268,6 +2305,21 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	//
 	// Preserving the stored attribution keeps the security question honest:
 	// "who set this up" must not change because someone else pressed Save.
+	// Never write over a targets column we could not read. decryptColumnOrLog
+	// renders a decrypt failure as "[]", which GetTargets returns as 200 with an
+	// empty list, so the panel shows "No delivery targets" and the next save
+	// permanently replaces still-recoverable ciphertext, webhook HMAC signing
+	// secrets included. Same class as the guard Update has on its metadata
+	// columns; this surface never got the equivalent.
+	if strings.TrimSpace(existingTargets) != "" {
+		if _, decErr := h.decryptColumn(existingTargets); decErr != nil {
+			logError(r, "vault.targets: refusing to overwrite an undecryptable targets column", "entry", id, "error", decErr)
+			writeError(w, r, http.StatusConflict, "decrypt_failed",
+				"the existing delivery targets could not be decrypted, so nothing was changed; saving would have overwritten data that is still recoverable with the correct key")
+			return
+		}
+	}
+
 	// Refuse a blind wipe. UpdateTargets is a full replace, so an empty array
 	// deletes every stored target including webhook HMAC secrets that exist
 	// nowhere else. The panel could send one by accident: a failed GET rendered
