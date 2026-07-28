@@ -104,3 +104,49 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 		t.Error("a normal replace lost the target")
 	}
 }
+
+// TestDamagedTargetsColumnIsNotOverwritten gives rotation_targets the same
+// protection Update has for its metadata columns.
+//
+// decryptColumnOrLog renders a decrypt failure as "[]", so GetTargets answered
+// 200 with an empty list and the panel showed "No delivery targets". Saving from
+// that view permanently replaced still-recoverable ciphertext, webhook HMAC
+// signing secrets included. The ?clear=1 guard does not help: the stored list
+// parses as empty, so it is not seen as a wipe at all.
+func TestDamagedTargetsColumnIsNotOverwritten(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+	owner := mustUser(t, queries, "damaged-targets@example.com", "user", "")
+	const entryID = "entry-dmg-targets"
+	mustEntry(t, h, queries, entryID, owner, "Stripe", "sk_live_x")
+
+	sealed, err := h.encryptColumn(`[{"type":"webhook","webhook_url":"https://c.example.com/h","webhook_secret":"HMAC"}]`)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	bad := []byte(sealed)
+	bad[len(bad)-3] ^= 0x01
+	if _, decErr := h.decryptColumn(string(bad)); decErr == nil {
+		t.Fatal("ABORT: the corrupted column still decrypts; the test would be vacuous")
+	}
+	if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+		RotationTargets: toNullString(string(bad)), ID: entryID,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID,
+		`[{"type":"webhook","label":"new","webhook_url":"https://new.example.com/h"}]`))
+	if rec.Code != http.StatusConflict {
+		t.Errorf("a save over an undecryptable targets column returned %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	raw, err := queries.GetVaultEntryTargets(ctx, entryID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if raw.String != string(bad) {
+		t.Error("the still-recoverable targets ciphertext was overwritten; the webhook HMAC secret is unrecoverable now")
+	}
+}

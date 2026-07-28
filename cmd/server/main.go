@@ -349,6 +349,14 @@ func main() {
 	loginLimiter := timw.NewRateLimiter(30, 15*time.Minute)
 	apiLimiter := timw.NewRateLimiter(500, 1*time.Minute)
 	sensitiveOpLimiter := timw.NewRateLimiter(5, 15*time.Minute)
+	// The capability bridge needs its own bucket. It shared the 5-per-15-minutes
+	// bucket with rotate and validate, and it is keyed by IP, so an agent behind
+	// one egress address could mint only 5 single-use tokens per 15 minutes
+	// across the whole team: the tokens are deliberately single-use and
+	// short-lived, so ordinary use exhausts it in a minute and then also locks
+	// out manual rotation from that address. A limit that makes the feature
+	// unusable is not a security control, it is an outage.
+	capabilityLimiter := timw.NewRateLimiter(60, time.Minute)
 	unlockLimiter := timw.NewRateLimiter(30, 15*time.Minute)
 	// The capability proxy is mounted on the root router, outside /api and its
 	// apiLimiter, because it authenticates with a capability token instead of a
@@ -360,7 +368,7 @@ func main() {
 	// MCP shares the sensitive-op budget with POST /api/secrets/issue: its
 	// use_secret tool mints capability tokens by calling the Issue handler
 	// in-process, which would otherwise skip the route's rate-limit middleware.
-	mcpHandler := handlers.NewMCPHandler(queries, cfg, capabilityHandler, shieldStore, sensitiveOpLimiter)
+	mcpHandler := handlers.NewMCPHandler(queries, cfg, capabilityHandler, shieldStore, capabilityLimiter)
 
 	// Build router.
 	r := chi.NewRouter()
@@ -555,7 +563,7 @@ func main() {
 			// Capability bridge token minting (dockyard main.go:894-896).
 			// Sensitive op: rate limited hard.
 			r.Route("/secrets", func(r chi.Router) {
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/issue", capabilityHandler.Issue)
+				r.With(timw.RateLimit(capabilityLimiter)).Post("/issue", capabilityHandler.Issue)
 			})
 
 			// Service identities: admin-only mint + list + revoke + delete +
@@ -604,13 +612,22 @@ func main() {
 	}
 
 	// Graceful shutdown.
+	//
+	// drained is what makes the 10s budget real. Shutdown closes the listeners
+	// immediately, so ListenAndServe returns ErrServerClosed straight away and
+	// main used to return ~0.3s after SIGTERM with the drain still in progress:
+	// the budget was dead code and every in-flight request was reset on every
+	// deploy. The sharp case is a rotation caught between the provider minting
+	// the successor key and the vault persisting it.
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
+
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 
 		slog.Info("shutting down...")
-		appCancel() // stop background workers + dispatcher work
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -618,6 +635,11 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Error("shutdown error", "error", err)
 		}
+		// AFTER the drain, not before: cancelling first would kill the
+		// dispatcher and background work that a still-draining handler depends
+		// on, which is the opposite of draining.
+		appCancel()
+		slog.Info("drain complete")
 	}()
 
 	slog.Info("Trustissues is running", "addr", srv.Addr, "version", Version)
@@ -625,4 +647,7 @@ func main() {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+	// Wait for the drain before main returns, or the deferred dbConn.Close()
+	// and appCancel() fire while handlers are still mid-write.
+	<-drained
 }

@@ -23,6 +23,13 @@ services:
       - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
       - TRUSTISSUES_TRUSTED_PROXY_HOPS=${TRUSTISSUES_TRUSTED_PROXY_HOPS:-1}
       - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}
+      # Shield (LLM-boundary PII tokenization for the AI gateway). Optional, but
+      # it was UNREACHABLE via the documented Compose path: these were absent
+      # here, so setting them in .env did nothing and Shield stayed off with no
+      # warning. A feature that cannot be turned on the way the README says to
+      # turn it on is not shipped. Empty means off, which is the prior default.
+      - TRUSTISSUES_SHIELD_KEY=${TRUSTISSUES_SHIELD_KEY:-}
+      - TRUSTISSUES_SHIELD_HINT_LEVEL=${TRUSTISSUES_SHIELD_HINT_LEVEL:-full}
 
 volumes:
   trustissues_data:
