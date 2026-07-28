@@ -44,7 +44,7 @@ INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 
 -- name: GetVaultEntryMeta :one
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?;
 
 -- name: UpdateVaultEntryCustomFields :exec
@@ -106,7 +106,7 @@ DELETE FROM vault_entries WHERE id = ?;
 SELECT password_hash FROM users WHERE id = ?;
 
 -- name: ListVaultEntriesWithSecrets :many
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, created_at, updated_at, encrypted_value, nonce
+SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at, encrypted_value, nonce
 FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 
 -- ============================================================================
@@ -245,3 +245,10 @@ LIMIT 1;
 -- targets configured by a departing member can be purged when they lose access.
 SELECT id, name, rotation_targets FROM vault_entries
 WHERE collection_id = ? AND rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]';
+
+-- name: UpdateVaultEntryDestinationPatterns :exec
+-- The capability ceiling: which hosts/paths an agent token minted for this
+-- secret may ever reach. Until this existed the column had exactly one writer
+-- (the provider preset seed), so a secret created without a recognised provider
+-- could never mint a capability token at all and the MCP feature was unusable.
+UPDATE vault_entries SET destination_patterns = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;

@@ -37,6 +37,9 @@ export interface VaultEntry {
   // Arbitrary label/value pairs. Present on the create response and on unlocked
   // entries; absent or empty on the plain locked list.
   custom_fields?: CustomField[];
+  // Capability ceiling, returned so the edit form can show what is set. An empty
+  // or absent list means no agent token can be minted for this secret at all.
+  destination_patterns?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -160,6 +163,11 @@ export const vaultApi = {
       // Sending the array REPLACES the whole set; omit to leave it unchanged;
       // send [] to clear all.
       custom_fields?: CustomField[];
+      // The capability ceiling: hosts an agent token minted for this secret may
+      // reach ("api.example.com/v1/*"). Omit to leave unchanged; [] clears it,
+      // which DISABLES minting rather than widening it. The server rejects host
+      // wildcards, private addresses and pasted URLs.
+      destination_patterns?: string[];
     }
   ) =>
     request<VaultEntry>(`/vault/${id}`, {

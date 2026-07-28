@@ -111,7 +111,7 @@ WHERE (e.collection_id IS NULL AND e.user_id = ?)
 ORDER BY e.name ASC;
 
 -- name: ListAccessibleVaultEntriesWithSecrets :many
-SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.created_at, e.updated_at, e.encrypted_value, e.nonce
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.destination_patterns, e.created_at, e.updated_at, e.encrypted_value, e.nonce
 FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
    OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)

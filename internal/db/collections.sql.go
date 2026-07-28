@@ -284,7 +284,7 @@ func (q *Queries) ListAccessibleVaultEntries(ctx context.Context, arg ListAccess
 }
 
 const listAccessibleVaultEntriesWithSecrets = `-- name: ListAccessibleVaultEntriesWithSecrets :many
-SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.created_at, e.updated_at, e.encrypted_value, e.nonce
+SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.destination_patterns, e.created_at, e.updated_at, e.encrypted_value, e.nonce
 FROM vault_entries e
 WHERE (e.collection_id IS NULL AND e.user_id = ?)
    OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
@@ -315,6 +315,7 @@ type ListAccessibleVaultEntriesWithSecretsRow struct {
 	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
 	LastRotationError    sql.NullString `json:"last_rotation_error"`
 	CustomFields         string         `json:"custom_fields"`
+	DestinationPatterns  string         `json:"destination_patterns"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 	EncryptedValue       []byte         `json:"encrypted_value"`
@@ -349,6 +350,7 @@ func (q *Queries) ListAccessibleVaultEntriesWithSecrets(ctx context.Context, arg
 			&i.AutoRotate,
 			&i.LastRotationError,
 			&i.CustomFields,
+			&i.DestinationPatterns,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.EncryptedValue,

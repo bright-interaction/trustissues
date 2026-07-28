@@ -408,8 +408,12 @@ type vaultEntryMeta struct {
 	AutoRotate           bool          `json:"auto_rotate"`
 	LastRotationError    string        `json:"last_rotation_error"`
 	CustomFields         []CustomField `json:"custom_fields,omitempty"`
-	CreatedAt            *string       `json:"created_at"`
-	UpdatedAt            *string       `json:"updated_at"`
+	// The capability ceiling, returned so the edit form can show what is set.
+	// Not a secret: it is a list of hosts, and the operator needs to see it to
+	// narrow it. An empty list means no agent token can be minted at all.
+	DestinationPatterns []string `json:"destination_patterns"`
+	CreatedAt           *string  `json:"created_at"`
+	UpdatedAt           *string  `json:"updated_at"`
 }
 
 // CustomField is an arbitrary user-defined field on an entry (Bitwarden-style):
@@ -449,6 +453,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CustomFields:         h.decryptCustomFields(row.CustomFields),
+		DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -1288,6 +1293,14 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ProviderMeta         *string        `json:"provider_meta"`
 		AutoRotate           *bool          `json:"auto_rotate"`
 		CustomFields         *[]CustomField `json:"custom_fields"`
+		// The capability ceiling: which hosts an agent token minted for this
+		// secret may ever reach. Until this existed the column had exactly one
+		// writer (the provider preset seed), so any secret created without a
+		// recognised provider could never mint a token and the whole MCP
+		// "use a secret without seeing it" feature was unreachable for it.
+		// nil means unchanged; an empty array clears the ceiling, which disables
+		// minting rather than widening it.
+		DestinationPatterns *[]string `json:"destination_patterns"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid JSON")
@@ -1308,6 +1321,34 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		} else if err := h.queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{CustomFields: enc, ID: id}); err != nil {
 			logError(r, "vault.update: update custom fields failed", "error", err)
 		}
+	}
+
+	// Capability ceiling. Validation is strict on purpose: this list is the only
+	// thing standing between a minted token and an arbitrary destination, so a
+	// pattern that looks like a restriction but is not (a host wildcard, a
+	// private address, a pasted URL) is rejected rather than stored.
+	if req.DestinationPatterns != nil {
+		patterns := NormalizeDestinationPatterns(*req.DestinationPatterns)
+		if err := ValidateDestinationPatterns(patterns); err != nil {
+			writeValidationError(w, r, err.Error())
+			return
+		}
+		encoded, mErr := json.Marshal(patterns)
+		if mErr != nil {
+			logError(r, "vault.update: encode destination patterns failed", "error", mErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if err := h.queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+			DestinationPatterns: string(encoded),
+			ID:                  id,
+		}); err != nil {
+			logError(r, "vault.update: update destination patterns failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		LogActivityFromRequest(h.queries, r, "vault.destinations_updated",
+			fmt.Sprintf("Agent destination allow-list set on entry %s: %v", id, patterns))
 	}
 
 	// If value is provided and non-empty, re-encrypt and update last_rotated_at
@@ -1632,6 +1673,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
 				CustomFields:         h.decryptCustomFields(row.CustomFields),
+				DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
 				CreatedAt:            nullTimePtr(row.CreatedAt),
 				UpdatedAt:            nullTimePtr(row.UpdatedAt),
 			},

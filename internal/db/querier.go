@@ -291,6 +291,11 @@ type Querier interface {
 	UpdateVaultEntryAutoLogin(ctx context.Context, arg UpdateVaultEntryAutoLoginParams) error
 	UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error
 	UpdateVaultEntryCustomFields(ctx context.Context, arg UpdateVaultEntryCustomFieldsParams) error
+	// The capability ceiling: which hosts/paths an agent token minted for this
+	// secret may ever reach. Until this existed the column had exactly one writer
+	// (the provider preset seed), so a secret created without a recognised provider
+	// could never mint a capability token at all and the MCP feature was unusable.
+	UpdateVaultEntryDestinationPatterns(ctx context.Context, arg UpdateVaultEntryDestinationPatternsParams) error
 	UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVaultEntryExpiresAtParams) error
 	UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error
 	// ============================================================================
