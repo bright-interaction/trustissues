@@ -178,6 +178,17 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	if target.ConfiguredBy == "" {
 		return fmt.Errorf("delivery target has no recorded configurer; re-save it in the rotation panel to re-enable delivery")
 	}
+	// Account status first, so a disabled or deleted configurer produces an
+	// accurate reason. entryAccessFor now refuses them too, but it would report
+	// "no longer has write access", which sends the operator looking at
+	// collection membership instead of at the account they just disabled.
+	u, uErr := vault.queries.GetUserByID(ctx, target.ConfiguredBy)
+	if uErr != nil {
+		return fmt.Errorf("delivery target skipped: the user who configured it no longer exists")
+	}
+	if u.Disabled != 0 {
+		return fmt.Errorf("delivery target skipped: the user who configured it (%s) is disabled", u.Email)
+	}
 	// isAdmin false on purpose: this asks whether THIS user still has access,
 	// not whether the process is privileged.
 	if _, canWrite := vault.entryAccessFor(ctx, target.ConfiguredBy, false, entryID); !canWrite {

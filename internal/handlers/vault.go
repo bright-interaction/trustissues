@@ -774,6 +774,23 @@ func (h *VaultHandler) entryAccessFor(ctx context.Context, userID string, isAdmi
 	if err != nil {
 		return false, false
 	}
+	// A disabled account has no access, on any path. The HTTP middleware already
+	// refuses disabled users, so for live requests this changes nothing; it
+	// matters for BACKGROUND callers, which ask about a user who is not the
+	// caller and never pass through middleware.
+	//
+	// Without it, Disable was a half-revocation: it cut a compromised user's
+	// browser access instantly, while their rotation delivery webhook kept
+	// receiving freshly rotated plaintext. Removing them from the collection
+	// closed that, but Disable is the control an admin reaches for during an
+	// incident, so the rotation performed TO revoke them was what handed them
+	// the new key. Checking here rather than only at the delivery gate means a
+	// future background caller inherits it by default.
+	if userID != "" {
+		if u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil || u.Disabled != 0 {
+			return false, false
+		}
+	}
 	if isAdmin {
 		return true, true
 	}

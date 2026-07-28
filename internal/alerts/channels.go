@@ -160,7 +160,25 @@ func (d *ChannelDispatcher) decryptConfig(config string, nonce []byte, encVersio
 // host, may be empty). Sends run in goroutines; Dispatch never blocks on
 // delivery.
 func (d *ChannelDispatcher) Dispatch(event, source, host string, data map[string]string) {
-	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	// Detach from the caller's context, then re-bound it.
+	//
+	// Delivery is asynchronous but the context was not: every rotation call site
+	// builds a dispatcher on a short-lived ctx and cancels it the moment Dispatch
+	// returns, and sendWebhook built its POST on that same ctx. The goroutine
+	// therefore died with "context canceled" before the request completed, so
+	// webhook channels received NOTHING for rotation failures (measured 0/20).
+	// Only slog channels survived, because sendSlog ignores ctx entirely.
+	//
+	// It was invisible from the UI: the Test button and the expiry reminders both
+	// run on the process-lifetime dispatcher, so the two paths an operator would
+	// use to convince themselves alerting works are exactly the two that worked.
+	//
+	// Detaching here rather than rewiring each call site is deliberate: it is the
+	// layer where a future caller cannot reintroduce the bug by constructing a
+	// dispatcher on a request context. WithoutCancel keeps values (trace ids) and
+	// drops only cancellation; the timeouts below still bound shutdown.
+	base := context.WithoutCancel(d.ctx)
+	ctx, cancel := context.WithTimeout(base, 30*time.Second)
 	defer cancel()
 	channels, err := d.queries.ListEnabledNotificationChannels(ctx)
 	if err != nil {
@@ -187,7 +205,7 @@ func (d *ChannelDispatcher) Dispatch(event, source, host string, data map[string
 			continue
 		}
 
-		go d.sendToChannel(ch, event, source, host, data)
+		go d.sendToChannel(base, ch, event, source, host, data)
 	}
 }
 
@@ -207,13 +225,19 @@ func (d *ChannelDispatcher) DispatchTest(row db.GetNotificationChannelRow) error
 		Config: config,
 		Events: row.Events,
 	}
-	return d.send(ch, EventTest, "Test Secret", "test.example.com", map[string]string{
+	testCtx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 15*time.Second)
+	defer cancel()
+	return d.send(testCtx, ch, EventTest, "Test Secret", "test.example.com", map[string]string{
 		"message": "This is a test notification from Trustissues",
 	})
 }
 
-func (d *ChannelDispatcher) sendToChannel(ch NotificationChannel, event, source, host string, data map[string]string) {
-	err := d.send(ch, event, source, host, data)
+func (d *ChannelDispatcher) sendToChannel(base context.Context, ch NotificationChannel, event, source, host string, data map[string]string) {
+	// Per-send bound. The parent is detached, so this timeout is the only thing
+	// limiting how long a send may outlive the caller.
+	ctx, cancel := context.WithTimeout(base, 15*time.Second)
+	defer cancel()
+	err := d.send(ctx, ch, event, source, host, data)
 
 	if err != nil {
 		slog.Error("channel dispatcher: send failed",
@@ -224,10 +248,10 @@ func (d *ChannelDispatcher) sendToChannel(ch NotificationChannel, event, source,
 	}
 }
 
-func (d *ChannelDispatcher) send(ch NotificationChannel, event, source, host string, data map[string]string) error {
+func (d *ChannelDispatcher) send(ctx context.Context, ch NotificationChannel, event, source, host string, data map[string]string) error {
 	switch ch.Type {
 	case ChannelWebhook:
-		return d.sendWebhook(ch, event, source, host, data)
+		return d.sendWebhook(ctx, ch, event, source, host, data)
 	case ChannelSlog:
 		return d.sendSlog(ch, event, source, host, data)
 	default:
@@ -248,7 +272,7 @@ func (d *ChannelDispatcher) sendSlog(ch NotificationChannel, event, source, host
 
 // sendWebhook sends a notification via generic webhook with optional
 // HMAC-SHA256 signing.
-func (d *ChannelDispatcher) sendWebhook(ch NotificationChannel, event, source, host string, data map[string]string) error {
+func (d *ChannelDispatcher) sendWebhook(ctx context.Context, ch NotificationChannel, event, source, host string, data map[string]string) error {
 	var cfg WebhookConfig
 	if err := json.Unmarshal([]byte(ch.Config), &cfg); err != nil {
 		return fmt.Errorf("invalid webhook config: %w", err)
@@ -266,7 +290,7 @@ func (d *ChannelDispatcher) sendWebhook(ch NotificationChannel, event, source, h
 	payload := formatGeneric(event, source, host, data)
 	body := mustMarshal(payload)
 
-	req, err := http.NewRequestWithContext(d.ctx, http.MethodPost, cfg.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

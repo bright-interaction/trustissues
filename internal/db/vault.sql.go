@@ -386,6 +386,44 @@ func (q *Queries) ListAllVaultEntries(ctx context.Context) ([]ListAllVaultEntrie
 	return items, nil
 }
 
+const listAllVaultEntryTargets = `-- name: ListAllVaultEntryTargets :many
+SELECT id, name, rotation_targets FROM vault_entries
+WHERE rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]'
+`
+
+type ListAllVaultEntryTargetsRow struct {
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	RotationTargets sql.NullString `json:"rotation_targets"`
+}
+
+// Estate-wide variant of the sweep above, for offboarding that is not scoped to
+// one collection: disabling an account has to detach that person's delivery
+// endpoints wherever they sit, including on entries they own personally, since
+// auto-rotation keeps running on those after the account is disabled.
+func (q *Queries) ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listAllVaultEntryTargets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllVaultEntryTargetsRow{}
+	for rows.Next() {
+		var i ListAllVaultEntryTargetsRow
+		if err := rows.Scan(&i.ID, &i.Name, &i.RotationTargets); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProviderEntries = `-- name: ListProviderEntries :many
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
 FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC

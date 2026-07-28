@@ -24,12 +24,21 @@ import (
 type UserHandler struct {
 	queries *db.Queries
 	cfg     *config.Config
+	// vault is optional and used only to detach a disabled user's rotation
+	// delivery targets. Wired by SetVault after construction because the vault
+	// handler is built later in main; nil simply skips the purge, and the
+	// authoritative refusal still happens at delivery time.
+	vault *VaultHandler
 }
 
 // NewUserHandler creates a new UserHandler.
 func NewUserHandler(queries *db.Queries, cfg *config.Config) *UserHandler {
 	return &UserHandler{queries: queries, cfg: cfg}
 }
+
+// SetVault wires the vault handler used to purge rotation targets when an
+// account is disabled.
+func (h *UserHandler) SetVault(v *VaultHandler) { h.vault = v }
 
 var validRoles = map[string]bool{"admin": true, "user": true, "vault_only": true}
 
@@ -230,6 +239,18 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 			action = "admin.user_disabled"
 		}
 		LogActivityFromRequest(h.queries, r, action, fmt.Sprintf("User %s", target.Email))
+
+		// Disabling is an offboarding control, so it has to detach delivery
+		// endpoints the same way removing someone from a collection does.
+		// Cutting only HTTP access left their rotation webhook receiving fresh
+		// plaintext on the next sweep, which meant the rotation an admin runs
+		// BECAUSE of an incident was what delivered the new key to them.
+		if *req.Disabled && h.vault != nil {
+			if summary := h.vault.PurgeTargetsConfiguredByUser(r.Context(), targetID); summary != "" {
+				LogActivityFromRequest(h.queries, r, "admin.user_targets_purged",
+					fmt.Sprintf("Offboarding cleanup for %s: %s", target.Email, summary))
+			}
+		}
 	}
 
 	if req.Name != nil {

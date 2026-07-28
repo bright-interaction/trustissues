@@ -54,7 +54,14 @@ var redactPatterns = []redactPattern{
 		// NOT include the "tok_" prefix, which is the shield marker token-id form
 		// (see MarkerPattern) and would corrupt emitted markers on a second pass.
 		kind: KindSecret,
-		re:   regexp.MustCompile(`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}|sk_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----`),
+		// The `(?:live|test)_` alternative has to come FIRST for each prefix and
+		// has to exist for BOTH. It was present for ak_ and missing for sk_,
+		// so every real Stripe secret key egressed verbatim: the underscore in
+		// sk_live_... is outside [A-Za-z0-9], so `sk_[A-Za-z0-9]{8,}` sees only
+		// the four characters of "live" and never matches at all. The generic
+		// alternative is what made it silent, because it looks like it covers
+		// the prefix.
+		re:   regexp.MustCompile(`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}|sk_(?:live|test)_[A-Za-z0-9]{4,}|sk_[A-Za-z0-9]{8,}|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----`),
 	},
 	{
 		// IPv4 addresses with valid 0-255 octets (e.g. server IPs from
@@ -119,8 +126,15 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 		out = replaceOutsideMarkers(out, p.re, func(match string) string {
 			// The hostname pattern is broad; don't tokenize things that are
 			// really filenames or code identifiers (config.json, main.go,
-			// docker-compose.yml) which show up heavily in compose/file content.
-			if p.kind == KindHostname && looksLikeFilename(match) {
+			// docker-compose.yml, strings.HasPrefix) which show up heavily in
+			// compose/file content and in any question about code.
+			//
+			// looksLikeHostname is the positive test and subsumes the filename
+			// case (no file extension is a TLD), but both run: the extension list
+			// is the explicit statement of intent for compose/file content, so
+			// adding a suffix to knownSuffixes can never silently start
+			// tokenizing main.go.
+			if p.kind == KindHostname && (looksLikeFilename(match) || !looksLikeHostname(match)) {
 				return match
 			}
 			// Honour the session's configured level. This used to call
@@ -169,6 +183,67 @@ func looksLikeFilename(s string) bool {
 		return false
 	}
 	return fileExtensions[strings.ToLower(s[i+1:])]
+}
+
+// knownSuffixes are the final labels that make a dotted token a hostname.
+//
+// The hostname regex only requires the last label to be 2..63 LETTERS, which is
+// also the shape of nearly every dotted code identifier: strings.HasPrefix,
+// console.error, json.Unmarshal, np.array, React.useEffect, res.json. Those were
+// all tokenized, so a developer using the AI gateway (its documented purpose)
+// shipped the provider an unreadable prompt full of [shield:hostname:tok_...]
+// and got back a confident answer about nothing. The response path does not
+// repair it either: the model writes the real name back, UnshieldJSON passes it
+// through, and nothing tells the caller their prompt was rewritten.
+//
+// An allowlist is the deliberate trade-off. The alternative, "anything dotted is
+// a hostname", is what caused this. A host under a TLD missing from this list is
+// not tokenized, so keep the internal suffixes at the end in sync with whatever
+// the deployment actually uses; a hostname is also the least sensitive kind here
+// (personnummer, email, IBAN and key patterns are matched by their own shape and
+// are unaffected by this list).
+var knownSuffixes = map[string]bool{
+	// Common gTLDs.
+	"com": true, "net": true, "org": true, "edu": true, "gov": true, "mil": true,
+	"int": true, "info": true, "biz": true, "name": true, "pro": true, "mobi": true,
+	"app": true, "dev": true, "io": true, "ai": true, "co": true, "me": true,
+	"tv": true, "cc": true, "xyz": true, "online": true, "site": true, "tech": true,
+	"store": true, "cloud": true, "digital": true, "agency": true, "studio": true,
+	"design": true, "media": true, "news": true, "blog": true, "wiki": true,
+	"email": true, "systems": true, "solutions": true, "services": true,
+	"software": true, "network": true, "host": true, "space": true, "zone": true,
+	"link": true, "click": true, "live": true, "life": true, "world": true,
+	"today": true, "group": true, "team": true, "works": true, "energy": true,
+	"finance": true, "capital": true, "consulting": true, "legal": true,
+	"security": true, "cyber": true, "data": true,
+	// European ccTLDs, Nordics first (the deployment's own market).
+	"se": true, "no": true, "dk": true, "fi": true, "is": true, "ee": true,
+	"lv": true, "lt": true, "de": true, "at": true, "ch": true, "nl": true,
+	"be": true, "lu": true, "fr": true, "es": true, "pt": true, "it": true,
+	"ie": true, "uk": true, "eu": true, "pl": true, "cz": true, "sk": true,
+	"hu": true, "ro": true, "bg": true, "gr": true, "hr": true, "si": true,
+	"rs": true, "ua": true, "tr": true, "ru": true,
+	// Rest of world, common ones.
+	"us": true, "ca": true, "mx": true, "br": true, "ar": true, "cl": true,
+	"au": true, "nz": true, "jp": true, "cn": true, "kr": true, "in": true,
+	"sg": true, "hk": true, "tw": true, "il": true, "ae": true, "sa": true,
+	"za": true, "ng": true, "ke": true,
+	// Internal / non-public suffixes: the case the hostname pattern's own
+	// comment calls out (host.internal).
+	"internal": true, "local": true, "lan": true, "home": true, "corp": true,
+	"intranet": true, "private": true, "arpa": true, "test": true,
+	"localhost": true, "onion": true,
+}
+
+// looksLikeHostname reports whether a dotted token's final label is a plausible
+// TLD or internal suffix, i.e. whether it is a hostname at all rather than a
+// code identifier that merely has the same shape.
+func looksLikeHostname(s string) bool {
+	i := strings.LastIndex(s, ".")
+	if i < 0 || i == len(s)-1 {
+		return false
+	}
+	return knownSuffixes[strings.ToLower(s[i+1:])]
 }
 
 // replaceOutsideMarkers runs re.ReplaceAllStringFunc over every part of s that
