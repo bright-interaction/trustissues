@@ -61,7 +61,7 @@ var redactPatterns = []redactPattern{
 		// the four characters of "live" and never matches at all. The generic
 		// alternative is what made it silent, because it looks like it covers
 		// the prefix.
-		re:   regexp.MustCompile(`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}|sk_(?:live|test)_[A-Za-z0-9]{4,}|sk_[A-Za-z0-9]{8,}|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----`),
+		re: regexp.MustCompile(`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}|sk_(?:live|test)_[A-Za-z0-9]{4,}|sk_[A-Za-z0-9]{8,}|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----`),
 	},
 	{
 		// IPv4 addresses with valid 0-255 octets (e.g. server IPs from
@@ -202,48 +202,94 @@ func looksLikeFilename(s string) bool {
 // the deployment actually uses; a hostname is also the least sensitive kind here
 // (personnummer, email, IBAN and key patterns are matched by their own shape and
 // are unaffected by this list).
-var knownSuffixes = map[string]bool{
-	// Common gTLDs.
+// unambiguousSuffixes are final labels that make a dotted token a hostname on
+// their own, because they essentially never appear as a property or method name.
+//
+// The previous version of this list was one flat set that included .data, .name,
+// .email, .info, .host, .link, .is and .at. Those are real TLDs AND some of the
+// most common identifiers in every language: res.data, user.name, user.email,
+// console.info, config.host, Object.is, arr.at. So the fix for "strings.HasPrefix
+// gets tokenized" shipped with a list that still mangled most real code. Splitting
+// the set is the point: an ambiguous suffix now has to prove it is a host.
+var unambiguousSuffixes = map[string]bool{
+	// Classic gTLDs. None of these is a plausible property name.
 	"com": true, "net": true, "org": true, "edu": true, "gov": true, "mil": true,
-	"int": true, "info": true, "biz": true, "name": true, "pro": true, "mobi": true,
-	"app": true, "dev": true, "io": true, "ai": true, "co": true, "me": true,
-	"tv": true, "cc": true, "xyz": true, "online": true, "site": true, "tech": true,
-	"store": true, "cloud": true, "digital": true, "agency": true, "studio": true,
-	"design": true, "media": true, "news": true, "blog": true, "wiki": true,
-	"email": true, "systems": true, "solutions": true, "services": true,
-	"software": true, "network": true, "host": true, "space": true, "zone": true,
-	"link": true, "click": true, "live": true, "life": true, "world": true,
-	"today": true, "group": true, "team": true, "works": true, "energy": true,
-	"finance": true, "capital": true, "consulting": true, "legal": true,
-	"security": true, "cyber": true, "data": true,
-	// European ccTLDs, Nordics first (the deployment's own market).
-	"se": true, "no": true, "dk": true, "fi": true, "is": true, "ee": true,
-	"lv": true, "lt": true, "de": true, "at": true, "ch": true, "nl": true,
-	"be": true, "lu": true, "fr": true, "es": true, "pt": true, "it": true,
-	"ie": true, "uk": true, "eu": true, "pl": true, "cz": true, "sk": true,
-	"hu": true, "ro": true, "bg": true, "gr": true, "hr": true, "si": true,
-	"rs": true, "ua": true, "tr": true, "ru": true,
-	// Rest of world, common ones.
-	"us": true, "ca": true, "mx": true, "br": true, "ar": true, "cl": true,
-	"au": true, "nz": true, "jp": true, "cn": true, "kr": true, "in": true,
+	"int": true, "biz": true, "xyz": true,
+	// ccTLDs, minus every two-letter code that collides with a common member
+	// name (at, is, to, do, so, sh, me, my, in, it, no, us, be, co).
+	"se": true, "dk": true, "fi": true, "ee": true, "lv": true, "lt": true,
+	"de": true, "ch": true, "nl": true, "lu": true, "fr": true, "es": true,
+	"pt": true, "ie": true, "uk": true, "eu": true, "pl": true, "cz": true,
+	"sk": true, "hu": true, "ro": true, "bg": true, "gr": true, "hr": true,
+	"si": true, "rs": true, "ua": true, "tr": true, "ru": true,
+	"ca": true, "mx": true, "br": true, "ar": true, "cl": true,
+	"au": true, "nz": true, "jp": true, "cn": true, "kr": true,
 	"sg": true, "hk": true, "tw": true, "il": true, "ae": true, "sa": true,
 	"za": true, "ng": true, "ke": true,
 	// Internal / non-public suffixes: the case the hostname pattern's own
 	// comment calls out (host.internal).
-	"internal": true, "local": true, "lan": true, "home": true, "corp": true,
-	"intranet": true, "private": true, "arpa": true, "test": true,
-	"localhost": true, "onion": true,
+	"internal": true, "local": true, "lan": true, "corp": true,
+	"intranet": true, "arpa": true, "localhost": true, "onion": true,
 }
 
-// looksLikeHostname reports whether a dotted token's final label is a plausible
-// TLD or internal suffix, i.e. whether it is a hostname at all rather than a
+// ambiguousSuffixes are real TLDs that are ALSO ordinary words or short
+// identifiers, so seeing one at the end of a dotted token proves nothing. They
+// tokenize only with a positive host signal (see hostSignal).
+var ambiguousSuffixes = map[string]bool{
+	"io": true, "ai": true, "co": true, "me": true, "app": true, "dev": true,
+	"tv": true, "cc": true, "info": true, "name": true, "email": true,
+	"host": true, "link": true, "click": true, "live": true, "life": true,
+	"works": true, "data": true, "today": true, "world": true, "group": true,
+	"team": true, "news": true, "media": true, "design": true, "store": true,
+	"space": true, "zone": true, "cloud": true, "digital": true, "online": true,
+	"site": true, "tech": true, "studio": true, "agency": true, "solutions": true,
+	"services": true, "software": true, "network": true, "systems": true,
+	"security": true, "legal": true, "finance": true, "capital": true,
+	"consulting": true, "energy": true, "blog": true, "wiki": true, "is": true,
+	"at": true, "in": true, "it": true, "no": true, "us": true, "be": true,
+	"to": true, "sh": true, "so": true, "home": true, "private": true,
+	"test": true, "pro": true, "mobi": true, "cyber": true,
+}
+
+// looksLikeHostname reports whether a dotted token is a hostname rather than a
 // code identifier that merely has the same shape.
+//
+// An unambiguous TLD decides it alone. An ambiguous one (a real TLD that is also
+// an ordinary word, like .data or .name) additionally requires a positive host
+// signal, because "ends in a word that happens to be a TLD" describes most
+// property accesses ever written.
 func looksLikeHostname(s string) bool {
 	i := strings.LastIndex(s, ".")
 	if i < 0 || i == len(s)-1 {
 		return false
 	}
-	return knownSuffixes[strings.ToLower(s[i+1:])]
+	last := strings.ToLower(s[i+1:])
+	if unambiguousSuffixes[last] {
+		return true
+	}
+	if !ambiguousSuffixes[last] {
+		return false
+	}
+	return hostSignal(s)
+}
+
+// hostSignal looks for structure that a member-access expression does not have:
+// three or more labels (api.eu.example.io), or a hyphen or digit inside a label
+// (host.local, db01.host). Identifiers are overwhelmingly two bare
+// alphabetic labels, which is exactly what this refuses.
+func hostSignal(s string) bool {
+	labels := strings.Split(s, ".")
+	if len(labels) >= 3 {
+		return true
+	}
+	for _, l := range labels {
+		for i := 0; i < len(l); i++ {
+			if l[i] == '-' || (l[i] >= '0' && l[i] <= '9') {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // replaceOutsideMarkers runs re.ReplaceAllStringFunc over every part of s that

@@ -19,6 +19,10 @@ import (
 // slog at the call site.
 const (
 	rotFailUnknownProvider = "rotation skipped: the configured provider is not registered in this build"
+	// rotFailInternal is recorded when a rotation panics. The panic is contained
+	// to the one entry (it used to kill the process), so the operator needs the
+	// row to say something happened rather than the rotation looking untried.
+	rotFailInternal = "rotation failed with an internal error (see server logs)"
 	rotFailDecrypt         = "decrypt failed (details in server logs)"
 	rotFailProvider        = "provider rotation failed (details in server logs)"
 	rotFailEncrypt         = "new value could not be encrypted; the provider may have already issued a replacement key (details in server logs)"

@@ -65,11 +65,21 @@ the key ever sit in the same place, you have defeated the encryption.
   the host owns the vault. Limit who can SSH to the box.
 - **The SQLite file is trusted-at-rest only in the sense that it is
   ciphertext.** Secret values, TOTP seeds, notification configs, rotation
-  targets, and entry metadata (name, URL, username) are all encrypted at rest
-  under the vault key. A stolen `.db` file without the key exposes the schema and
-  the Argon2 password hashes, plus AES-GCM ciphertext, but no plaintext secrets
-  and not the sites the team keeps entries for. It is safe to back up off-host
-  **as long as the key is stored elsewhere.**
+  targets, and entry metadata (URL, alias URL, username, category, notes) are
+  encrypted at rest under the vault key. A stolen `.db` file without the key
+  exposes the schema and the Argon2 password hashes, plus AES-GCM ciphertext, but
+  no plaintext secret values. It is safe to back up off-host **as long as the key
+  is stored elsewhere.**
+- **The entry NAME is stored in cleartext, and so is the inventory it implies.**
+  `vault_entries.name` carries the `UNIQUE(user_id, name)` constraint, the
+  by-name capability lookup and every `ORDER BY name`, so it is not encrypted
+  today. A leaked `.db` therefore does reveal the list of services the team keeps
+  entries for ("AWS root account", "Klarna prod DB", and any customer name an
+  operator puts in a title), even though no value decrypts. The same strings are
+  mirrored into `activity_log.detail`, `capability_log.secret_name` and
+  `service_identities.allowed_secrets`. Treat a backup as revealing WHAT you
+  hold, never the secrets themselves. Encrypting it behind a blind index is
+  designed and deferred, see DEFERRED.md.
 - **URL matching for the browser extension uses a keyed blind index, not the
   plaintext URL.** So the extension can ask "do we have an entry for this
   domain?" without the server storing the URL in the clear. The blind index

@@ -290,9 +290,22 @@ UPDATE vault_entries SET destination_patterns = ?, updated_at = CURRENT_TIMESTAM
 -- gives the product an actual erasure path.
 DELETE FROM vault_entries WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '');
 
--- name: ReassignCollectionVaultEntries :execresult
--- Entries the departing user created inside a SHARED collection are team
--- property and must not vanish with them, so they are re-owned by the admin
--- performing the delete rather than deleted or orphaned.
-UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP
+-- name: ListCollectionVaultEntriesForUser :many
+-- The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
+--
+-- A single blanket UPDATE was all-or-nothing: vault_entries still carries
+-- UNIQUE(user_id, name), so if the leaver and the new owner both had an entry
+-- called "GitHub" (generic names collide constantly in a password manager) the
+-- statement aborted and EVERY shared entry kept the deleted user's id, silently,
+-- while the confirmation dialog promised the team would keep them.
+SELECT id, name FROM vault_entries
 WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != '';
+
+-- name: ReassignCollectionVaultEntryOwner :execresult
+-- Re-own ONE entry, so a single name collision cannot block the rest.
+UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+
+-- name: RenameVaultEntry :execresult
+-- Used only to de-duplicate on re-ownership when the new owner already has an
+-- entry by that name.
+UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;

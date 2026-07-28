@@ -352,3 +352,21 @@ func deliverToWebhook(ctx context.Context, target RotationTarget, entryName stri
 // exactly the three types this file implements delivery for: webhook,
 // forgejo_secret, notify. TestUpdateTargetsValidationSetMatchesDelivery in
 // vault_targets_test.go guards that contract.
+
+// rotationTargetIdentity keys a rotation target by WHERE it delivers, so an
+// unchanged row can be recognised across a save and keep its original
+// ConfiguredBy.
+//
+// Deliberately excludes the label and any secret material: renaming a target is
+// not a change of destination and must not re-attribute it, while changing where
+// it points is a new target and must be stamped to whoever made that change.
+func rotationTargetIdentity(t RotationTarget) string {
+	switch t.Type {
+	case "webhook":
+		return "webhook|" + t.WebhookURL
+	case "forgejo_secret":
+		return "forgejo|" + t.Instance + "|" + t.Repo + "|" + t.SecretName
+	default:
+		return t.Type + "|" + t.Label
+	}
+}

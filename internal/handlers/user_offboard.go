@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/brightinteraction/trustissues/internal/db"
 )
@@ -90,19 +91,89 @@ func (h *UserHandler) disposeVaultEntriesOnDelete(r *http.Request, targetID, ema
 		return
 	}
 	if newOwnerID != "" {
-		if res, err := h.queries.ReassignCollectionVaultEntries(r.Context(), db.ReassignCollectionVaultEntriesParams{
-			UserID: newOwnerID, UserID_2: targetID,
-		}); err != nil {
-			slog.Error("offboard: could not reassign collection entries", "user", targetID, "error", err)
-		} else if n, _ := res.RowsAffected(); n > 0 {
-			LogActivityFromRequest(h.queries, r, "admin.entries_reassigned",
-				fmt.Sprintf("Deleting %s: re-owned %d shared collection secret(s) so the team keeps them", email, n))
-		}
+		h.reassignCollectionEntries(r, targetID, email, newOwnerID)
 	}
 	if res, err := h.queries.DeletePersonalVaultEntriesForUser(r.Context(), targetID); err != nil {
 		slog.Error("offboard: could not delete personal entries", "user", targetID, "error", err)
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		LogActivityFromRequest(h.queries, r, "admin.entries_deleted_with_user",
 			fmt.Sprintf("Deleting %s: removed %d personal secret(s)", email, n))
+	}
+}
+
+// reassignCollectionEntries re-owns the leaver's shared entries ONE AT A TIME.
+//
+// A single blanket UPDATE was all-or-nothing. vault_entries still carries
+// UNIQUE(user_id, name), and generic names ("GitHub", "AWS", "Stripe") collide
+// constantly in a password manager, so one clash aborted the whole statement:
+// every shared entry kept the deleted user's id, no activity row was written,
+// and the confirmation dialog had just promised the team would keep them. The
+// failure was invisible and the entries were left orphaned, which is exactly the
+// state the change was meant to eliminate.
+//
+// Per row, a collision is resolved by suffixing the leaver's address rather than
+// skipping, so the team keeps the secret either way and the rename says where it
+// came from. Anything that still fails is NAMED on the activity log instead of
+// being swallowed.
+func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email, newOwnerID string) {
+	rows, err := h.queries.ListCollectionVaultEntriesForUser(r.Context(), targetID)
+	if err != nil {
+		slog.Error("offboard: could not list collection entries", "user", targetID, "error", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	moved := 0
+	var renamed, failed []string
+	for _, row := range rows {
+		_, uErr := h.queries.ReassignCollectionVaultEntryOwner(r.Context(), db.ReassignCollectionVaultEntryOwnerParams{
+			UserID: newOwnerID, ID: row.ID,
+		})
+		if uErr == nil {
+			moved++
+			continue
+		}
+		if !strings.Contains(uErr.Error(), "UNIQUE constraint") {
+			slog.Error("offboard: could not re-own entry", "entry", row.ID, "error", uErr)
+			failed = append(failed, row.Name)
+			continue
+		}
+		// The new owner already has an entry by this name. Keep both.
+		dedup := row.Name + " (from " + email + ")"
+		if _, rErr := h.queries.RenameVaultEntry(r.Context(), db.RenameVaultEntryParams{
+			Name: dedup, ID: row.ID,
+		}); rErr != nil {
+			slog.Error("offboard: could not de-duplicate entry name", "entry", row.ID, "error", rErr)
+			failed = append(failed, row.Name)
+			continue
+		}
+		if _, uErr2 := h.queries.ReassignCollectionVaultEntryOwner(r.Context(), db.ReassignCollectionVaultEntryOwnerParams{
+			UserID: newOwnerID, ID: row.ID,
+		}); uErr2 != nil {
+			slog.Error("offboard: re-own failed after rename", "entry", row.ID, "error", uErr2)
+			failed = append(failed, row.Name)
+			continue
+		}
+		moved++
+		renamed = append(renamed, row.Name+" -> "+dedup)
+	}
+
+	if moved > 0 {
+		detail := fmt.Sprintf("Deleting %s: re-owned %d shared collection secret(s) so the team keeps them", email, moved)
+		if len(renamed) > 0 {
+			detail += fmt.Sprintf("; renamed %d to avoid a name clash: %v", len(renamed), renamed)
+		}
+		LogActivityFromRequest(h.queries, r, "admin.entries_reassigned", detail)
+	}
+	// Never silent. An entry left with a dangling owner is unreadable forever,
+	// so the admin has to be told which ones by name.
+	if len(failed) > 0 {
+		LogActivityFromRequest(h.queries, r, "admin.entries_reassign_failed",
+			fmt.Sprintf("Deleting %s: could NOT re-own %d shared secret(s), they are now orphaned and unreadable: %v",
+				email, len(failed), failed))
+		slog.Error("offboard: some collection entries could not be re-owned",
+			"user", targetID, "count", len(failed))
 	}
 }

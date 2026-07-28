@@ -166,3 +166,43 @@ and the operator UI. Three follow-ups are intentionally deferred:
 human; structured PII tokenized before egress; single-use destination-bound
 capability tokens) holds today. These three widen coverage and connector
 ergonomics, they do not change the security floor.
+
+## Encrypt `vault_entries.name` behind a blind index
+
+**Status:** designed, not implemented. Found in the round-6 audit (2026-07-28),
+confirmed against production.
+
+`name` is the one entry column still stored in cleartext. Every sibling
+(url, alias_url, username, category, notes) goes through `encryptMetaColumns`.
+THREAT-MODEL.md used to claim `name` was encrypted too; that claim has been
+corrected rather than left standing, so the docs and the code now agree.
+
+**Why it is deferred rather than done.** The column is load-bearing in four
+places at once, and getting any of them wrong loses or hides secrets:
+
+1. `UNIQUE(user_id, name)` is the duplicate-name guard the Create handler
+   depends on (it matches on `"UNIQUE constraint"` in the error string). SQLite
+   cannot alter a constraint in place, so this needs the 12-step table rebuild
+   on the table that holds every secret.
+2. Five queries `ORDER BY name`. Ciphertext does not sort, so those move to
+   app-side sorting, which also affects any future pagination.
+3. `ResolveVaultReference` and the capability by-name lookup match on `name = ?`.
+   Both would move to `name_bidx = ?`. The round-5 ambiguity refusal
+   (`errAmbiguousSecretName`) must keep working, which it does since a blind
+   index is deterministic.
+4. The same string is mirrored into `activity_log.detail`, `capability_log.secret_name`
+   and `service_identities.allowed_secrets`. `activity_log` has append-only
+   triggers, so history cannot be rewritten: future writes must log the entry id
+   and let the UI resolve the name, and existing rows stay as they are.
+
+**The design, when it is picked up.** Add `name_bidx TEXT NOT NULL DEFAULT ''`,
+reusing `urlBlindIndex` and its `bidxScope(userID, collectionID)` so the index
+cannot be correlated across users or collections. Writers: `vault.go` Create and
+Update, `vault_import.go`. Readers: the six mappers that already call
+`decryptColumnOrLog`. Swap `UNIQUE(user_id, name)` for `UNIQUE(user_id, name_bidx)`.
+Backfill via the existing `BackfillMetadataAtRest` pattern using
+`encryptColumnIfNeeded` (storage-side only, never on client input).
+
+**Interim guidance:** a leaked backup reveals the inventory, not the secrets.
+This is stated plainly in THREAT-MODEL.md so nobody plans around a guarantee the
+product does not offer.

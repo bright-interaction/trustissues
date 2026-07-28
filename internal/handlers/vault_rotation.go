@@ -80,6 +80,25 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 	slog.Info("vault rotation: found entries needing rotation", "count", len(entries))
 
 	for _, entry := range entries {
+		// Contain a panic to THIS entry. The sweep runs on a background
+		// goroutine with no recover above it, so any panic here took the whole
+		// process down rather than failing one rotation: a crash loop in which
+		// an upstream key may already have been minted but never persisted.
+		// One malformed row must not be able to stop the server.
+		rotateOneEntry(ctx, queries, vaultHandler, entry)
+	}
+}
+
+func rotateOneEntry(ctx context.Context, queries *db.Queries, vaultHandler *VaultHandler, entry db.ListVaultEntriesNeedingRotationRow) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("vault rotation: panic while rotating an entry; the sweep continues",
+				"entry", entry.Name, "recover", rec)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, entry.Provider.String,
+				entry.RotationLog.String, rotFailInternal, "auto", nil)
+		}
+	}()
+	{
 		providerName := entry.Provider.String
 		provider, ok := ProviderRegistry[providerName]
 		if !ok {
@@ -89,7 +108,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			slog.Warn("vault rotation: unknown provider", "provider", providerName, "entry", entry.Name)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
 				entry.RotationLog.String, rotFailUnknownProvider, "auto", nil)
-			continue
+			return
 		}
 
 		if !provider.CanAutoRotate() {
@@ -106,7 +125,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 				RotationLog: sql.NullString{String: updatedLog, Valid: true},
 				ID:          entry.ID,
 			})
-			continue
+			return
 		}
 
 		// Decrypt current value
@@ -115,7 +134,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			slog.Error("vault rotation: decrypt failed", "entry", entry.Name, "error", err)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
 				entry.RotationLog.String, rotFailDecrypt, "auto", nil)
-			continue
+			return
 		}
 
 		meta := ParseProviderMeta(vaultHandler.decryptColumnOrLog(entry.ProviderMeta.String, "{}", "provider_meta"))
@@ -135,7 +154,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			slog.Error("vault rotation: provider rotation failed", "provider", providerName, "entry", entry.Name, "error", err)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
 				entry.RotationLog.String, rotFailProvider, "auto", nil)
-			continue
+			return
 		}
 
 		// NOTE: the old key is NOT revoked yet. Rotate only recorded a pending
@@ -154,7 +173,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			slog.Error("vault rotation: encrypt failed", "entry", entry.Name, "error", err)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
 				entry.RotationLog.String, rotFailEncrypt, "auto", nil)
-			continue
+			return
 		}
 
 		// Update the entry with new encrypted value
@@ -169,7 +188,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			slog.Error("vault rotation: update failed", "entry", entry.Name, "error", err)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
 				entry.RotationLog.String, rotFailPersist, "auto", nil)
-			continue
+			return
 		}
 
 		// The new value is now durably stored, so it is finally safe to destroy the

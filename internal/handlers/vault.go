@@ -2187,6 +2187,13 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.GetUserID(r.Context())
 
+	// Load what is stored BEFORE overwriting, so unchanged rows keep their
+	// original attribution (see below).
+	existingTargets := ""
+	if cur, curErr := h.queries.GetVaultEntryTargets(r.Context(), id); curErr == nil {
+		existingTargets = cur.String
+	}
+
 	var targets []RotationTarget
 	if err := json.NewDecoder(r.Body).Decode(&targets); err != nil {
 		writeBadRequest(w, r, "invalid JSON array of targets")
@@ -2197,7 +2204,30 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// client sent. A target's auth_token resolves against THIS id at delivery
 	// time, so on a shared entry an editor can only reference their own
 	// secrets, never the entry owner's unrelated ones.
+	//
+	// But stamp only rows that are actually NEW or whose destination changed.
+	// Restamping the whole array laundered dead targets back to life: the
+	// rotation panel PUTs everything it loaded, so an owner adding one target of
+	// their own re-attributed a departed member's webhook to themselves, and
+	// targetStillAuthorized (which asks whether ConfiguredBy still has write
+	// access) then said yes. The next rotation POSTed the fresh plaintext secret
+	// to the endpoint of someone who had left the collection, undoing the whole
+	// offboarding chain in a single unrelated save.
+	//
+	// Preserving the stored attribution keeps the security question honest:
+	// "who set this up" must not change because someone else pressed Save.
+	stored := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets"))
+	priorBy := make(map[string]string, len(stored))
+	for _, t := range stored {
+		if t.ConfiguredBy != "" {
+			priorBy[rotationTargetIdentity(t)] = t.ConfiguredBy
+		}
+	}
 	for i := range targets {
+		if who, ok := priorBy[rotationTargetIdentity(targets[i])]; ok {
+			targets[i].ConfiguredBy = who
+			continue
+		}
 		targets[i].ConfiguredBy = userID
 	}
 

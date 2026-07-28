@@ -338,6 +338,24 @@ func (h *CollectionHandler) DeclineInvite(w http.ResponseWriter, r *http.Request
 		writeNotFound(w, r, "no invitation or membership for this collection")
 		return
 	}
+	// Same cleanup RemoveMember runs. Leaving and being removed are the same
+	// DELETE of the membership row (the code says so, and the UI ships a Leave
+	// button on every collection at every role), but only the remove path
+	// purged the departing member's rotation targets. So leaving left the row
+	// behind: every later rotation failed delivery, marked itself "partial" and
+	// fired an alert forever, and the stale endpoint sat in the rotation panel
+	// looking live. Worse, UpdateTargets used to restamp ConfiguredBy on the
+	// whole submitted array, so the owner simply saving that panel re-authorized
+	// the departed member's webhook and the next rotation POSTed them the fresh
+	// plaintext secret. Best-effort: never fail the leave over cleanup.
+	if summary := h.purgeTargetsConfiguredBy(r.Context(), id, userID); summary != "" {
+		name := id
+		if c, cErr := h.queries.GetCollection(r.Context(), id); cErr == nil {
+			name = c.Name
+		}
+		h.logTargetPurge(r, name, summary)
+	}
+
 	LogActivityFromRequest(h.queries, r, "collection.invite_declined", fmt.Sprintf("Declined or left collection %s", id))
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -345,22 +363,51 @@ func (h *CollectionHandler) DeclineInvite(w http.ResponseWriter, r *http.Request
 // ListMembers handles GET /api/collections/{id}/members for any member.
 func (h *CollectionHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, ok := h.role(r, id); !ok {
+	callerRole, ok := h.role(r, id)
+	if !ok {
 		writeNotFound(w, r, "collection not found")
 		return
 	}
+	// A manager sees pending identities because they issued the invitations and
+	// must be able to see and rescind them. Everyone else does not (see below).
+	canSeePending := callerRole == collRoleManager
 	rows, err := h.queries.ListCollectionMembers(r.Context(), id)
 	if err != nil {
 		logError(r, "collections.members: query failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	// A PENDING row proves only that a manager typed an address, not that an
+	// account exists, so returning its email/name/user_id re-opened the oracle
+	// AddMember was written to close: AddMember deliberately answers identically
+	// whether or not the address matches an account, and this endpoint then
+	// showed the answer one call later, to ANY member of the collection
+	// including a vault_only user, who is the most restricted role in the
+	// product. An invitation the invitee has not accepted is also not yet a
+	// relationship they have agreed to expose to the rest of the team.
+	//
+	// Managers keep the identity: they typed the address, so it tells them
+	// nothing new, and they need it to rescind. The row is still listed for
+	// everyone so the seat is visible; it just carries no identity below manager.
 	out := make([]memberResponse, 0, len(rows))
 	for _, m := range rows {
+		if !m.AcceptedAt.Valid && !canSeePending {
+			out = append(out, memberResponse{
+				Role: m.Role, AddedAt: nullTimePtr(m.AddedAt), Pending: true,
+			})
+			continue
+		}
+		if !m.AcceptedAt.Valid {
+			out = append(out, memberResponse{
+				UserID: m.UserID, Email: m.Email, Name: nullStringToString(m.Name),
+				Role: m.Role, AddedAt: nullTimePtr(m.AddedAt), Pending: true,
+			})
+			continue
+		}
 		out = append(out, memberResponse{
 			UserID: m.UserID, Email: m.Email, Name: nullStringToString(m.Name),
 			Role: m.Role, AddedAt: nullTimePtr(m.AddedAt),
-			AcceptedAt: nullTimePtr(m.AcceptedAt), Pending: !m.AcceptedAt.Valid,
+			AcceptedAt: nullTimePtr(m.AcceptedAt), Pending: false,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

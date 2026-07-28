@@ -29,6 +29,13 @@ func TestIdentifiersAreNotHostnames(t *testing.T) {
 			"console.error", "np.array", "React.useEffect", "res.json", "u.id",
 			"ctx.Done", "http.StatusOK", "time.Now", "os.Getenv", "db.Query",
 			"self.value", "this.state", "err.Error", "sql.NullString",
+			// Round 6: these are all REAL TLDs as well as some of the most
+			// common member names in any codebase, and the first version of
+			// this allow-list contained every one of them, so the fix for
+			// strings.HasPrefix still mangled most real code.
+			"res.data", "user.name", "user.email", "console.info", "config.host",
+			"errors.Is", "arr.at", "el.link", "obj.is", "promise.to",
+			"row.data", "opts.name", "cfg.host", "chai.to", "item.info",
 		}
 		for _, id := range identifiers {
 			out, err := s.RedactString(ctx, "Use "+id+" here")
@@ -51,10 +58,15 @@ func TestRealHostnamesStillTokenize(t *testing.T) {
 		ctx := context.Background()
 		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
 
+		// Real hosts. The ones under an AMBIGUOUS suffix (.io, .dev, .data)
+		// carry a positive host signal: 3+ labels, or a hyphen or digit in a
+		// label. A two-bare-word host under an ambiguous TLD is deliberately
+		// NOT tokenized, which is the accepted cost of not mangling res.data.
 		hosts := []string{
 			"crm.example.com", "host.internal", "trustissues.brightinteraction.com",
 			"api.stripe.com", "db01.corp.local", "foo.se", "svc.cluster.lan",
-			"registry.example.io", "mail.example.dev",
+			"registry.example.io", "mail.example.dev", "host.io",
+			"api.eu.example.data", "db01.host",
 		}
 		for _, h := range hosts {
 			out, err := s.RedactString(ctx, "Connect to "+h+" now")

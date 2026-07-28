@@ -239,10 +239,24 @@ func AppendRotationLog(existing string, entry RotationLogEntry) string {
 	return string(out)
 }
 
+// ParseProviderMeta decodes provider_meta into a map that is ALWAYS non-nil.
+//
+// The seeded map is not enough on its own: for the JSON literal `null`,
+// encoding/json sets the destination map to nil rather than leaving it alone. So
+// a column holding "null" (which round-trips out of any json.Marshal of a nil
+// map, and is what an unset column becomes once anything writes one) produced a
+// nil map here, and the first provider write-back (meta["key_id"] = ...) panicked
+// with "assignment to entry in nil map". That panic happens inside the
+// auto-rotation goroutine, which had no recover, so it took the whole process
+// down: a crash loop where the upstream key had already been minted but was
+// never persisted.
 func ParseProviderMeta(raw string) map[string]string {
 	m := map[string]string{}
 	if raw != "" && raw != "{}" {
 		_ = json.Unmarshal([]byte(raw), &m)
+	}
+	if m == nil {
+		m = map[string]string{}
 	}
 	return m
 }
