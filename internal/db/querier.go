@@ -79,6 +79,15 @@ type Querier interface {
 	DeleteCollection(ctx context.Context, id string) error
 	DeleteNotificationChannel(ctx context.Context, id string) (sql.Result, error)
 	DeletePendingInvitation(ctx context.Context, id string) (sql.Result, error)
+	// Hard user delete: their PERSONAL entries go with them.
+	//
+	// The alternative is what used to happen: the rows survived with a dangling
+	// user_id and no read path anywhere (unlock, the capability lookups and the
+	// service fetch are all scoped to a real user), so they were unrecoverable
+	// ciphertext held forever. Deleting them therefore loses nothing that could
+	// ever have been read again, makes the confirmation dialog's promise true, and
+	// gives the product an actual erasure path.
+	DeletePersonalVaultEntriesForUser(ctx context.Context, userID string) (sql.Result, error)
 	DeleteServiceIdentity(ctx context.Context, id string) (sql.Result, error)
 	DeleteUser(ctx context.Context, id string) (sql.Result, error)
 	DeleteVaultEntry(ctx context.Context, id string) (sql.Result, error)
@@ -227,6 +236,7 @@ type Querier interface {
 	// Admin CRUD
 	// ============================================================================
 	ListServiceIdentities(ctx context.Context) ([]ListServiceIdentitiesRow, error)
+	ListServiceIdentitiesByUser(ctx context.Context, createdByUserID sql.NullString) ([]ListServiceIdentitiesByUserRow, error)
 	ListUsers(ctx context.Context) ([]ListUsersRow, error)
 	ListUsersWithEntryCount(ctx context.Context) ([]ListUsersWithEntryCountRow, error)
 	ListUsersWithTOTPSecret(ctx context.Context) ([]ListUsersWithTOTPSecretRow, error)
@@ -270,6 +280,10 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
+	// Entries the departing user created inside a SHARED collection are team
+	// property and must not vanish with them, so they are re-owned by the admin
+	// performing the delete rather than deleted or orphaned.
+	ReassignCollectionVaultEntries(ctx context.Context, arg ReassignCollectionVaultEntriesParams) (sql.Result, error)
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
 	// ============================================================================
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
@@ -281,6 +295,13 @@ type Querier interface {
 	// click cannot come back as a confusing 404.
 	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (sql.Result, error)
 	RevokeAPIKeysByUser(ctx context.Context, userID string) error
+	// Offboarding: revoke every still-live service key a departing user minted.
+	// FetchOwnSecrets resolves secrets as the identity's created_by_user_id, so an
+	// un-revoked key outlives its owner and keeps reading their personal vault.
+	// The runtime gate in FetchOwnSecrets refuses those anyway; revoking here is
+	// what makes the revocation VISIBLE in the identities list instead of the key
+	// silently 401ing at the next boot.
+	RevokeServiceIdentitiesByUser(ctx context.Context, createdByUserID sql.NullString) (sql.Result, error)
 	RevokeServiceIdentity(ctx context.Context, id string) (sql.Result, error)
 	RevokeSession(ctx context.Context, id string) error
 	RevokeUserSessions(ctx context.Context, userID string) error

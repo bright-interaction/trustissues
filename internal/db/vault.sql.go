@@ -107,6 +107,22 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 	return err
 }
 
+const deletePersonalVaultEntriesForUser = `-- name: DeletePersonalVaultEntriesForUser :execresult
+DELETE FROM vault_entries WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '')
+`
+
+// Hard user delete: their PERSONAL entries go with them.
+//
+// The alternative is what used to happen: the rows survived with a dangling
+// user_id and no read path anywhere (unlock, the capability lookups and the
+// service fetch are all scoped to a real user), so they were unrecoverable
+// ciphertext held forever. Deleting them therefore loses nothing that could
+// ever have been read again, makes the confirmation dialog's promise true, and
+// gives the product an actual erasure path.
+func (q *Queries) DeletePersonalVaultEntriesForUser(ctx context.Context, userID string) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deletePersonalVaultEntriesForUser, userID)
+}
+
 const deleteVaultEntry = `-- name: DeleteVaultEntry :execresult
 DELETE FROM vault_entries WHERE id = ?
 `
@@ -663,6 +679,24 @@ WHERE auto_rotate = 1
   -- interval. computeRotationStatus uses the same fallback so the UI and the
   -- scheduler agree.
   AND (julianday('now') - julianday(COALESCE(last_rotated_at, created_at))) >= rotation_interval_days
+  -- The entry must still have a live owner, or live in a shared collection.
+  --
+  -- vault_entries.user_id has no foreign key (every other user-owned table has
+  -- one), and deleting a user does not touch the table, so a departed person's
+  -- personal entries survive with a dangling user_id. Nothing can READ them
+  -- afterwards: unlock, the capability lookups and the service fetch are all
+  -- scoped to a real user. But this sweep had no owner filter at all, so it
+  -- kept rotating those secrets AT THE PROVIDER forever: invalidating whatever
+  -- was deployed with the old value, writing the new value into a row nobody
+  -- can decrypt, then failing delivery and firing a rotation_partial alert on
+  -- every pass, from an account that no longer exists.
+  --
+  -- Disabled owners are excluded for the same reason offboarding revokes their
+  -- delivery targets: a suspended account's credentials should stop moving.
+  AND (
+    (collection_id IS NOT NULL AND collection_id != '')
+    OR EXISTS (SELECT 1 FROM users u WHERE u.id = vault_entries.user_id AND u.disabled = 0)
+  )
 ORDER BY COALESCE(last_rotated_at, created_at) ASC
 `
 
@@ -984,6 +1018,23 @@ type MigrateVaultEntryEncryptionParams struct {
 func (q *Queries) MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error {
 	_, err := q.db.ExecContext(ctx, migrateVaultEntryEncryption, arg.EncryptedValue, arg.Nonce, arg.ID)
 	return err
+}
+
+const reassignCollectionVaultEntries = `-- name: ReassignCollectionVaultEntries :execresult
+UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP
+WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != ''
+`
+
+type ReassignCollectionVaultEntriesParams struct {
+	UserID   string `json:"user_id"`
+	UserID_2 string `json:"user_id_2"`
+}
+
+// Entries the departing user created inside a SHARED collection are team
+// property and must not vanish with them, so they are re-owned by the admin
+// performing the delete rather than deleted or orphaned.
+func (q *Queries) ReassignCollectionVaultEntries(ctx context.Context, arg ReassignCollectionVaultEntriesParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reassignCollectionVaultEntries, arg.UserID, arg.UserID_2)
 }
 
 const resolveVaultReference = `-- name: ResolveVaultReference :one

@@ -350,7 +350,10 @@ export default function UsersPage() {
                               onClick={() => {
                                 if (
                                   window.confirm(
-                                    `Delete ${u.email}? Their vault entries go with them.`
+                                    `Delete ${u.email}?\n\n` +
+                                      `Their ${u.entry_count} personal secret${u.entry_count === 1 ? '' : 's'} will be deleted permanently. ` +
+                                      `Secrets they created inside shared collections stay with the team and transfer to you. ` +
+                                      `Any service keys they issued are revoked, so services using them must be re-provisioned.`
                                   )
                                 ) {
                                   deleteUserMutation.mutate(u.id);

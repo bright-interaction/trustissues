@@ -66,6 +66,24 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			created_by_user_id TEXT
 		)`,
+		// The service fetch now verifies the identity's owner is a live account,
+		// so this fixture needs a users table. Without it every FetchOwnSecrets
+		// test 401s on "owner account no longer exists" and the suite fails
+		// wholesale, which is how the gap it covers stayed invisible: the helper
+		// modelled service_identities and vault_entries but not the user those
+		// rows point at, so "does the owner still exist" was unaskable here.
+		`CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL DEFAULT '',
+			name TEXT,
+			password_hash TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL DEFAULT 'user',
+			disabled INTEGER NOT NULL DEFAULT 0,
+			totp_enabled INTEGER DEFAULT 0,
+			totp_secret TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE TABLE service_secret_audit (
 			id TEXT PRIMARY KEY,
 			service_identity_id TEXT,
@@ -81,6 +99,13 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 		if _, err := dbConn.Exec(s); err != nil {
 			t.Fatalf("schema: %v\n%s", err, s)
 		}
+	}
+	// The owner every seeded identity and secret belongs to. Live by default;
+	// individual tests disable or delete it to exercise offboarding.
+	if _, err := dbConn.Exec(
+		`INSERT INTO users (id, email, role, disabled) VALUES (?, 'svc-owner@example.com', 'admin', 0)`,
+		svcTestOwnerID); err != nil {
+		t.Fatalf("seed owner: %v", err)
 	}
 	return dbConn
 }

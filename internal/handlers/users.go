@@ -245,11 +245,8 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// Cutting only HTTP access left their rotation webhook receiving fresh
 		// plaintext on the next sweep, which meant the rotation an admin runs
 		// BECAUSE of an incident was what delivered the new key to them.
-		if *req.Disabled && h.vault != nil {
-			if summary := h.vault.PurgeTargetsConfiguredByUser(r.Context(), targetID); summary != "" {
-				LogActivityFromRequest(h.queries, r, "admin.user_targets_purged",
-					fmt.Sprintf("Offboarding cleanup for %s: %s", target.Email, summary))
-			}
+		if *req.Disabled {
+			h.offboardUser(r, targetID, target.Email)
 		}
 	}
 
@@ -312,6 +309,13 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Offboard BEFORE the row goes away: the cleanup resolves the user by id,
+	// and once the users row is deleted there is nothing left to look up. Hard
+	// delete previously did none of this, so it was strictly weaker than the
+	// Disable toggle next to it.
+	h.offboardUser(r, targetID, target.Email)
+	h.disposeVaultEntriesOnDelete(r, targetID, target.Email, middleware.GetUserID(r.Context()))
 
 	result, err := h.queries.DeleteUser(r.Context(), targetID)
 	if err != nil {

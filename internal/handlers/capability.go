@@ -149,6 +149,12 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusConflict, "ambiguous_destination", "multiple secrets match this destination; pass an explicit secret name")
 		return
 	}
+	if errors.Is(lookupErr, errAmbiguousSecretName) {
+		h.logCapabilityEvent(ctx, req.AgentID, nil, req.Secret, req.Destination, req.Method, "denied", 0, "ambiguous_secret_name", "")
+		writeError(w, r, http.StatusConflict, "ambiguous_secret_name",
+			"more than one secret you can reach is called that (for example a personal one and a shared one); rename one of them or request it by destination")
+		return
+	}
 	if lookupErr != nil {
 		slog.Error("capability.issue: lookup", "error", lookupErr)
 		writeInternalError(w, r, "lookup failed")
@@ -417,6 +423,7 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 
 var errNonceAlreadySpent = errors.New("capability: nonce already spent")
 var errAmbiguousDestination = errors.New("capability: multiple secrets match destination")
+var errAmbiguousSecretName = errors.New("capability: multiple reachable secrets share this name")
 
 func extractCapabilityToken(authHeader string) string {
 	const prefix = "Capability "
@@ -677,15 +684,49 @@ const accessibleEntriesPredicate = `(
 	)
 )`
 
+// lookupSecretByName resolves a secret by name within the caller's reach, and
+// REFUSES when the name is ambiguous.
+//
+// It used to be a QueryRow, which takes whatever row SQLite happens to return
+// first. A name is only unique per (user_id, name), so a user who is in a
+// collection holding "stripe" and also keeps a personal "stripe" has two
+// reachable entries with that name and nothing to choose between them. The
+// agent asked for "stripe", got 201 and a proxy_url, and the proxy injected
+// whichever key won: the sandbox key or the company's live one. Nothing in the
+// tool result, the token or the capability_log row distinguished them, since
+// secret_name is "stripe" either way, so the audit trail could not answer which
+// key was actually spent.
+//
+// lookupSecretByDestination, two functions down, already refused its equivalent
+// ambiguity with a 409. This is the same rule applied to the other lookup.
 func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name string) (capabilityEntryRow, error) {
-	row := h.db.QueryRowContext(ctx,
+	rows, err := h.db.QueryContext(ctx,
 		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+` AND name = ?`,
 		userID, userID, name)
-	var e capabilityEntryRow
-	if err := row.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
+	if err != nil {
 		return capabilityEntryRow{}, err
 	}
-	return e, nil
+	defer rows.Close()
+	var matched []capabilityEntryRow
+	for rows.Next() {
+		var e capabilityEntryRow
+		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
+			return capabilityEntryRow{}, err
+		}
+		matched = append(matched, e)
+	}
+	if err := rows.Err(); err != nil {
+		return capabilityEntryRow{}, err
+	}
+	switch len(matched) {
+	case 0:
+		// sql.ErrNoRows keeps the caller's existing not-found handling intact.
+		return capabilityEntryRow{}, sql.ErrNoRows
+	case 1:
+		return matched[0], nil
+	default:
+		return capabilityEntryRow{}, errAmbiguousSecretName
+	}
 }
 
 func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userID, dest string) (capabilityEntryRow, error) {

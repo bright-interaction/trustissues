@@ -326,8 +326,26 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 	imported := 0
 	skipped := []skippedEntry{}
 	for _, entry := range req.Entries {
-		// Skip if requested or unusable
-		if entry.Skip || entry.Name == "" || entry.Value == "" {
+		// entry.Skip is a user decision made in the conflict step, so it is the
+		// only silent drop. Name/Value being empty is NOT a user decision: it is
+		// how Bitwarden secure notes, cards and identities, and LastPass secure
+		// notes, come out of an export. Those rows were discarded here with no
+		// slog line and no entry in `skipped`, so a 500-item export could import
+		// 380 and still show a plain success toast. That is the exact failure the
+		// duplicate-title reporting was added for; it was only ever closed for
+		// the UNIQUE-constraint branch, and this guard sat two lines above it.
+		if entry.Skip {
+			continue
+		}
+		if entry.Name == "" || entry.Value == "" {
+			name := entry.Name
+			if name == "" {
+				name = "(unnamed row)"
+			}
+			skipped = append(skipped, skippedEntry{
+				Name:   name,
+				Reason: "no password value in the export row (secure notes, cards and identities have none)",
+			})
 			continue
 		}
 
@@ -335,6 +353,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		encrypted, nonce, err := h.handler.encrypt([]byte(entry.Value))
 		if err != nil {
 			slog.Error("failed to encrypt entry", "name", entry.Name, "error", err)
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be encrypted"})
 			continue
 		}
 
@@ -349,6 +368,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		idBytes := make([]byte, 16)
 		if _, err := rand.Read(idBytes); err != nil {
 			slog.Error("failed to generate ID", "error", err)
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not generate an entry id"})
 			continue
 		}
 		entryID := fmt.Sprintf("%x", idBytes)

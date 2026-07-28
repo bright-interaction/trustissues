@@ -44,6 +44,21 @@ UPDATE service_identities
 SET revoked_at = CURRENT_TIMESTAMP
 WHERE id = ? AND revoked_at IS NULL;
 
+-- name: RevokeServiceIdentitiesByUser :execresult
+-- Offboarding: revoke every still-live service key a departing user minted.
+-- FetchOwnSecrets resolves secrets as the identity's created_by_user_id, so an
+-- un-revoked key outlives its owner and keeps reading their personal vault.
+-- The runtime gate in FetchOwnSecrets refuses those anyway; revoking here is
+-- what makes the revocation VISIBLE in the identities list instead of the key
+-- silently 401ing at the next boot.
+UPDATE service_identities
+SET revoked_at = CURRENT_TIMESTAMP
+WHERE created_by_user_id = ? AND revoked_at IS NULL;
+
+-- name: ListServiceIdentitiesByUser :many
+SELECT id, name FROM service_identities
+WHERE created_by_user_id = ? AND revoked_at IS NULL;
+
 -- name: DeleteServiceIdentity :execresult
 DELETE FROM service_identities WHERE id = ?;
 
