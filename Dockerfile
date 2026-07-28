@@ -25,7 +25,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Stage 3: Minimal runtime
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates sqlite-libs tzdata \
+# `sqlite` (the CLI) as well as `sqlite-libs` (the shared library the binary
+# links against). The documented backup procedure runs
+# `docker compose exec trustissues sqlite3 ... ".backup ..."`, which is the only
+# WAL-safe way to snapshot a live database, and without the CLI that command
+# exits 127. ~1 MB. The `sqlite3 --version` assertion below keeps it from being
+# dropped again.
+RUN apk add --no-cache ca-certificates sqlite sqlite-libs tzdata \
+    && sqlite3 --version \
     && addgroup -S trustissues && adduser -S trustissues -G trustissues
 WORKDIR /app
 COPY --from=builder /trustissues /app/trustissues

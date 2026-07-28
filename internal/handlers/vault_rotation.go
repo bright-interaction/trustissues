@@ -197,7 +197,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		status := "success"
 		errSummary := ""
 		if len(targets) > 0 {
-			results := DeliverRotatedKey(ctx, queries, vaultHandler, entry.Name, oldValueCopy, newValue, targets, entry.UserID)
+			results := DeliverRotatedKey(ctx, queries, vaultHandler, entry.ID, entry.Name, oldValueCopy, newValue, targets, entry.UserID)
 			status, errSummary = summarizeDelivery(results)
 			slog.Info("vault rotation: delivery complete",
 				"entry", entry.Name,

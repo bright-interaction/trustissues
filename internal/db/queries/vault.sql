@@ -239,3 +239,9 @@ FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC;
 SELECT encrypted_value, nonce FROM vault_entries
 WHERE encryption_version = 2 AND length(encrypted_value) > 0
 LIMIT 1;
+
+-- name: ListVaultEntryTargetsInCollection :many
+-- Offboarding sweep: every entry in a collection that has rotation targets, so
+-- targets configured by a departing member can be purged when they lose access.
+SELECT id, name, rotation_targets FROM vault_entries
+WHERE collection_id = ? AND rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]';

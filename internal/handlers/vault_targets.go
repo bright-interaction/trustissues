@@ -84,16 +84,43 @@ func ParseRotationTargets(raw string) []RotationTarget {
 // userID is the ENTRY OWNER and is used for logging context only. Vault
 // references inside a target (forgejo_secret's auth_token) resolve as
 // target.ConfiguredBy instead; see the RotationTarget doc comment for why.
-func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryName string, oldValue string, newValue string, targets []RotationTarget, userID string) []DeliveryResult {
+func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryID string, entryName string, oldValue string, newValue string, targets []RotationTarget, userID string) []DeliveryResult {
 	results := make([]DeliveryResult, 0, len(targets))
 
 	for _, target := range targets {
 		var err error
+		// Every target must still be traceable to someone who currently has
+		// write on this entry, checked at DELIVERY rather than only at write.
+		//
+		// A collection editor can set targets on an entry they do not own, and
+		// removing them from the collection deletes only the membership row. The
+		// stored rotation_targets survived, and delivery never looked at who put
+		// them there (only forgejo_secret consulted ConfiguredBy, and only to
+		// resolve its auth_token). So an offboarded editor's webhook kept
+		// receiving the plaintext secret, and the rotation performed to revoke
+		// their access was the very thing that handed them the new value.
+		//
+		// Refusing here, rather than only purging on removal, is what makes this
+		// authoritative: it also covers targets planted before any purge existed.
+		// A refusal is a delivery FAILURE, not a silent skip, so summarizeDelivery
+		// marks the rotation partial and dispatchRotationAlert fires; a quiet skip
+		// would hide exactly the offboarding gap this is here to surface.
 		switch target.Type {
-		case "forgejo_secret":
-			err = deliverToForgejoSecret(ctx, queries, vault, target, newValue, userID)
-		case "webhook":
-			err = deliverToWebhook(ctx, target, entryName, newValue)
+		case "forgejo_secret", "webhook":
+			// Gate the types that actually transmit the secret. An unknown or
+			// retired type already fails below and never sends anything, so
+			// checking it here would only obscure that error.
+			if authErr := targetStillAuthorized(ctx, vault, entryID, target); authErr != nil {
+				results = append(results, DeliveryResult{Target: target, Success: false, Error: authErr.Error()})
+				slog.Error("vault delivery: target refused, configurer no longer has write on the entry",
+					"type", target.Type, "entry", entryName, "configured_by", target.ConfiguredBy)
+				continue
+			}
+			if target.Type == "forgejo_secret" {
+				err = deliverToForgejoSecret(ctx, queries, vault, target, newValue, userID)
+			} else {
+				err = deliverToWebhook(ctx, target, entryName, newValue)
+			}
 		case "notify":
 			// Notification is handled separately by the caller via ChannelDispatcher
 			continue
@@ -133,6 +160,30 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 	}
 
 	return results
+}
+
+// targetStillAuthorized reports whether the user who configured this target may
+// still write the entry, i.e. whether they would still be allowed to set it up
+// today. It is the offboarding gate for rotation delivery.
+//
+// An empty ConfiguredBy is refused outright. Targets predate the field, so an
+// unattributed one cannot be shown to belong to anyone with current access, and
+// a rotation must not ship a live secret to an address nobody can vouch for.
+// The owner can re-save the target to stamp their id and re-enable it.
+func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID string, target RotationTarget) error {
+	if vault == nil || entryID == "" {
+		// No way to check. Fail closed rather than deliver unverified.
+		return fmt.Errorf("delivery target could not be authorized (no entry context); re-save the target to re-enable it")
+	}
+	if target.ConfiguredBy == "" {
+		return fmt.Errorf("delivery target has no recorded configurer; re-save it in the rotation panel to re-enable delivery")
+	}
+	// isAdmin false on purpose: this asks whether THIS user still has access,
+	// not whether the process is privileged.
+	if _, canWrite := vault.entryAccessFor(ctx, target.ConfiguredBy, false, entryID); !canWrite {
+		return fmt.Errorf("delivery target skipped: the user who configured it no longer has write access to this secret")
+	}
+	return nil
 }
 
 // summarizeDelivery inspects delivery results and returns a rotation status

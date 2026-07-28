@@ -151,12 +151,17 @@ A naive `cp` of the database while the server runs can produce a torn snapshot
 backup API and writes the snapshot mode 0600:
 
 ```bash
+# bare metal
 TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/backup.sh /secure/backups
+
+# docker compose (the data lives in a named volume at /app/data)
+docker compose exec trustissues \
+  sqlite3 /app/data/trustissues.db ".backup '/app/data/backup.db'"
+docker compose cp trustissues:/app/data/backup.db ./trustissues-snapshot.db
+docker compose exec trustissues rm -f /app/data/backup.db
 ```
 
-For the Compose deploy, run the same `.backup` inside the container against
-`/app/data/trustissues.db`, or stop the container and tar the named volume. See
-`docs/BACKUP.md` for the full backup, restore, and key-custody procedure.
+See `docs/BACKUP.md` for the full backup, restore, and key-custody procedure.
 
 Backup rules (the short version):
 
@@ -164,10 +169,12 @@ Backup rules (the short version):
   **without** the key, which is exactly why the key must live somewhere else. A
   backup and the `TRUSTISSUES_VAULT_KEY` stored together is the same as no
   encryption.
-- To restore: drop the backup file into `TRUSTISSUES_DATA_DIR`, remove stale
-  `-wal`/`-shm` sidecars, and start the server with the **same**
-  `TRUSTISSUES_VAULT_KEY`. A different key yields `[decryption error]` on every
-  secret, permanently.
+- To restore, use `./scripts/restore.sh <snapshot>` (add `--compose` for the
+  Compose deploy). It refuses while the service is running and clears the stale
+  `-wal`/`-shm` sidecars, which matters: leaving them lets SQLite recover the OLD
+  database's tail over your restored file and silently undo the restore. Start
+  with the **same** `TRUSTISSUES_VAULT_KEY`; a different key yields
+  `[decryption error]` on every secret, permanently.
 - Automated/scheduled backups are deferred (`DEFERRED.md`); run the script from
   cron or a systemd timer for now.
 
