@@ -1259,7 +1259,7 @@ export default function Vault() {
   const [rotatingEntryId, setRotatingEntryId] = useState<string | null>(null);
   const [rotationPanelId, setRotationPanelId] = useState<string | null>(null);
   const [rotatePassword, setRotatePassword] = useState('');
-  const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+  const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '', destination_patterns: '' });
   const [editCustomFields, setEditCustomFields] = useState<CustomField[]>([]);
 
   // Collection filter: 'all' | 'personal' | a collection id.
@@ -1467,6 +1467,9 @@ export default function Vault() {
       rotation_interval_days: entry.rotation_interval_days?.toString() || '',
       expires_at: entry.expires_at ? entry.expires_at.split('T')[0] : '',
       collection_id: entry.collection_id ?? '',
+      // One host per line. Empty means no agent token can be minted for this
+      // secret at all, which is the safe default rather than a wide one.
+      destination_patterns: (entry.destination_patterns ?? []).join('\n'),
     });
     setEditCustomFields((entry.custom_fields ?? []).map((f) => ({ ...f })));
   }
@@ -1485,6 +1488,12 @@ export default function Vault() {
     // Always send the array: it replaces the whole set, so removing every row
     // clears the entry's custom fields.
     data.custom_fields = cleanCustomFields(editCustomFields);
+    // Always send it: the textarea holds the full list, so an emptied box means
+    // "clear the ceiling" (which disables minting) rather than "leave it alone".
+    data.destination_patterns = editForm.destination_patterns
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
     updateSecretMutation.mutate({ id: entryId, data });
   }
 
@@ -2064,6 +2073,35 @@ export default function Vault() {
                             placeholder="Optional description"
                             className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
                           />
+                        </div>
+                        {/*
+                          The capability ceiling. Without a writer for this the
+                          MCP "use a secret you never see" feature could not be
+                          used at all for any secret created in the product:
+                          minting always failed with no way to fix it from the UI.
+                        */}
+                        <div>
+                          <label className="mb-1 block text-xs font-medium text-slate-600">
+                            Agent access{' '}
+                            <span className="font-normal text-slate-400">
+                              (hosts an AI agent may send this secret to, one per line)
+                            </span>
+                          </label>
+                          <textarea
+                            rows={3}
+                            value={editForm.destination_patterns}
+                            onChange={(e) =>
+                              setEditForm({ ...editForm, destination_patterns: e.target.value })
+                            }
+                            placeholder={'api.example.com/*\napi.example.com/v1/chat/*'}
+                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-mono text-xs outline-none focus:border-slate-400"
+                          />
+                          <p className="mt-1 text-xs text-slate-500">
+                            Leave empty to block agent access entirely. Name the exact
+                            host and narrow with a path glob; host wildcards like{' '}
+                            <code className="font-mono">*.example.com</code> are rejected
+                            because anyone can register a sibling subdomain.
+                          </p>
                         </div>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <div>

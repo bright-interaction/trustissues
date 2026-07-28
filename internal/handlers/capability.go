@@ -180,8 +180,14 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	dests := ceiling
 	if len(req.Dests) > 0 {
 		if len(ceiling) == 0 {
+			// This pair used to contradict itself: asking for dests said "a custom
+			// dests request cannot be honored" while asking for none said "pass
+			// dests explicitly", so neither branch told the caller what to do and
+			// both were unreachable states. There is exactly one fix, and it is on
+			// the entry, not in the request.
 			writeError(w, r, http.StatusForbidden, "no_ceiling",
-				"secret has no destination allow-list configured; a custom dests request cannot be honored")
+				"this secret has no agent destination allow-list, so no capability token can be minted for it. "+
+					"Set one on the secret (Vault, edit the entry, Agent access) and try again")
 			return
 		}
 		var allowed []string
@@ -200,7 +206,8 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(dests) == 0 {
 		writeError(w, r, http.StatusBadRequest, "no_destinations",
-			"secret has no default destinations configured; pass dests explicitly")
+			"this secret has no agent destination allow-list, so no capability token can be minted for it. "+
+				"Set one on the secret (Vault, edit the entry, Agent access) and try again")
 		return
 	}
 	method := req.Method
