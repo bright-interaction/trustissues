@@ -76,7 +76,10 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
   const working = targets ?? [];
 
   const saveTargets = useMutation({
-    mutationFn: () => vaultApi.updateTargets(entry.id, working),
+    // An empty `working` here is a deliberate clear, not an accident: Save is
+    // disabled unless the targets query settled successfully, so the user is
+    // looking at the real list and has removed every row from it.
+    mutationFn: () => vaultApi.updateTargets(entry.id, working, { clear: working.length === 0 }),
     onSuccess: () => {
       toast.success('Rotation targets saved');
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.targets(entry.id) });
