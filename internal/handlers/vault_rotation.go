@@ -138,12 +138,11 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 			continue
 		}
 
-		// Rotate may have mutated meta: the NEW provider-side key id (so the next
-		// rotation revokes THIS key, not a stale/deleted id) and a transient
-		// last_revoke_error when the OLD key could not be revoked. Capture the
-		// revoke status, then strip it so it is never persisted into provider_meta.
-		revokeWarn := meta["last_revoke_error"]
-		delete(meta, "last_revoke_error")
+		// NOTE: the old key is NOT revoked yet. Rotate only recorded a pending
+		// revoke; it runs after the new value is durably stored, below. Revoking
+		// first meant a failure in the encrypt/persist window left the old
+		// credential dead upstream and the new one discarded, with no copy of
+		// either. See deferRevokeOldProviderKey.
 
 		// Encrypt the new value
 		encrypted, nonce, err := vaultHandler.EncryptValue([]byte(newValue))
@@ -172,6 +171,13 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 				entry.RotationLog.String, rotFailPersist, "auto", nil)
 			continue
 		}
+
+		// The new value is now durably stored, so it is finally safe to destroy the
+		// old key upstream. A failure here leaves BOTH keys live, which is
+		// recoverable and is reported as a partial rotation below.
+		performPendingRevoke(ctx, meta, newValue)
+		revokeWarn := meta["last_revoke_error"]
+		delete(meta, "last_revoke_error")
 
 		// Persist the meta Rotate mutated (new key id) so the NEXT rotation revokes
 		// the key we just minted instead of a stale predecessor id. Meta-only update

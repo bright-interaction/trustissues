@@ -23,14 +23,14 @@ func TestDefaultInjection(t *testing.T) {
 }
 
 func TestMarshalCapabilityDefaults(t *testing.T) {
-	dests, inj := MarshalCapabilityDefaults("cloudflare")
+	dests, inj := MarshalCapabilityDefaults("cloudflare", nil)
 	if dests == "" || inj == "" {
 		t.Fatalf("cloudflare defaults missing: dests=%s inj=%s", dests, inj)
 	}
 	if dests != `["api.cloudflare.com/*"]` {
 		t.Errorf("cloudflare dests = %s", dests)
 	}
-	if dests, inj = MarshalCapabilityDefaults("manual"); dests != "" || inj != "" {
+	if dests, inj = MarshalCapabilityDefaults("manual", nil); dests != "" || inj != "" {
 		t.Errorf("manual provider should have empty defaults: %s / %s", dests, inj)
 	}
 }
