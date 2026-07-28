@@ -246,6 +246,14 @@ LIMIT 1;
 SELECT id, name, rotation_targets FROM vault_entries
 WHERE collection_id = ? AND rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]';
 
+-- name: ListAllVaultEntryTargets :many
+-- Estate-wide variant of the sweep above, for offboarding that is not scoped to
+-- one collection: disabling an account has to detach that person's delivery
+-- endpoints wherever they sit, including on entries they own personally, since
+-- auto-rotation keeps running on those after the account is disabled.
+SELECT id, name, rotation_targets FROM vault_entries
+WHERE rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]';
+
 -- name: UpdateVaultEntryDestinationPatterns :exec
 -- The capability ceiling: which hosts/paths an agent token minted for this
 -- secret may ever reach. Until this existed the column had exactly one writer

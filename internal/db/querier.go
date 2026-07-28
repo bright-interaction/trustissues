@@ -204,6 +204,11 @@ type Querier interface {
 	// List entries (metadata only)
 	// ============================================================================
 	ListAllVaultEntries(ctx context.Context) ([]ListAllVaultEntriesRow, error)
+	// Estate-wide variant of the sweep above, for offboarding that is not scoped to
+	// one collection: disabling an account has to detach that person's delivery
+	// endpoints wherever they sit, including on entries they own personally, since
+	// auto-rotation keeps running on those after the account is disabled.
+	ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
 	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
 	// Accepted memberships only. A pending invitation must not surface the

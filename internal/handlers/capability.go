@@ -156,9 +156,11 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ACL: presence of a (agent_id, secret_id) row in capability_grants
-	// authorises. Empty table for the owner = permissive; the bridge
-	// install path inserts a "self-grant" so vibecoders never trip on
-	// this on day one but the mechanism exists for multi-agent setups.
+	// authorises. Nothing writes that table today, so in practice every caller
+	// takes the implicit branch, which permits whoever can currently reach the
+	// entry (see agentCanUse). The table stays as the narrowing mechanism for
+	// multi-agent setups; when a writer ships, granting one agent starts
+	// excluding the others for that agent id.
 	allowed, err := h.agentCanUse(ctx, req.AgentID, entry.ID, userID)
 	if err != nil {
 		slog.Error("capability.issue: acl", "error", err)
@@ -588,10 +590,22 @@ func joinDests(d []string) string {
 }
 
 // agentCanUse returns true when the (agent_id, secret_id) pair has an
-// active grant. The owner of the secret implicitly has access when no
-// grants exist for the agent at all, so a fresh install does not
-// require an extra step.
-func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, ownerID string) (bool, error) {
+// active grant. When no grants exist for the agent at all, a fresh install is
+// permitted implicitly so day one does not require an extra step.
+//
+// That implicit permit follows ACCESS, not ownership. It used to end in
+// `vault_entries WHERE id = ? AND user_id = ?`, i.e. the entry's creator, which
+// made the whole capability bridge dead for every shared secret: an accepted
+// editor or manager of a collection resolved the entry fine through
+// accessibleEntriesPredicate, then got a hard 403 agent_not_granted from this
+// ACL. list_secrets advertised a name that use_secret could never mint, and the
+// grant the error asks for has no writer anywhere in the tree, so there was no
+// operator workaround.
+//
+// The scope now comes from the SAME predicate as the lookups. That is the point:
+// this property had already been closed at the lookup, and leaving a second
+// ownership test behind it is how it stayed broken. A removed member fails both.
+func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, userID string) (bool, error) {
 	row := h.db.QueryRowContext(ctx,
 		`SELECT 1 FROM capability_grants WHERE agent_id = ? AND secret_id = ? AND revoked_at IS NULL`,
 		agentID, secretID)
@@ -612,10 +626,13 @@ func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, 
 	if n > 0 {
 		return false, nil
 	}
-	// Owner of the secret also gets implicit access until they
-	// configure explicit grants.
+	// Anyone who can currently REACH the secret gets implicit access until
+	// explicit grants are configured: the personal owner, or an accepted member
+	// of the collection it lives in. Same predicate as lookupSecretByName, so
+	// the two can never drift apart again.
 	row = h.db.QueryRowContext(ctx,
-		`SELECT 1 FROM vault_entries WHERE id = ? AND user_id = ?`, secretID, ownerID)
+		`SELECT 1 FROM vault_entries WHERE id = ? AND `+accessibleEntriesPredicate,
+		secretID, userID, userID)
 	if err := row.Scan(&v); err == nil {
 		return true, nil
 	}

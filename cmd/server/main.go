@@ -283,6 +283,10 @@ func main() {
 		slog.Error("vault encryption migration failed", "error", err)
 		os.Exit(1)
 	}
+	// Disabling an account detaches that user's rotation delivery targets, so
+	// the user handler needs the vault. Wired here because the vault handler is
+	// constructed after it.
+	userHandler.SetVault(vaultHandler)
 	if _, err := vaultHandler.BackfillMetadataEncryption(); err != nil {
 		slog.Error("vault metadata backfill failed", "error", err)
 	}
