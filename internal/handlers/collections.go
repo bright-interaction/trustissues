@@ -304,6 +304,28 @@ func (h *CollectionHandler) AcceptInvite(w http.ResponseWriter, r *http.Request)
 func (h *CollectionHandler) DeclineInvite(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	userID := middleware.GetUserID(r.Context())
+
+	// Same last-manager guard RemoveMember has. This endpoint doubles as "leave
+	// the collection", so without it the sole manager could walk out and orphan
+	// it: no member could then add anyone, change a role or delete it, and every
+	// secret inside would be stranded with only an instance admin able to
+	// recover it. Declining a PENDING invite is unaffected, since an unaccepted
+	// row is not a manager yet.
+	if role, roleErr := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+		CollectionID: id, UserID: userID,
+	}); roleErr == nil && role == collRoleManager {
+		count, cErr := h.queries.CountCollectionManagers(r.Context(), id)
+		if cErr != nil {
+			logError(r, "collections.decline: manager count failed", "error", cErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if count <= 1 {
+			writeConflict(w, r, "you are the last manager of this collection; promote another member before leaving")
+			return
+		}
+	}
+
 	res, err := h.queries.RemoveCollectionMember(r.Context(), db.RemoveCollectionMemberParams{
 		CollectionID: id, UserID: userID,
 	})

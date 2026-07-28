@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/smtp"
 	"strings"
+	"time"
 )
 
 // sendInvitationEmail sends a branded invitation email via SMTP.
@@ -86,13 +87,31 @@ func buildMIMEMessage(from, to, subject, htmlBody string) []byte {
 	return []byte(headers + htmlBody)
 }
 
+// SMTP network bounds. Neither transport had any: a relay that accepts the
+// connection and then stays silent pinned the sending goroutine (and its socket)
+// for the life of the process, with zero user-visible signal.
+const (
+	smtpDialTimeout = 10 * time.Second
+	smtpIOTimeout   = 30 * time.Second
+)
+
 func sendMailTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
 	tlsConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	// Bounded dial. Without a timeout a relay that accepts the TCP connection and
+	// then says nothing blocks this goroutine forever: the invitation send runs
+	// detached (go trySendInvitationEmail), so the HTTP request still returns
+	// "invitation created", the invite is never delivered, and even the error log
+	// never fires because the call never returns. The admin gets no signal at all.
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: smtpDialTimeout}, "tcp", addr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("TLS dial failed: %w", err)
 	}
 	defer conn.Close()
+	// The dial timeout only covers connect+handshake; this bounds the banner and
+	// every command after it.
+	if dErr := conn.SetDeadline(time.Now().Add(smtpIOTimeout)); dErr != nil {
+		return fmt.Errorf("TLS deadline: %w", dErr)
+	}
 
 	client, err := smtp.NewClient(conn, host)
 	if err != nil {
@@ -146,7 +165,23 @@ func isLoopbackSMTPHost(host string) bool {
 // credentials to an unencrypted non-local server, so the SMTP password was
 // never the exposure; the message body was.
 func sendMailSTARTTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte, requireTLS bool) error {
-	client, err := smtp.Dial(addr)
+	// Same bound for the STARTTLS path, and it is the likelier one to hang: an
+	// admin who sets port 465 but leaves "Use TLS" unticked lands here, sends
+	// plaintext at an implicit-TLS port, and then both ends wait forever (us for
+	// a 220 banner, the relay for a ClientHello).
+	rawConn, err := (&net.Dialer{Timeout: smtpDialTimeout}).Dial("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("smtp dial: %w", err)
+	}
+	// Covers banner, handshake, AUTH and DATA. Re-armed after STARTTLS below.
+	if dErr := rawConn.SetDeadline(time.Now().Add(smtpIOTimeout)); dErr != nil {
+		rawConn.Close()
+		return fmt.Errorf("smtp deadline: %w", dErr)
+	}
+	client, err := smtp.NewClient(rawConn, host)
+	if err != nil {
+		rawConn.Close()
+	}
 	if err != nil {
 		return fmt.Errorf("SMTP dial failed: %w", err)
 	}

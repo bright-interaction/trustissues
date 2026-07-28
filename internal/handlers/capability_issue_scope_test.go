@@ -58,9 +58,25 @@ func TestIssueIsCollectionScoped(t *testing.T) {
 
 	capH := setupCapabilityHandler(t, h.db)
 
+	// NOTE: the request field is "secret", not "name". An earlier version of this
+	// test sent "name", which json silently ignored, so every request resolved
+	// through destination auto-routing instead of the by-name lookup. It still
+	// exercised agentCanUse (which is what this test is for, and it did fail
+	// correctly at 403 before that fix), but it was not testing the path its own
+	// body implied. Both paths are driven explicitly below.
 	issueAs := func(t *testing.T, userID string) (int, string) {
 		t.Helper()
-		body := `{"agent_id":"agent-test","name":"Issue shared key","destination":"api.stripe.com/v1/charges","method":"POST"}`
+		body := `{"agent_id":"agent-test","secret":"Issue shared key","destination":"api.stripe.com/v1/charges","method":"POST"}`
+		r := httptest.NewRequest(http.MethodPost, "/api/secrets/issue", strings.NewReader(body))
+		r = r.WithContext(context.WithValue(r.Context(), middleware.UserIDKey, userID))
+		w := httptest.NewRecorder()
+		capH.Issue(w, r)
+		return w.Code, w.Body.String()
+	}
+
+	issueByDestination := func(t *testing.T, userID string) (int, string) {
+		t.Helper()
+		body := `{"agent_id":"agent-test","destination":"api.stripe.com/v1/charges","method":"POST"}`
 		r := httptest.NewRequest(http.MethodPost, "/api/secrets/issue", strings.NewReader(body))
 		r = r.WithContext(context.WithValue(r.Context(), middleware.UserIDKey, userID))
 		w := httptest.NewRecorder()
@@ -71,7 +87,10 @@ func TestIssueIsCollectionScoped(t *testing.T) {
 	// Guard the setup. If the creator cannot mint, every assertion below would
 	// pass for the wrong reason and the test would be vacuous.
 	if code, body := issueAs(t, creator); code != http.StatusOK && code != http.StatusCreated {
-		t.Fatalf("ABORT: the entry's creator cannot mint (%d): %s", code, body)
+		t.Fatalf("ABORT: the entry's creator cannot mint by name (%d): %s", code, body)
+	}
+	if code, body := issueByDestination(t, creator); code != http.StatusOK && code != http.StatusCreated {
+		t.Fatalf("ABORT: the entry's creator cannot mint by destination (%d): %s", code, body)
 	}
 
 	// The regression. Each of these resolved the entry fine and was then refused
@@ -94,6 +113,9 @@ func TestIssueIsCollectionScoped(t *testing.T) {
 		}
 		if err := json.Unmarshal([]byte(body), &out); err != nil || out.Token == "" {
 			t.Errorf("%s got %d but no usable token: %s", tc.role, code, body)
+		}
+		if dCode, dBody := issueByDestination(t, tc.who); dCode != http.StatusOK && dCode != http.StatusCreated {
+			t.Errorf("a current collection %s cannot mint by destination either (%d): %s", tc.role, dCode, dBody)
 		}
 	}
 

@@ -111,6 +111,27 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		writeUnauthorized(w, r, "service identity is not owner-scoped; re-provision it")
 		return
 	}
+	// The owner's account must still be live. This route resolves every secret
+	// as CreatedByUserID, so without this check a service key outlives its
+	// owner: disabling AND deleting the minting admin both left the key
+	// returning their personal secrets in plaintext, including values rotated
+	// after they left. revoked_at stayed NULL, so nothing in the UI showed it.
+	//
+	// This is the same property as the collection-removal, rotation-delivery
+	// and capability-minting fixes, reached through a fourth door. It needs its
+	// own check because this route never touches entryAccessFor (where round 4
+	// put the equivalent gate) and never passes through the auth middleware
+	// that rejects disabled users for session and API-key requests.
+	owner, ownerErr := h.queries.GetUserByID(r.Context(), identity.CreatedByUserID.String)
+	if ownerErr != nil || owner.Disabled != 0 {
+		reason := "owner account is disabled"
+		if ownerErr != nil {
+			reason = "owner account no longer exists"
+		}
+		h.audit(identity.ID, identity.Name, "denied", nil, reason, remoteIP)
+		writeUnauthorized(w, r, "service key owner is no longer active; re-provision this identity")
+		return
+	}
 
 	// Parse the allowed_secrets whitelist.
 	var allowed []string

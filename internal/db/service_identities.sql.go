@@ -357,6 +357,55 @@ func (q *Queries) ListServiceIdentities(ctx context.Context) ([]ListServiceIdent
 	return items, nil
 }
 
+const listServiceIdentitiesByUser = `-- name: ListServiceIdentitiesByUser :many
+SELECT id, name FROM service_identities
+WHERE created_by_user_id = ? AND revoked_at IS NULL
+`
+
+type ListServiceIdentitiesByUserRow struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func (q *Queries) ListServiceIdentitiesByUser(ctx context.Context, createdByUserID sql.NullString) ([]ListServiceIdentitiesByUserRow, error) {
+	rows, err := q.db.QueryContext(ctx, listServiceIdentitiesByUser, createdByUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListServiceIdentitiesByUserRow{}
+	for rows.Next() {
+		var i ListServiceIdentitiesByUserRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeServiceIdentitiesByUser = `-- name: RevokeServiceIdentitiesByUser :execresult
+UPDATE service_identities
+SET revoked_at = CURRENT_TIMESTAMP
+WHERE created_by_user_id = ? AND revoked_at IS NULL
+`
+
+// Offboarding: revoke every still-live service key a departing user minted.
+// FetchOwnSecrets resolves secrets as the identity's created_by_user_id, so an
+// un-revoked key outlives its owner and keeps reading their personal vault.
+// The runtime gate in FetchOwnSecrets refuses those anyway; revoking here is
+// what makes the revocation VISIBLE in the identities list instead of the key
+// silently 401ing at the next boot.
+func (q *Queries) RevokeServiceIdentitiesByUser(ctx context.Context, createdByUserID sql.NullString) (sql.Result, error) {
+	return q.db.ExecContext(ctx, revokeServiceIdentitiesByUser, createdByUserID)
+}
+
 const revokeServiceIdentity = `-- name: RevokeServiceIdentity :execresult
 UPDATE service_identities
 SET revoked_at = CURRENT_TIMESTAMP
