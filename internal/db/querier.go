@@ -220,6 +220,14 @@ type Querier interface {
 	ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
 	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
+	// The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
+	//
+	// A single blanket UPDATE was all-or-nothing: vault_entries still carries
+	// UNIQUE(user_id, name), so if the leaver and the new owner both had an entry
+	// called "GitHub" (generic names collide constantly in a password manager) the
+	// statement aborted and EVERY shared entry kept the deleted user's id, silently,
+	// while the confirmation dialog promised the team would keep them.
+	ListCollectionVaultEntriesForUser(ctx context.Context, userID string) ([]ListCollectionVaultEntriesForUserRow, error)
 	// Accepted memberships only. A pending invitation must not surface the
 	// collection (or its entries) until the invitee opts in.
 	ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error)
@@ -280,11 +288,12 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
-	// Entries the departing user created inside a SHARED collection are team
-	// property and must not vanish with them, so they are re-owned by the admin
-	// performing the delete rather than deleted or orphaned.
-	ReassignCollectionVaultEntries(ctx context.Context, arg ReassignCollectionVaultEntriesParams) (sql.Result, error)
+	// Re-own ONE entry, so a single name collision cannot block the rest.
+	ReassignCollectionVaultEntryOwner(ctx context.Context, arg ReassignCollectionVaultEntryOwnerParams) (sql.Result, error)
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
+	// Used only to de-duplicate on re-ownership when the new owner already has an
+	// entry by that name.
+	RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error)
 	// ============================================================================
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 	// ============================================================================

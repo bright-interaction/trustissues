@@ -375,12 +375,36 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 		t.Fatalf("legacy target should fail closed with a re-save hint, got %v", err)
 	}
 
-	// Sanity: the owner setting the same target does resolve, so the fix does
-	// not break the legitimate case.
+	// Re-saving an UNCHANGED target must NOT re-attribute it. This assertion
+	// used to demand the opposite (owner re-saves the same body, attribution
+	// moves to the owner), which was the laundering bug: the rotation panel PUTs
+	// every row it loaded, so an owner adding one target of their own silently
+	// re-authorized a departed member's webhook and the next rotation POSTed
+	// them the fresh plaintext. "Who set this up" must not change because
+	// somebody else pressed Save.
 	rec = httptest.NewRecorder()
 	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, body))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("owner could not set targets: HTTP %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("owner could not save targets: HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	raw, err = queries.GetVaultEntryTargets(ctx, entryID)
+	if err != nil {
+		t.Fatalf("read back targets: %v", err)
+	}
+	stored = ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+	if stored[0].ConfiguredBy != editor {
+		t.Fatalf("re-saving an unchanged target re-attributed it: configured_by = %q, want the original configurer %q",
+			stored[0].ConfiguredBy, editor)
+	}
+
+	// The legitimate case the old assertion was reaching for: a genuinely NEW
+	// target (different destination) is stamped to whoever created it.
+	newBody := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
+		`"secret_name":"OTHER_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, editor)
+	rec = httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, newBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner could not set a new target: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
 	raw, err = queries.GetVaultEntryTargets(ctx, entryID)
 	if err != nil {
@@ -388,7 +412,7 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	}
 	stored = ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
 	if stored[0].ConfiguredBy != owner {
-		t.Fatalf("configured_by = %q, want %q", stored[0].ConfiguredBy, owner)
+		t.Fatalf("a new target was not stamped to its creator: configured_by = %q, want %q", stored[0].ConfiguredBy, owner)
 	}
 	if _, err := queries.ResolveVaultReference(ctx, db.ResolveVaultReferenceParams{
 		Name:   "OWNER_PERSONAL",

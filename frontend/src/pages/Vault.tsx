@@ -1344,6 +1344,26 @@ export default function Vault() {
       setRotatedValue({ id: data.id, value: data.value ?? '' });
       toast.success('Secret rotated');
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+      // Rotate was the only mutation that did not refresh the unlocked list.
+      // vaultEntries holds the decrypted values from unlock, and invalidating
+      // the query only refetches the LOCKED list, so the row kept revealing and
+      // copying the PREVIOUS secret: the one that was just revoked upstream.
+      // Copy it into a deploy and it fails to authenticate, with the UI insisting
+      // the rotation succeeded. The rotation status shown alongside it was stale
+      // for the same reason.
+      setVaultEntries((entries) =>
+        entries.map((e) =>
+          e.id === data.id
+            ? {
+                ...e,
+                value: data.value ?? e.value,
+                last_rotated_at: data.last_rotated_at ?? e.last_rotated_at,
+                rotation_status: data.rotation_status ?? e.rotation_status,
+                last_rotation_error: data.last_rotation_error ?? '',
+              }
+            : e
+        )
+      );
     },
     onError: (err: Error) => toast.error(err.message),
   });

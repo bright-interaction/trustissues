@@ -440,6 +440,46 @@ func (q *Queries) ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultE
 	return items, nil
 }
 
+const listCollectionVaultEntriesForUser = `-- name: ListCollectionVaultEntriesForUser :many
+SELECT id, name FROM vault_entries
+WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != ''
+`
+
+type ListCollectionVaultEntriesForUserRow struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
+//
+// A single blanket UPDATE was all-or-nothing: vault_entries still carries
+// UNIQUE(user_id, name), so if the leaver and the new owner both had an entry
+// called "GitHub" (generic names collide constantly in a password manager) the
+// statement aborted and EVERY shared entry kept the deleted user's id, silently,
+// while the confirmation dialog promised the team would keep them.
+func (q *Queries) ListCollectionVaultEntriesForUser(ctx context.Context, userID string) ([]ListCollectionVaultEntriesForUserRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCollectionVaultEntriesForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCollectionVaultEntriesForUserRow{}
+	for rows.Next() {
+		var i ListCollectionVaultEntriesForUserRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProviderEntries = `-- name: ListProviderEntries :many
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
 FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC
@@ -1020,21 +1060,33 @@ func (q *Queries) MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVa
 	return err
 }
 
-const reassignCollectionVaultEntries = `-- name: ReassignCollectionVaultEntries :execresult
-UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP
-WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != ''
+const reassignCollectionVaultEntryOwner = `-- name: ReassignCollectionVaultEntryOwner :execresult
+UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
-type ReassignCollectionVaultEntriesParams struct {
-	UserID   string `json:"user_id"`
-	UserID_2 string `json:"user_id_2"`
+type ReassignCollectionVaultEntryOwnerParams struct {
+	UserID string `json:"user_id"`
+	ID     string `json:"id"`
 }
 
-// Entries the departing user created inside a SHARED collection are team
-// property and must not vanish with them, so they are re-owned by the admin
-// performing the delete rather than deleted or orphaned.
-func (q *Queries) ReassignCollectionVaultEntries(ctx context.Context, arg ReassignCollectionVaultEntriesParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, reassignCollectionVaultEntries, arg.UserID, arg.UserID_2)
+// Re-own ONE entry, so a single name collision cannot block the rest.
+func (q *Queries) ReassignCollectionVaultEntryOwner(ctx context.Context, arg ReassignCollectionVaultEntryOwnerParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reassignCollectionVaultEntryOwner, arg.UserID, arg.ID)
+}
+
+const renameVaultEntry = `-- name: RenameVaultEntry :execresult
+UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+`
+
+type RenameVaultEntryParams struct {
+	Name string `json:"name"`
+	ID   string `json:"id"`
+}
+
+// Used only to de-duplicate on re-ownership when the new owner already has an
+// entry by that name.
+func (q *Queries) RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, renameVaultEntry, arg.Name, arg.ID)
 }
 
 const resolveVaultReference = `-- name: ResolveVaultReference :one
