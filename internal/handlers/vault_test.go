@@ -247,7 +247,8 @@ func TestComputeRotationStatus(t *testing.T) {
 		{"rotated recently despite old created_at", intPtr(30), nil, fmtTime(now.Add(-1 * time.Hour)), fmtTime(now.Add(-400 * 24 * time.Hour)), "fresh"},
 	}
 	for _, tc := range cases {
-		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot, tc.created); got != tc.expected {
+		// nil rotation error: these cases exercise the age/expiry paths only.
+		if got := computeRotationStatus(tc.days, tc.expires, tc.lastRot, tc.created, nil); got != tc.expected {
 			t.Errorf("%s: got %q want %q", tc.name, got, tc.expected)
 		}
 	}

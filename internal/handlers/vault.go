@@ -457,7 +457,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
-	e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+	e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 	return e
 }
 
@@ -673,7 +673,16 @@ func (h *VaultHandler) DecryptValue(ciphertext, nonce []byte, encVersion int) ([
 
 // computeRotationStatus determines the rotation status of a vault entry based
 // on its rotation interval, expiration date, and last rotation time.
-func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *string, createdAt *string) string {
+// computeRotationStatus derives the badge shown for a vault entry.
+//
+// lastRotationError is NOT cosmetic: an entry whose auto-rotation is failing
+// must never report "fresh". It did until 2026-07-27, when the Cloudflare entry
+// logged 50 consecutive hourly failures ("identify token: token verification
+// failed") while the UI and MCP both reported `fresh`. Age alone cannot tell you
+// rotation works. Worse, UpdateVaultEntryValue stamps last_rotated_at, so saving
+// a value manually looks identical to a successful rotation and buys another
+// full interval of silence. Keep this in sync with the dockyard twin.
+func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *string, createdAt *string, lastRotationError *string) string {
 	// If expires_at is set and past, return "expired"
 	if expiresAt != nil && *expiresAt != "" {
 		exp, err := time.Parse("2006-01-02 15:04:05", *expiresAt)
@@ -685,6 +694,12 @@ func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *
 		if err == nil && time.Now().After(exp) {
 			return "expired"
 		}
+	}
+
+	// A recorded rotation failure outranks any age-based status. Checked after
+	// "expired" only because an already-expired credential is the worse fact.
+	if lastRotationError != nil && strings.TrimSpace(*lastRotationError) != "" {
+		return "error"
 	}
 
 	// If no rotation interval, it's fresh
@@ -708,7 +723,10 @@ func computeRotationStatus(rotationDays *int, expiresAt *string, lastRotatedAt *
 	// Calculate age
 	lastRotated, err := time.Parse("2006-01-02 15:04:05", *anchor)
 	if err != nil {
-		lastRotated, err = time.Parse(time.RFC3339, *lastRotatedAt)
+		// Must be *anchor, not *lastRotatedAt: when the entry has never rotated,
+		// anchor is createdAt and lastRotatedAt is nil, so this dereferenced nil
+		// and panicked for any createdAt the first layout could not parse.
+		lastRotated, err = time.Parse(time.RFC3339, *anchor)
 		if err != nil {
 			return "fresh"
 		}
@@ -874,7 +892,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromListAllRow(row)
 			e.CollectionID = nullStringPtr(row.CollectionID)
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
 	} else if isAdmin && r.URL.Query().Get("user_id") != "" {
@@ -886,7 +904,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			e := h.vaultMetaFromListByUserRow(row)
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
 	} else {
@@ -904,7 +922,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromAccessibleRow(row)
 			e.UserID = "" // omitempty will exclude it
-			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
 	}
@@ -1691,7 +1709,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 		entries = append(entries, e)
 	}
 
@@ -2301,7 +2319,7 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[e.ID] = true
-		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt)
+		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 		entries = append(entries, e)
 	}
 

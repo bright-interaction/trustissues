@@ -83,10 +83,10 @@ func TestNeverRotatedEntryIsNotInstantlyDue(t *testing.T) {
 	days365, days30 := 365, 30
 	created := time.Now().AddDate(0, 0, -400).Format("2006-01-02 15:04:05")
 	recent := time.Now().Format("2006-01-02 15:04:05")
-	if got := computeRotationStatus(&days365, nil, nil, &recent); got != "fresh" {
+	if got := computeRotationStatus(&days365, nil, nil, &recent, nil); got != "fresh" {
 		t.Fatalf("just-enrolled entry shows %q, want fresh", got)
 	}
-	if got := computeRotationStatus(&days30, nil, nil, &created); got == "fresh" {
+	if got := computeRotationStatus(&days30, nil, nil, &created, nil); got == "fresh" {
 		t.Fatal("an entry enrolled long before its interval still shows fresh: " +
 			"the UI would say fresh while the scheduler rotates it")
 	}

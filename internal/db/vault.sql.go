@@ -976,7 +976,7 @@ func (q *Queries) ResolveVaultReference(ctx context.Context, arg ResolveVaultRef
 
 const rotateVaultEntryValue = `-- name: RotateVaultEntryValue :execresult
 
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type RotateVaultEntryValueParams struct {
@@ -1270,7 +1270,7 @@ func (q *Queries) UpdateVaultEntryUsername(ctx context.Context, arg UpdateVaultE
 
 const updateVaultEntryValue = `-- name: UpdateVaultEntryValue :exec
 
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type UpdateVaultEntryValueParams struct {
