@@ -739,10 +739,15 @@ const (
 // missing entry so callers 404 uniformly. This is the single authorization point
 // for every single-entry operation; do not bypass it with a raw owner check.
 func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, canWrite bool) {
-	userID := middleware.GetUserID(r.Context())
-	isAdmin := middleware.IsAdmin(r.Context())
+	return h.entryAccessFor(r.Context(), middleware.GetUserID(r.Context()), middleware.IsAdmin(r.Context()), entryID)
+}
 
-	info, err := h.queries.GetVaultEntryAccess(r.Context(), entryID)
+// entryAccessFor is entryAccess without an *http.Request, so background work
+// (rotation delivery) can ask the same question about a user who is not the
+// caller. entryAccess is the request-scoped wrapper; both share this body so
+// the two can never drift into different answers.
+func (h *VaultHandler) entryAccessFor(ctx context.Context, userID string, isAdmin bool, entryID string) (canRead, canWrite bool) {
+	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
 	if err != nil {
 		return false, false
 	}
@@ -768,7 +773,7 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 		// A member of the collection still gets write below via their role; this
 		// branch only matters for a creator who is NOT currently a member.
 		if userID != "" && info.UserID == userID {
-			role, roleErr := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+			role, roleErr := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
 				CollectionID: info.CollectionID.String,
 				UserID:       userID,
 			})
@@ -784,7 +789,7 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 				return true, false
 			}
 		}
-		role, err := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+		role, err := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
 			CollectionID: info.CollectionID.String,
 			UserID:       userID,
 		})
@@ -1912,7 +1917,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		go func(eid, name, oldV, newV, uid, provider, method string, ts []RotationTarget) {
 			deliveryCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
-			results := DeliverRotatedKey(deliveryCtx, h.queries, h, name, oldV, newV, ts, uid)
+			results := DeliverRotatedKey(deliveryCtx, h.queries, h, eid, name, oldV, newV, ts, uid)
 			status, errSummary := summarizeDelivery(results)
 			slog.Info("vault.rotate: delivery complete", "entry", name, "status", status, "total_targets", len(ts))
 			if status != "success" {

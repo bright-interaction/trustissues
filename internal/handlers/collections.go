@@ -21,10 +21,13 @@ import (
 // (editor plus member and collection management).
 type CollectionHandler struct {
 	queries *db.Queries
+	// vault is needed to decrypt/re-encrypt rotation_targets when purging a
+	// departing member's delivery endpoints. Nil-safe: the purge is skipped.
+	vault *VaultHandler
 }
 
-func NewCollectionHandler(queries *db.Queries) *CollectionHandler {
-	return &CollectionHandler{queries: queries}
+func NewCollectionHandler(queries *db.Queries, vault *VaultHandler) *CollectionHandler {
+	return &CollectionHandler{queries: queries, vault: vault}
 }
 
 func validCollectionRole(role string) bool {
@@ -465,5 +468,26 @@ func (h *CollectionHandler) RemoveMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	LogActivityFromRequest(h.queries, r, "collection.member_removed", fmt.Sprintf("Member %s removed from collection %s", targetUser, id))
+
+	// Offboarding cleanup. A collection editor can configure rotation delivery
+	// targets on an entry they do not own, and removing them only deleted the
+	// membership row: their webhook stayed attached and kept receiving the
+	// plaintext secret on every rotation, so the rotation performed to revoke
+	// their access was the very thing that handed them the new value.
+	//
+	// DeliverRotatedKey now refuses such a target outright, which is the
+	// authoritative control and also covers targets planted before this existed.
+	// Purging as well keeps a dead endpoint from sitting in the UI looking
+	// active, from marking every future rotation "partial", and from silently
+	// reactivating if the person is re-added. Best-effort: never fail the
+	// removal over cleanup.
+	if summary := h.purgeTargetsConfiguredBy(r.Context(), id, targetUser); summary != "" {
+		name := id
+		if c, cErr := h.queries.GetCollection(r.Context(), id); cErr == nil {
+			name = c.Name
+		}
+		h.logTargetPurge(r, name, summary)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }

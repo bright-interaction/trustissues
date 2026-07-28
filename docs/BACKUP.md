@@ -40,6 +40,13 @@ Use the helper script (WAL-safe, writes the snapshot mode 0600):
 TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/backup.sh /secure/backups
 ```
 
+That path is the **bare-metal** layout. On the Docker Compose deploy the data
+lives in the named volume `trustissues_trustissues_data`, mounted at `/app/data`
+in the container (host source
+`/var/lib/docker/volumes/trustissues_trustissues_data/_data`, root-only). Running
+this script host-side against that path needs root and a host `sqlite3`; the
+in-container command in the next section is the normal route.
+
 It runs SQLite's online backup API under the hood:
 
 ```bash
@@ -113,9 +120,35 @@ must never be recoverable from the same place.
    chmod 600 "$TRUSTISSUES_DATA_DIR/trustissues.db"
    ```
 
-   For the Compose deploy, copy the file into the volume (`docker compose cp
-   ./trustissues.db trustissues:/app/data/trustissues.db`) while the container is
-   stopped.
+   Or use the helper, which does all of step 3 in one command and refuses if the
+   service is still running:
+
+   ```bash
+   TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/restore.sh /secure/backups/trustissues-....db
+   ```
+
+   **Docker Compose.** The data is inside a named volume, so the sidecars cannot
+   be removed with `docker compose exec`: that needs a RUNNING container, and
+   starting it is exactly what makes SQLite recover the OLD tail over your
+   restored file. Use a one-shot container instead, or the helper:
+
+   ```bash
+   docker compose stop trustissues
+   ./scripts/restore.sh --compose /secure/backups/trustissues-....db
+   docker compose up -d trustissues
+   ```
+
+   The equivalent by hand, if you prefer:
+
+   ```bash
+   docker compose stop trustissues
+   docker compose cp ./trustissues.db trustissues:/app/data/trustissues.db
+   docker compose run --rm --no-deps --entrypoint sh trustissues -c \
+     'rm -f /app/data/trustissues.db-wal /app/data/trustissues.db-shm && chmod 600 /app/data/trustissues.db'
+   docker compose up -d trustissues
+   ```
+
+   Do NOT `docker compose up` or `exec` before the sidecars are gone.
 4. Start the server with the same key and the same `TRUSTISSUES_DATA_DIR`.
    Embedded migrations run automatically and bring an older schema forward.
 5. **Verify before you trust it.** Log in, unlock the vault, and reveal at least

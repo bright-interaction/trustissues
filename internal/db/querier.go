@@ -233,6 +233,9 @@ type Querier interface {
 	// Import - conflict detection
 	// ============================================================================
 	ListVaultEntryNamesByUser(ctx context.Context, userID string) ([]string, error)
+	// Offboarding sweep: every entry in a collection that has rotation targets, so
+	// targets configured by a departing member can be purged when they lose access.
+	ListVaultEntryTargetsInCollection(ctx context.Context, collectionID sql.NullString) ([]ListVaultEntryTargetsInCollectionRow, error)
 	MarkInvitationRedeemed(ctx context.Context, arg MarkInvitationRedeemedParams) error
 	MatchAccessibleVaultEntriesByURL(ctx context.Context, arg MatchAccessibleVaultEntriesByURLParams) ([]MatchAccessibleVaultEntriesByURLRow, error)
 	// Autofill within one collection the caller has ACCEPTED. Callers must check

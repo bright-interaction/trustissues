@@ -96,7 +96,7 @@ func TestDeliverRotatedKeyRejectsRetiredTypes(t *testing.T) {
 		{Type: "bogus"},
 	}
 	// nil queries/vault are safe: unknown types never reach the DB or crypto.
-	results := DeliverRotatedKey(context.Background(), nil, nil, "entry", "old", "new", targets, "user1")
+	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry", "old", "new", targets, "user1")
 	if len(results) != 4 {
 		t.Fatalf("expected 4 results, got %d", len(results))
 	}
@@ -119,7 +119,7 @@ func TestDeliverRotatedKeyRejectsRetiredTypes(t *testing.T) {
 // result (the caller dispatches notifications separately) and never fail a
 // rotation.
 func TestDeliverRotatedKeyNotifySkipped(t *testing.T) {
-	results := DeliverRotatedKey(context.Background(), nil, nil, "entry", "", "new", []RotationTarget{{Type: "notify"}}, "user1")
+	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry", "", "new", []RotationTarget{{Type: "notify"}}, "user1")
 	if len(results) != 0 {
 		t.Fatalf("notify target should be skipped, got %d results", len(results))
 	}

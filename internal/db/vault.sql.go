@@ -813,6 +813,42 @@ func (q *Queries) ListVaultEntryNamesByUser(ctx context.Context, userID string) 
 	return items, nil
 }
 
+const listVaultEntryTargetsInCollection = `-- name: ListVaultEntryTargetsInCollection :many
+SELECT id, name, rotation_targets FROM vault_entries
+WHERE collection_id = ? AND rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]'
+`
+
+type ListVaultEntryTargetsInCollectionRow struct {
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	RotationTargets sql.NullString `json:"rotation_targets"`
+}
+
+// Offboarding sweep: every entry in a collection that has rotation targets, so
+// targets configured by a departing member can be purged when they lose access.
+func (q *Queries) ListVaultEntryTargetsInCollection(ctx context.Context, collectionID sql.NullString) ([]ListVaultEntryTargetsInCollectionRow, error) {
+	rows, err := q.db.QueryContext(ctx, listVaultEntryTargetsInCollection, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListVaultEntryTargetsInCollectionRow{}
+	for rows.Next() {
+		var i ListVaultEntryTargetsInCollectionRow
+		if err := rows.Scan(&i.ID, &i.Name, &i.RotationTargets); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const matchVaultEntriesByURL = `-- name: MatchVaultEntriesByURL :many
 
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at

@@ -269,7 +269,6 @@ func main() {
 	settingsHandler := handlers.NewSettingsHandler(queries, cfg)
 	activityHandler := handlers.NewActivityHandler(queries)
 	apiKeyHandler := handlers.NewAPIKeyHandler(queries)
-	collectionHandler := handlers.NewCollectionHandler(queries)
 
 	// Encrypt any plaintext TOTP seeds at rest (idempotent).
 	if err := authHandler.MigrateTOTPSecrets(); err != nil {
@@ -293,6 +292,9 @@ func main() {
 	if _, err := vaultHandler.BackfillMetadataAtRest(); err != nil {
 		slog.Error("vault metadata-at-rest backfill failed", "error", err)
 	}
+	// Built after vaultHandler: the collection handler needs it to decrypt and
+	// re-encrypt rotation_targets when purging a departing member's endpoints.
+	collectionHandler := handlers.NewCollectionHandler(queries, vaultHandler)
 	vaultImportHandler := handlers.NewVaultImportHandler(dbConn, vaultHandler)
 
 	// Capability bridge + service identities. The vault handler doubles as
