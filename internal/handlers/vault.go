@@ -1439,10 +1439,62 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Update metadata fields
+	// Refuse the whole request if any encrypted column on this entry cannot be
+	// opened. The edit form always resubmits every metadata field, and an
+	// undecryptable column reads back as "", so an ordinary save would replace
+	// still-recoverable ciphertext with NULL. Refusing the WHOLE request rather
+	// than skipping the damaged column is deliberate: a partial save on a damaged
+	// entry gives the operator no signal that anything was withheld.
+	if req.Name != nil || req.URL != nil || req.AliasURL != nil || req.Username != nil ||
+		req.Category != nil || req.Notes != nil || req.CustomFields != nil {
+		if damaged, err := h.queries.GetVaultEntryMeta(ctx, id); err == nil {
+			if field, broken := h.anyMetaColumnUndecryptable(map[string]string{
+				"url":           damaged.Url.String,
+				"alias_url":     damaged.AliasUrl.String,
+				"username":      damaged.Username.String,
+				"category":      damaged.Category.String,
+				"notes":         damaged.Notes.String,
+				"custom_fields": damaged.CustomFields,
+			}); broken {
+				logError(r, "vault.update: refusing to overwrite an undecryptable column", "entry", id, "field", field)
+				writeError(w, r, http.StatusConflict, "decrypt_failed",
+					"part of this entry ("+field+") could not be decrypted, so nothing was changed; saving would have overwritten data that is still recoverable with the correct key")
+				return
+			}
+		}
+	}
+
+	// Update metadata fields.
+	//
+	// The name is validated and its write error is SURFACED, matching Create.
+	// It used to be logged and stepped over: a rename onto a name the user
+	// already had hit UNIQUE(user_id, name), the handler continued, applied
+	// every other field in the request and returned 200, and the UI closed the
+	// editor and toasted "Secret updated". So the request was half-applied and
+	// reported as fully successful, on the field that is the lookup key for
+	// service-identity allowed_secrets and for MCP list_secrets/use_secret.
+	// A blank name was accepted the same way, leaving an entry nothing can
+	// resolve by name at all.
+	//
+	// Done FIRST so a refused rename leaves the rest of the entry untouched.
 	if req.Name != nil {
-		if err := h.queries.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: strings.TrimSpace(*req.Name), ID: id}); err != nil {
+		newName := strings.TrimSpace(*req.Name)
+		if newName == "" {
+			writeBadRequest(w, r, "name is required")
+			return
+		}
+		if len(newName) > 255 {
+			writeBadRequest(w, r, "name must be 255 characters or less")
+			return
+		}
+		if err := h.queries.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint") {
+				writeConflict(w, r, "a vault entry with that name already exists")
+				return
+			}
 			logError(r, "vault.update: update name failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 	if req.Category != nil {
@@ -2216,6 +2268,21 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	//
 	// Preserving the stored attribution keeps the security question honest:
 	// "who set this up" must not change because someone else pressed Save.
+	// Refuse a blind wipe. UpdateTargets is a full replace, so an empty array
+	// deletes every stored target including webhook HMAC secrets that exist
+	// nowhere else. The panel could send one by accident: a failed GET rendered
+	// byte-identically to "this entry has no targets", so a user who added one
+	// target on top of that empty view replaced the real ones, with a success
+	// toast and no undo. Clearing must be deliberate.
+	if len(targets) == 0 && strings.TrimSpace(existingTargets) != "" {
+		if prior := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets")); len(prior) > 0 &&
+			r.URL.Query().Get("clear") != "1" {
+			writeError(w, r, http.StatusConflict, "targets_not_cleared",
+				fmt.Sprintf("this would delete all %d delivery target(s); if that is intended, resend with ?clear=1", len(prior)))
+			return
+		}
+	}
+
 	stored := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets"))
 	priorBy := make(map[string]string, len(stored))
 	for _, t := range stored {

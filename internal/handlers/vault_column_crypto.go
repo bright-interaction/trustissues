@@ -187,3 +187,36 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 	}
 	return updated, nil
 }
+
+// anyMetaColumnUndecryptable reports whether any encrypted metadata column on a
+// stored row fails to open, i.e. whether the entry is partially damaged.
+//
+// The secret VALUE has had a refuse-to-overwrite guard since round 1: a save
+// that cannot decrypt the current value is refused with 409 rather than writing
+// over ciphertext that is still recoverable with the right key. The metadata
+// columns had no equivalent, and they are strictly worse off, because
+// decryptColumnOrLog renders a failure as "" and the edit form ALWAYS resubmits
+// url, alias_url, username, category and notes. So an operator who opened a
+// damaged entry, saw blank fields, fixed an unrelated typo and pressed Save
+// replaced the still-recoverable ciphertext with NULL. Permanently, with a 200
+// and a success toast.
+//
+// custom_fields is included because it can hold secret:true values, so this is
+// not merely metadata loss.
+//
+// Whole-database key mismatch is already caught at boot by EnforceVaultKey.
+// What reaches here is the case that gate cannot see: one damaged row, a torn
+// write, or a row still sealed under an older key after an operator used the
+// documented TRUSTISSUES_ALLOW_KEY_MISMATCH escape hatch, which re-seals the
+// sentinel and therefore makes every later boot look healthy.
+func (h *VaultHandler) anyMetaColumnUndecryptable(cols map[string]string) (string, bool) {
+	for field, stored := range cols {
+		if stored == "" {
+			continue
+		}
+		if _, err := h.decryptColumn(stored); err != nil {
+			return field, true
+		}
+	}
+	return "", false
+}

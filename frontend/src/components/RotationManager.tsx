@@ -201,6 +201,25 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
           <div className="flex items-center justify-center py-4">
             <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
           </div>
+        ) : targetsQuery.isError ? (
+          /* A failed load used to fall through to the empty state below, which
+             reads as "this entry has no targets". Saving from that view sent an
+             empty array and Save is a full replace, so the real targets (webhook
+             HMAC secrets included, which exist nowhere else) were deleted with a
+             success toast. Failure has to look like failure. */
+          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-4 text-center text-xs text-red-700">
+            <p className="font-medium">Could not load the delivery targets.</p>
+            <p className="mt-1">
+              Nothing has been changed. Saving is disabled until they load, so an existing target cannot be overwritten by accident.
+            </p>
+            <button
+              type="button"
+              onClick={() => targetsQuery.refetch()}
+              className="mt-2 rounded-lg border border-red-300 bg-white px-3 py-1 font-medium text-red-700 hover:bg-red-100"
+            >
+              Retry
+            </button>
+          </div>
         ) : working.length === 0 ? (
           <p className="rounded-lg border border-dashed border-slate-200 bg-white px-3 py-4 text-center text-xs text-slate-500">
             No delivery targets. A rotation with no targets only updates the stored value, it will not reach any consumer.
@@ -275,7 +294,9 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
           <button
             type="button"
             onClick={() => saveTargets.mutate()}
-            disabled={saveTargets.isPending}
+            /* Never savable from an unsettled or failed load: that is the state
+               that made an accidental full-replace-with-empty possible. */
+            disabled={saveTargets.isPending || targetsQuery.isLoading || targetsQuery.isError}
             className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
           >
             {saveTargets.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
