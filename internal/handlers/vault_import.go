@@ -49,6 +49,46 @@ type ImportEntry struct {
 	Category string `json:"category,omitempty"`
 	Notes    string `json:"notes,omitempty"`
 	Skip     bool   `json:"skip,omitempty"` // for conflict resolution
+	// CustomFields carries everything the source export held that has no
+	// dedicated column: Bitwarden's `fields` and `login_totp`, LastPass's
+	// `totp`, 1Password's one-time-password column.
+	//
+	// These used to be dropped server-side with no log line and no entry in
+	// `skipped`, because `skipped` reports dropped ROWS and these rows import
+	// fine. So a 240-entry Bitwarden migration reported plain success while
+	// every 2FA seed and every recovery PIN was discarded, and the documented
+	// responsible next step after an import is deleting the plaintext export.
+	// custom_fields has existed since migration 00025 and its own comment cites
+	// "a recovery PIN, a second token" as the use case, so the destination was
+	// already there.
+	CustomFields []CustomField `json:"custom_fields,omitempty"`
+}
+
+// importedCustomFields builds the custom-field set for one imported row from
+// the columns the source format carries but Trustissues has no column for.
+// Bitwarden emits `fields` as newline-separated "label: value" pairs.
+func importedCustomFields(extra, totp string) []CustomField {
+	var out []CustomField
+	for _, line := range strings.Split(extra, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		label, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		label, value = strings.TrimSpace(label), strings.TrimSpace(value)
+		if label == "" || value == "" {
+			continue
+		}
+		out = append(out, CustomField{Label: label, Value: value, Secret: false})
+	}
+	if t := strings.TrimSpace(totp); t != "" {
+		// secret:true so the UI masks it: a TOTP seed is a credential.
+		out = append(out, CustomField{Label: "TOTP", Value: t, Secret: true})
+	}
+	return out
 }
 
 // VaultImportPreview represents the preview of what will be imported
@@ -143,6 +183,8 @@ func parseRecordByFormat(headers []string, record []string, format PasswordManag
 			Value:    fields["password"],
 			Category: fields["categories"],
 			Notes:    fields["notes"],
+			CustomFields: importedCustomFields("",
+				getFirstField(fields, []string{"otpauth", "one-time password", "one_time_password", "totp"})),
 		}
 
 	case FormatBitwarden:
@@ -150,20 +192,22 @@ func parseRecordByFormat(headers []string, record []string, format PasswordManag
 			return nil // Skip non-login items
 		}
 		return &ImportEntry{
-			Name:     fields["name"],
-			URL:      getFirstField(fields, []string{"login_uri", "uri"}),
-			Username: fields["login_username"],
-			Value:    fields["login_password"],
-			Notes:    fields["notes"],
+			Name:         fields["name"],
+			URL:          getFirstField(fields, []string{"login_uri", "uri"}),
+			Username:     fields["login_username"],
+			Value:        fields["login_password"],
+			Notes:        fields["notes"],
+			CustomFields: importedCustomFields(fields["fields"], fields["login_totp"]),
 		}
 
 	case FormatLastPass:
 		return &ImportEntry{
-			Name:     getFirstField(fields, []string{"name", "title"}),
-			URL:      fields["url"],
-			Username: fields["username"],
-			Value:    fields["password"],
-			Notes:    fields["extra"],
+			Name:         getFirstField(fields, []string{"name", "title"}),
+			URL:          fields["url"],
+			Username:     fields["username"],
+			Value:        fields["password"],
+			Notes:        fields["extra"],
+			CustomFields: importedCustomFields("", fields["totp"]),
 		}
 	}
 
@@ -248,8 +292,23 @@ func (h *VaultImportHandler) ImportPreview(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Detect format
+	// Honour the operator's choice; auto-detect only when they left it on Auto.
+	//
+	// The modal has shipped a four-option selector (auto / 1password / bitwarden
+	// / lastpass) whose value was posted as a multipart field that no handler
+	// ever read, so detectFormat always won and a misdetection could not be
+	// corrected. A rendered control that changes nothing is a broken feature,
+	// not a preference.
 	format := detectFormat(headers)
+	if chosen := strings.ToLower(strings.TrimSpace(r.FormValue("format"))); chosen != "" && chosen != "auto" {
+		switch chosen {
+		case string(Format1Password), string(FormatBitwarden), string(FormatLastPass):
+			format = PasswordManagerFormat(chosen)
+		default:
+			writeBadRequest(w, r, "unknown import format: "+chosen)
+			return
+		}
+	}
 	if format == FormatUnknown {
 		writeBadRequest(w, r, "unsupported format")
 		return
@@ -409,6 +468,33 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			slog.Error("failed to insert entry", "name", entry.Name, "error", err)
 			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be saved (details in server logs)"})
 			continue
+		}
+
+		// Persist the fields the source export carried that have no dedicated
+		// column (Bitwarden `fields` / `login_totp`, LastPass `totp`, 1Password
+		// OTP). Encrypted at rest exactly like an interactively added one.
+		if len(entry.CustomFields) > 0 {
+			if cfErr := validateCustomFields(entry.CustomFields); cfErr != nil {
+				slog.Warn("import: dropping invalid custom fields", "name", entry.Name, "error", cfErr)
+				skipped = append(skipped, skippedEntry{
+					Name:   entry.Name,
+					Reason: "imported, but its extra fields were rejected: " + cfErr.Error(),
+				})
+			} else if encCF, encErr := h.handler.encryptCustomFields(entry.CustomFields); encErr != nil {
+				slog.Error("import: could not encrypt custom fields", "name", entry.Name, "error", encErr)
+				skipped = append(skipped, skippedEntry{
+					Name:   entry.Name,
+					Reason: "imported, but its extra fields could not be encrypted and were not saved",
+				})
+			} else if cfErr := qtx.UpdateVaultEntryCustomFields(r.Context(), db.UpdateVaultEntryCustomFieldsParams{
+				CustomFields: encCF, ID: entryID,
+			}); cfErr != nil {
+				slog.Error("import: could not save custom fields", "name", entry.Name, "error", cfErr)
+				skipped = append(skipped, skippedEntry{
+					Name:   entry.Name,
+					Reason: "imported, but its extra fields could not be saved",
+				})
+			}
 		}
 
 		imported++
