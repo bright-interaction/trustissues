@@ -1230,7 +1230,17 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, r *http.Reque
 	if provider == "" {
 		return
 	}
-	dests, inj := MarshalCapabilityDefaults(provider)
+	// Tenant-scoped presets (Supabase, Auth0, Grafana) need the entry's own
+	// project/tenant/instance id to expand into a concrete host. Read it back
+	// from the row that was just written; if it is absent the preset resolves to
+	// no destinations, and the bridge refuses to mint until the owner sets one.
+	// That is deliberate: the old "*.supabase.co/*" preset read like a ceiling
+	// while granting reach over a domain space anyone can register into.
+	var meta map[string]string
+	if row, err := h.queries.GetVaultEntryMeta(ctx, entryID); err == nil {
+		meta = ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"))
+	}
+	dests, inj := MarshalCapabilityDefaults(provider, meta)
 	if dests == "" && inj == "" {
 		return
 	}
@@ -1739,10 +1749,13 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		currentValue[i] = 0
 	}
 
+	// Declared out here so the deferred revoke after the value is persisted can
+	// still reach it; the revoke must not run until the new value is stored.
+	var providerMeta map[string]string
 	if providerName != "" {
 		provider, ok := ProviderRegistry[providerName]
 		if ok && provider.CanAutoRotate() {
-			providerMeta := ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
+			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
 			rotatedValue, rotErr := provider.Rotate(ctx, oldValue, providerMeta)
 			if rotErr != nil {
 				// Do NOT fall through to a locally generated value. The upstream
@@ -1871,6 +1884,33 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	if rowsAffected == 0 {
 		writeNotFound(w, r, "vault entry not found")
 		return
+	}
+
+	// The new value is durably stored, so it is finally safe to destroy the old
+	// key upstream. Rotate deferred it for exactly this reason: revoking first
+	// meant a failure in the encrypt/persist window above left the old
+	// credential dead at the provider and the new one discarded, with no copy of
+	// either anywhere. A failure here leaves BOTH keys live, which is
+	// recoverable and is recorded as last_rotation_error below.
+	if providerMeta != nil {
+		performPendingRevoke(ctx, providerMeta, newValue)
+		if warn := providerMeta["last_revoke_error"]; warn != "" {
+			delete(providerMeta, "last_revoke_error")
+			logError(r, "vault.rotate: old key revoke failed after persist (predecessor still live)", "entry", id, "detail", warn)
+			_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+				LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
+				ID:                id,
+			})
+		}
+		// Re-persist meta so the pending-revoke markers never linger.
+		if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
+			if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
+				_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+					ProviderMeta: toNullString(encMeta),
+					ID:           id,
+				})
+			}
+		}
 	}
 
 	// Fetch updated entry for response

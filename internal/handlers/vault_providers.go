@@ -141,6 +141,53 @@ func ListProviders() []ProviderInfo {
 // client to reach httptest loopback servers.
 var providerHTTP = alerts.GuardedWebhookClient(15 * time.Second)
 
+// Transient meta keys describing a revoke that has been DEFERRED until the new
+// value is safely persisted. Like last_revoke_error they are stripped before
+// provider_meta is written, so they never reach the database.
+const (
+	pendingRevokeMethod = "pending_revoke_method"
+	pendingRevokeURL    = "pending_revoke_url"
+)
+
+// deferRevokeOldProviderKey records a revoke to run AFTER the caller has stored
+// the new value, instead of performing it inline.
+//
+// Ordering is the whole point. Rotate used to delete the old key at the
+// provider before returning, so the window between "old key destroyed" and "new
+// key committed to our database" was covered by an encrypt step and a DB write.
+// A failure in that window (encrypt error, disk full, SQLITE_BUSY, process
+// killed) left the old credential dead upstream and the new one discarded: the
+// secret was gone with no copy anywhere. Persisting first turns that same
+// failure into a recoverable "both keys live" state, which the existing
+// last_revoke_error / partial-rotation path already knows how to report.
+//
+// The new key is not stored here. The caller passes it to
+// performPendingRevoke, so no secret is ever written into provider_meta.
+func deferRevokeOldProviderKey(meta map[string]string, method, url string) {
+	meta[pendingRevokeMethod] = method
+	meta[pendingRevokeURL] = url
+}
+
+// performPendingRevoke runs a revoke recorded by deferRevokeOldProviderKey,
+// authenticating with the NEW key, and clears the transient markers.
+//
+// Call it only after the new value is durably stored. A failure sets
+// meta["last_revoke_error"], which downgrades the rotation to partial and
+// alarms, exactly as an inline failure used to.
+func performPendingRevoke(ctx context.Context, meta map[string]string, newKey string) {
+	method, url := meta[pendingRevokeMethod], meta[pendingRevokeURL]
+	delete(meta, pendingRevokeMethod)
+	delete(meta, pendingRevokeURL)
+	if method == "" || url == "" {
+		return
+	}
+	auth := ""
+	if newKey != "" {
+		auth = "Bearer " + newKey
+	}
+	revokeOldProviderKey(ctx, meta, method, url, auth)
+}
+
 // revokeOldProviderKey issues a revoke (usually DELETE) of the previous key and
 // records the outcome in meta["last_revoke_error"] instead of swallowing it. A
 // failed revoke means the OLD key is still live at the provider, so the rotation
@@ -422,7 +469,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// old (now-deleted) id and every rotation leaves its immediate predecessor live.
 	oldID := meta["key_id"]
 	if oldID != "" && oldID != result.ID {
-		revokeOldProviderKey(ctx, meta, "DELETE", "https://api.resend.com/api-keys/"+oldID, "Bearer "+result.Token)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/"+oldID)
 	}
 	meta["key_id"] = result.ID
 	return result.Token, nil
@@ -479,7 +526,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	// deleted id and every rotation leaves its predecessor live).
 	oldID := meta["api_key_id"]
 	if oldID != "" && oldID != result.APIKeyID {
-		revokeOldProviderKey(ctx, meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID, "Bearer "+result.APIKey)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID)
 	}
 	meta["api_key_id"] = result.APIKeyID
 	return result.APIKey, nil
@@ -654,7 +701,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	newID := fmt.Sprintf("%d", result.ID)
 	oldID := meta["key_id"]
 	if oldID != "" && oldID != newID {
-		revokeOldProviderKey(ctx, meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID, "Bearer "+result.Key)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID)
 	}
 	if result.ID != 0 {
 		meta["key_id"] = newID

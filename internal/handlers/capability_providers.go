@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"regexp"
+	"strings"
 )
 
 // InjectionSpec describes how to insert a decrypted secret into an
@@ -67,9 +69,11 @@ var CapabilityDefaults = map[string]struct {
 	"linode":       {[]string{"api.linode.com/*"}, InjectionSpec{Type: "bearer"}},
 	"neon":         {[]string{"console.neon.tech/api/*"}, InjectionSpec{Type: "bearer"}},
 	"datadog":      {[]string{"api.datadoghq.com/*", "api.datadoghq.eu/*"}, InjectionSpec{Type: "header", Name: "DD-API-KEY"}},
-	"grafana":      {[]string{"*.grafana.net/*"}, InjectionSpec{Type: "bearer"}},
+	// {instance} is expanded from the entry's provider_meta at seed time. See
+	// tenantPlaceholder below for why these three cannot ship a bare "*." host.
+	"grafana":      {[]string{"{instance}.grafana.net/*"}, InjectionSpec{Type: "bearer"}},
 	"fastly":       {[]string{"api.fastly.com/*"}, InjectionSpec{Type: "header", Name: "Fastly-Key"}},
-	"auth0":        {[]string{"*.auth0.com/*"}, InjectionSpec{Type: "bearer"}},
+	"auth0":        {[]string{"{tenant}.auth0.com/*"}, InjectionSpec{Type: "bearer"}},
 	"backblaze":    {[]string{"api.backblazeb2.com/*"}, InjectionSpec{Type: "header", Name: "Authorization"}},
 	"forgejo":      {[]string{"code.forgejo.org/*"}, InjectionSpec{Type: "header", Name: "Authorization", Format: "token {value}"}},
 	"github":       {[]string{"api.github.com/*", "uploads.github.com/*"}, InjectionSpec{Type: "bearer"}},
@@ -85,20 +89,79 @@ var CapabilityDefaults = map[string]struct {
 	"sentry":       {[]string{"sentry.io/api/*"}, InjectionSpec{Type: "bearer"}},
 	"postmark":     {[]string{"api.postmarkapp.com/*"}, InjectionSpec{Type: "header", Name: "X-Postmark-Server-Token"}},
 	"mollie":       {[]string{"api.mollie.com/*"}, InjectionSpec{Type: "bearer"}},
-	"supabase":     {[]string{"*.supabase.co/*"}, InjectionSpec{Type: "header", Name: "apikey"}},
+	"supabase":     {[]string{"{project_ref}.supabase.co/*"}, InjectionSpec{Type: "header", Name: "apikey"}},
 	"railway":      {[]string{"backboard.railway.app/*"}, InjectionSpec{Type: "bearer"}},
 	"render":       {[]string{"api.render.com/*"}, InjectionSpec{Type: "bearer"}},
+}
+
+// tenantPlaceholderRe matches a "{key}" placeholder in a destination pattern.
+//
+// Three providers host every customer on a shared registrable suffix, so a
+// preset of "*.supabase.co/*" is not a ceiling at all: anyone can register
+// attacker.supabase.co (or .auth0.com, or .grafana.net) and a capability token
+// minted for one tenant's key would happily send it there. The wildcard reads
+// like a restriction while granting provider-wide reach to a domain space the
+// attacker can join.
+//
+// The entry already knows its own tenant (Supabase requires project_ref, Auth0
+// requires tenant, Grafana requires instance), so the preset names the meta key
+// and it is expanded at seed time into a single concrete host.
+var tenantPlaceholderRe = regexp.MustCompile(`\{([a-z_]+)\}`)
+
+// ExpandCapabilityDestinations substitutes {key} placeholders from the entry's
+// provider_meta.
+//
+// If any placeholder cannot be resolved, it returns nil rather than a partially
+// expanded or wildcarded pattern. Seeding nothing is the safe outcome: the
+// capability bridge then refuses to mint for that entry until the owner sets a
+// destination explicitly, which is a visible, fixable error. Falling back to the
+// wildcard would silently hand out provider-wide reach, and a security default
+// that degrades to "allow" when data is missing is not a default at all.
+func ExpandCapabilityDestinations(patterns []string, meta map[string]string) []string {
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		if !strings.Contains(p, "{") {
+			out = append(out, p)
+			continue
+		}
+		resolved := p
+		missing := false
+		for _, m := range tenantPlaceholderRe.FindAllStringSubmatch(p, -1) {
+			v := strings.TrimSpace(meta[m[1]])
+			// A tenant id has to be a single DNS label. Anything with a dot or a
+			// slash could widen the pattern past the intended host.
+			if v == "" || strings.ContainsAny(v, "./*: \\") {
+				missing = true
+				break
+			}
+			resolved = strings.ReplaceAll(resolved, m[0], v)
+		}
+		if missing {
+			return nil
+		}
+		out = append(out, resolved)
+	}
+	return out
 }
 
 // MarshalCapabilityDefaults returns (destinations_json, injection_json)
 // for the given provider name. Empty strings when no default exists,
 // which the caller stores as '[]' / '{}' to keep the column NOT NULL.
-func MarshalCapabilityDefaults(provider string) (string, string) {
+//
+// meta supplies tenant values for providers whose preset is tenant-scoped; pass
+// nil when none is available, in which case those providers seed no destinations
+// and the bridge refuses to mint until the owner sets one.
+func MarshalCapabilityDefaults(provider string, meta map[string]string) (string, string) {
 	d, ok := CapabilityDefaults[provider]
 	if !ok {
 		return "", ""
 	}
-	dests, _ := json.Marshal(d.Destinations)
+	expanded := ExpandCapabilityDestinations(d.Destinations, meta)
 	inj, _ := json.Marshal(d.Injection)
+	if len(expanded) == 0 {
+		// Injection spec is still useful; the ceiling stays empty on purpose.
+		return "", string(inj)
+	}
+	dests, _ := json.Marshal(expanded)
 	return string(dests), string(inj)
 }
