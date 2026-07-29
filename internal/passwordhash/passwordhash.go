@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/bcrypt"
@@ -84,7 +85,11 @@ var ErrIncompatibleVersion = errors.New("passwordhash: incompatible argon2 versi
 
 // Hash returns an Argon2id-encoded password hash safe to persist.
 func Hash(password string) (string, error) {
-	defer acquireHashSlot()()
+	release, err := acquireHashSlot()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	if password == "" {
 		return "", errors.New("passwordhash: empty password")
 	}
@@ -124,14 +129,37 @@ func Hash(password string) (string, error) {
 // traffic, and a single-team vault never has four people logging in at once.
 var hashSlots = make(chan struct{}, 4)
 
-// acquireHashSlot blocks until a slot is free and returns its release func.
-func acquireHashSlot() func() {
-	hashSlots <- struct{}{}
-	return func() { <-hashSlots }
+// ErrBusy is returned when no Argon2 slot became free within the wait budget.
+// Callers should surface it as 503, not 401: it says nothing about the password.
+var ErrBusy = errors.New("passwordhash: too many concurrent password computations")
+
+// hashWait is how long a caller queues for a slot before giving up.
+//
+// An UNBOUNDED wait would swap one exhaustion for another: under sustained load
+// every blocked caller holds a goroutine and its whole request, so the queue
+// grows without limit and the process dies of goroutines instead of Argon2
+// buffers. Failing fast keeps the queue bounded by arrival rate over 2 seconds.
+//
+// 2s is comfortably above the ~50ms a production-cost hash takes even with four
+// ahead of you, so a legitimate login never sees it.
+const hashWait = 2 * time.Second
+
+// acquireHashSlot waits for a slot and returns its release func, or ErrBusy.
+func acquireHashSlot() (func(), error) {
+	select {
+	case hashSlots <- struct{}{}:
+		return func() { <-hashSlots }, nil
+	case <-time.After(hashWait):
+		return nil, ErrBusy
+	}
 }
 
 func Verify(password, encoded string) (bool, error) {
-	defer acquireHashSlot()()
+	release, err := acquireHashSlot()
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	if encoded == "" {
 		return false, ErrInvalidHash
 	}

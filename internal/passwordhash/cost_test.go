@@ -1,6 +1,7 @@
 package passwordhash
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -67,7 +68,10 @@ func TestHashSlotsBoundConcurrency(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer wg.Done()
-			release := acquireHashSlot()
+			release, aErr := acquireHashSlot()
+			if aErr != nil {
+				return
+			}
 			mu.Lock()
 			inFlight++
 			if inFlight > peak {
@@ -127,5 +131,46 @@ func TestVerifyStillWorksUnderContention(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Errorf("concurrent verify failed: %v", e)
+	}
+}
+
+// TestBusyRatherThanQueueingForever pins the bound on the wait.
+//
+// An unbounded semaphore swaps one exhaustion for another: every blocked caller
+// holds a goroutine and its whole request, so under sustained load the process
+// dies of goroutines instead of Argon2 buffers. Failing fast keeps the queue
+// bounded by arrival rate over the wait budget.
+//
+// The caller contract matters as much as the bound: login must surface ErrBusy
+// as 503 and NOT as a failed attempt, or an attacker saturating the semaphore
+// could drive any account to its lockout threshold without guessing anything.
+func TestBusyRatherThanQueueingForever(t *testing.T) {
+	// Fill every slot and hold them.
+	var releases []func()
+	for i := 0; i < cap(hashSlots); i++ {
+		rel, err := acquireHashSlot()
+		if err != nil {
+			t.Fatalf("ABORT: could not fill slot %d (%v); the test would not be measuring saturation", i, err)
+		}
+		releases = append(releases, rel)
+	}
+	defer func() {
+		for _, r := range releases {
+			r()
+		}
+	}()
+
+	start := time.Now()
+	rel, err := acquireHashSlot()
+	elapsed := time.Since(start)
+	if err == nil {
+		rel()
+		t.Fatal("acquired a slot while all were held; the semaphore is not bounding anything")
+	}
+	if !errors.Is(err, ErrBusy) {
+		t.Errorf("got %v, want ErrBusy", err)
+	}
+	if elapsed > hashWait+time.Second {
+		t.Errorf("waited %v before giving up, budget is %v", elapsed, hashWait)
 	}
 }
