@@ -56,6 +56,17 @@ func RunScheduledRotations(ctx context.Context, dbConn *sql.DB, queries *db.Quer
 // them. Called by RunScheduledRotations; exported so main.go or tests can
 // trigger a single pass directly.
 func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHandler) {
+	// ONE registration for the whole pass, not one per entry.
+	//
+	// Add(1)/Done() around each entry let the counter fall to zero between
+	// entries. sync.WaitGroup panics with "WaitGroup misuse: Add called
+	// concurrently with Wait" if an Add that takes the counter off zero races a
+	// Wait that is already blocked, which is exactly what a SIGTERM landing
+	// mid-sweep produces: the shutdown drain crashed the process instead of
+	// draining it.
+	vaultHandler.delivery.Add(1)
+	defer vaultHandler.delivery.Done()
+
 	// The LIST gets the pass budget; each ENTRY gets its own below.
 	//
 	// One shared 5-minute deadline for the whole pass meant a slow head of the
@@ -103,17 +114,6 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 	// silently prevented.
 	ctx, cancelEntry := context.WithTimeout(context.WithoutCancel(passCtx), 90*time.Second)
 	defer cancelEntry()
-
-	// The SCHEDULED sweep counts toward the shutdown drain too.
-	//
-	// Round 10 added the WaitGroup for the manual rotate path only, which left
-	// the more dangerous half uncovered: the hourly sweep rotates unattended, so
-	// a deploy landing mid-sweep killed it after the provider had minted the new
-	// key and the value was stored, but before delivery finished, with nobody
-	// watching. Registering here means shutdown waits for the whole rotate +
-	// deliver + record cycle, not just the part a human triggered.
-	vaultHandler.delivery.Add(1)
-	defer vaultHandler.delivery.Done()
 
 	defer func() {
 		if rec := recover(); rec != nil {

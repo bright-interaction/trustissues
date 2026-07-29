@@ -2044,6 +2044,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 
 	var newValue string
 	var oldValue string // current plaintext, needed by provider.Rotate()
+	// Deferred until after the CAS: writing either of these before it would move
+	// updated_at and make the compare-and-swap reject the handler's own write.
+	var pendingProviderMeta map[string]string
+	var pendingRevokeWarn string
 	rotationMethod := "manual"
 	providerName := meta.Provider.String
 
@@ -2128,23 +2132,18 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			// instead of a stale predecessor id. Strip the transient revoke
 			// flag first (never persisted); a failed old-key revoke is
 			// surfaced as a rotation error.
-			revokeWarn := providerMeta["last_revoke_error"]
+			// Held in memory until AFTER the CAS, deliberately.
+			//
+			// Writing provider_meta here bumps updated_at, which is the exact
+			// column the compare-and-swap below reads from a snapshot taken
+			// before this point. So the handler invalidated its own CAS and
+			// every provider-backed rotate 409'd, after the provider had already
+			// minted a replacement key. The sweep does CAS-then-meta and works;
+			// this path did meta-then-CAS. Nothing may touch the row between the
+			// snapshot and the CAS.
+			pendingRevokeWarn = providerMeta["last_revoke_error"]
 			delete(providerMeta, "last_revoke_error")
-			if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
-				if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
-					_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-						ProviderMeta: toNullString(encMeta),
-						ID:           id,
-					})
-				}
-			}
-			if revokeWarn != "" {
-				logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
-				_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-					LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
-					ID:                id,
-				})
-			}
+			pendingProviderMeta = providerMeta
 		}
 	}
 
@@ -2233,6 +2232,26 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusConflict, "rotation_conflict",
 			"this secret changed while it was being rotated, so the new value was not stored; reload and try again")
 		return
+	}
+
+	// Now that the value is committed, persist the provider metadata that was
+	// held back so it could not disturb the CAS.
+	if pendingProviderMeta != nil {
+		if metaJSON, mErr := json.Marshal(pendingProviderMeta); mErr == nil {
+			if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
+				_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+					ProviderMeta: toNullString(encMeta),
+					ID:           id,
+				})
+			}
+		}
+	}
+	if pendingRevokeWarn != "" {
+		logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", pendingRevokeWarn)
+		_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+			LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
+			ID:                id,
+		})
 	}
 
 	// The new value is durably stored, so it is finally safe to destroy the old
