@@ -1192,13 +1192,13 @@ func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]Res
 	return items, nil
 }
 
-const rotateVaultEntryValue = `-- name: RotateVaultEntryValue :execresult
+const rotateVaultEntryValueUnchecked = `-- name: RotateVaultEntryValueUnchecked :execresult
 
 UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
 WHERE id = ? AND CAST(updated_at AS TEXT) = CAST(? AS TEXT)
 `
 
-type RotateVaultEntryValueParams struct {
+type RotateVaultEntryValueUncheckedParams struct {
 	EncryptedValue []byte `json:"encrypted_value"`
 	Nonce          []byte `json:"nonce"`
 	ID             string `json:"id"`
@@ -1208,6 +1208,10 @@ type RotateVaultEntryValueParams struct {
 // ============================================================================
 // Rotate (generate new secret value)
 // ============================================================================
+// "Unchecked" means unchecked BY THIS QUERY: it will happily bind an empty
+// token and match zero rows. Call persistRotatedValue instead, which refuses a
+// missing token. TestRotateValueHasOneCallSite enforces that this name appears
+// in exactly one non-test file.
 // Compare-and-swap on updated_at.
 //
 // The scheduled sweep snapshots every due entry at pass start and writes back
@@ -1223,8 +1227,8 @@ type RotateVaultEntryValueParams struct {
 // matched: the first version of this CAS made every scheduled rotation report a
 // conflict and persist nothing, turning a rare lost-update into a total silent
 // outage of auto-rotation. Compare the raw text both ways.
-func (q *Queries) RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntryValueParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, rotateVaultEntryValue,
+func (q *Queries) RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, rotateVaultEntryValueUnchecked,
 		arg.EncryptedValue,
 		arg.Nonce,
 		arg.ID,

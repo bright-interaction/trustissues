@@ -21,8 +21,8 @@ import (
 //	UpdateVaultEntryValue -> a human replaced the credential by hand
 func TestVaultValueWritesClearRotationError(t *testing.T) {
 	for name, query := range map[string]string{
-		"RotateVaultEntryValue": rotateVaultEntryValue,
-		"UpdateVaultEntryValue": updateVaultEntryValue,
+		"RotateVaultEntryValueUnchecked": rotateVaultEntryValueUnchecked,
+		"UpdateVaultEntryValue":          updateVaultEntryValue,
 	} {
 		if !strings.Contains(query, "last_rotation_error = NULL") {
 			t.Errorf("%s must clear last_rotation_error, otherwise a stale failure pins the entry to the error badge forever:\n%s", name, query)

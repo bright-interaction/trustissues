@@ -363,6 +363,10 @@ type Querier interface {
 	// ============================================================================
 	// Rotate (generate new secret value)
 	// ============================================================================
+	// "Unchecked" means unchecked BY THIS QUERY: it will happily bind an empty
+	// token and match zero rows. Call persistRotatedValue instead, which refuses a
+	// missing token. TestRotateValueHasOneCallSite enforces that this name appears
+	// in exactly one non-test file.
 	// Compare-and-swap on updated_at.
 	//
 	// The scheduled sweep snapshots every due entry at pass start and writes back
@@ -378,7 +382,7 @@ type Querier interface {
 	// matched: the first version of this CAS made every scheduled rotation report a
 	// conflict and persist nothing, turning a rare lost-update into a total silent
 	// outage of auto-rotation. Compare the raw text both ways.
-	RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntryValueParams) (sql.Result, error)
+	RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error)
 	// Seeds the capability-bridge columns from the provider defaults at
 	// enrollment time. Only fills untouched rows so explicit per-entry
 	// patterns are never overwritten.
