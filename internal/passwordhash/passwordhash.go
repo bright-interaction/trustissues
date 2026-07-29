@@ -19,6 +19,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"flag"
 	"fmt"
 	"strings"
 
@@ -29,12 +30,50 @@ import (
 // Tunables. Memory and iteration costs are deliberately conservative for
 // SQLite-on-VPS workloads. See RFC 9106 §4 for guidance.
 const (
-	argonTime    uint32 = 3
-	argonMemory  uint32 = 64 * 1024 // 64 MiB
-	argonThreads uint8  = 4
-	argonKeyLen  uint32 = 32
-	argonSaltLen uint32 = 16
+	argonTimeProd    uint32 = 3
+	argonMemoryProd  uint32 = 64 * 1024 // 64 MiB
+	argonThreadsProd uint8  = 4
+	argonKeyLen      uint32 = 32
+	argonSaltLen     uint32 = 16
 )
+
+// Cost parameters, overridable ONLY from tests via SetTestCost.
+//
+// These are variables rather than constants because the production cost makes
+// the handler test package unusable: 90 hash/verify calls at 64 MiB and t=3 put
+// internal/handlers at ~51s, and ~228s under -race. Adding the rotation
+// behaviour matrix on top would push it past Go's default 10-minute timeout,
+// at which point the suite stops being run at all, which is a worse security
+// outcome than a cheap KDF in tests.
+//
+// A wrong value here silently weakens every stored password, so SetTestCost
+// refuses to run outside a test binary rather than trusting callers.
+var (
+	argonTime    = argonTimeProd
+	argonMemory  = argonMemoryProd
+	argonThreads = argonThreadsProd
+)
+
+// SetTestCost lowers the argon2id cost for the duration of a test binary.
+//
+// It panics if called from a non-test binary. That check is the whole point:
+// an accidental import from production code must fail loudly at startup rather
+// than quietly hashing every user password at a cost an attacker can brute
+// force. Detection is by the test flag the go tool always defines, which is
+// present only when the binary was built by `go test`.
+func SetTestCost() {
+	if flag.Lookup("test.v") == nil {
+		panic("passwordhash: SetTestCost called outside a test binary; " +
+			"this would weaken every stored password")
+	}
+	argonTime = 1
+	argonMemory = 8 // 8 KiB
+	argonThreads = 1
+}
+
+// ProdCost reports whether the production cost is in force. Tests that assert
+// on hashing behaviour can use it to skip when the cost has been lowered.
+func ProdCost() bool { return argonMemory == argonMemoryProd }
 
 // ErrInvalidHash is returned when an encoded hash cannot be parsed.
 var ErrInvalidHash = errors.New("passwordhash: invalid encoded hash")

@@ -1,0 +1,106 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// TestRotateValueHasOneCallSite keeps the compare-and-swap chokepoint a
+// chokepoint.
+//
+// The raw query took four parameters and one of them was easy to omit. It had
+// two call sites that had to agree, and for three consecutive audit rounds they
+// did not: the sweep bound the token and the manual handler did not, so manual
+// rotation was 100% dead while the suite stayed green. A third entry point would
+// have had the same coin flip.
+//
+// persistRotatedValue is now the only caller, and it refuses a missing token
+// outright. This test fails if anyone reintroduces a direct call.
+func TestRotateValueHasOneCallSite(t *testing.T) {
+	const raw = "RotateVaultEntryValueUnchecked("
+	const allowed = "vault_rotation_cas.go"
+
+	var offenders []string
+	seen := 0
+	err := filepath.Walk("..", func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		base := filepath.Base(path)
+		// Skip tests and sqlc output: the generated file necessarily declares it.
+		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, ".sql.go") || base == "querier.go" {
+			return nil
+		}
+		src, rErr := os.ReadFile(path)
+		if rErr != nil {
+			return rErr
+		}
+		if !strings.Contains(string(src), raw) {
+			return nil
+		}
+		seen++
+		if base != allowed {
+			offenders = append(offenders, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	// Fail closed: if the identifier vanished the guard is asserting nothing.
+	if seen == 0 {
+		t.Fatal("ABORT: the raw rotate query is referenced nowhere; this guard is vacuous " +
+			"(was it renamed? update this test with it)")
+	}
+	for _, o := range offenders {
+		t.Errorf("%s calls the raw rotate query directly.\n"+
+			"Use persistRotatedValue: it refuses a missing compare-and-swap token, which is "+
+			"the mistake that killed manual rotation for three audit rounds.", o)
+	}
+}
+
+// TestPersistRotatedValueRefusesAMissingToken pins the fail-loud behaviour.
+//
+// Without the token the UPDATE matches zero rows, which is indistinguishable
+// from a genuine conflict. Callers then reported it as 404 "vault entry not
+// found" (round 12) and later as 409 "the secret changed" (round 13), both for
+// an entry nobody had touched. An error is the only honest answer.
+func TestPersistRotatedValueRefusesAMissingToken(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+	owner := mustUser(t, queries, "cas-guard@example.com", "user", "")
+	mustEntry(t, h, queries, "cas-guard-1", owner, "Entry", "v")
+
+	for name, snap := range map[string]rotationSnapshot{
+		"no token":    {EntryID: "cas-guard-1"},
+		"no entry id": {UpdatedAtText: "2026-07-29 12:00:00"},
+	} {
+		applied, err := persistRotatedValue(ctx, queries, snap, []byte("ct"), []byte("nonce"))
+		if !errors.Is(err, errNoCASToken) {
+			t.Errorf("%s: got (applied=%v, err=%v), want errNoCASToken", name, applied, err)
+		}
+		if applied {
+			t.Errorf("%s: reported the write as applied", name)
+		}
+	}
+
+	// And the happy path still works through the same door.
+	row, err := queries.GetVaultEntryForRotation(ctx, "cas-guard-1")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	ct, nonce, err := h.encrypt([]byte("NEW"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	applied, err := persistRotatedValue(ctx, queries,
+		snapshotFromRotationRow("cas-guard-1", row.UpdatedAtText), ct, nonce)
+	if err != nil || !applied {
+		t.Fatalf("a valid snapshot did not apply: applied=%v err=%v", applied, err)
+	}
+}

@@ -206,14 +206,10 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// at pass start and may be writing back minutes later, so without the
 		// predicate a value the user saved in between is silently overwritten by
 		// the stale one.
-		res, casErr := queries.RotateVaultEntryValue(ctx, db.RotateVaultEntryValueParams{
-			EncryptedValue: encrypted,
-			Nonce:          nonce,
-			ID:             entry.ID,
-			UpdatedAtText:  entry.UpdatedAtText,
-		})
+		applied, casErr := persistRotatedValue(ctx, queries,
+			snapshotFromRotationRow(entry.ID, entry.UpdatedAtText), encrypted, nonce)
 		if casErr == nil {
-			if n, _ := res.RowsAffected(); n == 0 {
+			if !applied {
 				// Someone changed or deleted the entry during the pass. The
 				// provider has already minted a replacement, so say so plainly
 				// rather than pretending the rotation succeeded; the next pass

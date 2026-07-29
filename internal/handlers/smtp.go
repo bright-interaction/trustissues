@@ -90,10 +90,23 @@ func buildMIMEMessage(from, to, subject, htmlBody string) []byte {
 // SMTP network bounds. Neither transport had any: a relay that accepts the
 // connection and then stays silent pinned the sending goroutine (and its socket)
 // for the life of the process, with zero user-visible signal.
-const (
+// Variables, not constants, so the deadline test can assert the BEHAVIOUR
+// (a silent relay is given up on) without paying the production wait. The test
+// that proves these exist took 40 of the handler package's 51 seconds, which is
+// most of a suite budget spent watching two timers expire.
+var (
 	smtpDialTimeout = 10 * time.Second
 	smtpIOTimeout   = 30 * time.Second
 )
+
+// setSMTPTimeoutsForTest shortens the network bounds and returns a restore func.
+// Test-only by convention; the production values are pinned by a test so a
+// permanent change has to be deliberate.
+func setSMTPTimeoutsForTest(dial, io time.Duration) func() {
+	prevDial, prevIO := smtpDialTimeout, smtpIOTimeout
+	smtpDialTimeout, smtpIOTimeout = dial, io
+	return func() { smtpDialTimeout, smtpIOTimeout = prevDial, prevIO }
+}
 
 func sendMailTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
 	tlsConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}

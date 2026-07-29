@@ -113,7 +113,11 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- Rotate (generate new secret value)
 -- ============================================================================
 
--- name: RotateVaultEntryValue :execresult
+-- name: RotateVaultEntryValueUnchecked :execresult
+-- "Unchecked" means unchecked BY THIS QUERY: it will happily bind an empty
+-- token and match zero rows. Call persistRotatedValue instead, which refuses a
+-- missing token. TestRotateValueHasOneCallSite enforces that this name appears
+-- in exactly one non-test file.
 -- Compare-and-swap on updated_at.
 --
 -- The scheduled sweep snapshots every due entry at pass start and writes back

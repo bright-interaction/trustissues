@@ -24,6 +24,11 @@ import (
 //
 // The listener below is exactly that: it accepts and never writes a byte.
 func TestSMTPSendsGiveUpOnASilentRelay(t *testing.T) {
+
+	// Short bounds: this test proves the deadlines EXIST and fire, which does not
+	// require waiting out the production 10s/30s. Restoring afterwards keeps the
+	// shipped values in force for everything else.
+	defer setSMTPTimeoutsForTest(300*time.Millisecond, 600*time.Millisecond)()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -89,5 +94,22 @@ func TestSMTPSendsGiveUpOnASilentRelay(t *testing.T) {
 	case <-accepted:
 	default:
 		t.Fatal("ABORT: the fake relay was never connected to; this test proved nothing")
+	}
+}
+
+// TestSMTPProductionTimeoutsArePinned stops the test-only shortening from
+// quietly becoming the shipped behaviour.
+//
+// smtpDialTimeout and smtpIOTimeout became variables so the deadline test could
+// run in under a second instead of forty. That is a safe trade only while the
+// production values are asserted somewhere: otherwise a stray
+// setSMTPTimeoutsForTest, or an edit to the defaults, would ship a 300ms dial
+// budget to real relays and every invitation email would fail.
+func TestSMTPProductionTimeoutsArePinned(t *testing.T) {
+	if smtpDialTimeout != 10*time.Second {
+		t.Errorf("production SMTP dial timeout is %v, want 10s", smtpDialTimeout)
+	}
+	if smtpIOTimeout != 30*time.Second {
+		t.Errorf("production SMTP IO timeout is %v, want 30s", smtpIOTimeout)
 	}
 }

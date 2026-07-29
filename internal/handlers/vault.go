@@ -2205,19 +2205,15 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// and the handler answered 404 for an entry the user was looking at. The
 	// sweep passed it and this path did not, so the CAS made manual rotation
 	// 100% dead while the test suite stayed green.
-	result, err := h.queries.RotateVaultEntryValue(ctx, db.RotateVaultEntryValueParams{
-		EncryptedValue: encrypted,
-		Nonce:          nonce,
-		ID:             id,
-		UpdatedAtText:  entryRow.UpdatedAtText,
-	})
+	applied, err := persistRotatedValue(ctx, h.queries,
+		snapshotFromRotationRow(id, entryRow.UpdatedAtText), encrypted, nonce)
 	if err != nil {
 		logError(r, "vault.rotate: update failed", "error", err)
 		writeInternalError(w, r, "failed to update secret")
 		return
 	}
 
-	if rowsAffected, _ := result.RowsAffected(); rowsAffected == 0 {
+	if !applied {
 		// A CAS miss is a CONFLICT, not a missing entry, and saying "not found"
 		// about a row the caller is looking at sends them hunting for the wrong
 		// problem. It also matters that a provider has usually ALREADY minted the
