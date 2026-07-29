@@ -84,6 +84,7 @@ var ErrIncompatibleVersion = errors.New("passwordhash: incompatible argon2 versi
 
 // Hash returns an Argon2id-encoded password hash safe to persist.
 func Hash(password string) (string, error) {
+	defer acquireHashSlot()()
 	if password == "" {
 		return "", errors.New("passwordhash: empty password")
 	}
@@ -105,7 +106,32 @@ func Hash(password string) (string, error) {
 // Verify checks a candidate password against an encoded hash. It accepts
 // both Argon2id PHC-format strings (new) and bcrypt strings (legacy).
 // Returns true if the password matches.
+// hashSlots bounds how many Argon2 computations may run at once.
+//
+// Argon2id at the production cost allocates 64 MiB per call, and Hash/Verify are
+// reachable from UNAUTHENTICATED endpoints (login, invitation redemption). The
+// login rate limiter is 30 requests per 15 minutes PER IP, which bounds the rate
+// from one source and does not bound concurrent memory at all: distributed
+// sources multiply it, and an audit measured one source driving RSS from 74 MB
+// to 1038 MB.
+//
+// A semaphore is the right control because the resource being exhausted is
+// memory in flight, not requests per minute. Excess callers queue rather than
+// allocate, which converts a memory-exhaustion crash into added latency under
+// attack, and costs nothing at normal load.
+//
+// 4 is deliberate: at 64 MiB each that caps Argon2 at ~256 MiB regardless of
+// traffic, and a single-team vault never has four people logging in at once.
+var hashSlots = make(chan struct{}, 4)
+
+// acquireHashSlot blocks until a slot is free and returns its release func.
+func acquireHashSlot() func() {
+	hashSlots <- struct{}{}
+	return func() { <-hashSlots }
+}
+
 func Verify(password, encoded string) (bool, error) {
+	defer acquireHashSlot()()
 	if encoded == "" {
 		return false, ErrInvalidHash
 	}

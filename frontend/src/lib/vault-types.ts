@@ -27,7 +27,11 @@ export interface VaultEntry {
   rotation_interval_days: number | null;
   expires_at: string | null;
   last_rotated_at: string;
-  rotation_status: 'fresh' | 'due_soon' | 'overdue' | 'expired';
+  // 'error' is returned whenever last_rotation_error is set, and the server
+  // checks it BEFORE the age branches, so it also replaces 'overdue'. The client
+  // type omitted it, which rendered an empty pill: the one state an operator
+  // most needs to see was the only invisible one.
+  rotation_status: 'fresh' | 'due_soon' | 'overdue' | 'expired' | 'error';
   provider?: string;
   provider_meta?: string;
   auto_rotate?: boolean;
