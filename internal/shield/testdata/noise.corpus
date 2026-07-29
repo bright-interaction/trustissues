@@ -1,0 +1,49 @@
+# Realistic prompt text that must produce ZERO shield markers.
+#
+# This file is the precision denominator. Six rounds of regex patching each
+# widened a pattern to catch a true positive and silently created a new false
+# positive, because nothing measured the collateral. Every line here was an
+# actual observed false positive, or is one line away from one.
+#
+# Lines starting with # are comments. Blank lines are ignored.
+# A line that produces ANY marker fails the build.
+
+# --- dates and timestamps (the phone pattern ate these) ---
+the incident started at 2026-07-29T13:06:04Z and ended an hour later
+sqlite wrote updated_at = 2026-07-29 13:06:04 for that row
+the window is 08:00-09:30 on weekdays
+build 20260729 shipped on 2026-07-29
+between 2026-01-02 03:04:05 and 2026-01-02 04:05:06
+
+# --- identifiers and version strings ---
+trace id 123456789012345678 shows the retry
+order 1234567890 was refunded
+v1.2.3 and v10.20.30 are both released
+commit 4f6ad976 reverted 1bbb154d
+uuid 550e8400-e29b-41d4-a716-446655440000 is the tenant
+CVE-2024-12345 affects the parser
+port 8080 and port 5432 are open
+we had 42 errors in 2026
+
+# --- code identifiers (the hostname pattern ate these) ---
+use strings.HasPrefix instead of a manual slice
+call json.Unmarshal then check err.Error
+res.data and user.name are both nil here
+React.useEffect fires twice in strict mode
+np.array and pd.DataFrame need the import
+config.host is read from the env
+errors.Is beats a string compare
+
+# --- filenames and paths ---
+open config.json and docker-compose.yml
+the file is internal/handlers/vault.go line 2208
+main.go imports net/http
+
+# --- money and quantities ---
+the invoice is 1234.56 SEK excluding VAT
+we processed 9876543210 events last quarter
+
+# --- prose that merely mentions the concepts ---
+send the customer their personnummer verification link
+call the office and ask for the account manager
+the api key is stored in the vault, not in the prompt
