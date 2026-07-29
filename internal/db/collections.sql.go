@@ -217,12 +217,14 @@ func (q *Queries) GetVaultEntryAccess(ctx context.Context, id string) (GetVaultE
 const listAccessibleVaultEntries = `-- name: ListAccessibleVaultEntries :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
-WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
 ORDER BY e.name ASC
 `
 
 type ListAccessibleVaultEntriesParams struct {
+	ID       string `json:"id"`
 	UserID   string `json:"user_id"`
 	UserID_2 string `json:"user_id_2"`
 }
@@ -249,8 +251,12 @@ type ListAccessibleVaultEntriesRow struct {
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
+// The disabled-account clause matches grantFor's row 2. Without it, disabling an
+// account left the unlock screen returning every shared secret's plaintext to
+// it, which is the widest of the offboarding doors because it is bulk rather
+// than one entry. Bind params: userID three times.
 func (q *Queries) ListAccessibleVaultEntries(ctx context.Context, arg ListAccessibleVaultEntriesParams) ([]ListAccessibleVaultEntriesRow, error) {
-	rows, err := q.db.QueryContext(ctx, listAccessibleVaultEntries, arg.UserID, arg.UserID_2)
+	rows, err := q.db.QueryContext(ctx, listAccessibleVaultEntries, arg.ID, arg.UserID, arg.UserID_2)
 	if err != nil {
 		return nil, err
 	}
@@ -295,12 +301,14 @@ func (q *Queries) ListAccessibleVaultEntries(ctx context.Context, arg ListAccess
 const listAccessibleVaultEntriesWithSecrets = `-- name: ListAccessibleVaultEntriesWithSecrets :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.destination_patterns, e.created_at, e.updated_at, e.encrypted_value, e.nonce
 FROM vault_entries e
-WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
 ORDER BY e.name ASC
 `
 
 type ListAccessibleVaultEntriesWithSecretsParams struct {
+	ID       string `json:"id"`
 	UserID   string `json:"user_id"`
 	UserID_2 string `json:"user_id_2"`
 }
@@ -331,8 +339,10 @@ type ListAccessibleVaultEntriesWithSecretsRow struct {
 	Nonce                []byte         `json:"nonce"`
 }
 
+// The disabled-account clause matches grantFor's row 2; see
+// ListAccessibleVaultEntries above. Bind params: userID three times.
 func (q *Queries) ListAccessibleVaultEntriesWithSecrets(ctx context.Context, arg ListAccessibleVaultEntriesWithSecretsParams) ([]ListAccessibleVaultEntriesWithSecretsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listAccessibleVaultEntriesWithSecrets, arg.UserID, arg.UserID_2)
+	rows, err := q.db.QueryContext(ctx, listAccessibleVaultEntriesWithSecrets, arg.ID, arg.UserID, arg.UserID_2)
 	if err != nil {
 		return nil, err
 	}
@@ -597,13 +607,15 @@ func (q *Queries) ListPendingCollectionInvitesForUser(ctx context.Context, userI
 const matchAccessibleVaultEntriesByURL = `-- name: MatchAccessibleVaultEntriesByURL :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
-WHERE ((e.collection_id IS NULL AND e.user_id = ?)
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
        OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
   AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
 ORDER BY e.name ASC
 `
 
 type MatchAccessibleVaultEntriesByURLParams struct {
+	ID           string `json:"id"`
 	UserID       string `json:"user_id"`
 	UserID_2     string `json:"user_id_2"`
 	UrlBidx      string `json:"url_bidx"`
@@ -632,8 +644,12 @@ type MatchAccessibleVaultEntriesByURLRow struct {
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
+// The disabled-account clause matches grantFor's row 2. This one feeds
+// browser-extension autofill, so a disabled account kept getting entry
+// suggestions for collections it had been cut from.
 func (q *Queries) MatchAccessibleVaultEntriesByURL(ctx context.Context, arg MatchAccessibleVaultEntriesByURLParams) ([]MatchAccessibleVaultEntriesByURLRow, error) {
 	rows, err := q.db.QueryContext(ctx, matchAccessibleVaultEntriesByURL,
+		arg.ID,
 		arg.UserID,
 		arg.UserID_2,
 		arg.UrlBidx,

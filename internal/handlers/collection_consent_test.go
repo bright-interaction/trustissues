@@ -42,6 +42,7 @@ func TestPendingMembershipGrantsNothing(t *testing.T) {
 	accessible := func(who string) int {
 		t.Helper()
 		rows, err := queries.ListAccessibleVaultEntries(ctx, db.ListAccessibleVaultEntriesParams{
+			ID:     who,
 			UserID: who, UserID_2: who,
 		})
 		if err != nil {
@@ -52,6 +53,7 @@ func TestPendingMembershipGrantsNothing(t *testing.T) {
 	revealed := func(who string) int {
 		t.Helper()
 		rows, err := queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
+			ID:     who,
 			UserID: who, UserID_2: who,
 		})
 		if err != nil {

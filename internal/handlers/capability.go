@@ -639,7 +639,7 @@ func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, 
 	// the two can never drift apart again.
 	row = h.db.QueryRowContext(ctx,
 		`SELECT 1 FROM vault_entries WHERE id = ? AND `+accessibleEntriesPredicate,
-		secretID, userID, userID)
+		secretID, userID, userID, userID)
 	if err := row.Scan(&v); err == nil {
 		return true, nil
 	}
@@ -676,11 +676,21 @@ type capabilityEntryRow struct {
 //     secret they legitimately have access to, because they are not its user_id.
 //
 // Bind params: userID twice.
+// The SQL twin of grantFor's use column. It exists because a bulk lookup cannot
+// call grantFor per row, which means the rule is encoded twice and the two can
+// drift. TestSQLPredicateAgreesWithGrantFor pins them together.
+//
+// The disabled-account clause was missing for the whole audit: grantFor refuses
+// a disabled user at row 2, this did not, so disabling an account left the
+// capability bridge minting tokens for it. Bind params: userID three times.
 const accessibleEntriesPredicate = `(
-	(collection_id IS NULL AND user_id = ?)
-	OR collection_id IN (
-		SELECT collection_id FROM collection_members
-		WHERE user_id = ? AND accepted_at IS NOT NULL
+	EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+	AND (
+		(collection_id IS NULL AND user_id = ?)
+		OR collection_id IN (
+			SELECT collection_id FROM collection_members
+			WHERE user_id = ? AND accepted_at IS NOT NULL
+		)
 	)
 )`
 
@@ -702,7 +712,7 @@ const accessibleEntriesPredicate = `(
 func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name string) (capabilityEntryRow, error) {
 	rows, err := h.db.QueryContext(ctx,
 		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+` AND name = ?`,
-		userID, userID, name)
+		userID, userID, userID, name)
 	if err != nil {
 		return capabilityEntryRow{}, err
 	}
@@ -733,7 +743,7 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 	rows, err := h.db.QueryContext(ctx,
 		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+
 			` AND destination_patterns != '' AND destination_patterns != '[]'`,
-		userID, userID)
+		userID, userID, userID)
 	if err != nil {
 		return capabilityEntryRow{}, err
 	}
