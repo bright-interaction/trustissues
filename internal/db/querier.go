@@ -222,7 +222,13 @@ type Querier interface {
 	InsertServiceSecretAudit(ctx context.Context, arg InsertServiceSecretAuditParams) error
 	InvalidateUserSessions(ctx context.Context, arg InvalidateUserSessionsParams) error
 	ListAPIKeysByUser(ctx context.Context, userID string) ([]ListAPIKeysByUserRow, error)
+	// The disabled-account clause matches grantFor's row 2. Without it, disabling an
+	// account left the unlock screen returning every shared secret's plaintext to
+	// it, which is the widest of the offboarding doors because it is bulk rather
+	// than one entry. Bind params: userID three times.
 	ListAccessibleVaultEntries(ctx context.Context, arg ListAccessibleVaultEntriesParams) ([]ListAccessibleVaultEntriesRow, error)
+	// The disabled-account clause matches grantFor's row 2; see
+	// ListAccessibleVaultEntries above. Bind params: userID three times.
 	ListAccessibleVaultEntriesWithSecrets(ctx context.Context, arg ListAccessibleVaultEntriesWithSecretsParams) ([]ListAccessibleVaultEntriesWithSecretsRow, error)
 	// Names visible to the user (personal + collections) for import conflict checks.
 	ListAccessibleVaultEntryNames(ctx context.Context, arg ListAccessibleVaultEntryNamesParams) ([]string, error)
@@ -306,6 +312,9 @@ type Querier interface {
 	// targets configured by a departing member can be purged when they lose access.
 	ListVaultEntryTargetsInCollection(ctx context.Context, collectionID sql.NullString) ([]ListVaultEntryTargetsInCollectionRow, error)
 	MarkInvitationRedeemed(ctx context.Context, arg MarkInvitationRedeemedParams) error
+	// The disabled-account clause matches grantFor's row 2. This one feeds
+	// browser-extension autofill, so a disabled account kept getting entry
+	// suggestions for collections it had been cut from.
 	MatchAccessibleVaultEntriesByURL(ctx context.Context, arg MatchAccessibleVaultEntriesByURLParams) ([]MatchAccessibleVaultEntriesByURLRow, error)
 	// Autofill within one collection the caller has ACCEPTED. Callers must check
 	// membership before calling; the collection id is the index scope.

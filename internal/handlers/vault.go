@@ -816,28 +816,10 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 // capability bridge draws: reading a secret and delegating it are different
 // questions, and delegation is the narrow one.
 func (h *VaultHandler) entryCurrentlyUsableBy(ctx context.Context, userID, entryID string) bool {
-	if userID == "" || entryID == "" {
-		return false
-	}
-	// A disabled or deleted account can use nothing.
-	if u, err := h.queries.GetUserByID(ctx, userID); err != nil || u.Disabled != 0 {
-		return false
-	}
-	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
-	if err != nil {
-		return false
-	}
-	if !info.CollectionID.Valid || info.CollectionID.String == "" {
-		// Personal entry: only its owner.
-		return info.UserID == userID
-	}
-	// Collection entry: current accepted membership, any role. Creating it is
-	// not enough and never expires on its own.
-	_, roleErr := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
-		CollectionID: info.CollectionID.String,
-		UserID:       userID,
-	})
-	return roleErr == nil
+	// isAdmin false on purpose: this asks whether THIS user may spend the
+	// credential, not whether the process is privileged. Callers that want an
+	// admin bypass add it explicitly at the call site (see ValidateKey).
+	return h.grantFor(ctx, userID, false, entryID).use
 }
 
 // entryAccessFor is entryAccess without an *http.Request, so background work
@@ -845,83 +827,8 @@ func (h *VaultHandler) entryCurrentlyUsableBy(ctx context.Context, userID, entry
 // caller. entryAccess is the request-scoped wrapper; both share this body so
 // the two can never drift into different answers.
 func (h *VaultHandler) entryAccessFor(ctx context.Context, userID string, isAdmin bool, entryID string) (canRead, canWrite bool) {
-	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
-	if err != nil {
-		return false, false
-	}
-	// A disabled account has no access, on any path. The HTTP middleware already
-	// refuses disabled users, so for live requests this changes nothing; it
-	// matters for BACKGROUND callers, which ask about a user who is not the
-	// caller and never pass through middleware.
-	//
-	// Without it, Disable was a half-revocation: it cut a compromised user's
-	// browser access instantly, while their rotation delivery webhook kept
-	// receiving freshly rotated plaintext. Removing them from the collection
-	// closed that, but Disable is the control an admin reaches for during an
-	// incident, so the rotation performed TO revoke them was what handed them
-	// the new key. Checking here rather than only at the delivery gate means a
-	// future background caller inherits it by default.
-	if userID != "" {
-		if u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil || u.Disabled != 0 {
-			return false, false
-		}
-	}
-	if isAdmin {
-		return true, true
-	}
-	if info.CollectionID.Valid && info.CollectionID.String != "" {
-		// Residual owner right, READ ONLY. Without any residual right a
-		// collection member could move the entry into a collection the creator
-		// is not a member of and the creator would lose their own secret
-		// permanently, so recovery has to stay possible.
-		//
-		// It must NOT carry write. When a membership row is deleted the creator
-		// is indistinguishable from someone who was never a member, so a
-		// residual write right meant removing a person from a collection did not
-		// revoke them: they kept delete and rotate on the shared secret, and
-		// could move it into their PERSONAL vault, where they would keep reading
-		// it even after the team rotated. Read-only leaves the correct property
-		// in place, which is that removing someone and then rotating the secret
-		// ends their access. It also cannot strand anyone, because recovery only
-		// ever needed read.
-		//
-		// A member of the collection still gets write below via their role; this
-		// branch only matters for a creator who is NOT currently a member.
-		if userID != "" && info.UserID == userID {
-			role, roleErr := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
-				CollectionID: info.CollectionID.String,
-				UserID:       userID,
-			})
-			if roleErr != nil {
-				// Not a member: recovery read only.
-				return true, false
-			}
-			switch role {
-			case collRoleManager, collRoleEditor:
-				return true, true
-			default:
-				// Viewer member who happens to be the creator: still a viewer.
-				return true, false
-			}
-		}
-		role, err := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
-			CollectionID: info.CollectionID.String,
-			UserID:       userID,
-		})
-		if err != nil {
-			return false, false
-		}
-		switch role {
-		case collRoleManager, collRoleEditor:
-			return true, true
-		case collRoleViewer:
-			return true, false
-		default:
-			return false, false
-		}
-	}
-	owns := info.UserID == userID
-	return owns, owns
+	g := h.grantFor(ctx, userID, isAdmin, entryID)
+	return g.read, g.manage
 }
 
 // canMoveEntryOutOfCollection reports whether the caller may move an entry that
@@ -1003,6 +910,7 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		// Non-admin: personal entries plus entries in collections the user
 		// belongs to. Access is enforced in the query itself.
 		rows, err := h.queries.ListAccessibleVaultEntries(ctx, db.ListAccessibleVaultEntriesParams{
+			ID:       userID,
 			UserID:   userID,
 			UserID_2: userID,
 		})
@@ -1934,6 +1842,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 
 	// Reveal spans personal entries plus entries in the user's collections.
 	rows, err := h.queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
+		ID:       userID,
 		UserID:   userID,
 		UserID_2: userID,
 	})

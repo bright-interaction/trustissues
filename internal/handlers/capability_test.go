@@ -448,7 +448,17 @@ func newTestDB(t *testing.T) *sql.DB {
 		// optional decoration: capability lookups are collection-scoped, so a
 		// fixture without them fails at SQL level and would hide a regression in
 		// the offboarding rule. NULL collection_id means a personal entry.
-		`CREATE TABLE vault_entries (
+		`CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			email TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL DEFAULT '',
+			name TEXT,
+			role TEXT NOT NULL DEFAULT 'user',
+			disabled INTEGER NOT NULL DEFAULT 0,
+			totp_enabled INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE vault_entries (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
 			collection_id TEXT,
@@ -503,6 +513,11 @@ func newTestDB(t *testing.T) *sql.DB {
 			nonce TEXT PRIMARY KEY,
 			expires_at TEXT NOT NULL
 		)`,
+		`CREATE TRIGGER fixture_seed_user AFTER INSERT ON vault_entries
+		BEGIN
+			INSERT OR IGNORE INTO users (id, email)
+			VALUES (NEW.user_id, NEW.user_id || '@fixture.test');
+		END`,
 	}
 	for _, s := range stmts {
 		if _, err := dbConn.Exec(s); err != nil {

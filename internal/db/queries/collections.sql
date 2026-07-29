@@ -113,21 +113,33 @@ UPDATE vault_entries SET collection_id = ?, updated_at = CURRENT_TIMESTAMP WHERE
 -- name: ListAccessibleVaultEntries :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
-WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
+-- The disabled-account clause matches grantFor's row 2. Without it, disabling an
+-- account left the unlock screen returning every shared secret's plaintext to
+-- it, which is the widest of the offboarding doors because it is bulk rather
+-- than one entry. Bind params: userID three times.
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
 ORDER BY e.name ASC;
 
 -- name: ListAccessibleVaultEntriesWithSecrets :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.custom_fields, e.destination_patterns, e.created_at, e.updated_at, e.encrypted_value, e.nonce
 FROM vault_entries e
-WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL)
+-- The disabled-account clause matches grantFor's row 2; see
+-- ListAccessibleVaultEntries above. Bind params: userID three times.
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
 ORDER BY e.name ASC;
 
 -- name: MatchAccessibleVaultEntriesByURL :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
 FROM vault_entries e
-WHERE ((e.collection_id IS NULL AND e.user_id = ?)
+-- The disabled-account clause matches grantFor's row 2. This one feeds
+-- browser-extension autofill, so a disabled account kept getting entry
+-- suggestions for collections it had been cut from.
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+  AND ((e.collection_id IS NULL AND e.user_id = ?)
        OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
   AND ((e.url_bidx != '' AND e.url_bidx = ?) OR (e.alias_url_bidx != '' AND e.alias_url_bidx = ?))
 ORDER BY e.name ASC;
