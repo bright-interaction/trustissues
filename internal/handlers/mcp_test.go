@@ -27,7 +27,18 @@ func mcpTestDB(t *testing.T) *sql.DB {
 	CREATE TABLE vault_entries (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL,
 		encrypted_value BLOB NOT NULL DEFAULT x'', nonce BLOB NOT NULL DEFAULT x'',
-		collection_id TEXT
+		collection_id TEXT,
+		custom_fields TEXT NOT NULL DEFAULT '',
+		destination_patterns TEXT NOT NULL DEFAULT '[]',
+		last_rotation_error TEXT DEFAULT '',
+		encryption_version INTEGER DEFAULT 2,
+		last_rotated_at DATETIME,
+		provider TEXT DEFAULT '',
+		provider_meta TEXT DEFAULT '{}',
+		rotation_log TEXT DEFAULT '[]',
+		rotation_targets TEXT DEFAULT '[]',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE collection_members (
 		collection_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer',

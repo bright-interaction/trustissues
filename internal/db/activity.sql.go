@@ -348,23 +348,23 @@ SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
        a.ip_address, a.user_agent, a.created_at
 FROM activity_log a
 LEFT JOIN users u ON u.id = a.user_id
-WHERE (CAST(? AS TEXT) = '' OR a.user_id = ?)
+WHERE (CAST(?1 AS TEXT) = '' OR a.user_id = ?1)
   AND (
-        (CAST(? AS TEXT) = '' AND CAST(? AS TEXT) = '')
-     OR (CAST(? AS TEXT) != ''
-         AND substr(a.action, 1, length(CAST(? AS TEXT))) = CAST(? AS TEXT))
-     OR (CAST(? AS TEXT) = '' AND a.action = ?)
+        (CAST(?2 AS TEXT) = '' AND CAST(?3 AS TEXT) = '')
+     OR (CAST(?3 AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(?3 AS TEXT))) = CAST(?3 AS TEXT))
+     OR (CAST(?3 AS TEXT) = '' AND a.action = ?2)
   )
 ORDER BY a.created_at DESC
-LIMIT ? OFFSET ?
+LIMIT ?5 OFFSET ?4
 `
 
 type ListActivityEntriesFilteredParams struct {
 	UserFilter   string `json:"user_filter"`
 	ActionFilter string `json:"action_filter"`
 	ActionPrefix string `json:"action_prefix"`
-	Limit        int64  `json:"limit"`
-	Offset       int64  `json:"offset"`
+	RowOffset    int64  `json:"row_offset"`
+	RowLimit     int64  `json:"row_limit"`
 }
 
 type ListActivityEntriesFilteredRow struct {
@@ -385,13 +385,17 @@ type ListActivityEntriesFilteredRow struct {
 // combined them, which meant the table and the CSV of the same view returned
 // DIFFERENT rows: for an audit surface, two disagreeing answers is worse than
 // one wrong one.
+// Named params throughout. Mixing @named with positional ? made sqlc emit ELEVEN
+// placeholders for a call that passes five arguments, so every request to
+// GET /api/activity failed with "sql: expected 11 arguments, got 5" and the
+// admin audit log was entirely dead. Never mix the two styles in one query.
 func (q *Queries) ListActivityEntriesFiltered(ctx context.Context, arg ListActivityEntriesFilteredParams) ([]ListActivityEntriesFilteredRow, error) {
 	rows, err := q.db.QueryContext(ctx, listActivityEntriesFiltered,
 		arg.UserFilter,
 		arg.ActionFilter,
 		arg.ActionPrefix,
-		arg.Limit,
-		arg.Offset,
+		arg.RowOffset,
+		arg.RowLimit,
 	)
 	if err != nil {
 		return nil, err

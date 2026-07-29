@@ -239,6 +239,10 @@ type Querier interface {
 	// combined them, which meant the table and the CSV of the same view returned
 	// DIFFERENT rows: for an audit surface, two disagreeing answers is worse than
 	// one wrong one.
+	// Named params throughout. Mixing @named with positional ? made sqlc emit ELEVEN
+	// placeholders for a call that passes five arguments, so every request to
+	// GET /api/activity failed with "sql: expected 11 arguments, got 5" and the
+	// admin audit log was entirely dead. Never mix the two styles in one query.
 	ListActivityEntriesFiltered(ctx context.Context, arg ListActivityEntriesFilteredParams) ([]ListActivityEntriesFilteredRow, error)
 	ListAllCollections(ctx context.Context) ([]Collection, error)
 	// ============================================================================

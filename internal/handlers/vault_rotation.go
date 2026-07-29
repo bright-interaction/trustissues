@@ -56,6 +56,13 @@ func RunScheduledRotations(ctx context.Context, dbConn *sql.DB, queries *db.Quer
 // them. Called by RunScheduledRotations; exported so main.go or tests can
 // trigger a single pass directly.
 func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHandler) {
+	// The LIST gets the pass budget; each ENTRY gets its own below.
+	//
+	// One shared 5-minute deadline for the whole pass meant a slow head of the
+	// queue starved the tail: entries that were never attempted got recorded as
+	// provider failures, and because the context was already dead their own
+	// last_rotation_error and rotation_log writes silently failed too, so the UI
+	// showed them clean while the alert text said they had failed.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -89,7 +96,14 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 	}
 }
 
-func rotateOneEntry(ctx context.Context, queries *db.Queries, vaultHandler *VaultHandler, entry db.ListVaultEntriesNeedingRotationRow) {
+func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *VaultHandler, entry db.ListVaultEntriesNeedingRotationRow) {
+	// Detached from the pass budget and re-bounded per entry. Detaching is the
+	// point: an entry late in the queue must still get a full attempt AND must
+	// still be able to write its own failure record, which a dead pass context
+	// silently prevented.
+	ctx, cancelEntry := context.WithTimeout(context.WithoutCancel(passCtx), 90*time.Second)
+	defer cancelEntry()
+
 	// The SCHEDULED sweep counts toward the shutdown drain too.
 	//
 	// Round 10 added the WaitGroup for the manual rotate path only, which left

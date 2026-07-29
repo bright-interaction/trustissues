@@ -152,7 +152,19 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstreamPath := "/" + chi.URLParam(r, "*")
-	upReq, err := http.NewRequestWithContext(ctx, r.Method, p.baseURL+upstreamPath, bytes.NewReader(body))
+	// Carry the caller's query string. Concatenating baseURL+path dropped it, so
+	// every documented GET through the gateway (pagination cursors, filters,
+	// limits) silently returned an unfiltered first page with a 200 and no hint
+	// that the parameters had been discarded.
+	upstreamURL := p.baseURL + upstreamPath
+	if raw := r.URL.RawQuery; raw != "" {
+		if strings.Contains(upstreamURL, "?") {
+			upstreamURL += "&" + raw
+		} else {
+			upstreamURL += "?" + raw
+		}
+	}
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		writeInternalError(w, r, "internal server error")
 		return

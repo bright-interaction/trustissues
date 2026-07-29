@@ -51,8 +51,17 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 			destination_patterns TEXT NOT NULL DEFAULT '[]',
 			injection_spec TEXT NOT NULL DEFAULT '{}',
 			collection_id TEXT,
+		custom_fields TEXT NOT NULL DEFAULT '',
+		last_rotation_error TEXT DEFAULT '',
+		last_rotated_at DATETIME,
+		provider TEXT DEFAULT '',
+		provider_meta TEXT DEFAULT '{}',
+		rotation_log TEXT DEFAULT '[]',
+		rotation_targets TEXT DEFAULT '[]',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(user_id, name)
-		)`,
+	)`,
 		`CREATE TABLE service_identities (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL UNIQUE,

@@ -23,11 +23,11 @@ const (
 	// to the one entry (it used to kill the process), so the operator needs the
 	// row to say something happened rather than the rotation looking untried.
 	rotFailInternal = "rotation failed with an internal error (see server logs)"
-	rotFailDecrypt         = "decrypt failed (details in server logs)"
-	rotFailProvider        = "provider rotation failed (details in server logs)"
-	rotFailEncrypt         = "new value could not be encrypted; the provider may have already issued a replacement key (details in server logs)"
-	rotFailConflict        = "the secret was changed during the rotation pass, so the new value was not written; the provider may have issued a replacement key, and the entry will be retried on the next pass"
-	rotFailPersist         = "new value could not be saved; the provider may have already issued a replacement key (details in server logs)"
+	rotFailDecrypt  = "decrypt failed (details in server logs)"
+	rotFailProvider = "provider rotation failed (details in server logs)"
+	rotFailEncrypt  = "new value could not be encrypted; the provider may have already issued a replacement key (details in server logs)"
+	rotFailConflict = "the secret was changed during the rotation pass, so the new value was not written; the provider may have issued a replacement key, and the entry will be retried on the next pass"
+	rotFailPersist  = "new value could not be saved; the provider may have already issued a replacement key (details in server logs)"
 )
 
 // recordRotationFailure is the single exit for every hard failure in the

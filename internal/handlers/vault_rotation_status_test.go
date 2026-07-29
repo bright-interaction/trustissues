@@ -6,7 +6,7 @@ import (
 )
 
 func rotStrPtr(s string) *string { return &s }
-func rotIntP(i int) *int          { return &i }
+func rotIntP(i int) *int         { return &i }
 
 // The exact state the Cloudflare entry was in on 2026-07-27: recently stamped
 // (so age says fresh) but auto-rotation had failed 50 consecutive hourly runs.

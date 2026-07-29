@@ -23,9 +23,9 @@ import (
 // on the way out. Auth is the same X-API-Key / session middleware as the rest of
 // /api, so the caller is a real Trustissues user.
 type MCPHandler struct {
-	queries     *db.Queries
-	cfg         *config.Config
-	capability  *CapabilityHandler
+	queries    *db.Queries
+	cfg        *config.Config
+	capability *CapabilityHandler
 	// shieldStore is nil when Shield is disabled. It is deliberately unused on
 	// the tools/call path: see the comment in callTool for why a blanket redact
 	// there breaks the feature. Kept because any future field-level shielding of

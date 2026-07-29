@@ -62,6 +62,7 @@ func newVaultTestDB(t *testing.T) *sql.DB {
 		collection_id TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		custom_fields TEXT NOT NULL DEFAULT '',
 		UNIQUE(user_id, name)
 	);
 	-- collection_id and collection_members are required, not optional extras:
