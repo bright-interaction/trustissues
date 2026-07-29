@@ -414,10 +414,10 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	if stored[0].ConfiguredBy != owner {
 		t.Fatalf("a new target was not stamped to its creator: configured_by = %q, want %q", stored[0].ConfiguredBy, owner)
 	}
-	if _, err := queries.ResolveVaultReference(ctx, db.ResolveVaultReferenceParams{
-		Name:   "OWNER_PERSONAL",
-		UserID: stored[0].ConfiguredBy,
-	}); err != nil {
+	// Resolve through the handler helper, not the raw query: the query is now
+	// name-only and access is decided by entryCurrentlyUsableBy, so calling the
+	// query directly would assert nothing about authorization.
+	if _, err := h.resolveVaultReferenceFor(ctx, "OWNER_PERSONAL", stored[0].ConfiguredBy); err != nil {
 		t.Fatalf("owner-configured target should resolve its own secret: %v", err)
 	}
 }

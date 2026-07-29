@@ -297,7 +297,17 @@ type Querier interface {
 	// ============================================================================
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 	// ============================================================================
-	ResolveVaultReference(ctx context.Context, arg ResolveVaultReferenceParams) (ResolveVaultReferenceRow, error)
+	// Resolves a {{vault:NAME}} / auth_token reference to its ciphertext.
+	//
+	// Returns id so the CALLER can run the resolved row through entryAccessFor
+	// rather than trusting this predicate. user_id is the CREATOR column, not a
+	// statement of current access: removing someone from a collection deletes only
+	// the collection_members row, so a name+user_id match kept resolving a shared
+	// secret for a member who had been removed from the collection holding it.
+	//
+	// :many, not :one, so an ambiguous name is refused by the caller instead of
+	// SQLite silently picking a row.
+	ResolveVaultReference(ctx context.Context, name string) ([]ResolveVaultReferenceRow, error)
 	// Revocation by flag, not by DELETE, so the audit trail survives the incident.
 	// COALESCE keeps the call idempotent: revoking an already-revoked key does not
 	// move its timestamp and still reports a row, so a repeated incident-response

@@ -184,11 +184,20 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve markers back to plaintext for the (trusted) caller.
+	//
+	// Take the resolved body even on error. UnshieldJSON now returns the partial
+	// result plus the first failure, and one unresolvable marker must not cost
+	// the caller every marker that DID resolve. Discarding the whole body meant a
+	// model that abbreviated or mistyped a single marker, or untrusted text that
+	// merely contained a marker-shaped string, silently downgraded the entire
+	// response to [shield:...] placeholders with a 200 and no explanation.
 	if session != nil && len(respBody) > 0 {
-		if resolved, uErr := session.UnshieldJSON(ctx, respBody); uErr == nil {
+		resolved, uErr := session.UnshieldJSON(ctx, respBody)
+		if len(resolved) > 0 {
 			respBody = resolved
-		} else {
-			logError(r, "ai_gateway: shield resolve failed (returning shielded body)", "error", uErr)
+		}
+		if uErr != nil {
+			logError(r, "ai_gateway: some shield markers did not resolve (partial body returned)", "error", uErr)
 		}
 	}
 

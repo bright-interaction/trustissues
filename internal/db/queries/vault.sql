@@ -132,9 +132,19 @@ FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (
 -- Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 -- ============================================================================
 
--- name: ResolveVaultReference :one
-SELECT encrypted_value, nonce FROM vault_entries
-WHERE vault_entries.name = ? AND user_id = ?;
+-- name: ResolveVaultReference :many
+-- Resolves a {{vault:NAME}} / auth_token reference to its ciphertext.
+--
+-- Returns id so the CALLER can run the resolved row through entryAccessFor
+-- rather than trusting this predicate. user_id is the CREATOR column, not a
+-- statement of current access: removing someone from a collection deletes only
+-- the collection_members row, so a name+user_id match kept resolving a shared
+-- secret for a member who had been removed from the collection holding it.
+--
+-- :many, not :one, so an ambiguous name is refused by the caller instead of
+-- SQLite silently picking a row.
+SELECT id, user_id, collection_id, encrypted_value, nonce FROM vault_entries
+WHERE vault_entries.name = ?;
 
 -- ============================================================================
 -- Import - conflict detection

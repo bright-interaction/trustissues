@@ -1089,30 +1089,60 @@ func (q *Queries) RenameVaultEntry(ctx context.Context, arg RenameVaultEntryPara
 	return q.db.ExecContext(ctx, renameVaultEntry, arg.Name, arg.ID)
 }
 
-const resolveVaultReference = `-- name: ResolveVaultReference :one
+const resolveVaultReference = `-- name: ResolveVaultReference :many
 
-SELECT encrypted_value, nonce FROM vault_entries
-WHERE vault_entries.name = ? AND user_id = ?
+SELECT id, user_id, collection_id, encrypted_value, nonce FROM vault_entries
+WHERE vault_entries.name = ?
 `
 
-type ResolveVaultReferenceParams struct {
-	Name   string `json:"name"`
-	UserID string `json:"user_id"`
-}
-
 type ResolveVaultReferenceRow struct {
-	EncryptedValue []byte `json:"encrypted_value"`
-	Nonce          []byte `json:"nonce"`
+	ID             string         `json:"id"`
+	UserID         string         `json:"user_id"`
+	CollectionID   sql.NullString `json:"collection_id"`
+	EncryptedValue []byte         `json:"encrypted_value"`
+	Nonce          []byte         `json:"nonce"`
 }
 
 // ============================================================================
 // Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 // ============================================================================
-func (q *Queries) ResolveVaultReference(ctx context.Context, arg ResolveVaultReferenceParams) (ResolveVaultReferenceRow, error) {
-	row := q.db.QueryRowContext(ctx, resolveVaultReference, arg.Name, arg.UserID)
-	var i ResolveVaultReferenceRow
-	err := row.Scan(&i.EncryptedValue, &i.Nonce)
-	return i, err
+// Resolves a {{vault:NAME}} / auth_token reference to its ciphertext.
+//
+// Returns id so the CALLER can run the resolved row through entryAccessFor
+// rather than trusting this predicate. user_id is the CREATOR column, not a
+// statement of current access: removing someone from a collection deletes only
+// the collection_members row, so a name+user_id match kept resolving a shared
+// secret for a member who had been removed from the collection holding it.
+//
+// :many, not :one, so an ambiguous name is refused by the caller instead of
+// SQLite silently picking a row.
+func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]ResolveVaultReferenceRow, error) {
+	rows, err := q.db.QueryContext(ctx, resolveVaultReference, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ResolveVaultReferenceRow{}
+	for rows.Next() {
+		var i ResolveVaultReferenceRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.CollectionID,
+			&i.EncryptedValue,
+			&i.Nonce,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const rotateVaultEntryValue = `-- name: RotateVaultEntryValue :execresult

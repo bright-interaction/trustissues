@@ -765,6 +765,46 @@ func (h *VaultHandler) entryAccess(r *http.Request, entryID string) (canRead, ca
 	return h.entryAccessFor(r.Context(), middleware.GetUserID(r.Context()), middleware.IsAdmin(r.Context()), entryID)
 }
 
+// entryCurrentlyUsableBy reports whether userID may USE this entry's secret
+// value right now: they are the personal owner, or an accepted member of the
+// collection it lives in.
+//
+// This is deliberately NARROWER than entryAccessFor's canRead. entryAccessFor
+// grants a removed creator a residual READ so they can recover a secret they own
+// when somebody moves it into a collection they are not a member of. That right
+// is for recovering their own value through the UI; it must never let them spend
+// the credential, because a removed creator is otherwise indistinguishable from
+// a current one (the entry keeps their user_id forever).
+//
+// Gating value-resolution on canRead is exactly the mistake that made the
+// forgejo auth_token path an exfiltration channel. Same distinction the
+// capability bridge draws: reading a secret and delegating it are different
+// questions, and delegation is the narrow one.
+func (h *VaultHandler) entryCurrentlyUsableBy(ctx context.Context, userID, entryID string) bool {
+	if userID == "" || entryID == "" {
+		return false
+	}
+	// A disabled or deleted account can use nothing.
+	if u, err := h.queries.GetUserByID(ctx, userID); err != nil || u.Disabled != 0 {
+		return false
+	}
+	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
+	if err != nil {
+		return false
+	}
+	if !info.CollectionID.Valid || info.CollectionID.String == "" {
+		// Personal entry: only its owner.
+		return info.UserID == userID
+	}
+	// Collection entry: current accepted membership, any role. Creating it is
+	// not enough and never expires on its own.
+	_, roleErr := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
+		CollectionID: info.CollectionID.String,
+		UserID:       userID,
+	})
+	return roleErr == nil
+}
+
 // entryAccessFor is entryAccess without an *http.Request, so background work
 // (rotation delivery) can ask the same question about a user who is not the
 // caller. entryAccess is the request-scoped wrapper; both share this body so
@@ -1391,6 +1431,30 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 
+	// Everything from here down runs in ONE transaction.
+	//
+	// Update writes each column with its own statement and validates as it goes,
+	// so a refusal partway through left the earlier writes committed. Concretely:
+	// a rename colliding on UNIQUE(user_id, name) returned 409 "a vault entry
+	// with that name already exists" AFTER custom_fields had been replaced
+	// (destroying imported TOTP seeds and recovery PINs), the secret value had
+	// been rewritten and last_rotated_at restamped. The user is told the save was
+	// rejected and the still-open editor shows the old data, so nothing suggests
+	// anything changed.
+	//
+	// Reordering the name check would fix only the name case. Every one of the
+	// 20-odd early returns below has the same shape, and the next validation
+	// added late would reintroduce it. A transaction plus a deferred Rollback
+	// makes every return path leave the row exactly as it was.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.update: begin transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
+	qtx := h.queries.WithTx(tx)
+
 	// Custom fields: nil means "unchanged"; a present (even empty) array replaces
 	// the set. Encrypted at rest.
 	if req.CustomFields != nil {
@@ -1402,7 +1466,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.update: custom fields encrypt failed", "error", cfErr)
 			writeInternalError(w, r, "internal server error")
 			return
-		} else if err := h.queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{CustomFields: enc, ID: id}); err != nil {
+		} else if err := qtx.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{CustomFields: enc, ID: id}); err != nil {
 			logError(r, "vault.update: update custom fields failed", "error", err)
 		}
 	}
@@ -1423,7 +1487,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		if err := h.queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+		if err := qtx.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
 			DestinationPatterns: string(encoded),
 			ID:                  id,
 		}); err != nil {
@@ -1451,7 +1515,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		//    secret back (the edit form used to pre-fill it) silently reset the
 		//    rotation clock and de-scheduled an overdue auto-rotation. If the
 		//    plaintext is unchanged, skip the write entirely.
-		current, curErr := h.queries.GetVaultEntryForRotation(ctx, id)
+		current, curErr := qtx.GetVaultEntryForRotation(ctx, id)
 		if curErr != nil {
 			logError(r, "vault.update: load current value failed", "entry", id, "error", curErr)
 			writeInternalError(w, r, "internal server error")
@@ -1476,7 +1540,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				writeInternalError(w, r, "failed to encrypt secret")
 				return
 			}
-			if err := h.queries.UpdateVaultEntryValue(ctx, db.UpdateVaultEntryValueParams{
+			if err := qtx.UpdateVaultEntryValue(ctx, db.UpdateVaultEntryValueParams{
 				EncryptedValue: encrypted,
 				Nonce:          nonce,
 				ID:             id,
@@ -1511,7 +1575,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeBadRequest(w, r, "name must be 255 characters or less")
 			return
 		}
-		if err := h.queries.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
+		if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {
 				writeConflict(w, r, "a vault entry with that name already exists")
 				return
@@ -1524,31 +1588,31 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Category != nil {
 		if enc, encErr := h.encryptColumn(*req.Category); encErr != nil {
 			logError(r, "vault.update: category encrypt failed", "error", encErr)
-		} else if err := h.queries.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(enc), ID: id}); err != nil {
+		} else if err := qtx.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update category failed", "error", err)
 		}
 	}
 	if req.Notes != nil {
 		if enc, encErr := h.encryptColumn(*req.Notes); encErr != nil {
 			logError(r, "vault.update: notes encrypt failed", "error", encErr)
-		} else if err := h.queries.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(enc), ID: id}); err != nil {
+		} else if err := qtx.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update notes failed", "error", err)
 		}
 	}
 	if req.RotationIntervalDays != nil {
-		if err := h.queries.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{RotationIntervalDays: sql.NullInt64{Int64: int64(*req.RotationIntervalDays), Valid: true}, ID: id}); err != nil {
+		if err := qtx.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{RotationIntervalDays: sql.NullInt64{Int64: int64(*req.RotationIntervalDays), Valid: true}, ID: id}); err != nil {
 			logError(r, "vault.update: update rotation_interval_days failed", "error", err)
 		}
 	}
 	if req.ExpiresAt != nil {
-		if err := h.queries.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: stringPtrToNullTime(req.ExpiresAt), ID: id}); err != nil {
+		if err := qtx.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: stringPtrToNullTime(req.ExpiresAt), ID: id}); err != nil {
 			logError(r, "vault.update: update expires_at failed", "error", err)
 		}
 	}
 	if req.URL != nil || req.AliasURL != nil {
 		// The blind index is scoped, so recomputing one needs the entry's CURRENT
 		// scope (its collection, or its owner when personal).
-		access, accErr := h.queries.GetVaultEntryAccess(ctx, id)
+		access, accErr := qtx.GetVaultEntryAccess(ctx, id)
 		if accErr != nil {
 			logError(r, "vault.update: scope lookup failed", "error", accErr)
 			writeInternalError(w, r, "internal server error")
@@ -1558,14 +1622,14 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if req.URL != nil {
 			if enc, encErr := h.encryptColumn(*req.URL); encErr != nil {
 				logError(r, "vault.update: url encrypt failed", "error", encErr)
-			} else if err := h.queries.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(scope, *req.URL), ID: id}); err != nil {
+			} else if err := qtx.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(scope, *req.URL), ID: id}); err != nil {
 				logError(r, "vault.update: update url failed", "error", err)
 			}
 		}
 		if req.AliasURL != nil {
 			if enc, encErr := h.encryptColumn(*req.AliasURL); encErr != nil {
 				logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
-			} else if err := h.queries.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(scope, *req.AliasURL), ID: id}); err != nil {
+			} else if err := qtx.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(scope, *req.AliasURL), ID: id}); err != nil {
 				logError(r, "vault.update: update alias_url failed", "error", err)
 			}
 		}
@@ -1573,18 +1637,18 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Username != nil {
 		if enc, encErr := h.encryptColumn(*req.Username); encErr != nil {
 			logError(r, "vault.update: username encrypt failed", "error", encErr)
-		} else if err := h.queries.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(enc), ID: id}); err != nil {
+		} else if err := qtx.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update username failed", "error", err)
 		}
 	}
 	if req.AutoLogin != nil {
-		if err := h.queries.UpdateVaultEntryAutoLogin(ctx, db.UpdateVaultEntryAutoLoginParams{AutoLogin: boolToInt64(*req.AutoLogin), ID: id}); err != nil {
+		if err := qtx.UpdateVaultEntryAutoLogin(ctx, db.UpdateVaultEntryAutoLoginParams{AutoLogin: boolToInt64(*req.AutoLogin), ID: id}); err != nil {
 			logError(r, "vault.update: update auto_login failed", "error", err)
 		}
 	}
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
 		// Fetch current values for fields not being updated
-		current, fetchErr := h.queries.GetVaultEntryMeta(ctx, id)
+		current, fetchErr := qtx.GetVaultEntryMeta(ctx, id)
 		if fetchErr == nil {
 			provider := current.Provider.String
 			providerMeta := current.ProviderMeta.String
@@ -1610,7 +1674,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				}
 				encMeta = enc
 			}
-			if err := h.queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+			if err := qtx.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
 				Provider:     toNullString(provider),
 				ProviderMeta: toNullString(encMeta),
 				AutoRotate:   sql.NullInt64{Int64: autoRotate, Valid: true},
@@ -1626,7 +1690,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch updated entry
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.update: commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	// Fetch updated entry (post-commit, so it reflects what was actually stored)
 	row, err := h.queries.GetVaultEntryMeta(ctx, id)
 	if err == sql.ErrNoRows {
 		writeNotFound(w, r, "vault entry not found")
@@ -2552,18 +2622,13 @@ func (h *VaultHandler) ResolveReferences(content string, userID string) string {
 		}
 		name := strings.TrimSpace(parts[1])
 
-		row, err := h.queries.ResolveVaultReference(context.Background(), db.ResolveVaultReferenceParams{
-			Name:   name,
-			UserID: userID,
-		})
+		// Scoped to what this user can CURRENTLY reach, not to who created the
+		// entry. See resolveVaultReferenceFor: the raw (name, user_id) match kept
+		// resolving for a member removed from the collection holding the secret.
+		decrypted, err := h.resolveVaultReferenceFor(context.Background(), name, userID)
 		if err != nil {
-			slog.Warn("vault.resolveReferences: secret not found", "name", name, "user_id", userID)
-			return match
-		}
-
-		decrypted, err := h.decrypt(row.EncryptedValue, row.Nonce)
-		if err != nil {
-			slog.Error("vault.resolveReferences: decrypt failed", "name", name, "error", err)
+			slog.Warn("vault.resolveReferences: secret not resolvable for this user",
+				"name", name, "user_id", userID, "error", err)
 			return match
 		}
 
