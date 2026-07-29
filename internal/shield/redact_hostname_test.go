@@ -346,3 +346,40 @@ func TestPhonePatternDoesNotEatOrdinaryNumbers(t *testing.T) {
 		}
 	})
 }
+
+// TestPhonePatternRejectsDatesAndIds pins the false positives that the first
+// widening introduced.
+//
+// Loosening the pattern to "a run of digits and separators" caught the national
+// formats but also ate ISO dates (mangling 2026-07-29T13:06:04Z into a phone
+// marker), 18-digit trace ids, card numbers and build stamps. Dates appear in
+// almost every prompt, so that corrupted the text the model sees for no gain.
+func TestPhonePatternRejectsDatesAndIds(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		for name, in := range map[string]string{
+			"iso timestamp": "at 2026-07-29T13:06:04Z it failed",
+			"trace id":      "trace 123456789012345678 done",
+			"build stamp":   "build 20260729 shipped",
+		} {
+			out, err := s.RedactString(ctx, in)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if strings.Contains(out, "[shield:phone:") {
+				t.Errorf("%s was tokenized as a phone number: %q", name, out)
+			}
+		}
+
+		// And a personnummer must still be classified as itself, not as a phone.
+		out, err := s.RedactString(ctx, "pnr 19850101-1234 ok")
+		if err != nil {
+			t.Fatalf("pnr: %v", err)
+		}
+		if !strings.Contains(out, "[shield:personnummer:") {
+			t.Errorf("personnummer lost to another pattern: %q", out)
+		}
+	})
+}
