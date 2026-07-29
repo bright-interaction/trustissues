@@ -134,3 +134,93 @@ func TestHostnameGuardDoesNotWeakenOtherKinds(t *testing.T) {
 		}
 	})
 }
+
+// TestHyphenatedProviderKeysAreTokenized covers the families that were entirely
+// absent from KindSecret, including the two providers this product's own AI
+// gateway proxies to.
+//
+// An Anthropic or OpenAI key pasted into a prompt egressed verbatim to that same
+// provider. The underscore alternatives (sk_live_, sk_) look like they cover
+// "sk", which is exactly what made the gap invisible: the pattern reads as
+// though the prefix is handled.
+func TestHyphenatedProviderKeysAreTokenized(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		for name, key := range map[string]string{
+			"anthropic":      "sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345",
+			"openai project": "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+			"openai legacy":  "sk-abcdefghijklmnopqrstuvwxyz012345",
+			"openai svcacct": "sk-svcacct-abcdefghijklmnopqrstuvwxyz01",
+			"aws access key": "AKIAIOSFODNN7EXAMPLE",
+			"aws temp key":   "ASIAIOSFODNN7EXAMPLE",
+			"google api key": "AIzaSyD-abcdefghijklmnopqrstuvwxyz01234",
+		} {
+			out, err := s.RedactString(ctx, "the key is "+key+" ok")
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if strings.Contains(out, key) {
+				t.Errorf("%s key egressed VERBATIM to the LLM provider: %q", name, out)
+			}
+		}
+	})
+}
+
+// TestSecretPatternWinsOverPersonnummer locks the ordering fix.
+//
+// Pattern order is match priority. The personnummer pattern claims any 10-digit
+// run, so a Slack token was cut in half and re-emitted as
+// xoxb-[shield:personnummer:...]-ABCDEF. It round-trips, so nothing breaks
+// visibly, but the kind is wrong and an operator reading the audit sees a
+// personnummer where a credential actually was.
+func TestSecretPatternWinsOverPersonnummer(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		out, err := s.RedactString(ctx, "token xoxb-1234567890-ABCDEFGHIJ here")
+		if err != nil {
+			t.Fatalf("redact: %v", err)
+		}
+		if strings.Contains(out, "personnummer") {
+			t.Errorf("a Slack token was classified as a personnummer: %q", out)
+		}
+		if !strings.Contains(out, "[shield:secret:") {
+			t.Errorf("the Slack token was not tokenized as a secret: %q", out)
+		}
+		if strings.Contains(out, "1234567890") {
+			t.Errorf("part of the token egressed verbatim: %q", out)
+		}
+
+		// A real personnummer must still be classified correctly.
+		out, err = s.RedactString(ctx, "personnummer 19850101-1234 ok")
+		if err != nil {
+			t.Fatalf("redact: %v", err)
+		}
+		if !strings.Contains(out, "[shield:personnummer:") {
+			t.Errorf("a real personnummer is no longer detected: %q", out)
+		}
+	})
+}
+
+// TestPEMPrivateKeyBodyIsTokenized proves the whole key is taken, not just the
+// banner line. Matching only "-----BEGIN ... PRIVATE KEY-----" left the actual
+// key material sitting in the prompt.
+func TestPEMPrivateKeyBodyIsTokenized(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		body := "MIIEowIBAAKCAQEAsecretkeymaterialthatmustnotleak0123456789"
+		pem := "-----BEGIN RSA PRIVATE KEY-----\n" + body + "\n-----END RSA PRIVATE KEY-----"
+		out, err := s.RedactString(ctx, "here it is:\n"+pem+"\nthanks")
+		if err != nil {
+			t.Fatalf("redact: %v", err)
+		}
+		if strings.Contains(out, body) {
+			t.Errorf("the PEM key BODY egressed verbatim; only the banner was tokenized:\n%s", out)
+		}
+	})
+}

@@ -79,6 +79,7 @@ type CollectionMember struct {
 type Invitation struct {
 	ID         string         `json:"id"`
 	Code       string         `json:"code"`
+	CodeHash   string         `json:"code_hash"`
 	Email      string         `json:"email"`
 	Name       string         `json:"name"`
 	Status     string         `json:"status"`

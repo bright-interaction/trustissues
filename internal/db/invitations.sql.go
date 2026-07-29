@@ -12,13 +12,14 @@ import (
 )
 
 const createInvitation = `-- name: CreateInvitation :one
-INSERT INTO invitations (code, email, name, target_role, created_by, expires_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO invitations (code, code_hash, email, name, target_role, created_by, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING id, code, email, name, status, target_role, expires_at, created_at
 `
 
 type CreateInvitationParams struct {
 	Code       string         `json:"code"`
+	CodeHash   string         `json:"code_hash"`
 	Email      string         `json:"email"`
 	Name       string         `json:"name"`
 	TargetRole string         `json:"target_role"`
@@ -37,9 +38,12 @@ type CreateInvitationRow struct {
 	CreatedAt  sql.NullTime `json:"created_at"`
 }
 
+// code holds the vault-key ciphertext (resend has to email the original), and
+// code_hash is what redemption looks up. See migration 00030.
 func (q *Queries) CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error) {
 	row := q.db.QueryRowContext(ctx, createInvitation,
 		arg.Code,
+		arg.CodeHash,
 		arg.Email,
 		arg.Name,
 		arg.TargetRole,
@@ -131,7 +135,7 @@ func (q *Queries) GetInvitationForResend(ctx context.Context, id string) (GetInv
 const getPendingInvitationByCode = `-- name: GetPendingInvitationByCode :one
 SELECT id, code, email, name, target_role, expires_at
 FROM invitations
-WHERE code = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP
+WHERE code_hash = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP
 `
 
 type GetPendingInvitationByCodeRow struct {
@@ -143,8 +147,11 @@ type GetPendingInvitationByCodeRow struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
-func (q *Queries) GetPendingInvitationByCode(ctx context.Context, code string) (GetPendingInvitationByCodeRow, error) {
-	row := q.db.QueryRowContext(ctx, getPendingInvitationByCode, code)
+// Lookup is by HASH, never by the code itself: a leaked database must not
+// contain anything redeemable. Constant-shape and still O(1) via the unique
+// index on code_hash.
+func (q *Queries) GetPendingInvitationByCode(ctx context.Context, codeHash string) (GetPendingInvitationByCodeRow, error) {
+	row := q.db.QueryRowContext(ctx, getPendingInvitationByCode, codeHash)
 	var i GetPendingInvitationByCodeRow
 	err := row.Scan(
 		&i.ID,

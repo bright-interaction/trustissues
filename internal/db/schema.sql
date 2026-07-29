@@ -66,7 +66,10 @@ CREATE TABLE settings (
 -- 00005_invitations.sql
 CREATE TABLE invitations (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    -- Vault-key ciphertext of the invite code (resend must email the original).
+    -- Redemption looks up code_hash, never this. See migration 00030.
     code TEXT UNIQUE NOT NULL,
+    code_hash TEXT NOT NULL DEFAULT '',
     email TEXT NOT NULL,
     name TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'redeemed', 'expired')),

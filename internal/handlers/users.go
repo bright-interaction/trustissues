@@ -500,7 +500,7 @@ func (h *UserHandler) ListInvitations(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		invitations = append(invitations, invitationResponse{
 			ID:         row.ID,
-			Code:       row.Code,
+			Code:       h.openInviteCode(row.Code),
 			Email:      row.Email,
 			Name:       row.Name,
 			Status:     row.Status,
@@ -547,7 +547,9 @@ func (h *UserHandler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	expiresAt := time.Now().UTC().Add(48 * time.Hour)
 
 	row, err := h.queries.CreateInvitation(ctx, db.CreateInvitationParams{
-		Code:       code,
+		// Ciphertext at rest, hash for lookup. See invitation_code.go.
+		Code:       h.sealInviteCode(code),
+		CodeHash:   hashInviteCode(code),
 		Email:      req.Email,
 		Name:       req.Name,
 		TargetRole: req.Role,
@@ -561,8 +563,10 @@ func (h *UserHandler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inv := invitationResponse{
-		ID:         row.ID,
-		Code:       row.Code,
+		ID: row.ID,
+		// The plaintext, shown to the admin once here and never readable from
+		// the stored row without the vault key.
+		Code:       code,
 		Email:      row.Email,
 		Name:       row.Name,
 		Status:     row.Status,
@@ -626,7 +630,7 @@ func (h *UserHandler) ResendInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go h.trySendInvitationEmail(row.Email, row.Name, row.Code)
+	go h.trySendInvitationEmail(row.Email, row.Name, h.openInviteCode(row.Code))
 	writeJSON(w, http.StatusOK, map[string]string{"message": "invitation email queued"})
 }
 
@@ -652,7 +656,7 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 	// Expire stale invitations
 	h.queries.ExpireStaleInvitations(ctx)
 
-	inv, err := h.queries.GetPendingInvitationByCode(ctx, req.Code)
+	inv, err := h.queries.GetPendingInvitationByCode(ctx, hashInviteCode(req.Code))
 	if err == sql.ErrNoRows {
 		writeBadRequest(w, r, "invalid or expired invitation code")
 		return

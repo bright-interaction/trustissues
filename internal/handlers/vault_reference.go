@@ -66,3 +66,16 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 	}
 	return plaintext, nil
 }
+
+// queuedActivity is an activity-log row queued during a transaction and written
+// once it commits.
+//
+// LogActivityFromRequest deliberately runs on its own background context (so a
+// cancelled request still gets audited), which means its own connection. Calling
+// it while a write transaction is open on another connection makes it contend
+// for the SQLite write lock: it burns the whole _busy_timeout and then loses the
+// row. Queue, commit, then write.
+type queuedActivity struct {
+	action string
+	detail string
+}

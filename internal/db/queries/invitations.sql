@@ -1,6 +1,8 @@
 -- name: CreateInvitation :one
-INSERT INTO invitations (code, email, name, target_role, created_by, expires_at)
-VALUES (?, ?, ?, ?, ?, ?)
+-- code holds the vault-key ciphertext (resend has to email the original), and
+-- code_hash is what redemption looks up. See migration 00030.
+INSERT INTO invitations (code, code_hash, email, name, target_role, created_by, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING id, code, email, name, status, target_role, expires_at, created_at;
 
 -- name: ListInvitations :many
@@ -15,9 +17,12 @@ DELETE FROM invitations WHERE id = ? AND status = 'pending';
 SELECT id, code, email, name, status FROM invitations WHERE id = ?;
 
 -- name: GetPendingInvitationByCode :one
+-- Lookup is by HASH, never by the code itself: a leaked database must not
+-- contain anything redeemable. Constant-shape and still O(1) via the unique
+-- index on code_hash.
 SELECT id, code, email, name, target_role, expires_at
 FROM invitations
-WHERE code = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP;
+WHERE code_hash = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP;
 
 -- name: ExpireStaleInvitations :exec
 UPDATE invitations SET status = 'expired'

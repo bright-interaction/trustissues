@@ -59,6 +59,8 @@ type Querier interface {
 	// Collections CRUD
 	// ============================================================================
 	CreateCollection(ctx context.Context, arg CreateCollectionParams) error
+	// code holds the vault-key ciphertext (resend has to email the original), and
+	// code_hash is what redemption looks up. See migration 00030.
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
 	CreateInvitedUser(ctx context.Context, arg CreateInvitedUserParams) (string, error)
 	CreateLoginAttempt(ctx context.Context, arg CreateLoginAttemptParams) error
@@ -123,7 +125,10 @@ type Querier interface {
 	GetInvitationForResend(ctx context.Context, id string) (GetInvitationForResendRow, error)
 	GetNotificationChannel(ctx context.Context, id string) (GetNotificationChannelRow, error)
 	GetPasswordHashByUserID(ctx context.Context, id string) (string, error)
-	GetPendingInvitationByCode(ctx context.Context, code string) (GetPendingInvitationByCodeRow, error)
+	// Lookup is by HASH, never by the code itself: a leaked database must not
+	// contain anything redeemable. Constant-shape and still O(1) via the unique
+	// index on code_hash.
+	GetPendingInvitationByCode(ctx context.Context, codeHash string) (GetPendingInvitationByCodeRow, error)
 	GetServiceIdentityByID(ctx context.Context, id string) (GetServiceIdentityByIDRow, error)
 	// service_identities.sql: scope-limited API keys for production services
 	// to fetch their declared secrets at boot. Source:
