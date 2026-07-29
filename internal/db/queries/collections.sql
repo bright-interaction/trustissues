@@ -32,7 +32,7 @@ ORDER BY c.name ASC;
 SELECT c.id, c.name, c.description, cm.role, cm.added_at, u.email AS invited_by_email
 FROM collections c
 JOIN collection_members cm ON cm.collection_id = c.id
-LEFT JOIN users u ON u.id = c.created_by
+LEFT JOIN users u ON u.id = cm.invited_by
 WHERE cm.user_id = ? AND cm.accepted_at IS NULL
 ORDER BY cm.added_at DESC;
 
@@ -55,8 +55,15 @@ SELECT COUNT(*) FROM vault_entries WHERE collection_id = ?;
 -- accept, set for a self-membership (the creator of a collection). On conflict
 -- only the role changes, so re-inviting never silently re-grants access and a
 -- role change never revokes an existing acceptance.
-INSERT INTO collection_members (collection_id, user_id, role, accepted_at) VALUES (?, ?, ?, ?)
-ON CONFLICT(collection_id, user_id) DO UPDATE SET role = excluded.role;
+--
+-- invited_by records who actually SENT this invitation, which the consent card
+-- shows. On conflict it is only rewritten while the row is still pending: a role
+-- change on an already-accepted member must not rewrite the history of who
+-- brought them in.
+INSERT INTO collection_members (collection_id, user_id, role, accepted_at, invited_by) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(collection_id, user_id) DO UPDATE SET
+  role = excluded.role,
+  invited_by = CASE WHEN collection_members.accepted_at IS NULL THEN excluded.invited_by ELSE collection_members.invited_by END;
 
 -- name: RemoveCollectionMember :execresult
 DELETE FROM collection_members WHERE collection_id = ? AND user_id = ?;

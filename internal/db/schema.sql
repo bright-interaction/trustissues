@@ -112,6 +112,9 @@ CREATE TABLE collection_members (
   role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'editor', 'manager')),
   added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   accepted_at TIMESTAMP,
+  -- Who actually sent this invitation (see migration 00031). Distinct from
+  -- collections.created_by, which is who created the COLLECTION.
+  invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   PRIMARY KEY (collection_id, user_id)
 );
 CREATE INDEX idx_collection_members_user ON collection_members(user_id);

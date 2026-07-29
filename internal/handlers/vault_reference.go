@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -78,4 +80,15 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 type queuedActivity struct {
 	action string
 	detail string
+}
+
+// rotationTargetsVersion fingerprints the stored rotation_targets column so a
+// client can prove it is editing the view it was shown.
+//
+// It hashes the CIPHERTEXT, which changes on every write (a fresh nonce per
+// encryption), so any modification invalidates an outstanding view even if the
+// decrypted target list happens to be identical.
+func rotationTargetsVersion(storedCiphertext string) string {
+	sum := sha256.Sum256([]byte(storedCiphertext))
+	return hex.EncodeToString(sum[:8])
 }

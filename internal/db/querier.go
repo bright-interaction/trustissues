@@ -18,6 +18,11 @@ type Querier interface {
 	// accept, set for a self-membership (the creator of a collection). On conflict
 	// only the role changes, so re-inviting never silently re-grants access and a
 	// role change never revokes an existing acceptance.
+	//
+	// invited_by records who actually SENT this invitation, which the consent card
+	// shows. On conflict it is only rewritten while the row is still pending: a role
+	// change on an already-accepted member must not rewrite the history of who
+	// brought them in.
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
 	// Boot key-gate probe 3: every OTHER columncrypto surface.
 	//
@@ -47,6 +52,7 @@ type Querier interface {
 	// any LIKE metacharacters in it.
 	CountActivityEntriesByActionPrefix(ctx context.Context, action string) (int64, error)
 	CountActivityEntriesByUser(ctx context.Context, userID sql.NullString) (int64, error)
+	CountActivityEntriesFiltered(ctx context.Context, arg CountActivityEntriesFilteredParams) (int64, error)
 	CountAdmins(ctx context.Context) (int64, error)
 	CountCollectionEntries(ctx context.Context, collectionID sql.NullString) (int64, error)
 	// Accepted managers only: a pending invitee cannot be the manager that keeps a
@@ -226,6 +232,14 @@ type Querier interface {
 	// queries so paging behaves identically.
 	ListActivityEntriesByActionPrefix(ctx context.Context, arg ListActivityEntriesByActionPrefixParams) ([]ListActivityEntriesByActionPrefixRow, error)
 	ListActivityEntriesByUser(ctx context.Context, arg ListActivityEntriesByUserParams) ([]ListActivityEntriesByUserRow, error)
+	// One query for all three filters, mirroring ExportActivityEntries.
+	//
+	// The list endpoint used a switch whose FIRST arm was "a user is selected", so
+	// picking a user silently discarded the action filter. The export twin already
+	// combined them, which meant the table and the CSV of the same view returned
+	// DIFFERENT rows: for an audit surface, two disagreeing answers is worse than
+	// one wrong one.
+	ListActivityEntriesFiltered(ctx context.Context, arg ListActivityEntriesFilteredParams) ([]ListActivityEntriesFilteredRow, error)
 	ListAllCollections(ctx context.Context) ([]Collection, error)
 	// ============================================================================
 	// List entries (metadata only)
@@ -345,6 +359,14 @@ type Querier interface {
 	// ============================================================================
 	// Rotate (generate new secret value)
 	// ============================================================================
+	// Compare-and-swap on updated_at.
+	//
+	// The scheduled sweep snapshots every due entry at pass start and writes back
+	// minutes later, so a value a user saved during the pass was silently
+	// overwritten by the stale one. The extra predicate makes that a no-op instead:
+	// the caller checks RowsAffected and treats 0 as "someone else changed it,
+	// leave it alone and pick it up next pass". It also stops a rotation landing on
+	// an entry that was deleted mid-pass.
 	RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntryValueParams) (sql.Result, error)
 	// Seeds the capability-bridge columns from the provider defaults at
 	// enrollment time. Only fills untouched rows so explicit per-entry

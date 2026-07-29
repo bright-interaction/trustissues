@@ -44,6 +44,12 @@ var redactPatterns = []redactPattern{
 				`|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}` +
 				`|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}` +
 				`|github_pat_[A-Za-z0-9_]{20,}` +
+				// Trustissues' OWN API key: "ti_" + 64 hex. The bank knew every
+				// third-party vendor's format and not the one this product
+				// mints, so a user pasting their own key into a prompt sent it
+				// verbatim to Anthropic or OpenAI through this product's own
+				// gateway. Look at what you issue, not only what you consume.
+				`|ti_[0-9a-f]{64}` +
 				// HYPHENATED families. These were entirely absent, including the
 				// two providers this product's own AI gateway proxies to: an
 				// Anthropic or OpenAI key pasted into a prompt egressed verbatim

@@ -90,6 +90,17 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 }
 
 func rotateOneEntry(ctx context.Context, queries *db.Queries, vaultHandler *VaultHandler, entry db.ListVaultEntriesNeedingRotationRow) {
+	// The SCHEDULED sweep counts toward the shutdown drain too.
+	//
+	// Round 10 added the WaitGroup for the manual rotate path only, which left
+	// the more dangerous half uncovered: the hourly sweep rotates unattended, so
+	// a deploy landing mid-sweep killed it after the provider had minted the new
+	// key and the value was stored, but before delivery finished, with nobody
+	// watching. Registering here means shutdown waits for the whole rotate +
+	// deliver + record cycle, not just the part a human triggered.
+	vaultHandler.delivery.Add(1)
+	defer vaultHandler.delivery.Done()
+
 	defer func() {
 		if rec := recover(); rec != nil {
 			slog.Error("vault rotation: panic while rotating an entry; the sweep continues",
@@ -177,11 +188,30 @@ func rotateOneEntry(ctx context.Context, queries *db.Queries, vaultHandler *Vaul
 		}
 
 		// Update the entry with new encrypted value
-		_, err = queries.RotateVaultEntryValue(ctx, db.RotateVaultEntryValueParams{
+		// Compare-and-swap on the snapshot's updated_at. The sweep read this row
+		// at pass start and may be writing back minutes later, so without the
+		// predicate a value the user saved in between is silently overwritten by
+		// the stale one.
+		res, casErr := queries.RotateVaultEntryValue(ctx, db.RotateVaultEntryValueParams{
 			EncryptedValue: encrypted,
 			Nonce:          nonce,
 			ID:             entry.ID,
+			UpdatedAt:      entry.UpdatedAt,
 		})
+		if casErr == nil {
+			if n, _ := res.RowsAffected(); n == 0 {
+				// Someone changed or deleted the entry during the pass. The
+				// provider has already minted a replacement, so say so plainly
+				// rather than pretending the rotation succeeded; the next pass
+				// picks the entry up again if it is still due.
+				slog.Warn("vault rotation: entry changed during the pass, skipping the write-back",
+					"entry", entry.Name)
+				recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+					entry.RotationLog.String, rotFailConflict, "auto", nil)
+				return
+			}
+		}
+		err = casErr
 		if err != nil {
 			// Same hazard as the encrypt failure above: the replacement key
 			// exists at the provider but the vault still holds the old value.

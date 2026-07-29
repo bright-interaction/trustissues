@@ -2375,7 +2375,13 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	//
 	// Ninth distinct door onto "removing someone ends their access". Same
 	// read-versus-use distinction as the reference resolver.
-	if !h.entryCurrentlyUsableBy(ctx, userID, id) {
+	// Admins keep their branch. entryCurrentlyUsableBy deliberately has no admin
+	// bypass (it answers "may THIS user spend it", which is what closed the
+	// removed-member oracle), but an instance admin can already rotate this entry
+	// for plaintext, so refusing them a validity check protects nothing and just
+	// breaks the operator flow. Round 10 tightened this without restoring the
+	// bypass that entryAccess had.
+	if !middleware.IsAdmin(ctx) && !h.entryCurrentlyUsableBy(ctx, userID, id) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -2455,7 +2461,15 @@ func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targets := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
-	writeJSON(w, http.StatusOK, targets)
+	// The version pins the view the client is editing. UpdateTargets is a full
+	// replace, so a panel held open across an offboarding would otherwise
+	// resubmit the departed member's purged webhook, and since that target is no
+	// longer stored it would be re-attributed to whoever pressed Save, silently
+	// re-authorizing plaintext delivery to them.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"targets": targets,
+		"version": rotationTargetsVersion(raw.String),
+	})
 }
 
 // UpdateTargets handles PUT /api/vault/{id}/targets - sets rotation targets
@@ -2526,6 +2540,18 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 			r.URL.Query().Get("clear") != "1" {
 			writeError(w, r, http.StatusConflict, "targets_not_cleared",
 				fmt.Sprintf("this would delete all %d delivery target(s); if that is intended, resend with ?clear=1", len(prior)))
+			return
+		}
+	}
+
+	// Refuse a stale view. Without this, a full replace posted from a panel
+	// loaded before an offboarding purge writes the removed member's webhook back
+	// and stamps it with the saver's id, so targetStillAuthorized then approves
+	// delivery to an address the purge had just closed.
+	if want := r.URL.Query().Get("version"); want != "" {
+		if got := rotationTargetsVersion(existingTargets); got != want {
+			writeError(w, r, http.StatusConflict, "targets_changed",
+				"the delivery targets changed since this panel was loaded; reload and reapply your edit")
 			return
 		}
 	}

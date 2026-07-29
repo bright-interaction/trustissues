@@ -274,3 +274,29 @@ func TestProviderDereferencedURLsAreNotTokenized(t *testing.T) {
 		}
 	})
 }
+
+// TestOwnAPIKeyIsTokenized covers the credential this product itself mints.
+//
+// The KindSecret bank knew Stripe, GitHub, Slack, Anthropic, OpenAI, AWS and
+// Google, and not "ti_" + 64 hex, which is what apikeys.go and the invite
+// redemption hand to users. So a user pasting their own Trustissues key into a
+// prompt sent it verbatim to a third-party model through this product's own
+// gateway. Audit what you ISSUE, not only what you consume.
+func TestOwnAPIKeyIsTokenized(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		key := "ti_" + strings.Repeat("a1b2c3d4", 8) // ti_ + 64 hex
+		out, err := s.RedactString(ctx, "my key is "+key+" please help")
+		if err != nil {
+			t.Fatalf("redact: %v", err)
+		}
+		if strings.Contains(out, key) {
+			t.Errorf("the product's own API key egressed verbatim to the LLM provider: %q", out)
+		}
+		if !strings.Contains(out, "[shield:secret:") {
+			t.Errorf("the key was not classified as a secret: %q", out)
+		}
+	})
+}

@@ -146,6 +146,8 @@ func (h *CollectionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
 		CollectionID: id, UserID: userID, Role: collRoleManager,
 		AcceptedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+		// Self-membership: the creator invited themselves.
+		InvitedBy: toNullString(userID),
 	}); err != nil {
 		logError(r, "collections.create: seed manager failed", "error", err)
 		writeInternalError(w, r, "failed to create collection")
@@ -486,6 +488,9 @@ func (h *CollectionHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 		if addErr := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
 			CollectionID: id, UserID: user.ID, Role: req.Role,
 			AcceptedAt: sql.NullTime{}, // pending until the invitee accepts
+			// The consent card shows this, so it must be who ACTUALLY invited
+			// them, not the collection's creator.
+			InvitedBy: toNullString(middleware.GetUserID(r.Context())),
 		}); addErr != nil {
 			logError(r, "collections.addmember: failed", "error", addErr)
 			writeInternalError(w, r, "internal server error")

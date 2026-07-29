@@ -69,11 +69,12 @@ type Collection struct {
 }
 
 type CollectionMember struct {
-	CollectionID string       `json:"collection_id"`
-	UserID       string       `json:"user_id"`
-	Role         string       `json:"role"`
-	AddedAt      sql.NullTime `json:"added_at"`
-	AcceptedAt   sql.NullTime `json:"accepted_at"`
+	CollectionID string         `json:"collection_id"`
+	UserID       string         `json:"user_id"`
+	Role         string         `json:"role"`
+	AddedAt      sql.NullTime   `json:"added_at"`
+	AcceptedAt   sql.NullTime   `json:"accepted_at"`
+	InvitedBy    sql.NullString `json:"invited_by"`
 }
 
 type Invitation struct {

@@ -36,7 +36,20 @@ function targetIcon(type: RotationTarget['type']) {
   return (TARGET_TYPES.find((t) => t.value === type) || TARGET_TYPES[0]).icon;
 }
 
-export default function RotationManager({ entry }: { entry: VaultEntry }) {
+export default function RotationManager({
+  entry,
+  onScheduleSaved,
+}: {
+  entry: VaultEntry;
+  // Patches the caller's in-memory copy after a schedule save. The unlocked
+  // entries live in useState, not in react-query, so invalidateQueries does not
+  // reach them: without this the parent keeps the OLD interval, and the next
+  // metadata edit submits that stale value. Since an explicit null now genuinely
+  // clears the field, that stale save silently wiped the interval the user had
+  // just set while leaving auto_rotate on, i.e. auto-rotation enabled with no
+  // schedule.
+  onScheduleSaved?: (patch: { rotation_interval_days: number | null; auto_rotate: boolean }) => void;
+}) {
   const queryClient = useQueryClient();
   const [targets, setTargets] = useState<RotationTarget[] | null>(null);
   const [addType, setAddType] = useState<RotationTarget['type']>('webhook');
@@ -69,7 +82,8 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
     : 0;
 
   // Seed local editable state once the server targets arrive.
-  const serverTargets = targetsQuery.data;
+  const serverTargets = targetsQuery.data?.targets;
+  const targetsVersion = targetsQuery.data?.version;
   if (targets === null && serverTargets) {
     setTargets(serverTargets.map((t) => ({ ...t })));
   }
@@ -79,7 +93,12 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
     // An empty `working` here is a deliberate clear, not an accident: Save is
     // disabled unless the targets query settled successfully, so the user is
     // looking at the real list and has removed every row from it.
-    mutationFn: () => vaultApi.updateTargets(entry.id, working, { clear: working.length === 0 }),
+    mutationFn: () =>
+      vaultApi.updateTargets(entry.id, working, {
+        clear: working.length === 0,
+        // Pins the view being edited; the server 409s if it moved.
+        version: targetsVersion,
+      }),
     onSuccess: () => {
       toast.success('Rotation targets saved');
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.targets(entry.id) });
@@ -91,6 +110,10 @@ export default function RotationManager({ entry }: { entry: VaultEntry }) {
     mutationFn: () => vaultApi.updateSchedule(entry.id, { rotation_interval_days: interval, auto_rotate: autoRotate }),
     onSuccess: () => {
       toast.success('Rotation schedule saved');
+      onScheduleSaved?.({
+        rotation_interval_days: interval > 0 ? interval : null,
+        auto_rotate: autoRotate,
+      });
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
     },
     onError: (e: Error) => toast.error(e.message || 'Failed to save schedule'),

@@ -59,6 +59,30 @@ func (q *Queries) CountActivityEntriesByUser(ctx context.Context, userID sql.Nul
 	return count, err
 }
 
+const countActivityEntriesFiltered = `-- name: CountActivityEntriesFiltered :one
+SELECT COUNT(*) FROM activity_log a
+WHERE (CAST(?1 AS TEXT) = '' OR a.user_id = ?1)
+  AND (
+        (CAST(?2 AS TEXT) = '' AND CAST(?3 AS TEXT) = '')
+     OR (CAST(?3 AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(?3 AS TEXT))) = CAST(?3 AS TEXT))
+     OR (CAST(?3 AS TEXT) = '' AND a.action = ?2)
+  )
+`
+
+type CountActivityEntriesFilteredParams struct {
+	UserFilter   string `json:"user_filter"`
+	ActionFilter string `json:"action_filter"`
+	ActionPrefix string `json:"action_prefix"`
+}
+
+func (q *Queries) CountActivityEntriesFiltered(ctx context.Context, arg CountActivityEntriesFilteredParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActivityEntriesFiltered, arg.UserFilter, arg.ActionFilter, arg.ActionPrefix)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const insertActivity = `-- name: InsertActivity :exec
 INSERT INTO activity_log (user_id, action, detail, ip_address, user_agent)
 VALUES (?, ?, ?, ?, ?)
@@ -296,6 +320,86 @@ func (q *Queries) ListActivityEntriesByUser(ctx context.Context, arg ListActivit
 	items := []ListActivityEntriesByUserRow{}
 	for rows.Next() {
 		var i ListActivityEntriesByUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.UserEmail,
+			&i.Action,
+			&i.Detail,
+			&i.IpAddress,
+			&i.UserAgent,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActivityEntriesFiltered = `-- name: ListActivityEntriesFiltered :many
+SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
+       a.ip_address, a.user_agent, a.created_at
+FROM activity_log a
+LEFT JOIN users u ON u.id = a.user_id
+WHERE (CAST(? AS TEXT) = '' OR a.user_id = ?)
+  AND (
+        (CAST(? AS TEXT) = '' AND CAST(? AS TEXT) = '')
+     OR (CAST(? AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(? AS TEXT))) = CAST(? AS TEXT))
+     OR (CAST(? AS TEXT) = '' AND a.action = ?)
+  )
+ORDER BY a.created_at DESC
+LIMIT ? OFFSET ?
+`
+
+type ListActivityEntriesFilteredParams struct {
+	UserFilter   string `json:"user_filter"`
+	ActionFilter string `json:"action_filter"`
+	ActionPrefix string `json:"action_prefix"`
+	Limit        int64  `json:"limit"`
+	Offset       int64  `json:"offset"`
+}
+
+type ListActivityEntriesFilteredRow struct {
+	ID        int64          `json:"id"`
+	UserID    sql.NullString `json:"user_id"`
+	UserEmail sql.NullString `json:"user_email"`
+	Action    string         `json:"action"`
+	Detail    sql.NullString `json:"detail"`
+	IpAddress sql.NullString `json:"ip_address"`
+	UserAgent sql.NullString `json:"user_agent"`
+	CreatedAt sql.NullTime   `json:"created_at"`
+}
+
+// One query for all three filters, mirroring ExportActivityEntries.
+//
+// The list endpoint used a switch whose FIRST arm was "a user is selected", so
+// picking a user silently discarded the action filter. The export twin already
+// combined them, which meant the table and the CSV of the same view returned
+// DIFFERENT rows: for an audit surface, two disagreeing answers is worse than
+// one wrong one.
+func (q *Queries) ListActivityEntriesFiltered(ctx context.Context, arg ListActivityEntriesFilteredParams) ([]ListActivityEntriesFilteredRow, error) {
+	rows, err := q.db.QueryContext(ctx, listActivityEntriesFiltered,
+		arg.UserFilter,
+		arg.ActionFilter,
+		arg.ActionPrefix,
+		arg.Limit,
+		arg.Offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActivityEntriesFilteredRow{}
+	for rows.Next() {
+		var i ListActivityEntriesFilteredRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
