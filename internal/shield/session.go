@@ -361,11 +361,15 @@ func (s *Session) UnshieldJSON(ctx context.Context, raw []byte) ([]byte, error) 
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil, fmt.Errorf("shield: unmarshal: %w", err)
 	}
-	resolved, err := s.unshieldAny(ctx, v)
-	if err != nil {
-		return nil, err
+	// Keep the partial result: a marker this session cannot resolve must not cost
+	// the caller every marker it CAN resolve. The error is returned alongside so
+	// the caller can log it, and a genuine marshal failure is still fatal.
+	resolved, unshieldErr := s.unshieldAny(ctx, v)
+	out, marshalErr := json.Marshal(resolved)
+	if marshalErr != nil {
+		return nil, fmt.Errorf("shield: marshal: %w", marshalErr)
 	}
-	return json.Marshal(resolved)
+	return out, unshieldErr
 }
 
 // ShieldJSON parses a JSON document, walks every string node, runs the
@@ -415,30 +419,47 @@ func (s *Session) shieldAny(ctx context.Context, v any) (any, error) {
 	}
 }
 
+// unshieldAny walks the document resolving markers. It keeps the PARTIAL result
+// and reports the first error, rather than discarding everything.
+//
+// It used to `return nil, err` on the first unresolvable marker, which made the
+// whole response fall back to the shielded body: one bad marker anywhere and the
+// caller got [shield:email:tok_...] instead of every address in the document,
+// with a 200 and no indication why. That is easy to trigger without meaning to,
+// because the model is free to reformat: quoting a marker with one digit
+// mistyped, or abbreviating it, is enough. Untrusted text being summarised can
+// also contain a marker-shaped string, which then breaks resolution of the real
+// ones.
+//
+// UnshieldString already has exactly this contract (leave what it cannot resolve
+// in place, keep going), so the walk was the only piece disagreeing.
 func (s *Session) unshieldAny(ctx context.Context, v any) (any, error) {
 	switch t := v.(type) {
 	case string:
+		// UnshieldString returns its partial result alongside any error.
 		return s.UnshieldString(ctx, t)
 	case []any:
+		var firstErr error
 		out := make([]any, len(t))
 		for i, item := range t {
 			r, err := s.unshieldAny(ctx, item)
-			if err != nil {
-				return nil, err
+			if err != nil && firstErr == nil {
+				firstErr = err
 			}
 			out[i] = r
 		}
-		return out, nil
+		return out, firstErr
 	case map[string]any:
+		var firstErr error
 		out := make(map[string]any, len(t))
 		for k, val := range t {
 			r, err := s.unshieldAny(ctx, val)
-			if err != nil {
-				return nil, err
+			if err != nil && firstErr == nil {
+				firstErr = err
 			}
 			out[k] = r
 		}
-		return out, nil
+		return out, firstErr
 	default:
 		return v, nil
 	}

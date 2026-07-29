@@ -281,3 +281,80 @@ func TestGuardRunsBeforeEveryWrite(t *testing.T) {
 		}
 	})
 }
+
+// TestRejectedRenameLeavesEverythingUntouched locks the atomicity of Update.
+//
+// Update writes each column with its own statement, so a validation that runs
+// late used to reject the request AFTER earlier writes had committed. The
+// rename collision is the reachable case: the user renames an entry to a name
+// already taken and pastes a new value in the same save. The server replaced
+// custom_fields (destroying imported TOTP seeds and recovery PINs), wrote the
+// new value, restamped last_rotated_at, then hit UNIQUE(user_id, name) and
+// returned 409. The toast says the save was rejected and the still-open editor
+// shows the old data, so nothing tells the user their secrets are gone.
+//
+// The comment on the name block claimed it ran FIRST precisely so this could not
+// happen. It was third.
+func TestRejectedRenameLeavesEverythingUntouched(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+	owner := mustUser(t, queries, "atomic@example.com", "user", "")
+
+	mustEntry(t, h, queries, "atomic-a", owner, "GitHub", "ORIGINAL-TOKEN")
+	mustEntry(t, h, queries, "atomic-b", owner, "GitHub Deploy", "OTHER")
+
+	cf, err := h.encryptColumn(`[{"label":"totp","value":"JBSWY3DPEHPK3PXP","secret":true}]`)
+	if err != nil {
+		t.Fatalf("seal custom fields: %v", err)
+	}
+	if err := queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
+		CustomFields: cf, ID: "atomic-a",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before, err := queries.GetVaultEntryMeta(ctx, "atomic-a")
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	// Rename onto the taken name AND supply a new value, the way the edit form
+	// submits the whole form at once.
+	rec := updateEntry(t, h, owner, "atomic-a", map[string]any{
+		"name": "GitHub Deploy", "value": "BRAND-NEW-TOKEN", "custom_fields": []any{},
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for the name collision, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	after, err := queries.GetVaultEntryMeta(ctx, "atomic-a")
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if after.CustomFields != before.CustomFields {
+		t.Error("the rejected save destroyed custom_fields; the TOTP seed is unrecoverable")
+	}
+	if after.Name != before.Name {
+		t.Errorf("the rejected rename was applied anyway: %q", after.Name)
+	}
+	if after.LastRotatedAt != before.LastRotatedAt {
+		t.Error("the rejected save restamped last_rotated_at, so the entry now looks freshly rotated")
+	}
+
+	// The secret value must be the original one.
+	entries, err := queries.ListVaultEntriesWithSecrets(ctx, owner)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, e := range entries {
+		if e.ID != "atomic-a" {
+			continue
+		}
+		plain, dErr := h.DecryptValue(e.EncryptedValue, e.Nonce, 2)
+		if dErr != nil {
+			t.Fatalf("decrypt: %v", dErr)
+		}
+		if string(plain) != "ORIGINAL-TOKEN" {
+			t.Errorf("the rejected save replaced the secret value with %q", string(plain))
+		}
+	}
+}

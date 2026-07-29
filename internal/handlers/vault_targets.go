@@ -247,20 +247,18 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 	}
 
 	// Resolve the auth token as the user who CONFIGURED this target, never as
-	// the entry owner. ResolveVaultReference is scoped to entries that identity
-	// owns, so a collection editor can only ever reach their OWN secrets here.
-	// Targets written before ConfiguredBy existed carry no identity and are
-	// refused rather than falling back to the owner, which is the exact
-	// exfiltration path this closes.
+	// the entry owner. The resolve is gated on entryAccessFor for that identity,
+	// so it reaches only what they can CURRENTLY read: the raw (name, user_id)
+	// query matched on the creator column, which let a removed collection member
+	// name a shared secret here and have its post-rotation plaintext delivered to
+	// a host they control. Targets written before ConfiguredBy existed carry no
+	// identity and are refused rather than falling back to the owner.
 	if target.ConfiguredBy == "" {
 		return fmt.Errorf("target has no recorded configuring user; re-save this entry's rotation targets to authorize the auth_token lookup")
 	}
 
-	// Resolve the auth token from vault
-	row, err := queries.ResolveVaultReference(ctx, db.ResolveVaultReferenceParams{
-		Name:   authToken,
-		UserID: target.ConfiguredBy,
-	})
+	// Resolve the auth token, scoped to what the configuring user can still reach.
+	tokenPlaintext, err := vault.resolveVaultReferenceFor(ctx, authToken, target.ConfiguredBy)
 	if err != nil {
 		slog.Error("vault delivery: auth_token resolve failed",
 			"auth_token", authToken,
@@ -268,11 +266,6 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 			"entry_owner", userID,
 			"error", err)
 		return fmt.Errorf("resolve Forgejo auth token %q from the configuring user's vault: %w", authToken, err)
-	}
-
-	tokenPlaintext, err := vault.DecryptValue(row.EncryptedValue, row.Nonce, 2)
-	if err != nil {
-		return fmt.Errorf("decrypt Forgejo auth token: %w", err)
 	}
 	defer func() {
 		for i := range tokenPlaintext {

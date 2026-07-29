@@ -32,6 +32,7 @@ func newVaultTestDB(t *testing.T) *sql.DB {
 		name TEXT,
 		role TEXT NOT NULL DEFAULT 'user',
 		disabled INTEGER NOT NULL DEFAULT 0,
+		totp_enabled INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE vault_entries (
@@ -58,9 +59,24 @@ func newVaultTestDB(t *testing.T) *sql.DB {
 		rotation_targets TEXT DEFAULT '[]',
 		destination_patterns TEXT NOT NULL DEFAULT '[]',
 		injection_spec TEXT NOT NULL DEFAULT '{}',
+		collection_id TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(user_id, name)
+	);
+	-- collection_id and collection_members are required, not optional extras:
+	-- entryAccessFor reads both, and every authorization decision in this package
+	-- now routes through it. A fixture missing them makes GetVaultEntryAccess
+	-- error, which fails closed, so tests would "pass" by denying access for a
+	-- reason production never has. This hand-rolled schema had already drifted
+	-- once; when the real schema gains an authorization-relevant column, add it
+	-- here in the same commit.
+	CREATE TABLE collection_members (
+		collection_id TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		role TEXT NOT NULL,
+		accepted_at DATETIME,
+		PRIMARY KEY (collection_id, user_id)
 	);
 	CREATE INDEX idx_vault_entries_url ON vault_entries(url) WHERE url != '';
 	CREATE INDEX idx_vault_entries_user ON vault_entries(user_id);
@@ -302,6 +318,18 @@ func TestResolveReferences(t *testing.T) {
 	ct, nonce, err := vh.encrypt([]byte("resolved-secret"))
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
+	}
+	// The users rows are load-bearing, not decoration. Reference resolution now
+	// goes through entryAccessFor, which fails closed on an account it cannot
+	// find or that is disabled, so a fixture with a vault entry but no owner row
+	// is a shape production never produces and would make this test assert the
+	// wrong thing.
+	for _, u := range []string{"user-a", "user-b"} {
+		if _, err := conn.Exec(
+			`INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, 'x', 'user')`,
+			u, u+"@example.com"); err != nil {
+			t.Fatalf("seed user %s: %v", u, err)
+		}
 	}
 	if _, err := conn.Exec(`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce)
 		VALUES ('e1', 'user-a', 'MY_TOKEN', ?, ?)`, ct, nonce); err != nil {
