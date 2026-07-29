@@ -328,6 +328,13 @@ UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 -- channel config satisfied neither, so the gate reported "no ciphertext", sealed
 -- the sentinel under whatever key was configured, and then permanently refused
 -- the CORRECT key. Cheap to close: one row from each surface is enough.
-SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != ''
+-- Each surface is bounded by its OWN subquery. A trailing LIMIT on a compound
+-- SELECT applies to the WHOLE result, so the first version returned only the
+-- settings row and never probed an invitation code at all: a database whose only
+-- ciphertext was an invite code still fell through the gate, which is the exact
+-- hole this probe exists to close.
+SELECT blob FROM (SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL
-SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1;
+SELECT blob FROM (SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1)
+UNION ALL
+SELECT blob FROM (SELECT config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1);

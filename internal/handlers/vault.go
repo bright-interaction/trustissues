@@ -45,9 +45,30 @@ type VaultHandler struct {
 	delivery sync.WaitGroup
 }
 
-// WaitForDelivery blocks until every in-flight rotation delivery has finished.
-// Called from main after the HTTP drain, before the process exits.
-func (h *VaultHandler) WaitForDelivery() { h.delivery.Wait() }
+// WaitForDelivery blocks until every in-flight rotation delivery has finished,
+// or until the budget expires. It reports whether everything drained.
+//
+// The budget is essential: a delivery goroutine runs on a 15-minute context, and
+// an unbounded wait would hold the process open far past any container stop
+// grace period. Docker SIGKILLs 10 seconds after SIGTERM by default, so an
+// unbounded wait does not protect the delivery at all, it just guarantees the
+// process is killed hard instead of exiting cleanly. Bounded, plus a
+// stop_grace_period in the compose file that exceeds it, means the common case
+// (delivery finishes in a second or two) completes and the pathological case
+// still exits in a predictable time.
+func (h *VaultHandler) WaitForDelivery(budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		h.delivery.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(budget):
+		return false
+	}
+}
 
 // NewVaultHandler creates a new VaultHandler keyed off cfg.VaultKey. The
 // encryption key is derived using PBKDF2-SHA256 with 600,000 iterations
