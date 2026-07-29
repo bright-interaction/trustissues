@@ -84,7 +84,25 @@ var redactPatterns = []redactPattern{
 	},
 	{
 		kind: KindEmail,
-		re:   regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`),
+		// The local part accepts any non-ASCII letter, and the leading \b is
+		// gone.
+		//
+		// Both classes were ASCII-only and Go's \b is an ASCII word boundary, so
+		// a UTF-8 lead byte terminated the local part and the engine simply
+		// restarted after it: "Åsa.Öberg@example.se" tokenized as
+		// "Åsa.Ö[shield:email:...:domain=example.se]". The name fragment egressed
+		// in cleartext directly beside a marker whose hint supplied the domain,
+		// which is worse than not redacting at all.
+		//
+		// This product's market is Swedish, where Å, Ä and Ö in a name are the
+		// common case rather than an edge case, so the ASCII-only class made the
+		// email detector unreliable for most of the names it exists to protect.
+		//
+		// \p{L} covers accented and non-Latin scripts. The leading boundary is
+		// replaced by an explicit "not already part of an address" check in the
+		// character class itself: \b would not fire before "Å" anyway, because
+		// the byte before it is not an ASCII word character.
+		re:   regexp.MustCompile(`[\p{L}0-9._%+\-]+@[\p{L}0-9.\-]+\.[\p{L}]{2,}`),
 		hint: []string{"domain", "len"},
 	},
 	{
@@ -149,7 +167,17 @@ var redactPatterns = []redactPattern{
 		// so it runs LAST; emails are already tokenized above, and shield
 		// markers contain no dotted FQDN so they are not re-matched.
 		kind: KindHostname,
-		re:   regexp.MustCompile(`\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}\b`),
+		// Non-ASCII labels included, for the same reason as the email pattern:
+		// an ASCII-only class stops at the first UTF-8 lead byte and the engine
+		// restarts after it, so "skåne-db.example.se" tokenized as
+		// "skå[shield:hostname:...]" and leaked the fragment. Internationalised
+		// hostnames are ordinary in this product's market.
+		//
+		// The final label stays ASCII-ish because looksLikeHostname matches it
+		// against knownSuffixes, which lists ASCII TLDs. A fully non-ASCII TLD
+		// therefore still will not tokenize; that is a recall gap, not a partial
+		// leak, and partial leaks are the failure worth removing first.
+		re: regexp.MustCompile(`(?:[\p{L}0-9](?:[\p{L}0-9-]{0,61}[\p{L}0-9])?\.)+[a-zA-Z]{2,63}\b`),
 	},
 }
 

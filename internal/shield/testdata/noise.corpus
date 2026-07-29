@@ -47,3 +47,8 @@ we processed 9876543210 events last quarter
 send the customer their personnummer verification link
 call the office and ask for the account manager
 the api key is stored in the vault, not in the prompt
+
+# --- accented prose (added when the local part accepted non-ASCII) ---
+Åsa och Jörg granskade rapporten i går
+the naive approach was to compare strings directly
+skicka en påminnelse till teamet

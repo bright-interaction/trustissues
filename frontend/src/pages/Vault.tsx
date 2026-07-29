@@ -2201,13 +2201,20 @@ export default function Vault() {
                                 entry.rotation_status === 'fresh' && 'bg-emerald-100 text-emerald-700',
                                 entry.rotation_status === 'due_soon' && 'bg-amber-100 text-amber-700',
                                 entry.rotation_status === 'overdue' && 'bg-red-100 text-red-700',
-                                entry.rotation_status === 'expired' && 'bg-red-100 text-red-700'
+                                entry.rotation_status === 'expired' && 'bg-red-100 text-red-700',
+                                entry.rotation_status === 'error' && 'bg-red-100 text-red-700'
                               )}
+                              title={
+                                entry.rotation_status === 'error'
+                                  ? entry.last_rotation_error || 'The last rotation failed'
+                                  : undefined
+                              }
                             >
                               {entry.rotation_status === 'fresh' && 'Fresh'}
                               {entry.rotation_status === 'due_soon' && 'Due Soon'}
                               {entry.rotation_status === 'overdue' && 'Overdue'}
                               {entry.rotation_status === 'expired' && 'Expired'}
+                              {entry.rotation_status === 'error' && 'Rotation failed'}
                             </span>
                             {entry.provider && entry.provider !== 'manual' && (
                               <span
