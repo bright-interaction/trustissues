@@ -2548,12 +2548,24 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// loaded before an offboarding purge writes the removed member's webhook back
 	// and stamps it with the saver's id, so targetStillAuthorized then approves
 	// delivery to an address the purge had just closed.
-	if want := r.URL.Query().Get("version"); want != "" {
-		if got := rotationTargetsVersion(existingTargets); got != want {
-			writeError(w, r, http.StatusConflict, "targets_changed",
-				"the delivery targets changed since this panel was loaded; reload and reapply your edit")
-			return
-		}
+	// REQUIRED, not optional. An opt-in staleness check protects only the clients
+	// that opt in, and the whole point is that a purge stays purged no matter who
+	// writes next: a client omitting the version would still resurrect a removed
+	// member's webhook and have it re-attributed to itself.
+	//
+	// Cheap to satisfy (GET returns it) and this is the only write path for the
+	// column, so requiring it costs one extra field and closes the hole for every
+	// caller including ones not written yet.
+	want := r.URL.Query().Get("version")
+	if want == "" {
+		writeBadRequest(w, r,
+			"version is required; GET this entry's targets first and send the version it returns")
+		return
+	}
+	if got := rotationTargetsVersion(existingTargets); got != want {
+		writeError(w, r, http.StatusConflict, "targets_changed",
+			"the delivery targets changed since this panel was loaded; reload and reapply your edit")
+		return
 	}
 
 	stored := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets"))

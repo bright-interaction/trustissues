@@ -47,8 +47,7 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 
 	// The leaver configures a delivery target while they are a legitimate editor.
 	body := `[{"type":"webhook","label":"editor-hook","webhook_url":"https://editor.example.com/h"}]`
-	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", leaver, "user", entryID, body))
+	rec := putTargets(t, h, leaver, "user", entryID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ABORT: the editor could not set a target while a member: %d %s", rec.Code, rec.Body.String())
 	}
@@ -111,8 +110,7 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 	// The owner opens the rotation panel and saves it back unchanged, which is
 	// exactly what the UI does.
 	sameBody := `[{"type":"webhook","label":"stale","webhook_url":"https://editor.example.com/h"}]`
-	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, sameBody))
+	rec = putTargets(t, h, owner, "user", entryID, sameBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner save failed: %d %s", rec.Code, rec.Body.String())
 	}

@@ -122,8 +122,15 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- the caller checks RowsAffected and treats 0 as "someone else changed it,
 -- leave it alone and pick it up next pass". It also stops a rotation landing on
 -- an entry that was deleted mid-pass.
+-- The comparison is on TEXT, deliberately. The column is DATETIME but SQLite
+-- stores it as the literal string CURRENT_TIMESTAMP produced
+-- ("2026-07-29 13:06:22"), while Go's driver scans it into a time.Time and binds
+-- it back in a different layout. So `updated_at = ?` with a time.Time NEVER
+-- matched: the first version of this CAS made every scheduled rotation report a
+-- conflict and persist nothing, turning a rare lost-update into a total silent
+-- outage of auto-rotation. Compare the raw text both ways.
 UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND updated_at = ?;
+WHERE id = ? AND CAST(updated_at AS TEXT) = CAST(@updated_at_text AS TEXT);
 
 -- ============================================================================
 -- URL matching (browser extension autofill)
@@ -210,7 +217,7 @@ UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP WHERE 
 UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: ListVaultEntriesNeedingRotation :many
-SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, updated_at
+SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, CAST(updated_at AS TEXT) AS updated_at_text
 FROM vault_entries
 WHERE auto_rotate = 1
   AND provider != ''
