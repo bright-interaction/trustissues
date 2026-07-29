@@ -16,6 +16,52 @@ type redactPattern struct {
 }
 
 var redactPatterns = []redactPattern{
+	// KindSecret runs FIRST, before personnummer.
+	//
+	// Pattern order is match priority, and the personnummer pattern
+	// \b(?:19|20)?\d{6}[-\s]?\d{4}\b claims any 10-digit run. A Slack token
+	// (xoxb-1234567890-ABCDEF) contains one, so the token was cut in half and
+	// re-emitted as xoxb-[shield:personnummer:...]-ABCDEF: it round-trips, but
+	// the kind is wrong, the hint leaks a fake "century", and the operator
+	// reading the audit sees a personnummer where a credential was. Anything
+	// with a known credential prefix is a secret first.
+	{
+		// Known-prefix API keys / tokens and PEM private-key headers. NOTE: does
+		// NOT include the "tok_" prefix, which is the shield marker token-id form
+		// (see MarkerPattern) and would corrupt emitted markers on a second pass.
+		kind: KindSecret,
+		// The `(?:live|test)_` alternative has to come FIRST for each prefix and
+		// has to exist for BOTH. It was present for ak_ and missing for sk_,
+		// so every real Stripe secret key egressed verbatim: the underscore in
+		// sk_live_... is outside [A-Za-z0-9], so `sk_[A-Za-z0-9]{8,}` sees only
+		// the four characters of "live" and never matches at all. The generic
+		// alternative is what made it silent, because it looks like it covers
+		// the prefix.
+		re: regexp.MustCompile(
+			// Underscore families (Stripe, GitHub).
+			`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}` +
+				`|sk_(?:live|test)_[A-Za-z0-9]{4,}|sk_[A-Za-z0-9]{8,}` +
+				`|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}` +
+				`|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}` +
+				`|github_pat_[A-Za-z0-9_]{20,}` +
+				// HYPHENATED families. These were entirely absent, including the
+				// two providers this product's own AI gateway proxies to: an
+				// Anthropic or OpenAI key pasted into a prompt egressed verbatim
+				// to that same provider. The underscore alternatives above look
+				// like they cover "sk", which is what made the gap invisible.
+				`|sk-ant-api[0-9]{2}-[A-Za-z0-9_\-]{20,}|sk-ant-[A-Za-z0-9_\-]{20,}` +
+				`|sk-proj-[A-Za-z0-9_\-]{20,}|sk-svcacct-[A-Za-z0-9_\-]{20,}` +
+				`|sk-[A-Za-z0-9]{20,}` +
+				`|xox[baprs]-[A-Za-z0-9-]{10,}` +
+				// Cloud provider keys.
+				`|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}` +
+				`|AIza[0-9A-Za-z_\-]{35}` +
+				// A PEM private key: the whole body, not just the banner. Matching
+				// only the BEGIN line left the actual key material in the prompt.
+				`|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----` +
+				`|-----BEGIN [A-Z ]*PRIVATE KEY-----`),
+	},
+
 	{
 		kind: KindPersonnummer,
 		// Swedish personnummer: YYYYMMDD-XXXX or YYMMDD-XXXX, optional
@@ -48,20 +94,6 @@ var redactPatterns = []redactPattern{
 		// for an IPv6 address.
 		kind: KindSSHFingerprint,
 		re:   regexp.MustCompile(`SHA256:[A-Za-z0-9+/]{43}=*|(?:MD5:)?(?:[0-9a-f]{2}:){15}[0-9a-f]{2}`),
-	},
-	{
-		// Known-prefix API keys / tokens and PEM private-key headers. NOTE: does
-		// NOT include the "tok_" prefix, which is the shield marker token-id form
-		// (see MarkerPattern) and would corrupt emitted markers on a second pass.
-		kind: KindSecret,
-		// The `(?:live|test)_` alternative has to come FIRST for each prefix and
-		// has to exist for BOTH. It was present for ak_ and missing for sk_,
-		// so every real Stripe secret key egressed verbatim: the underscore in
-		// sk_live_... is outside [A-Za-z0-9], so `sk_[A-Za-z0-9]{8,}` sees only
-		// the four characters of "live" and never matches at all. The generic
-		// alternative is what made it silent, because it looks like it covers
-		// the prefix.
-		re: regexp.MustCompile(`ak_(?:live|test)_[A-Za-z0-9]{4,}|ak_[A-Za-z0-9]{8,}|sk_(?:live|test)_[A-Za-z0-9]{4,}|sk_[A-Za-z0-9]{8,}|rk_(?:live|test)_[A-Za-z0-9]{4,}|pk_(?:live|test)_[A-Za-z0-9]{4,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----`),
 	},
 	{
 		// IPv4 addresses with valid 0-255 octets (e.g. server IPs from

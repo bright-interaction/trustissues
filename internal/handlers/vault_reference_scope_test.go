@@ -117,3 +117,57 @@ func TestAmbiguousVaultReferenceIsRefused(t *testing.T) {
 		t.Errorf("resolved the wrong entry: %q", string(got))
 	}
 }
+
+// TestPendingInviteeCannotUseCollectionSecret pins the consent property against
+// the newest gate.
+//
+// entryCurrentlyUsableBy is the right that lets a caller SPEND a credential, and
+// it decides collection membership through GetCollectionMemberRole. That query
+// filters accepted_at IS NOT NULL, so an unaccepted invite grants nothing. This
+// test exists because that is a property of a query the gate merely calls: if
+// someone later swaps in a raw membership lookup for speed, consent silently
+// stops being enforced on the path that hands out plaintext.
+func TestPendingInviteeCannotUseCollectionSecret(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	owner := mustUser(t, queries, "consent-owner@example.com", "user", "")
+	invitee := mustUser(t, queries, "consent-invitee@example.com", "user", "")
+
+	mustCollection(t, queries, "coll-consent", owner, map[string]string{owner: collRoleManager})
+	const entryID = "entry-consent"
+	mustEntry(t, h, queries, entryID, owner, "team-secret", "TEAM-VALUE")
+	placeInCollection(t, queries, entryID, "coll-consent")
+
+	// Invite without accepting: AddCollectionMember leaves accepted_at NULL.
+	if err := queries.AddCollectionMember(ctx, db.AddCollectionMemberParams{
+		CollectionID: "coll-consent", UserID: invitee, Role: collRoleEditor,
+	}); err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	// Guard the fixture: the row must exist, or this passes for the wrong reason.
+	if _, err := queries.GetCollectionMembership(ctx, db.GetCollectionMembershipParams{
+		CollectionID: "coll-consent", UserID: invitee,
+	}); err != nil {
+		t.Fatalf("ABORT: no membership row was created, so the pending state is not under test: %v", err)
+	}
+
+	if h.entryCurrentlyUsableBy(ctx, invitee, entryID) {
+		t.Error("a PENDING invitee can spend a collection secret; adding someone to a collection " +
+			"would grant credential use before they ever consented")
+	}
+	if _, err := h.resolveVaultReferenceFor(ctx, "team-secret", invitee); err == nil {
+		t.Error("a PENDING invitee resolved the shared secret's plaintext")
+	}
+
+	// After accepting, they can. Otherwise this test would pass on a gate that
+	// simply refuses everyone.
+	if _, err := queries.AcceptCollectionInvite(ctx, db.AcceptCollectionInviteParams{
+		CollectionID: "coll-consent", UserID: invitee,
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if !h.entryCurrentlyUsableBy(ctx, invitee, entryID) {
+		t.Error("an ACCEPTED member cannot spend the collection secret; the gate refuses everyone")
+	}
+}

@@ -70,6 +70,16 @@ the key ever sit in the same place, you have defeated the encryption.
   exposes the schema and the Argon2 password hashes, plus AES-GCM ciphertext, but
   no plaintext secret values. It is safe to back up off-host **as long as the key
   is stored elsewhere.**
+
+  This claim was false until 2026-07-29: invitation codes were stored in
+  cleartext, and `POST /api/invitations/redeem` is unauthenticated by design, so
+  a keyless backup taken while an invite was pending could be read for the code
+  and redeemed against the live server. An admin-role invite produced a real
+  admin account, and an admin can reset another user's password and then unlock
+  their vault. Codes are now stored as vault-key ciphertext with a SHA-256 lookup
+  hash (migration 00030), matching how `api_keys` and `service_identities` have
+  always stored their bearer credentials. Any pending invite that predates that
+  migration was expired, because its code is already sitting in older backups.
 - **The entry NAME is stored in cleartext, and so is the inventory it implies.**
   `vault_entries.name` carries the `UNIQUE(user_id, name)` constraint, the
   by-name capability lookup and every `ORDER BY name`, so it is not encrypted

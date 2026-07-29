@@ -1194,7 +1194,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// Seed the capability-bridge columns from the provider's defaults so the
 	// secret is immediately usable through /secrets/issue + /proxy (dockyard
 	// did this in its vault-enroll path). Only untouched rows are filled.
-	h.seedCapabilityDefaults(ctx, r, entryID, req.Provider)
+	h.seedCapabilityDefaults(ctx, h.queries, r, entryID, req.Provider)
 
 	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", req.Name, userID))
 
@@ -1306,7 +1306,20 @@ func collectionLabel(collectionID string) string {
 // provider's CapabilityDefaults when the entry still carries the untouched
 // '[]' / '{}' defaults. Best-effort: a failure only means auto-routing stays
 // off until patterns are set explicitly.
-func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, r *http.Request, entryID, provider string) {
+// seedCapabilityDefaults writes the provider's capability preset onto an entry.
+//
+// q is the querier to use. Callers inside an open write transaction MUST pass
+// their qtx: this helper both reads and writes, and running it on the pool while
+// the caller holds the SQLite write lock made the two contend on separate
+// connections. Measured from Update: the whole _busy_timeout burned (about 5.3s
+// of DB-wide write stall), a stale provider_meta read, and the seed then
+// silently discarded while the request returned 200 with no way to enrol the
+// secret afterwards.
+//
+// Same shape as the activity-log write that used to sit inside this handler's
+// transaction. Any helper called between BeginTx and Commit has to take the
+// transaction, not reach for h.queries.
+func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries, r *http.Request, entryID, provider string) {
 	if provider == "" {
 		return
 	}
@@ -1317,7 +1330,7 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, r *http.Reque
 	// That is deliberate: the old "*.supabase.co/*" preset read like a ceiling
 	// while granting reach over a domain space anyone can register into.
 	var meta map[string]string
-	if row, err := h.queries.GetVaultEntryMeta(ctx, entryID); err == nil {
+	if row, err := q.GetVaultEntryMeta(ctx, entryID); err == nil {
 		meta = ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"))
 	}
 	dests, inj := MarshalCapabilityDefaults(provider, meta)
@@ -1330,7 +1343,7 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, r *http.Reque
 	if inj == "" {
 		inj = "{}"
 	}
-	if err := h.queries.SeedVaultEntryCapabilityDefaults(ctx, db.SeedVaultEntryCapabilityDefaultsParams{
+	if err := q.SeedVaultEntryCapabilityDefaults(ctx, db.SeedVaultEntryCapabilityDefaultsParams{
 		DestinationPatterns: dests,
 		InjectionSpec:       inj,
 		ID:                  entryID,
@@ -1362,8 +1375,11 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Category             *string        `json:"category"`
 		Notes                *string        `json:"notes"`
 		AutoLogin            *bool          `json:"auto_login"`
-		RotationIntervalDays *int           `json:"rotation_interval_days"`
-		ExpiresAt            *string        `json:"expires_at"`
+		// nullableField, not a bare pointer: the edit form sends an explicit
+		// null to CLEAR these, and a pointer cannot tell that apart from the key
+		// being absent, so clearing was silently dropped.
+		RotationIntervalDays nullableField[int]    `json:"rotation_interval_days"`
+		ExpiresAt            nullableField[string] `json:"expires_at"`
 		Provider             *string        `json:"provider"`
 		ProviderMeta         *string        `json:"provider_meta"`
 		AutoRotate           *bool          `json:"auto_rotate"`
@@ -1446,6 +1462,10 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// 20-odd early returns below has the same shape, and the next validation
 	// added late would reintroduce it. A transaction plus a deferred Rollback
 	// makes every return path leave the row exactly as it was.
+	// Activity rows are queued and written AFTER commit: see the note at the
+	// first append for why writing them inside the transaction is a 5s stall.
+	var deferredActivity []queuedActivity
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		logError(r, "vault.update: begin transaction failed", "error", err)
@@ -1468,6 +1488,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if err := qtx.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{CustomFields: enc, ID: id}); err != nil {
 			logError(r, "vault.update: update custom fields failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 
@@ -1495,8 +1517,16 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		LogActivityFromRequest(h.queries, r, "vault.destinations_updated",
-			fmt.Sprintf("Agent destination allow-list set on entry %s: %v", id, patterns))
+		// Queued, NOT written here. LogActivityFromRequest runs on its own
+		// background context and therefore its own connection, so writing it
+		// inside the transaction made it contend with the write lock this
+		// handler holds: measured a 5.1s stall (the full _busy_timeout) and the
+		// row was then LOST to SQLITE_BUSY. Emitting after commit also means the
+		// audit trail never claims a change that later rolled back.
+		deferredActivity = append(deferredActivity, queuedActivity{
+			action: "vault.destinations_updated",
+			detail: fmt.Sprintf("Agent destination allow-list set on entry %s: %v", id, patterns),
+		})
 	}
 
 	// If value is provided and non-empty, re-encrypt and update last_rotated_at
@@ -1590,6 +1620,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.update: category encrypt failed", "error", encErr)
 		} else if err := qtx.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update category failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 	if req.Notes != nil {
@@ -1597,16 +1629,26 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.update: notes encrypt failed", "error", encErr)
 		} else if err := qtx.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update notes failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
-	if req.RotationIntervalDays != nil {
-		if err := qtx.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{RotationIntervalDays: sql.NullInt64{Int64: int64(*req.RotationIntervalDays), Valid: true}, ID: id}); err != nil {
+	if req.RotationIntervalDays.Set {
+		interval := sql.NullInt64{}
+		if req.RotationIntervalDays.Value != nil {
+			interval = sql.NullInt64{Int64: int64(*req.RotationIntervalDays.Value), Valid: true}
+		}
+		if err := qtx.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{RotationIntervalDays: interval, ID: id}); err != nil {
 			logError(r, "vault.update: update rotation_interval_days failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
-	if req.ExpiresAt != nil {
-		if err := qtx.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: stringPtrToNullTime(req.ExpiresAt), ID: id}); err != nil {
+	if req.ExpiresAt.Set {
+		if err := qtx.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: stringPtrToNullTime(req.ExpiresAt.Value), ID: id}); err != nil {
 			logError(r, "vault.update: update expires_at failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 	if req.URL != nil || req.AliasURL != nil {
@@ -1624,6 +1666,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				logError(r, "vault.update: url encrypt failed", "error", encErr)
 			} else if err := qtx.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(scope, *req.URL), ID: id}); err != nil {
 				logError(r, "vault.update: update url failed", "error", err)
+				writeInternalError(w, r, "internal server error")
+				return
 			}
 		}
 		if req.AliasURL != nil {
@@ -1631,6 +1675,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
 			} else if err := qtx.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(scope, *req.AliasURL), ID: id}); err != nil {
 				logError(r, "vault.update: update alias_url failed", "error", err)
+				writeInternalError(w, r, "internal server error")
+				return
 			}
 		}
 	}
@@ -1639,11 +1685,15 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.update: username encrypt failed", "error", encErr)
 		} else if err := qtx.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update username failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 	if req.AutoLogin != nil {
 		if err := qtx.UpdateVaultEntryAutoLogin(ctx, db.UpdateVaultEntryAutoLoginParams{AutoLogin: boolToInt64(*req.AutoLogin), ID: id}); err != nil {
 			logError(r, "vault.update: update auto_login failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
 	}
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
@@ -1681,11 +1731,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				ID:           id,
 			}); err != nil {
 				logError(r, "vault.update: update provider failed", "error", err)
+				writeInternalError(w, r, "internal server error")
+				return
 			}
 			// A newly set provider seeds the capability-bridge columns
 			// (untouched rows only, same as Create).
 			if req.Provider != nil {
-				h.seedCapabilityDefaults(ctx, r, id, provider)
+				h.seedCapabilityDefaults(ctx, qtx, r, id, provider)
 			}
 		}
 	}
@@ -1694,6 +1746,10 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		logError(r, "vault.update: commit failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
+	}
+
+	for _, a := range deferredActivity {
+		LogActivityFromRequest(h.queries, r, a.action, a.detail)
 	}
 
 	// Fetch updated entry (post-commit, so it reflects what was actually stored)

@@ -343,6 +343,31 @@ func main() {
 		}
 	}()
 
+	// Shield sessions and their tokens are never otherwise deleted. The AI
+	// gateway opens a session with a fresh random id per request, so the
+	// revive-and-sweep branch in shield.NewSession (which only fires for an id it
+	// has seen before) is unreachable on that path and nothing ever calls
+	// SweepExpired. The rows are AES-GCM ciphertext and cannot be redeemed by any
+	// caller (resolve is scoped to the session id), so this is data minimisation
+	// rather than a leak: prompt-derived PII should not accumulate for the life
+	// of the deployment.
+	if shieldStore != nil {
+		go func() {
+			t := time.NewTicker(30 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-appCtx.Done():
+					return
+				case <-t.C:
+					if err := shield.SweepExpired(appCtx, shieldStore); err != nil {
+						slog.Error("shield janitor: sweep failed", "error", err)
+					}
+				}
+			}
+		}()
+	}
+
 	// Rate limiters (same budgets as dockyard). Unlock gets its own budget:
 	// the UI re-locks the vault after every mutation, so the 5/15min
 	// sensitive-op budget would 429 normal editing sessions.
