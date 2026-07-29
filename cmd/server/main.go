@@ -665,7 +665,14 @@ func main() {
 		// stored, old key revoked upstream" and "delivery finished", which would
 		// otherwise record the rotation as a clean success while the consumer
 		// never got the new key.
-		vaultHandler.WaitForDelivery()
+		// 20s, comfortably under the 45s stop_grace_period in docker-compose.yml
+		// and well over a normal delivery. An unbounded wait would just get the
+		// process SIGKILLed at the container's grace period instead.
+		if !vaultHandler.WaitForDelivery(20 * time.Second) {
+			slog.Warn("shutdown: rotation delivery did not finish in time; " +
+				"a rotated value may be stored without having reached its targets, " +
+				"check last_rotation_error after restart")
+		}
 
 		// AFTER the drain, not before: cancelling first would kill the
 		// dispatcher and background work that a still-draining handler depends

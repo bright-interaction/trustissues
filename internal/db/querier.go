@@ -26,6 +26,11 @@ type Querier interface {
 	// channel config satisfied neither, so the gate reported "no ciphertext", sealed
 	// the sentinel under whatever key was configured, and then permanently refused
 	// the CORRECT key. Cheap to close: one row from each surface is enough.
+	// Each surface is bounded by its OWN subquery. A trailing LIMIT on a compound
+	// SELECT applies to the WHOLE result, so the first version returned only the
+	// settings row and never probed an invitation code at all: a database whose only
+	// ciphertext was an invite code still fell through the gate, which is the exact
+	// hole this probe exists to close.
 	AnyEncryptedColumnSample(ctx context.Context) ([]string, error)
 	// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
 	// test whether the configured key actually opens this database BEFORE writing

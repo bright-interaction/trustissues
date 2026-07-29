@@ -6,6 +6,11 @@ services:
         - SERVER_VERSION
     container_name: trustissues
     restart: unless-stopped
+    # Longer than the server's 20s delivery drain (see WaitForDelivery), so a
+    # restart during a rotation lets the new value reach its targets instead of
+    # being SIGKILLed halfway. Docker's default is 10s, which is shorter than the
+    # drain and would defeat it.
+    stop_grace_period: 45s
     ports:
       # Publish to host loopback ONLY. This app speaks plaintext HTTP; TLS must
       # terminate in a reverse proxy (Caddy) in front of it. Never publish this

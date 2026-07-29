@@ -11,9 +11,11 @@ import (
 )
 
 const anyEncryptedColumnSample = `-- name: AnyEncryptedColumnSample :many
-SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != ''
+SELECT blob FROM (SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL
-SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1
+SELECT blob FROM (SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1)
+UNION ALL
+SELECT blob FROM (SELECT config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1)
 `
 
 // Boot key-gate probe 3: every OTHER columncrypto surface.
@@ -23,6 +25,11 @@ SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1
 // channel config satisfied neither, so the gate reported "no ciphertext", sealed
 // the sentinel under whatever key was configured, and then permanently refused
 // the CORRECT key. Cheap to close: one row from each surface is enough.
+// Each surface is bounded by its OWN subquery. A trailing LIMIT on a compound
+// SELECT applies to the WHOLE result, so the first version returned only the
+// settings row and never probed an invitation code at all: a database whose only
+// ciphertext was an invite code still fell through the gate, which is the exact
+// hole this probe exists to close.
 func (q *Queries) AnyEncryptedColumnSample(ctx context.Context) ([]string, error) {
 	rows, err := q.db.QueryContext(ctx, anyEncryptedColumnSample)
 	if err != nil {

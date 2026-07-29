@@ -208,3 +208,37 @@ func TestClearingExpiryAndIntervalActuallyClears(t *testing.T) {
 		t.Error("a partial update that never mentioned expires_at wiped it")
 	}
 }
+
+// TestWaitForDeliveryIsBounded locks the shutdown drain against the failure mode
+// the first version had.
+//
+// The delivery goroutine runs on a 15-minute context, and the first version of
+// this wait was unbounded. Docker SIGKILLs 10 seconds after SIGTERM by default,
+// so an unbounded wait did not protect the delivery at all: it guaranteed the
+// process was killed hard mid-delivery instead of exiting cleanly, which is
+// worse than not waiting. The wait is now bounded and the compose file gives the
+// container a grace period longer than the budget.
+func TestWaitForDeliveryIsBounded(t *testing.T) {
+	h, _ := newCollectionAuthzEnv(t)
+
+	// Nothing in flight: returns immediately and reports a clean drain.
+	start := time.Now()
+	if !h.WaitForDelivery(2 * time.Second) {
+		t.Error("WaitForDelivery reported an incomplete drain with nothing in flight")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("an empty drain took %v; it should return at once", elapsed)
+	}
+
+	// A delivery that outlives the budget must NOT hold the process open.
+	h.delivery.Add(1)
+	defer h.delivery.Done()
+	start = time.Now()
+	if h.WaitForDelivery(200 * time.Millisecond) {
+		t.Error("WaitForDelivery claimed a clean drain while a delivery was still running")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the bounded wait blocked for %v; a slow delivery would hold shutdown "+
+			"past the container grace period and get the process SIGKILLed", elapsed)
+	}
+}
