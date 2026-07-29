@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -313,6 +314,17 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok, verifyErr := passwordhash.Verify(req.Password, row.PasswordHash)
+	if errors.Is(verifyErr, passwordhash.ErrBusy) {
+		// Server capacity, not a wrong password. Reporting it as a failed
+		// attempt would be a lie AND an account-lockout vector: an attacker
+		// saturating the hash semaphore could drive any account to its lockout
+		// threshold without ever guessing a password.
+		logError(r, "auth.login: hash capacity exhausted", "error", verifyErr)
+		w.Header().Set("Retry-After", "2")
+		writeError(w, r, http.StatusServiceUnavailable, "server_busy",
+			"the server is at capacity verifying passwords; retry shortly")
+		return
+	}
 	if verifyErr != nil || !ok {
 		recordFailure()
 		writeUnauthorized(w, r, "invalid credentials")
