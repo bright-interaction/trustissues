@@ -141,3 +141,45 @@ func TestPendingInvitesWereExpiredByTheMigration(t *testing.T) {
 		t.Error("a legacy cleartext invitation is still redeemable after the migration")
 	}
 }
+
+// TestInviteCreationRefusesWhenItCannotSealTheCode locks the failure mode.
+//
+// sealInviteCode originally returned "" on failure and the row was inserted
+// anyway. That looked like a safe degradation, since redemption uses the hash
+// and only resend would break. It was not: the invite is created with a code
+// nobody can recover, resend emails a blank code with no signal, and because the
+// column is UNIQUE a SECOND failure collides and surfaces as
+// "UNIQUE constraint failed: invitations.code", pointing the operator at
+// entirely the wrong problem.
+func TestInviteCreationRefusesWhenItCannotSealTheCode(t *testing.T) {
+	_, queries := newCollectionAuthzEnv(t)
+	// No SetVault: sealing cannot work.
+	uh := NewUserHandler(queries, &config.Config{VaultKey: strings.Repeat("k", 32)})
+	admin := mustUser(t, queries, "seal-admin@example.com", "admin", "")
+
+	mk := func(email string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
+			strings.NewReader(`{"email":"`+email+`","name":"X","role":"user"}`))
+		req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, admin))
+		rec := httptest.NewRecorder()
+		uh.CreateInvitation(rec, req)
+		return rec.Code
+	}
+
+	if code := mk("one@example.com"); code == http.StatusCreated || code == http.StatusOK {
+		t.Error("an invitation was created with an unsealable code; resend would email a blank code")
+	}
+	// The second attempt must fail the same way, not with a UNIQUE collision on
+	// two empty codes.
+	if code := mk("two@example.com"); code == http.StatusCreated || code == http.StatusOK {
+		t.Error("a second unsealable invitation was created")
+	}
+
+	n, err := queries.ListInvitations(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(n) != 0 {
+		t.Errorf("%d invitation row(s) were persisted despite the seal failing", len(n))
+	}
+}

@@ -660,6 +660,13 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Error("shutdown error", "error", err)
 		}
+		// Rotation delivery runs detached from the request, so Shutdown does not
+		// know about it. Waiting here means a restart cannot land between "value
+		// stored, old key revoked upstream" and "delivery finished", which would
+		// otherwise record the rotation as a clean success while the consumer
+		// never got the new key.
+		vaultHandler.WaitForDelivery()
+
 		// AFTER the drain, not before: cancelling first would kill the
 		// dispatcher and background work that a still-draining handler depends
 		// on, which is the opposite of draining.

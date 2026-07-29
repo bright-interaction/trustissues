@@ -459,6 +459,30 @@ func (h *CollectionHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	// The invitee learns of the invitation through their own pending list.
 	user, err := h.queries.GetUserByEmail(r.Context(), req.Email)
 	if err == nil {
+		// AddCollectionMember is an UPSERT, so this endpoint doubles as the
+		// role-CHANGE path: the members UI sends it when a dropdown changes.
+		// Without a last-manager check, one click could demote the only manager
+		// and orphan the collection, with no manager left to invite one. Removal
+		// and leaving both guard this; the third way to lose a manager did not.
+		//
+		// Demoting yourself is the reachable case, so it is worth naming the
+		// account rather than returning a generic refusal.
+		if user.ID != "" && req.Role != collRoleManager {
+			if current, roleErr := h.queries.GetCollectionMemberRole(r.Context(), db.GetCollectionMemberRoleParams{
+				CollectionID: id, UserID: user.ID,
+			}); roleErr == nil && current == collRoleManager {
+				count, cErr := h.queries.CountCollectionManagers(r.Context(), id)
+				if cErr != nil {
+					logError(r, "collections.addmember: manager count failed", "error", cErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				if count <= 1 {
+					writeConflict(w, r, "this is the collection's only manager; promote another member to manager first")
+					return
+				}
+			}
+		}
 		if addErr := h.queries.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
 			CollectionID: id, UserID: user.ID, Role: req.Role,
 			AcceptedAt: sql.NullTime{}, // pending until the invitee accepts

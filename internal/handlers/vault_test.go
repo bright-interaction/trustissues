@@ -288,21 +288,32 @@ func TestSharedNullHelpers(t *testing.T) {
 	if got := intPtrToNullInt64(&seven); !got.Valid || got.Int64 != 7 {
 		t.Fatal("intPtrToNullInt64 round-trip broken")
 	}
-	if stringPtrToNullTime(nil).Valid {
-		t.Fatal("stringPtrToNullTime(nil) should be invalid")
+	if got, err := stringPtrToNullTime(nil); got.Valid || err != nil {
+		t.Fatal("stringPtrToNullTime(nil) should be an invalid time with no error")
 	}
 	for _, in := range []string{"2026-07-20 10:00:00", "2026-07-20T10:00:00Z", "2026-07-20"} {
 		s := in
-		if got := stringPtrToNullTime(&s); !got.Valid {
-			t.Fatalf("stringPtrToNullTime failed to parse %q", in)
+		got, err := stringPtrToNullTime(&s)
+		if err != nil || !got.Valid {
+			t.Fatalf("stringPtrToNullTime failed to parse %q: %v", in, err)
 		}
 	}
+	// Garbage must ERROR, not quietly return the zero value. The zero value is
+	// byte-identical to the "clear this field" return, so falling through meant a
+	// typo silently cleared the expiry and reported success.
 	bad := "garbage"
-	if stringPtrToNullTime(&bad).Valid {
-		t.Fatal("stringPtrToNullTime should reject garbage")
+	if got, err := stringPtrToNullTime(&bad); err == nil || got.Valid {
+		t.Fatal("stringPtrToNullTime silently cleared the field instead of rejecting garbage")
 	}
 	if nullTimePtr(sql.NullTime{}) != nil {
 		t.Fatal("nullTimePtr on invalid should be nil")
+	}
+	// RFC3339, not a space-separated format: the edit form splits on "T" to seed
+	// <input type="date">, so a non-ISO string renders the field blank and the
+	// next save clears an expiry the user could not see.
+	when := time.Date(2026, 12, 31, 10, 30, 0, 0, time.UTC)
+	if got := nullTimePtr(sql.NullTime{Time: when, Valid: true}); got == nil || *got != "2026-12-31T10:30:00Z" {
+		t.Fatalf("nullTimePtr must emit RFC3339, got %v", got)
 	}
 	tok, err := generateToken(32)
 	if err != nil || len(tok) != 64 {

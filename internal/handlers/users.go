@@ -546,9 +546,17 @@ func (h *UserHandler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	code := generateInviteCode()
 	expiresAt := time.Now().UTC().Add(48 * time.Hour)
 
+	// Refuse rather than storing an unrecoverable code: see sealInviteCode.
+	sealed, sealErr := h.sealInviteCode(code)
+	if sealErr != nil {
+		logError(r, "invitations.create: could not seal the invite code", "error", sealErr)
+		writeInternalError(w, r, "failed to create invitation")
+		return
+	}
+
 	row, err := h.queries.CreateInvitation(ctx, db.CreateInvitationParams{
 		// Ciphertext at rest, hash for lookup. See invitation_code.go.
-		Code:       h.sealInviteCode(code),
+		Code:       sealed,
 		CodeHash:   hashInviteCode(code),
 		Email:      req.Email,
 		Name:       req.Name,

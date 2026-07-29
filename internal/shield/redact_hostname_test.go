@@ -224,3 +224,53 @@ func TestPEMPrivateKeyBodyIsTokenized(t *testing.T) {
 		}
 	})
 }
+
+// TestProviderDereferencedURLsAreNotTokenized locks the gateway against a
+// self-inflicted 400.
+//
+// shieldAny type-switches on string/slice/map and has no knowledge of the JSON
+// key, so every string leaf went through RedactString and the hostname pattern
+// rewrote image_url and friends into [shield:hostname:tok_...]. The provider
+// then tried to FETCH that as a URL and returned 400, so any vision request,
+// document URL or mcp_servers block failed outright whenever Shield was on.
+//
+// Tokenizing them protects nothing: the caller chose the destination and the
+// provider must resolve it to do the work at all.
+func TestProviderDereferencedURLsAreNotTokenized(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		doc := []byte(`{
+			"messages":[{"role":"user","content":[
+				{"type":"image_url","image_url":{"url":"https://cdn.example.com/photo.png"}},
+				{"type":"text","text":"who is anna@klientfirman.se"}
+			]}],
+			"mcp_servers":[{"server_url":"https://mcp.example.com/api"}]
+		}`)
+		out, err := s.ShieldJSON(ctx, doc)
+		if err != nil {
+			t.Fatalf("ShieldJSON: %v", err)
+		}
+		got := string(out)
+
+		for _, u := range []string{"https://cdn.example.com/photo.png", "https://mcp.example.com/api"} {
+			if !strings.Contains(got, u) {
+				t.Errorf("a provider-dereferenced URL was tokenized, so the request 400s upstream: %s", got)
+			}
+		}
+		// The prose leaf beside it must still be shielded, or this "fix" would
+		// just be turning Shield off.
+		if strings.Contains(got, "anna@klientfirman.se") {
+			t.Errorf("PII in the text leaf egressed verbatim: %s", got)
+		}
+		// A hostname in PROSE must still tokenize.
+		out2, err := s.RedactString(ctx, "connect to crm.example.com now")
+		if err != nil {
+			t.Fatalf("RedactString: %v", err)
+		}
+		if strings.Contains(out2, "crm.example.com") {
+			t.Errorf("hostname shielding was turned off for prose too: %q", out2)
+		}
+	})
+}

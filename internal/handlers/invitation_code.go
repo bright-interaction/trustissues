@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 )
 
@@ -38,21 +40,24 @@ func hashInviteCode(code string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// sealInviteCode encrypts an invite code for storage. On failure it returns an
-// empty string, which stores nothing recoverable: redemption still works (it
-// uses the hash), and only resend degrades. Failing closed on the ciphertext is
-// better than falling back to cleartext, which is the bug this closes.
-func (h *UserHandler) sealInviteCode(code string) string {
+// sealInviteCode encrypts an invite code for storage.
+//
+// It returns an error rather than an empty string on failure, and the caller
+// must abort. Storing "" looked like a safe degradation (redemption uses the
+// hash, so only resend breaks) and was not: the invite is created with a code
+// nobody can ever recover, resend then emails a blank code with no signal, and
+// because the column is UNIQUE a SECOND failure collides and surfaces as
+// "UNIQUE constraint failed: invitations.code", which points an operator at the
+// wrong problem entirely.
+func (h *UserHandler) sealInviteCode(code string) (string, error) {
 	if h.vault == nil {
-		slog.Error("invitations: no vault wired, invite code cannot be stored encrypted")
-		return ""
+		return "", errors.New("no vault is wired, so the invite code cannot be stored encrypted")
 	}
 	enc, err := h.vault.encryptColumn(code)
 	if err != nil {
-		slog.Error("invitations: sealing invite code failed", "error", err)
-		return ""
+		return "", fmt.Errorf("sealing the invite code: %w", err)
 	}
-	return enc
+	return enc, nil
 }
 
 // openInviteCode decrypts a stored invite code for display or resend. An empty

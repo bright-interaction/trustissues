@@ -171,3 +171,51 @@ func TestPendingInviteeCannotUseCollectionSecret(t *testing.T) {
 		t.Error("an ACCEPTED member cannot spend the collection secret; the gate refuses everyone")
 	}
 }
+
+// TestRemovedMemberCannotValidateSharedKey closes the NINTH door.
+//
+// ValidateKey was the last entryAccess site gated on canRead. It decrypts the
+// stored value and authenticates with it against the provider, so it is a live
+// USE of the credential rather than a look at metadata. entryAccessFor grants a
+// removed creator a residual read, so after removal they kept an oracle: ask
+// "is the team's key valid?", have the server spend it upstream on their behalf,
+// and learn every rotation, with no activity_log row for it.
+func TestRemovedMemberCannotValidateSharedKey(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	creator := mustUser(t, queries, "val-creator@example.com", "user", "")
+	manager := mustUser(t, queries, "val-manager@example.com", "user", "")
+	mustCollection(t, queries, "coll-val", manager, map[string]string{
+		manager: collRoleManager,
+		creator: collRoleEditor,
+	})
+	const entryID = "entry-val"
+	mustEntry(t, h, queries, entryID, creator, "Cloudflare", "cf-token")
+	placeInCollection(t, queries, entryID, "coll-val")
+
+	// Guard: while a member, the spend right holds.
+	if !h.entryCurrentlyUsableBy(ctx, creator, entryID) {
+		t.Fatal("ABORT: an active editor cannot use the entry, so removal proves nothing")
+	}
+
+	if _, err := queries.RemoveCollectionMember(ctx, db.RemoveCollectionMemberParams{
+		CollectionID: "coll-val", UserID: creator,
+	}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	// The residual READ must survive (that is deliberate, for recovery)...
+	if canRead, _ := h.entryAccessFor(ctx, creator, false, entryID); !canRead {
+		t.Error("the residual recovery read was removed; that is a separate, wanted property")
+	}
+	// ...but the SPEND right must not.
+	if h.entryCurrentlyUsableBy(ctx, creator, entryID) {
+		t.Error("a removed member can still spend the shared credential: ValidateKey would " +
+			"authenticate upstream with it and hand them a validity oracle")
+	}
+	// The manager, still a member, is unaffected.
+	if !h.entryCurrentlyUsableBy(ctx, manager, entryID) {
+		t.Error("a current manager lost the ability to validate the key")
+	}
+}

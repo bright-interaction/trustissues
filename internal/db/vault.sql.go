@@ -10,6 +10,42 @@ import (
 	"database/sql"
 )
 
+const anyEncryptedColumnSample = `-- name: AnyEncryptedColumnSample :many
+SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != ''
+UNION ALL
+SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1
+`
+
+// Boot key-gate probe 3: every OTHER columncrypto surface.
+//
+// Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
+// only ciphertext is an SMTP password, an invitation code or a notification
+// channel config satisfied neither, so the gate reported "no ciphertext", sealed
+// the sentinel under whatever key was configured, and then permanently refused
+// the CORRECT key. Cheap to close: one row from each surface is enough.
+func (q *Queries) AnyEncryptedColumnSample(ctx context.Context) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, anyEncryptedColumnSample)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var blob string
+		if err := rows.Scan(&blob); err != nil {
+			return nil, err
+		}
+		items = append(items, blob)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const anyEncryptedVaultEntry = `-- name: AnyEncryptedVaultEntry :one
 SELECT encrypted_value, nonce FROM vault_entries
 WHERE encryption_version = 2 AND length(encrypted_value) > 0
