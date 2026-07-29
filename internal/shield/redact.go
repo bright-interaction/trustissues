@@ -199,6 +199,15 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 			if p.kind == KindHostname && (looksLikeFilename(match) || !looksLikeHostname(match)) {
 				return match
 			}
+			// Same shape as the hostname guard: the regex finds candidates, a
+			// validator decides. See looksLikePhone / plausiblePersonnummer for
+			// why each rejection exists, and testdata/noise.corpus for proof.
+			if p.kind == KindPhone && !looksLikePhone(match) {
+				return match
+			}
+			if p.kind == KindPersonnummer && !plausiblePersonnummer(match) {
+				return match
+			}
 			// Honour the session's configured level. This used to call
 			// buildHint, which hardcodes HintFull, so
 			// TRUSTISSUES_SHIELD_HINT_LEVEL was inert on the ONLY production
@@ -408,4 +417,73 @@ func looksLikeEncodedBlob(s string) bool {
 		}
 	}
 	return true
+}
+
+// looksLikePhone rejects candidates that matched the phone shape but are
+// something else. RE2 has no lookbehind, so the pattern alone cannot tell that
+// "07-29 13:06" is the tail of a timestamp rather than a Swedish number.
+//
+// Rejecting here rather than tightening the regex keeps the pattern readable and
+// puts the reasoning where it can be explained. The corpus is what proves it.
+func looksLikePhone(s string) bool {
+	digits := 0
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	// A real phone number is 7 to 15 digits (E.164 caps at 15).
+	if digits < 7 || digits > 15 {
+		return false
+	}
+	// A colon means a clock time got swept in: "13:06:04", "08:00-09:30".
+	if strings.ContainsRune(s, ':') {
+		return false
+	}
+	// Date-shaped: NN-NN followed by a space and more digits is a timestamp
+	// tail, not a subscriber number.
+	if dateTail.MatchString(s) {
+		return false
+	}
+	return true
+}
+
+// dateTail matches the "07-29 13" shape that a national-prefix phone pattern
+// picks up out of "2026-07-29 13:06:04".
+var dateTail = regexp.MustCompile(`^\d{2}-\d{2}\s`)
+
+// plausiblePersonnummer rejects a bare digit run whose date fields are nonsense.
+//
+// The pattern claims any 10 or 12 digit run, so order ids and epoch timestamps
+// became [shield:personnummer:...] complete with a fabricated century hint. This
+// checks only that the month and day COULD be a date; it deliberately does not
+// verify the Luhn check digit or reject a real-but-odd date, because a false
+// negative here sends a personnummer to the LLM provider while a false positive
+// only mangles prose. Samordningsnummer (day + 60) stay accepted for the same
+// reason.
+func plausiblePersonnummer(s string) bool {
+	var d []rune
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			d = append(d, r)
+		}
+	}
+	// Take the YYMMDD part: last 10 digits are YYMMDD+4, 12 are YYYYMMDD+4.
+	switch len(d) {
+	case 10:
+	case 12:
+		d = d[2:]
+	default:
+		return false
+	}
+	month := int(d[2]-'0')*10 + int(d[3]-'0')
+	day := int(d[4]-'0')*10 + int(d[5]-'0')
+	if month < 1 || month > 12 {
+		return false
+	}
+	// Day may carry +60 (samordningsnummer), a real Skatteverket identifier.
+	if day > 60 {
+		day -= 60
+	}
+	return day >= 1 && day <= 31
 }

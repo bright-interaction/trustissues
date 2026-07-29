@@ -1,0 +1,27 @@
+# Text that MUST be tokenized, with the expected kind.
+#
+# Format: kind<TAB>line
+#
+# This is the recall half of the gate. Without it, the cheapest way to make
+# noise.corpus pass is to stop detecting things, which is the worst possible
+# outcome for a redactor: a false positive mangles prose, a false negative sends
+# PII to a third-party model.
+personnummer	the number is 19850101-1234 on file
+personnummer	pnr 850101-1234 confirmed
+email	write to anna.andersson@example.com about it
+email	forward to first.last+tag@sub.example.co.uk please
+phone	call me on 070-123 45 67 tomorrow
+phone	the office is 08-123 456 78
+phone	international is +46 70 123 45 67
+phone	us number 415-555-0199 works
+ip	server at 192.168.1.10 responds
+ip	addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up
+secret	token sk_live_51HabcdefgABCDEFG leaked
+secret	anthropic key sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345 pasted
+secret	openai key sk-proj-abcdefghijklmnopqrstuvwxyz012345 pasted
+secret	aws key AKIAIOSFODNN7EXAMPLE in the log
+secret	google key AIzaSyD-abcdefghijklmnopqrstuvwxyz01234 exposed
+secret	our own key ti_a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4 pasted
+secret	github token ghp_a123456789012345678901 committed
+hostname	connect to crm.example.com now
+hostname	host.internal is unreachable
