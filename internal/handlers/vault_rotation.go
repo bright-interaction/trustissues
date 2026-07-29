@@ -196,7 +196,7 @@ func rotateOneEntry(ctx context.Context, queries *db.Queries, vaultHandler *Vaul
 			EncryptedValue: encrypted,
 			Nonce:          nonce,
 			ID:             entry.ID,
-			UpdatedAt:      entry.UpdatedAt,
+			UpdatedAtText:  entry.UpdatedAtText,
 		})
 		if casErr == nil {
 			if n, _ := res.RowsAffected(); n == 0 {

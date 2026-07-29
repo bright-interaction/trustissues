@@ -367,6 +367,13 @@ type Querier interface {
 	// the caller checks RowsAffected and treats 0 as "someone else changed it,
 	// leave it alone and pick it up next pass". It also stops a rotation landing on
 	// an entry that was deleted mid-pass.
+	// The comparison is on TEXT, deliberately. The column is DATETIME but SQLite
+	// stores it as the literal string CURRENT_TIMESTAMP produced
+	// ("2026-07-29 13:06:22"), while Go's driver scans it into a time.Time and binds
+	// it back in a different layout. So `updated_at = ?` with a time.Time NEVER
+	// matched: the first version of this CAS made every scheduled rotation report a
+	// conflict and persist nothing, turning a rare lost-update into a total silent
+	// outage of auto-rotation. Compare the raw text both ways.
 	RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntryValueParams) (sql.Result, error)
 	// Seeds the capability-bridge columns from the provider defaults at
 	// enrollment time. Only fills untouched rows so explicit per-entry

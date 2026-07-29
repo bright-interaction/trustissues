@@ -45,8 +45,7 @@ func TestRemovedMemberCannotReadTargets(t *testing.T) {
 	// A target configured by the MANAGER, carrying an HMAC secret that exists
 	// nowhere else.
 	body := `[{"type":"webhook","label":"prod","webhook_url":"https://consumer.example.com/h","webhook_secret":"HMAC-SECRET-NOWHERE-ELSE"}]`
-	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", manager, "user", entryID, body))
+	rec := putTargets(t, h, manager, "user", entryID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ABORT: manager could not set the target: %d %s", rec.Code, rec.Body.String())
 	}

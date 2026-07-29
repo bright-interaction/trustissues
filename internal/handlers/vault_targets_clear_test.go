@@ -63,8 +63,7 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 	}
 
 	// An accidental blind wipe must be refused.
-	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, `[]`))
+	rec := putTargets(t, h, owner, "user", entryID, `[]`)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("a blind empty PUT returned %d, want 409: %s", rec.Code, rec.Body.String())
 	}
@@ -74,8 +73,7 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 
 	// A deliberate clear must succeed, or the user can never remove their last
 	// target through the UI.
-	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets?clear=1", owner, "user", entryID, `[]`))
+	rec = putTargets(t, h, owner, "user", entryID, `[]`, "clear=1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("a deliberate clear returned %d, want 200: %s\nthe UI would have no way to delete the last target",
 			rec.Code, rec.Body.String())
@@ -86,8 +84,7 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 
 	// Clearing an ALREADY-empty list needs no ceremony: there is nothing to lose,
 	// and refusing it would break saving an entry that simply has no targets.
-	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, `[]`))
+	rec = putTargets(t, h, owner, "user", entryID, `[]`)
 	if rec.Code != http.StatusOK {
 		t.Errorf("saving an already-empty target list returned %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -95,8 +92,8 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 	// And a non-empty save is never affected by the guard.
 	seed()
 	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID,
-		`[{"type":"webhook","label":"new","webhook_url":"https://other.example.com/h"}]`))
+	rec = putTargets(t, h, owner, "user", entryID,
+		`[{"type":"webhook","label":"new","webhook_url":"https://other.example.com/h"}]`)
 	if rec.Code != http.StatusOK {
 		t.Errorf("a normal replace returned %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -136,8 +133,8 @@ func TestDamagedTargetsColumnIsNotOverwritten(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID,
-		`[{"type":"webhook","label":"new","webhook_url":"https://new.example.com/h"}]`))
+	rec = putTargets(t, h, owner, "user", entryID,
+		`[{"type":"webhook","label":"new","webhook_url":"https://new.example.com/h"}]`)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("a save over an undecryptable targets column returned %d, want 409: %s", rec.Code, rec.Body.String())
 	}
@@ -179,8 +176,7 @@ func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
 
 	// The leaver configures a delivery target.
 	body := `[{"type":"webhook","label":"leaver","webhook_url":"https://leaver.example.com/hook"}]`
-	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", leaver, "user", entryID, body))
+	rec := putTargets(t, h, leaver, "user", entryID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ABORT: leaver could not set a target: %d %s", rec.Code, rec.Body.String())
 	}
@@ -246,4 +242,32 @@ func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("a save with the current version returned %d: the panel would be unusable", rec.Code)
 	}
+}
+
+// putTargets does the real GET-then-PUT flow: load the current view, take its
+// version, and send it back on save.
+//
+// The version is REQUIRED on write, because an opt-in staleness check protects
+// only the clients that opt in and the point is that an offboarding purge stays
+// purged whoever writes next. Tests have to follow the same contract a client
+// does, or they stop describing the shipped behaviour.
+func putTargets(t *testing.T, h *VaultHandler, userID, role, entryID, body string, extraQuery ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.GetTargets(rec, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", userID, role, entryID, ""))
+	version := ""
+	if rec.Code == http.StatusOK {
+		var loaded struct {
+			Version string `json:"version"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &loaded)
+		version = loaded.Version
+	}
+	q := "?version=" + version
+	for _, e := range extraQuery {
+		q += "&" + e
+	}
+	out := httptest.NewRecorder()
+	h.UpdateTargets(out, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets"+q, userID, role, entryID, body))
+	return out
 }

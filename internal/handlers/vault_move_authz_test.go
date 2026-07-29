@@ -337,8 +337,7 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 
 	body := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
 		`"secret_name":"CI_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, owner)
-	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", editor, "user", entryID, body))
+	rec := putTargets(t, h, editor, "user", entryID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("editor could not set targets: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
@@ -382,8 +381,7 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	// re-authorized a departed member's webhook and the next rotation POSTed
 	// them the fresh plaintext. "Who set this up" must not change because
 	// somebody else pressed Save.
-	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, body))
+	rec = putTargets(t, h, owner, "user", entryID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner could not save targets: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
@@ -401,8 +399,7 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	// target (different destination) is stamped to whoever created it.
 	newBody := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
 		`"secret_name":"OTHER_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, editor)
-	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", owner, "user", entryID, newBody))
+	rec = putTargets(t, h, owner, "user", entryID, newBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner could not set a new target: HTTP %d: %s", rec.Code, rec.Body.String())
 	}

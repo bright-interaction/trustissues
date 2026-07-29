@@ -259,8 +259,23 @@ func newTestVaultEnv(t *testing.T) (*VaultHandler, *db.Queries, string, string) 
 
 // targetsRequest builds an authenticated PUT /api/vault/{id}/targets request
 // with the chi URL param and the middleware context keys populated.
-func targetsRequest(userID, role, entryID, body string) *http.Request {
-	r := httptest.NewRequest("PUT", "/api/vault/"+entryID+"/targets", strings.NewReader(body))
+// targetsRequest builds a PUT carrying the CURRENT targets version, which the
+// handler requires. Taking the handler is deliberate: a test that fabricates a
+// request without the version no longer describes what a client does.
+func targetsRequest(h *VaultHandler, userID, role, entryID, body string) *http.Request {
+	version := ""
+	if h != nil {
+		gr := httptest.NewRecorder()
+		h.GetTargets(gr, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", userID, role, entryID, ""))
+		if gr.Code == http.StatusOK {
+			var loaded struct {
+				Version string `json:"version"`
+			}
+			_ = json.Unmarshal(gr.Body.Bytes(), &loaded)
+			version = loaded.Version
+		}
+	}
+	r := httptest.NewRequest("PUT", "/api/vault/"+entryID+"/targets?version="+version, strings.NewReader(body))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", entryID)
 	ctx := context.WithValue(r.Context(), chi.RouteCtxKey, rctx)
@@ -283,7 +298,7 @@ func TestUpdateTargetsValidationSetMatchesDelivery(t *testing.T) {
 		{"type":"notify"}
 	]`
 	rec := httptest.NewRecorder()
-	h.UpdateTargets(rec, targetsRequest(userID, "admin", entryID, valid))
+	h.UpdateTargets(rec, targetsRequest(h, userID, "admin", entryID, valid))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("valid targets rejected: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
@@ -321,7 +336,7 @@ func TestUpdateTargetsValidationSetMatchesDelivery(t *testing.T) {
 	for _, c := range rejected {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			h.UpdateTargets(rec, targetsRequest(userID, "admin", entryID, c.body))
+			h.UpdateTargets(rec, targetsRequest(h, userID, "admin", entryID, c.body))
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 			}
@@ -330,7 +345,7 @@ func TestUpdateTargetsValidationSetMatchesDelivery(t *testing.T) {
 
 	// A non-owner non-admin cannot see or set targets on someone else's entry.
 	rec = httptest.NewRecorder()
-	h.UpdateTargets(rec, targetsRequest("someone-else", "user", entryID, `[{"type":"notify"}]`))
+	h.UpdateTargets(rec, targetsRequest(h, "someone-else", "user", entryID, `[{"type":"notify"}]`))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("non-owner should get 404, got %d", rec.Code)
 	}
