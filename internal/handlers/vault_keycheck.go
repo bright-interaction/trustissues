@@ -158,6 +158,31 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 		}
 	}
 
+	// Probe 3: every OTHER columncrypto surface.
+	//
+	// Probes 1 and 2 look only at v2 vault secrets and marked TOTP seeds. A
+	// database whose only ciphertext is an SMTP password, an invitation code or a
+	// notification channel config satisfied neither, so the gate concluded "no
+	// ciphertext at all", sealed the sentinel under whatever key happened to be
+	// configured, and thereafter refused the CORRECT key permanently. The gate
+	// exists to prevent exactly that, so it has to see every surface, not the two
+	// that happened to exist when it was written.
+	//
+	// If a new encrypted column is added anywhere, add it here in the same commit.
+	blobs, bErr := queries.AnyEncryptedColumnSample(ctx)
+	if bErr != nil {
+		return hasCiphertext, false, fmt.Errorf("read columncrypto surfaces: %w", bErr)
+	}
+	for _, b := range blobs {
+		if !columncrypto.IsEncrypted(b) {
+			continue
+		}
+		hasCiphertext = true
+		if _, decErr := columncrypto.DecryptString(b, vaultKey); decErr == nil {
+			return true, true, nil
+		}
+	}
+
 	return hasCiphertext, false, nil
 }
 

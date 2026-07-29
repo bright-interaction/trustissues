@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/brightinteraction/trustissues/internal/config"
@@ -33,7 +34,20 @@ type VaultHandler struct {
 	encryptionKey [32]byte // PBKDF2-derived key (current, version 2)
 	legacyKey     [32]byte // SHA-256 key (version 1, only used during migration)
 	bidxKey       [32]byte // PBKDF2-derived key for the URL blind index (HMAC)
+	// delivery tracks the detached rotation-delivery goroutines so shutdown can
+	// wait for them. srv.Shutdown only drains in-flight HTTP requests; a manual
+	// rotate returns as soon as the value is stored and finishes delivery in the
+	// background, so a restart in that window killed the goroutine mid-flight.
+	// The value was already committed and the old key already revoked upstream,
+	// but rotation_log and last_rotation_error were never finalised, so the
+	// rotation was recorded as a clean success while the consumer never received
+	// the new key.
+	delivery sync.WaitGroup
 }
+
+// WaitForDelivery blocks until every in-flight rotation delivery has finished.
+// Called from main after the HTTP drain, before the process exits.
+func (h *VaultHandler) WaitForDelivery() { h.delivery.Wait() }
 
 // NewVaultHandler creates a new VaultHandler keyed off cfg.VaultKey. The
 // encryption key is derived using PBKDF2-SHA256 with 600,000 iterations
@@ -1120,6 +1134,11 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	aliasBidx := h.urlBlindIndex(entryScope, req.AliasURL)
 
 	// Use separate INSERT + SELECT instead of RETURNING (mattn/go-sqlite3 has bugs with RETURNING)
+	createExpiresAt, expErr := stringPtrToNullTime(req.ExpiresAt)
+	if expErr != nil {
+		writeValidationError(w, r, expErr.Error())
+		return
+	}
 	err = h.queries.CreateVaultEntry(ctx, db.CreateVaultEntryParams{
 		ID:                   entryID,
 		UserID:               userID,
@@ -1133,7 +1152,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Notes:                toNullString(encNotes),
 		AutoLogin:            boolToInt64(req.AutoLogin),
 		RotationIntervalDays: intPtrToNullInt64(req.RotationIntervalDays),
-		ExpiresAt:            stringPtrToNullTime(req.ExpiresAt),
+		ExpiresAt:            createExpiresAt,
 		Provider:             toNullString(req.Provider),
 		ProviderMeta:         toNullString(providerMeta),
 		AutoRotate:           sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},
@@ -1367,23 +1386,23 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name                 *string        `json:"name"`
-		Value                *string        `json:"value"`
-		URL                  *string        `json:"url"`
-		AliasURL             *string        `json:"alias_url"`
-		Username             *string        `json:"username"`
-		Category             *string        `json:"category"`
-		Notes                *string        `json:"notes"`
-		AutoLogin            *bool          `json:"auto_login"`
+		Name      *string `json:"name"`
+		Value     *string `json:"value"`
+		URL       *string `json:"url"`
+		AliasURL  *string `json:"alias_url"`
+		Username  *string `json:"username"`
+		Category  *string `json:"category"`
+		Notes     *string `json:"notes"`
+		AutoLogin *bool   `json:"auto_login"`
 		// nullableField, not a bare pointer: the edit form sends an explicit
 		// null to CLEAR these, and a pointer cannot tell that apart from the key
 		// being absent, so clearing was silently dropped.
 		RotationIntervalDays nullableField[int]    `json:"rotation_interval_days"`
 		ExpiresAt            nullableField[string] `json:"expires_at"`
-		Provider             *string        `json:"provider"`
-		ProviderMeta         *string        `json:"provider_meta"`
-		AutoRotate           *bool          `json:"auto_rotate"`
-		CustomFields         *[]CustomField `json:"custom_fields"`
+		Provider             *string               `json:"provider"`
+		ProviderMeta         *string               `json:"provider_meta"`
+		AutoRotate           *bool                 `json:"auto_rotate"`
+		CustomFields         *[]CustomField        `json:"custom_fields"`
 		// The capability ceiling: which hosts an agent token minted for this
 		// secret may ever reach. Until this existed the column had exactly one
 		// writer (the provider preset seed), so any secret created without a
@@ -1445,7 +1464,6 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 
 	// Everything from here down runs in ONE transaction.
 	//
@@ -1618,6 +1636,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Category != nil {
 		if enc, encErr := h.encryptColumn(*req.Category); encErr != nil {
 			logError(r, "vault.update: category encrypt failed", "error", encErr)
+			writeInternalError(w, r, "internal server error")
+			return
 		} else if err := qtx.UpdateVaultEntryCategory(ctx, db.UpdateVaultEntryCategoryParams{Category: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update category failed", "error", err)
 			writeInternalError(w, r, "internal server error")
@@ -1627,6 +1647,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Notes != nil {
 		if enc, encErr := h.encryptColumn(*req.Notes); encErr != nil {
 			logError(r, "vault.update: notes encrypt failed", "error", encErr)
+			writeInternalError(w, r, "internal server error")
+			return
 		} else if err := qtx.UpdateVaultEntryNotes(ctx, db.UpdateVaultEntryNotesParams{Notes: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update notes failed", "error", err)
 			writeInternalError(w, r, "internal server error")
@@ -1645,7 +1667,12 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.ExpiresAt.Set {
-		if err := qtx.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: stringPtrToNullTime(req.ExpiresAt.Value), ID: id}); err != nil {
+		expires, expErr := stringPtrToNullTime(req.ExpiresAt.Value)
+		if expErr != nil {
+			writeValidationError(w, r, expErr.Error())
+			return
+		}
+		if err := qtx.UpdateVaultEntryExpiresAt(ctx, db.UpdateVaultEntryExpiresAtParams{ExpiresAt: expires, ID: id}); err != nil {
 			logError(r, "vault.update: update expires_at failed", "error", err)
 			writeInternalError(w, r, "internal server error")
 			return
@@ -1664,6 +1691,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if req.URL != nil {
 			if enc, encErr := h.encryptColumn(*req.URL); encErr != nil {
 				logError(r, "vault.update: url encrypt failed", "error", encErr)
+				writeInternalError(w, r, "internal server error")
+				return
 			} else if err := qtx.UpdateVaultEntryURL(ctx, db.UpdateVaultEntryURLParams{Url: toNullString(enc), UrlBidx: h.urlBlindIndex(scope, *req.URL), ID: id}); err != nil {
 				logError(r, "vault.update: update url failed", "error", err)
 				writeInternalError(w, r, "internal server error")
@@ -1673,6 +1702,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if req.AliasURL != nil {
 			if enc, encErr := h.encryptColumn(*req.AliasURL); encErr != nil {
 				logError(r, "vault.update: alias_url encrypt failed", "error", encErr)
+				writeInternalError(w, r, "internal server error")
+				return
 			} else if err := qtx.UpdateVaultEntryAliasURL(ctx, db.UpdateVaultEntryAliasURLParams{AliasUrl: toNullString(enc), AliasUrlBidx: h.urlBlindIndex(scope, *req.AliasURL), ID: id}); err != nil {
 				logError(r, "vault.update: update alias_url failed", "error", err)
 				writeInternalError(w, r, "internal server error")
@@ -1683,6 +1714,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Username != nil {
 		if enc, encErr := h.encryptColumn(*req.Username); encErr != nil {
 			logError(r, "vault.update: username encrypt failed", "error", encErr)
+			writeInternalError(w, r, "internal server error")
+			return
 		} else if err := qtx.UpdateVaultEntryUsername(ctx, db.UpdateVaultEntryUsernameParams{Username: toNullString(enc), ID: id}); err != nil {
 			logError(r, "vault.update: update username failed", "error", err)
 			writeInternalError(w, r, "internal server error")
@@ -2233,7 +2266,9 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// user gets immediate feedback. The goroutine then finalises the
 		// rotation_log with the REAL delivery+verify outcome (success or
 		// partial) and alarms on failure.
+		h.delivery.Add(1)
 		go func(eid, name, oldV, newV, uid, provider, method string, ts []RotationTarget) {
+			defer h.delivery.Done()
 			deliveryCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 			results := DeliverRotatedKey(deliveryCtx, h.queries, h, eid, name, oldV, newV, ts, uid)
@@ -2306,7 +2341,20 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if canRead, _ := h.entryAccess(r, id); !canRead {
+	// The SPEND right, not the read right. This handler decrypts the stored
+	// value and authenticates with it against the provider, so it is a live use
+	// of the credential, not a look at metadata.
+	//
+	// It was the last entryAccess site still gated on canRead, and entryAccessFor
+	// deliberately grants a removed creator a residual READ so they can recover a
+	// secret they own. That left them an oracle: after being removed from the
+	// collection they could still ask "is the team's key valid?" and have the
+	// server spend it upstream on their behalf, learning every rotation, with no
+	// activity_log row to show for it.
+	//
+	// Ninth distinct door onto "removing someone ends their access". Same
+	// read-versus-use distinction as the reference resolver.
+	if !h.entryCurrentlyUsableBy(ctx, userID, id) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
@@ -2705,9 +2753,17 @@ func (h *VaultHandler) ResolveReferences(content string, userID string) string {
 
 // nullTimePtr converts a sql.NullTime to a *string in "2006-01-02 15:04:05"
 // format (nil if not valid).
+// nullTimePtr renders a timestamp for the API as RFC3339.
+//
+// It used to emit "2006-01-02 15:04:05", which is not ISO: the edit form does
+// entry.expires_at.split('T')[0] to seed <input type="date">, and with no "T"
+// that returns the whole string, which the input rejects and renders BLANK. So
+// every entry with an expiry showed an empty date field, and saving the form
+// then cleared the expiry the user could not see. Safari also refuses to parse
+// the space-separated form in new Date() at all.
 func nullTimePtr(nt sql.NullTime) *string {
 	if nt.Valid {
-		s := nt.Time.Format("2006-01-02 15:04:05")
+		s := nt.Time.UTC().Format(time.RFC3339)
 		return &s
 	}
 	return nil
@@ -2715,16 +2771,23 @@ func nullTimePtr(nt sql.NullTime) *string {
 
 // stringPtrToNullTime parses a *string into a sql.NullTime, accepting the
 // SQLite datetime format, RFC3339, and bare dates.
-func stringPtrToNullTime(s *string) sql.NullTime {
+// stringPtrToNullTime parses a timestamp, returning an error for anything it
+// cannot read.
+//
+// It used to fall through to a bare sql.NullTime{} on an unparseable value,
+// which is byte-identical to the "clear this field" return for nil. So a typo or
+// a locale-formatted date silently CLEARED the expiry and reported success. The
+// caller must surface the error as a 400.
+func stringPtrToNullTime(s *string) (sql.NullTime, error) {
 	if s == nil || *s == "" {
-		return sql.NullTime{}
+		return sql.NullTime{}, nil
 	}
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339, "2006-01-02"} {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
 		if t, err := time.Parse(layout, *s); err == nil {
-			return sql.NullTime{Time: t, Valid: true}
+			return sql.NullTime{Time: t, Valid: true}, nil
 		}
 	}
-	return sql.NullTime{}
+	return sql.NullTime{}, fmt.Errorf("could not parse %q as a date; use YYYY-MM-DD or RFC3339", *s)
 }
 
 // nullInt64ToIntPtr converts a sql.NullInt64 to *int (nil if not valid).

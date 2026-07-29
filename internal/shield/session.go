@@ -390,14 +390,40 @@ func (s *Session) ShieldJSON(ctx context.Context, raw []byte) ([]byte, error) {
 	return json.Marshal(redacted)
 }
 
+// dereferencedURLKeys are JSON keys whose string value is a URL the PROVIDER
+// will fetch, not prose the model reads.
+//
+// shieldAny has no knowledge of the key, so every string leaf went through
+// RedactString and the hostname pattern rewrote these into
+// [shield:hostname:tok_...]. The provider then tried to fetch that as a URL and
+// returned 400, so a vision request with an image_url, a document URL, or an
+// mcp_servers block failed outright whenever Shield was on. Tokenizing them
+// protects nothing either: the caller chose the destination and the provider has
+// to resolve it to do the work.
+var dereferencedURLKeys = map[string]bool{
+	"url": true, "image_url": true, "audio_url": true, "video_url": true,
+	"document_url": true, "file_url": true, "source_url": true, "server_url": true,
+}
+
 func (s *Session) shieldAny(ctx context.Context, v any) (any, error) {
+	return s.shieldAnyUnderKey(ctx, "", v)
+}
+
+// shieldAnyUnderKey carries the enclosing JSON key so leaves that are
+// provider-dereferenced URLs can be left intact.
+func (s *Session) shieldAnyUnderKey(ctx context.Context, key string, v any) (any, error) {
 	switch t := v.(type) {
 	case string:
+		if dereferencedURLKeys[key] {
+			return t, nil
+		}
 		return s.RedactString(ctx, t)
 	case []any:
 		out := make([]any, len(t))
 		for i, item := range t {
-			r, err := s.shieldAny(ctx, item)
+			// An array inherits its parent key: image_url: [...] is still a list
+			// of URLs.
+			r, err := s.shieldAnyUnderKey(ctx, key, item)
 			if err != nil {
 				return nil, err
 			}
@@ -407,7 +433,7 @@ func (s *Session) shieldAny(ctx context.Context, v any) (any, error) {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for k, val := range t {
-			r, err := s.shieldAny(ctx, val)
+			r, err := s.shieldAnyUnderKey(ctx, k, val)
 			if err != nil {
 				return nil, err
 			}

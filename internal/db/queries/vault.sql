@@ -319,3 +319,15 @@ UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 
 -- Used only to de-duplicate on re-ownership when the new owner already has an
 -- entry by that name.
 UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+
+-- name: AnyEncryptedColumnSample :many
+-- Boot key-gate probe 3: every OTHER columncrypto surface.
+--
+-- Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
+-- only ciphertext is an SMTP password, an invitation code or a notification
+-- channel config satisfied neither, so the gate reported "no ciphertext", sealed
+-- the sentinel under whatever key was configured, and then permanently refused
+-- the CORRECT key. Cheap to close: one row from each surface is enough.
+SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != ''
+UNION ALL
+SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1;

@@ -19,6 +19,14 @@ type Querier interface {
 	// only the role changes, so re-inviting never silently re-grants access and a
 	// role change never revokes an existing acceptance.
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
+	// Boot key-gate probe 3: every OTHER columncrypto surface.
+	//
+	// Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
+	// only ciphertext is an SMTP password, an invitation code or a notification
+	// channel config satisfied neither, so the gate reported "no ciphertext", sealed
+	// the sentinel under whatever key was configured, and then permanently refused
+	// the CORRECT key. Cheap to close: one row from each surface is enough.
+	AnyEncryptedColumnSample(ctx context.Context) ([]string, error)
 	// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
 	// test whether the configured key actually opens this database BEFORE writing
 	// the sentinel. Version 1 rows are excluded: they are sealed under the legacy
