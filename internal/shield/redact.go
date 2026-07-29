@@ -103,7 +103,19 @@ var redactPatterns = []redactPattern{
 		// No "." in the separator class: it collides with IPv4 (192.168.1.10) and
 		// version strings, and the phone pattern runs BEFORE the IP patterns, so
 		// including it made every server address tokenize as a phone number.
-		re:   regexp.MustCompile(`\+?\d[\d\s\-()]{6,18}\d`),
+		// Three explicit shapes rather than "a long run of digits and separators".
+		// The loose version ate ISO dates (2026-07-29 inside a timestamp),
+		// 18-digit trace ids, card numbers and build stamps: dates in particular
+		// appear in almost every prompt, and mangling one corrupts the text the
+		// model sees for no gain.
+		//
+		//   +CC...        international
+		//   0N...         national trunk prefix (Swedish 070-, 08-)
+		//   NNN-NNN-NNNN  the common US grouping
+		re: regexp.MustCompile(
+			`\+\d[\d\s\-()]{6,18}\d` +
+				`|\b0\d[\d\s\-()]{5,17}\d` +
+				`|\b\d{3}[-\s]\d{3}[-\s]\d{4}\b`),
 		hint: []string{"country", "len"},
 	},
 	{
