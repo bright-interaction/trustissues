@@ -45,7 +45,13 @@ func aiGatewayTestDB(t *testing.T) *sql.DB {
 		encrypted_value BLOB NOT NULL, nonce BLOB NOT NULL, encryption_version INTEGER DEFAULT 2,
 		provider TEXT DEFAULT '', provider_meta TEXT DEFAULT '{}',
 		rotation_interval_days INTEGER, last_rotated_at DATETIME,
-		rotation_log TEXT DEFAULT '[]', rotation_targets TEXT DEFAULT '[]'
+		rotation_log TEXT DEFAULT '[]', rotation_targets TEXT DEFAULT '[]',
+		collection_id TEXT,
+		custom_fields TEXT NOT NULL DEFAULT '',
+		destination_patterns TEXT NOT NULL DEFAULT '[]',
+		last_rotation_error TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME);
 	CREATE TABLE activity_log (

@@ -190,11 +190,12 @@ func (q *Queries) GetUserPasswordHash(ctx context.Context, id string) (string, e
 }
 
 const getVaultEntryForRotation = `-- name: GetVaultEntryForRotation :one
-SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
+SELECT CAST(updated_at AS TEXT) AS updated_at_text, id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
 FROM vault_entries WHERE id = ?
 `
 
 type GetVaultEntryForRotationRow struct {
+	UpdatedAtText        string         `json:"updated_at_text"`
 	ID                   string         `json:"id"`
 	UserID               string         `json:"user_id"`
 	Name                 string         `json:"name"`
@@ -222,6 +223,7 @@ func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetV
 	row := q.db.QueryRowContext(ctx, getVaultEntryForRotation, id)
 	var i GetVaultEntryForRotationRow
 	err := row.Scan(
+		&i.UpdatedAtText,
 		&i.ID,
 		&i.UserID,
 		&i.Name,

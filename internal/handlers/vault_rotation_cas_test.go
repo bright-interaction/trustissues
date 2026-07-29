@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -129,5 +131,57 @@ func TestSweepStillDetectsARealConflict(t *testing.T) {
 	if meta.LastRotationError.String == "" {
 		t.Error("a rotation that raced a concurrent save reported success; the stale value would " +
 			"have overwritten the one the user just saved")
+	}
+}
+
+// TestManualRotateActuallyRotates is the test whose absence let a headline
+// feature ship completely dead.
+//
+// The round-11 CAS added a fourth parameter to RotateVaultEntryValue. The sweep
+// passed it; the manual handler did not, so it bound "" and the UPDATE matched
+// zero rows on EVERY entry. The handler mapped that to 404, so clicking "Rotate
+// now" answered "vault entry not found" for a secret the user was looking at,
+// and for a provider-backed entry the replacement key had already been minted
+// upstream and was left orphaned while the old one stayed live.
+//
+// The only existing manual-rotate test asserted a 502 from a FAILING provider,
+// so it never reached the write and the suite stayed green with the feature
+// dead. Assert the success path: a rotate must return 2xx AND change the stored
+// value.
+func TestManualRotateActuallyRotates(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	const password = "CorrectHorseBatteryStaple1!"
+	owner := mustUser(t, queries, "manualrot@example.com", "user", password)
+	const entryID = "manual-rot-1"
+	mustEntry(t, h, queries, entryID, owner, "Local secret", "OLD-VALUE")
+
+	before, err := queries.GetVaultEntryForRotation(ctx, entryID)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	if before.UpdatedAtText == "" {
+		t.Fatal("ABORT: the row carries no updated_at text, so the CAS has nothing to bind")
+	}
+
+	rec := httptest.NewRecorder()
+	h.Rotate(rec, vaultAuthzRequest("POST", "/api/vault/"+entryID+"/rotate", owner, "user", entryID,
+		`{"password":"`+password+`"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manual rotate returned %d, want 200: %s\n"+
+			"the user is told their secret does not exist while looking at it", rec.Code, rec.Body.String())
+	}
+
+	after, err := queries.GetVaultEntryForRotation(ctx, entryID)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(plain) == "OLD-VALUE" {
+		t.Error("manual rotate returned success but the stored value is unchanged")
 	}
 }

@@ -75,8 +75,12 @@ WHERE (CAST(@user_filter AS TEXT) = '' OR a.user_id = @user_filter)
          AND substr(a.action, 1, length(CAST(@action_prefix AS TEXT))) = CAST(@action_prefix AS TEXT))
      OR (CAST(@action_prefix AS TEXT) = '' AND a.action = @action_filter)
   )
+-- Named params throughout. Mixing @named with positional ? made sqlc emit ELEVEN
+-- placeholders for a call that passes five arguments, so every request to
+-- GET /api/activity failed with "sql: expected 11 arguments, got 5" and the
+-- admin audit log was entirely dead. Never mix the two styles in one query.
 ORDER BY a.created_at DESC
-LIMIT ? OFFSET ?;
+LIMIT @row_limit OFFSET @row_offset;
 
 -- name: CountActivityEntriesFiltered :one
 SELECT COUNT(*) FROM activity_log a

@@ -458,8 +458,17 @@ func newTestDB(t *testing.T) *sql.DB {
 			encryption_version INTEGER DEFAULT 2,
 			destination_patterns TEXT NOT NULL DEFAULT '[]',
 			injection_spec TEXT NOT NULL DEFAULT '{}',
+		custom_fields TEXT NOT NULL DEFAULT '',
+		last_rotation_error TEXT DEFAULT '',
+		last_rotated_at DATETIME,
+		provider TEXT DEFAULT '',
+		provider_meta TEXT DEFAULT '{}',
+		rotation_log TEXT DEFAULT '[]',
+		rotation_targets TEXT DEFAULT '[]',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(user_id, name)
-		)`,
+	)`,
 		`CREATE TABLE collection_members (
 			collection_id TEXT NOT NULL,
 			user_id TEXT NOT NULL,

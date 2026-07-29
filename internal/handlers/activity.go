@@ -111,7 +111,7 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 	if listErr == nil {
 		rows, err := h.queries.ListActivityEntriesFiltered(ctx, db.ListActivityEntriesFilteredParams{
 			UserFilter: userFilter, ActionFilter: exact, ActionPrefix: prefix,
-			Limit: int64(limit), Offset: int64(offset),
+			RowLimit: int64(limit), RowOffset: int64(offset),
 		})
 		if err != nil {
 			listErr = err

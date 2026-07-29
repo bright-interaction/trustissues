@@ -300,3 +300,49 @@ func TestOwnAPIKeyIsTokenized(t *testing.T) {
 		}
 	})
 }
+
+// TestNationalPhoneFormatsAreTokenized covers the formats a Swedish team writes.
+//
+// The pattern required a leading "+", so only E.164 matched and every national
+// format egressed verbatim through the AI gateway. That is most real phone
+// numbers in the product's actual market.
+func TestNationalPhoneFormatsAreTokenized(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		for name, phone := range map[string]string{
+			"swedish mobile":   "070-123 45 67",
+			"swedish landline": "08-123 456 78",
+			"e164":             "+46 70 123 45 67",
+			"us":               "415-555-0199",
+		} {
+			out, err := s.RedactString(ctx, "call me on "+phone+" tomorrow")
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if strings.Contains(out, phone) {
+				t.Errorf("%s phone egressed verbatim to the LLM provider: %q", name, out)
+			}
+		}
+	})
+}
+
+// TestPhonePatternDoesNotEatOrdinaryNumbers is the other half: a pattern loose
+// enough to catch national formats must not tokenize years, counts or IDs.
+func TestPhonePatternDoesNotEatOrdinaryNumbers(t *testing.T) {
+	runOnAllStores(t, func(t *testing.T, store Store) {
+		ctx := context.Background()
+		s, _ := NewSession(ctx, store, "id", testKey(), time.Minute, HintFull)
+
+		for _, in := range []string{"we had 42 errors", "in 2026 we grew", "port 8080 is open", "id 12345"} {
+			out, err := s.RedactString(ctx, in)
+			if err != nil {
+				t.Fatalf("%q: %v", in, err)
+			}
+			if strings.Contains(out, "[shield:phone:") {
+				t.Errorf("ordinary text was tokenized as a phone number: %q -> %q", in, out)
+			}
+		}
+	})
+}

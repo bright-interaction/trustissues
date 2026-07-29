@@ -264,7 +264,7 @@ ORDER BY COALESCE(last_rotated_at, created_at) ASC;
 -- Do NOT re-add "AND auto_rotate = 1" here: it makes manual rotate panic
 -- (empty row -> nil nonce -> GCM) and validate 404 for every entry that is not
 -- auto-rotating.
-SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
+SELECT CAST(updated_at AS TEXT) AS updated_at_text, id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
 FROM vault_entries WHERE id = ?;
 
 -- name: GetVaultEntryTargets :one

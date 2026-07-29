@@ -2201,11 +2201,16 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the entry
+	// Update the entry. UpdatedAtText feeds the compare-and-swap; omitting it
+	// binds "", which never matches, so this write silently affected zero rows
+	// and the handler answered 404 for an entry the user was looking at. The
+	// sweep passed it and this path did not, so the CAS made manual rotation
+	// 100% dead while the test suite stayed green.
 	result, err := h.queries.RotateVaultEntryValue(ctx, db.RotateVaultEntryValueParams{
 		EncryptedValue: encrypted,
 		Nonce:          nonce,
 		ID:             id,
+		UpdatedAtText:  entryRow.UpdatedAtText,
 	})
 	if err != nil {
 		logError(r, "vault.rotate: update failed", "error", err)
@@ -2213,9 +2218,20 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		writeNotFound(w, r, "vault entry not found")
+	if rowsAffected, _ := result.RowsAffected(); rowsAffected == 0 {
+		// A CAS miss is a CONFLICT, not a missing entry, and saying "not found"
+		// about a row the caller is looking at sends them hunting for the wrong
+		// problem. It also matters that a provider has usually ALREADY minted the
+		// replacement key by this point, so record the orphan rather than
+		// dropping it silently: the old key is still live and the new one is
+		// stranded upstream with nobody holding it.
+		logError(r, "vault.rotate: entry changed during rotation, value not stored", "entry", id)
+		if providerName != "" {
+			recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+				entryRow.RotationLog.String, rotFailConflict, "manual", nil)
+		}
+		writeError(w, r, http.StatusConflict, "rotation_conflict",
+			"this secret changed while it was being rotated, so the new value was not stored; reload and try again")
 		return
 	}
 

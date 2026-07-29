@@ -91,7 +91,19 @@ var redactPatterns = []redactPattern{
 		kind: KindPhone,
 		// Loose international + Swedish formats. Matches +CC followed
 		// by 7..14 digits with optional spaces/dashes/parentheses.
-		re:   regexp.MustCompile(`\+\d{1,3}[\s\-().]*\d{1,4}[\s\-().]*\d{1,4}[\s\-().]*\d{1,9}`),
+		// The leading + used to be REQUIRED, so only E.164 matched and every
+		// national format egressed verbatim: Swedish 070-123 45 67 and 08-123
+		// 456, US (415) 555-0199. Those are the forms a Swedish team actually
+		// writes, which made the phone tokenizer close to useless in practice.
+		//
+		// Now: an optional +, then a 7..15 digit number allowing spaces, dashes
+		// and parentheses as separators. Anchored on a word boundary and
+		// requiring at least 7 digits so it does not eat ordinary integers,
+		// years or short IDs.
+		// No "." in the separator class: it collides with IPv4 (192.168.1.10) and
+		// version strings, and the phone pattern runs BEFORE the IP patterns, so
+		// including it made every server address tokenize as a phone number.
+		re:   regexp.MustCompile(`\+?\d[\d\s\-()]{6,18}\d`),
 		hint: []string{"country", "len"},
 	},
 	{

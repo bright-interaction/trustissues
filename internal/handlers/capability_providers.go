@@ -61,14 +61,14 @@ var CapabilityDefaults = map[string]struct {
 	Destinations []string
 	Injection    InjectionSpec
 }{
-	"cloudflare":   {[]string{"api.cloudflare.com/*"}, InjectionSpec{Type: "bearer"}},
-	"vercel":       {[]string{"api.vercel.com/*"}, InjectionSpec{Type: "bearer"}},
-	"resend":       {[]string{"api.resend.com/*"}, InjectionSpec{Type: "bearer"}},
-	"sendgrid":     {[]string{"api.sendgrid.com/*"}, InjectionSpec{Type: "bearer"}},
-	"twilio":       {[]string{"api.twilio.com/*"}, InjectionSpec{Type: "basic"}},
-	"linode":       {[]string{"api.linode.com/*"}, InjectionSpec{Type: "bearer"}},
-	"neon":         {[]string{"console.neon.tech/api/*"}, InjectionSpec{Type: "bearer"}},
-	"datadog":      {[]string{"api.datadoghq.com/*", "api.datadoghq.eu/*"}, InjectionSpec{Type: "header", Name: "DD-API-KEY"}},
+	"cloudflare": {[]string{"api.cloudflare.com/*"}, InjectionSpec{Type: "bearer"}},
+	"vercel":     {[]string{"api.vercel.com/*"}, InjectionSpec{Type: "bearer"}},
+	"resend":     {[]string{"api.resend.com/*"}, InjectionSpec{Type: "bearer"}},
+	"sendgrid":   {[]string{"api.sendgrid.com/*"}, InjectionSpec{Type: "bearer"}},
+	"twilio":     {[]string{"api.twilio.com/*"}, InjectionSpec{Type: "basic"}},
+	"linode":     {[]string{"api.linode.com/*"}, InjectionSpec{Type: "bearer"}},
+	"neon":       {[]string{"console.neon.tech/api/*"}, InjectionSpec{Type: "bearer"}},
+	"datadog":    {[]string{"api.datadoghq.com/*", "api.datadoghq.eu/*"}, InjectionSpec{Type: "header", Name: "DD-API-KEY"}},
 	// {instance} is expanded from the entry's provider_meta at seed time. See
 	// tenantPlaceholder below for why these three cannot ship a bare "*." host.
 	"grafana":      {[]string{"{instance}.grafana.net/*"}, InjectionSpec{Type: "bearer"}},
