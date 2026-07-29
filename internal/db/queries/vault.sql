@@ -114,7 +114,16 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- ============================================================================
 
 -- name: RotateVaultEntryValue :execresult
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- Compare-and-swap on updated_at.
+--
+-- The scheduled sweep snapshots every due entry at pass start and writes back
+-- minutes later, so a value a user saved during the pass was silently
+-- overwritten by the stale one. The extra predicate makes that a no-op instead:
+-- the caller checks RowsAffected and treats 0 as "someone else changed it,
+-- leave it alone and pick it up next pass". It also stops a rotation landing on
+-- an entry that was deleted mid-pass.
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND updated_at = ?;
 
 -- ============================================================================
 -- URL matching (browser extension autofill)
@@ -201,7 +210,7 @@ UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP WHERE 
 UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: ListVaultEntriesNeedingRotation :many
-SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
+SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, updated_at
 FROM vault_entries
 WHERE auto_rotate = 1
   AND provider != ''

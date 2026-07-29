@@ -55,3 +55,35 @@ SELECT COUNT(*) FROM activity_log WHERE action LIKE ? ESCAPE '\';
 
 -- name: CountActivityEntriesByUser :one
 SELECT COUNT(*) FROM activity_log WHERE user_id = ?;
+
+-- name: ListActivityEntriesFiltered :many
+-- One query for all three filters, mirroring ExportActivityEntries.
+--
+-- The list endpoint used a switch whose FIRST arm was "a user is selected", so
+-- picking a user silently discarded the action filter. The export twin already
+-- combined them, which meant the table and the CSV of the same view returned
+-- DIFFERENT rows: for an audit surface, two disagreeing answers is worse than
+-- one wrong one.
+SELECT a.id, a.user_id, u.email AS user_email, a.action, a.detail,
+       a.ip_address, a.user_agent, a.created_at
+FROM activity_log a
+LEFT JOIN users u ON u.id = a.user_id
+WHERE (CAST(@user_filter AS TEXT) = '' OR a.user_id = @user_filter)
+  AND (
+        (CAST(@action_filter AS TEXT) = '' AND CAST(@action_prefix AS TEXT) = '')
+     OR (CAST(@action_prefix AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(@action_prefix AS TEXT))) = CAST(@action_prefix AS TEXT))
+     OR (CAST(@action_prefix AS TEXT) = '' AND a.action = @action_filter)
+  )
+ORDER BY a.created_at DESC
+LIMIT ? OFFSET ?;
+
+-- name: CountActivityEntriesFiltered :one
+SELECT COUNT(*) FROM activity_log a
+WHERE (CAST(@user_filter AS TEXT) = '' OR a.user_id = @user_filter)
+  AND (
+        (CAST(@action_filter AS TEXT) = '' AND CAST(@action_prefix AS TEXT) = '')
+     OR (CAST(@action_prefix AS TEXT) != ''
+         AND substr(a.action, 1, length(CAST(@action_prefix AS TEXT))) = CAST(@action_prefix AS TEXT))
+     OR (CAST(@action_prefix AS TEXT) = '' AND a.action = @action_filter)
+  );

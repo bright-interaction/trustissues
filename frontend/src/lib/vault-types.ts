@@ -193,14 +193,23 @@ export const vaultApi = {
       body: JSON.stringify({ collection_id: collectionId }),
     }),
   // Rotation delivery targets (where a rotated secret is pushed).
-  getTargets: (id: string) => request<RotationTarget[]>(`/vault/${id}/targets`),
+  // Returns the list plus a version pinning the view. Send that version back on
+  // save so a panel held open across an offboarding purge cannot resubmit the
+  // departed member's webhook and have it re-attributed to whoever saved.
+  getTargets: (id: string) =>
+    request<{ targets: RotationTarget[]; version: string }>(`/vault/${id}/targets`),
   // `clear` must be set to send an EMPTY array. The server refuses a blind
   // wipe of a non-empty target list, because a failed GET used to render
   // identically to "no targets" and Save is a full replace, so an accidental []
   // deleted real targets (webhook HMAC secrets included) with a success toast.
   // Deleting the last target in the UI is a deliberate act, so the panel opts in.
-  updateTargets: (id: string, targets: RotationTarget[], opts?: { clear?: boolean }) =>
-    request<RotationTarget[]>(`/vault/${id}/targets${opts?.clear ? '?clear=1' : ''}`, {
+  updateTargets: (id: string, targets: RotationTarget[], opts?: { clear?: boolean; version?: string }) =>
+    request<RotationTarget[]>(
+      `/vault/${id}/targets?${new URLSearchParams({
+        ...(opts?.clear ? { clear: '1' } : {}),
+        ...(opts?.version ? { version: opts.version } : {}),
+      }).toString()}`,
+      {
       method: 'PUT',
       body: JSON.stringify(targets),
     }),

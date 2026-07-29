@@ -93,65 +93,31 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	switch {
-	case userFilter != "":
-		total, listErr = h.queries.CountActivityEntriesByUser(ctx, toNullString(userFilter))
-		if listErr == nil {
-			rows, err := h.queries.ListActivityEntriesByUser(ctx, db.ListActivityEntriesByUserParams{
-				UserID: toNullString(userFilter), Limit: int64(limit), Offset: int64(offset),
-			})
-			if err != nil {
-				listErr = err
-			} else {
-				for _, row := range rows {
-					appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
-				}
-			}
-		}
-	case strings.HasSuffix(actionFilter, ".*"):
-		// Category filter, e.g. "vault.*". The UI has always offered these, but
-		// the only filter query was an exact match, so every wildcard option
-		// silently returned zero rows and read as "nothing ever happened".
-		pattern := likePrefixPattern(strings.TrimSuffix(actionFilter, "*"))
-		total, listErr = h.queries.CountActivityEntriesByActionPrefix(ctx, pattern)
-		if listErr == nil {
-			rows, err := h.queries.ListActivityEntriesByActionPrefix(ctx, db.ListActivityEntriesByActionPrefixParams{
-				Action: pattern, Limit: int64(limit), Offset: int64(offset),
-			})
-			if err != nil {
-				listErr = err
-			} else {
-				for _, row := range rows {
-					appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
-				}
-			}
-		}
-	case actionFilter != "":
-		total, listErr = h.queries.CountActivityEntriesByAction(ctx, actionFilter)
-		if listErr == nil {
-			rows, err := h.queries.ListActivityEntriesByAction(ctx, db.ListActivityEntriesByActionParams{
-				Action: actionFilter, Limit: int64(limit), Offset: int64(offset),
-			})
-			if err != nil {
-				listErr = err
-			} else {
-				for _, row := range rows {
-					appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
-				}
-			}
-		}
-	default:
-		total, listErr = h.queries.CountActivityEntries(ctx)
-		if listErr == nil {
-			rows, err := h.queries.ListActivityEntries(ctx, db.ListActivityEntriesParams{
-				Limit: int64(limit), Offset: int64(offset),
-			})
-			if err != nil {
-				listErr = err
-			} else {
-				for _, row := range rows {
-					appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
-				}
+	// One query for all three filters, matching the export twin exactly.
+	//
+	// This used to be a switch whose first arm was "a user is selected", so
+	// picking a user silently dropped the action filter, and the table and the
+	// CSV export of the SAME view returned different rows. Two disagreeing
+	// answers is the worst outcome for an audit surface.
+	prefix := ""
+	exact := actionFilter
+	if strings.HasSuffix(actionFilter, ".*") {
+		prefix = strings.TrimSuffix(actionFilter, "*")
+		exact = ""
+	}
+	total, listErr = h.queries.CountActivityEntriesFiltered(ctx, db.CountActivityEntriesFilteredParams{
+		UserFilter: userFilter, ActionFilter: exact, ActionPrefix: prefix,
+	})
+	if listErr == nil {
+		rows, err := h.queries.ListActivityEntriesFiltered(ctx, db.ListActivityEntriesFilteredParams{
+			UserFilter: userFilter, ActionFilter: exact, ActionPrefix: prefix,
+			Limit: int64(limit), Offset: int64(offset),
+		})
+		if err != nil {
+			listErr = err
+		} else {
+			for _, row := range rows {
+				appendEntry(row.ID, row.UserID, row.UserEmail, row.Detail, row.IpAddress, row.UserAgent, row.Action, row.CreatedAt)
 			}
 		}
 	}

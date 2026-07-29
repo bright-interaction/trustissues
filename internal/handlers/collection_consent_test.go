@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/brightinteraction/trustissues/internal/db"
@@ -114,5 +115,66 @@ func TestPendingMembershipGrantsNothing(t *testing.T) {
 	}
 	if n, _ := res2.RowsAffected(); n != 0 {
 		t.Fatalf("second accept affected %d rows, want 0", n)
+	}
+}
+
+// TestConsentCardNamesTheRealInviter locks the identity the consent decision
+// rests on.
+//
+// The card read "Invited by <email>" and that email came from
+// collections.created_by, i.e. whoever created the COLLECTION. collection_members
+// had no inviter column, so it could not be right by construction. Any manager
+// of a collection created by a trusted person therefore inherited that person's
+// name on the card, and the consent step is the only control against the attack
+// migration 00029 exists for: planting a credential that lands in a colleague's
+// vault list and autofill.
+func TestConsentCardNamesTheRealInviter(t *testing.T) {
+	_, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	creator := mustUser(t, queries, "card-creator@example.com", "admin", "")
+	inviter := mustUser(t, queries, "card-inviter@example.com", "user", "")
+	victim := mustUser(t, queries, "card-victim@example.com", "user", "")
+
+	mustCollection(t, queries, "coll-card", creator, map[string]string{
+		creator: collRoleManager,
+		inviter: collRoleManager,
+	})
+
+	// The inviter, not the creator, sends the invitation.
+	if err := queries.AddCollectionMember(ctx, db.AddCollectionMemberParams{
+		CollectionID: "coll-card", UserID: victim, Role: collRoleViewer,
+		AcceptedAt: sql.NullTime{}, InvitedBy: toNullString(inviter),
+	}); err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+
+	pending, err := queries.ListPendingCollectionInvitesForUser(ctx, victim)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending invite, got %d", len(pending))
+	}
+	got := nullStringToString(pending[0].InvitedByEmail)
+	if got == "card-creator@example.com" {
+		t.Error("the consent card names the collection's CREATOR, so any manager can borrow " +
+			"a trusted colleague's name to get an invitation accepted")
+	}
+	if got != "card-inviter@example.com" {
+		t.Errorf("consent card names %q, want the actual inviter", got)
+	}
+
+	// A role change on an ACCEPTED member must not rewrite who brought them in.
+	if _, err := queries.AcceptCollectionInvite(ctx, db.AcceptCollectionInviteParams{
+		CollectionID: "coll-card", UserID: victim,
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if err := queries.AddCollectionMember(ctx, db.AddCollectionMemberParams{
+		CollectionID: "coll-card", UserID: victim, Role: collRoleEditor,
+		AcceptedAt: sql.NullTime{}, InvitedBy: toNullString(creator),
+	}); err != nil {
+		t.Fatalf("role change: %v", err)
 	}
 }

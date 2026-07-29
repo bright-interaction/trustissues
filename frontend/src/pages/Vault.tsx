@@ -889,7 +889,7 @@ function PendingInvitesCard() {
                       <p className="mt-0.5 truncate text-xs text-slate-500">{invite.description}</p>
                     )}
                     <p className="mt-0.5 text-xs text-slate-400">
-                      Invited by {invite.invited_by_email}
+                      Invited by {invite.invited_by_email || 'a manager of this collection'}
                       {invite.invited_at ? ` · ${timeAgo(invite.invited_at)}` : ''}
                     </p>
                   </div>
@@ -2380,7 +2380,16 @@ export default function Vault() {
                         </button>
                       </form>
                     )}
-                    {rotationPanelId === entry.id && <RotationManager entry={entry} />}
+                    {rotationPanelId === entry.id && (
+                      <RotationManager
+                        entry={entry}
+                        onScheduleSaved={(patch) =>
+                          setVaultEntries((prev) =>
+                            prev.map((e) => (e.id === entry.id ? { ...e, ...patch } : e))
+                          )
+                        }
+                      />
+                    )}
                   </div>
                 ))}
               </div>

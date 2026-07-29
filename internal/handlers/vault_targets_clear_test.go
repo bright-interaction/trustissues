@@ -150,3 +150,100 @@ func TestDamagedTargetsColumnIsNotOverwritten(t *testing.T) {
 		t.Error("the still-recoverable targets ciphertext was overwritten; the webhook HMAC secret is unrecoverable now")
 	}
 }
+
+// TestStalePanelCannotResurrectAPurgedTarget locks the durability of the
+// offboarding purge.
+//
+// UpdateTargets is a full replace and preserves ConfiguredBy only for targets
+// STILL stored. So a manager with the rotation panel open across an offboarding
+// would resubmit the departed member's webhook; the purge had removed it, so it
+// matched nothing and was stamped with the SAVER's id. targetStillAuthorized
+// then asked whether that id still has write access, said yes, and plaintext
+// delivery to the leaver's address was quietly reopened by someone who thought
+// they were adding an unrelated target.
+//
+// The panel now pins the view with a version and the server refuses a stale one.
+func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	manager := mustUser(t, queries, "stale-mgr@example.com", "user", "")
+	leaver := mustUser(t, queries, "stale-leaver@example.com", "user", "")
+	mustCollection(t, queries, "coll-stale", manager, map[string]string{
+		manager: collRoleManager,
+		leaver:  collRoleEditor,
+	})
+	const entryID = "entry-stale"
+	mustEntry(t, h, queries, entryID, manager, "Stripe", "sk_live_x")
+	placeInCollection(t, queries, entryID, "coll-stale")
+
+	// The leaver configures a delivery target.
+	body := `[{"type":"webhook","label":"leaver","webhook_url":"https://leaver.example.com/hook"}]`
+	rec := httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT", "/api/vault/"+entryID+"/targets", leaver, "user", entryID, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ABORT: leaver could not set a target: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The manager opens the panel and captures the version it was shown.
+	rec = httptest.NewRecorder()
+	h.GetTargets(rec, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", manager, "user", entryID, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ABORT: manager could not load the panel: %d", rec.Code)
+	}
+	var loaded struct {
+		Targets []RotationTarget `json:"targets"`
+		Version string           `json:"version"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &loaded); err != nil || loaded.Version == "" {
+		t.Fatalf("ABORT: no version returned, the staleness check cannot work: %s", rec.Body.String())
+	}
+
+	// The leaver is offboarded and their target purged while the panel is open.
+	if _, err := queries.RemoveCollectionMember(ctx, db.RemoveCollectionMemberParams{
+		CollectionID: "coll-stale", UserID: leaver,
+	}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	ch := &CollectionHandler{queries: queries, vault: h}
+	if summary := ch.purgeTargetsConfiguredBy(ctx, "coll-stale", leaver); summary == "" {
+		t.Fatal("ABORT: the purge removed nothing, so this no longer tests resurrection")
+	}
+
+	// The manager saves the stale panel, adding one of their own on top.
+	staleBody := `[{"type":"webhook","label":"leaver","webhook_url":"https://leaver.example.com/hook"},` +
+		`{"type":"webhook","label":"mine","webhook_url":"https://mine.example.com/hook"}]`
+	rec = httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT",
+		"/api/vault/"+entryID+"/targets?version="+loaded.Version, manager, "user", entryID, staleBody))
+	if rec.Code != http.StatusConflict {
+		t.Errorf("a stale panel save returned %d, want 409: the purged webhook would be written back "+
+			"and re-attributed to the saver, reopening plaintext delivery to the leaver", rec.Code)
+	}
+
+	// The purged target must still be gone.
+	raw, err := queries.GetVaultEntryTargets(ctx, entryID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	for _, tg := range ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets")) {
+		if tg.WebhookURL == "https://leaver.example.com/hook" {
+			t.Error("the offboarded member's webhook was resurrected")
+		}
+	}
+
+	// A save with the CURRENT version still works, or the panel is unusable.
+	rec = httptest.NewRecorder()
+	h.GetTargets(rec, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", manager, "user", entryID, ""))
+	var fresh struct {
+		Version string `json:"version"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &fresh)
+	rec = httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT",
+		"/api/vault/"+entryID+"/targets?version="+fresh.Version, manager, "user", entryID,
+		`[{"type":"webhook","label":"mine","webhook_url":"https://mine.example.com/hook"}]`))
+	if rec.Code != http.StatusOK {
+		t.Errorf("a save with the current version returned %d: the panel would be unusable", rec.Code)
+	}
+}

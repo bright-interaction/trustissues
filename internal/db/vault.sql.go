@@ -745,7 +745,7 @@ func (q *Queries) ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVa
 }
 
 const listVaultEntriesNeedingRotation = `-- name: ListVaultEntriesNeedingRotation :many
-SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets
+SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, updated_at
 FROM vault_entries
 WHERE auto_rotate = 1
   AND provider != ''
@@ -796,6 +796,7 @@ type ListVaultEntriesNeedingRotationRow struct {
 	LastRotatedAt        sql.NullTime   `json:"last_rotated_at"`
 	RotationLog          sql.NullString `json:"rotation_log"`
 	RotationTargets      sql.NullString `json:"rotation_targets"`
+	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
 func (q *Queries) ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVaultEntriesNeedingRotationRow, error) {
@@ -820,6 +821,7 @@ func (q *Queries) ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVa
 			&i.LastRotatedAt,
 			&i.RotationLog,
 			&i.RotationTargets,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1190,20 +1192,35 @@ func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]Res
 
 const rotateVaultEntryValue = `-- name: RotateVaultEntryValue :execresult
 
-UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND updated_at = ?
 `
 
 type RotateVaultEntryValueParams struct {
-	EncryptedValue []byte `json:"encrypted_value"`
-	Nonce          []byte `json:"nonce"`
-	ID             string `json:"id"`
+	EncryptedValue []byte       `json:"encrypted_value"`
+	Nonce          []byte       `json:"nonce"`
+	ID             string       `json:"id"`
+	UpdatedAt      sql.NullTime `json:"updated_at"`
 }
 
 // ============================================================================
 // Rotate (generate new secret value)
 // ============================================================================
+// Compare-and-swap on updated_at.
+//
+// The scheduled sweep snapshots every due entry at pass start and writes back
+// minutes later, so a value a user saved during the pass was silently
+// overwritten by the stale one. The extra predicate makes that a no-op instead:
+// the caller checks RowsAffected and treats 0 as "someone else changed it,
+// leave it alone and pick it up next pass". It also stops a rotation landing on
+// an entry that was deleted mid-pass.
 func (q *Queries) RotateVaultEntryValue(ctx context.Context, arg RotateVaultEntryValueParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, rotateVaultEntryValue, arg.EncryptedValue, arg.Nonce, arg.ID)
+	return q.db.ExecContext(ctx, rotateVaultEntryValue,
+		arg.EncryptedValue,
+		arg.Nonce,
+		arg.ID,
+		arg.UpdatedAt,
+	)
 }
 
 const updateVaultEntryAliasURL = `-- name: UpdateVaultEntryAliasURL :exec
