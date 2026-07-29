@@ -185,3 +185,70 @@ func TestManualRotateActuallyRotates(t *testing.T) {
 		t.Error("manual rotate returned success but the stored value is unchanged")
 	}
 }
+
+// TestManualRotateWorksForProviderBackedEntries covers the branch my round-12
+// test could not reach.
+//
+// TestManualRotateActuallyRotates uses an entry with NO provider, so it never
+// enters the CanAutoRotate branch. That branch persisted provider_meta BEFORE
+// the compare-and-swap, and that write bumps updated_at, which is the column the
+// CAS compares against a snapshot taken earlier. So the handler invalidated its
+// own CAS and every provider-backed rotate 409'd after the provider had already
+// minted a replacement key, leaving an orphan upstream and stamping
+// last_rotation_error that only a successful rotate can clear.
+//
+// The sweep does CAS-then-meta and was always fine. Same operation, two orders,
+// and the test only covered the order that worked.
+func TestManualRotateWorksForProviderBackedEntries(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	const password = "CorrectHorseBatteryStaple1!"
+	owner := mustUser(t, queries, "provrot@example.com", "user", password)
+	const entryID = "prov-rot-1"
+	mustEntry(t, h, queries, entryID, owner, "Shared", "OLD-VALUE")
+
+	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+		Provider:     toNullString("shared-secret"),
+		ProviderMeta: toNullString("{}"),
+		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},
+		ID:           entryID,
+	}); err != nil {
+		t.Fatalf("set provider: %v", err)
+	}
+	// Age updated_at: without this the handler's own bump can land in the same
+	// second as the snapshot and the test passes for the wrong reason.
+	if _, err := h.db.Exec(
+		`UPDATE vault_entries SET updated_at = datetime('now','-1 hour') WHERE id = ?`, entryID); err != nil {
+		t.Fatalf("age: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.Rotate(rec, vaultAuthzRequest("POST", "/api/vault/"+entryID+"/rotate", owner, "user", entryID,
+		`{"password":"`+password+`"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("provider-backed rotate returned %d, want 200: %s\n"+
+			"the provider has already minted a replacement key, so this leaves an orphan upstream",
+			rec.Code, rec.Body.String())
+	}
+
+	after, err := queries.GetVaultEntryForRotation(ctx, entryID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(plain) == "OLD-VALUE" {
+		t.Error("rotate reported success but the stored value is unchanged")
+	}
+	meta, err := queries.GetVaultEntryMeta(ctx, entryID)
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if meta.LastRotationError.String != "" {
+		t.Errorf("a successful rotate left last_rotation_error set, so the entry shows "+
+			"\"error\" forever: %q", meta.LastRotationError.String)
+	}
+}
