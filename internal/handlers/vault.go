@@ -2238,19 +2238,6 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		revokeWarn = warn
 	}
 
-	// Fetch updated entry for response
-	row, err := h.queries.GetVaultEntryMeta(ctx, id)
-	if err != nil {
-		logError(r, "vault.rotate: fetch failed", "error", err)
-		writeInternalError(w, r, "internal server error")
-		return
-	}
-
-	entry := vaultEntryFull{
-		vaultEntryMeta: h.vaultMetaFromGetRow(row),
-	}
-	entry.Value = newValue
-
 	// Record the rotation outcome. The TRUE status depends on whether each
 	// configured target applied + verified the new key, so with targets we
 	// finalise the rotation_log in the delivery goroutine below (the HTTP
@@ -2260,7 +2247,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 
 	rec := rotationRecord{
 		EntryID:     id,
-		EntryName:   entry.Name,
+		EntryName:   meta.Name,
 		Provider:    providerName,
 		Method:      rotationMethod,
 		UserID:      userID,
@@ -2294,7 +2281,36 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		}(rec)
 	}
 
-	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, entry.Name, userID, len(targets)))
+	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, meta.Name, userID, len(targets)))
+
+	// The response body is fetched LAST, and a failure here degrades it instead of
+	// aborting.
+	//
+	// This read used to sit between the CAS and the outcome block, and its error
+	// path returned 500 immediately. By that point the value was durably rotated
+	// AND the predecessor key was already destroyed upstream, so the abort skipped
+	// everything that records or acts on it: no rotation_log entry, no
+	// last_rotation_error, no alert, no activity row, and no DeliverRotatedKey, so
+	// every configured webhook and CI secret kept the key that had just been
+	// revoked. The row reads "rotated seconds ago, no error" while its consumers are
+	// dead. If the entry was deleted in the window (delete needs no re-auth), the
+	// new plaintext is lost entirely and the successor key is stranded at the
+	// provider with nothing left to revoke it.
+	//
+	// Nothing about this read is load-bearing: it exists to fill the response body,
+	// and meta.Name (already in hand) is all the outcome recording needs. So the
+	// order is now record-then-render, and if the render input is gone we still
+	// return the new secret, which is the one thing the caller cannot obtain
+	// anywhere else.
+	entry := vaultEntryFull{}
+	if row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {
+		entry.vaultEntryMeta = h.vaultMetaFromGetRow(row)
+	} else {
+		logError(r, "vault.rotate: post-rotation fetch failed, returning the rotated value with "+
+			"pre-rotation metadata", "entry", id, "error", fErr)
+		entry.vaultEntryMeta = h.vaultMetaFromGetRow(meta)
+	}
+	entry.Value = newValue
 
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
