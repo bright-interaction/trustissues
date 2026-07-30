@@ -52,6 +52,13 @@ type rotationOutcome struct {
 	// test asserting only the database would have caught two of them while
 	// leaving operators un-notified.
 	alertWanted bool
+	// metaWrites is how many times provider_meta may be written, -1 to skip.
+	//
+	// Asserting the END STATE is useless here: the buggy manual path wrote meta
+	// twice and the second write REMOVED the transient markers, so a post-rotation
+	// read is clean with the bug fully present. Only counting the writes, and
+	// inspecting each version, can see it.
+	metaWrites int
 }
 
 type rotationCase struct {
@@ -166,6 +173,7 @@ func rotationCases() []rotationCase {
 			wantManualStatus: http.StatusOK,
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
+				metaWrites: 1,
 			},
 		},
 	}
@@ -326,6 +334,20 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 		t.Fatalf("age entry: %v", err)
 	}
 
+	if tc.want.metaWrites > 0 {
+		// Capture EVERY version of provider_meta as it is written, not just the
+		// final one. See rotationOutcome.metaWrites.
+		if _, err := h.db.Exec(`CREATE TABLE meta_writes (n INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+			t.Fatalf("create meta_writes: %v", err)
+		}
+		if _, err := h.db.Exec(`CREATE TRIGGER capture_meta
+			AFTER UPDATE OF provider_meta ON vault_entries
+			BEGIN INSERT INTO meta_writes (val) VALUES (NEW.provider_meta); END`); err != nil {
+			t.Fatalf("install meta-capture trigger: %v", err)
+		}
+		t.Cleanup(func() { _, _ = h.db.Exec(`DROP TRIGGER IF EXISTS capture_meta`) })
+	}
+
 	if tc.failPersist {
 		// Fail exactly the write that stores the rotated value, and nothing else.
 		//
@@ -410,6 +432,44 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 			"An operator who is not told is an operator who does not act. This is a "+
 			"separate symptom from the database record, deliberately.",
 			path, got, want.alertWanted, e.alerts.events)
+	}
+
+	if want.metaWrites > 0 {
+		rows, qErr := e.h.db.Query(`SELECT val FROM meta_writes ORDER BY n`)
+		if qErr != nil {
+			t.Fatalf("%s: read meta_writes: %v", path, qErr)
+		}
+		var versions []string
+		for rows.Next() {
+			var v string
+			if sErr := rows.Scan(&v); sErr != nil {
+				t.Fatalf("%s: scan meta_writes: %v", path, sErr)
+			}
+			versions = append(versions, v)
+		}
+		rows.Close()
+
+		if len(versions) != want.metaWrites {
+			t.Errorf("%s: provider_meta written %d times, want %d\n"+
+				"One logical change is one write. Two writes means the transient revoke "+
+				"markers were persisted and then cleaned up, and it bumps updated_at twice.",
+				path, len(versions), want.metaWrites)
+		}
+		// No version, at any point, may have carried the pending-revoke markers.
+		// vault_providers.go documents them as never reaching the database.
+		for i, v := range versions {
+			plain := e.h.decryptColumnOrLog(v, "{}", "provider_meta")
+			for _, marker := range []string{pendingRevokeMethod, pendingRevokeURL} {
+				if strings.Contains(plain, marker) {
+					t.Errorf("%s: provider_meta write #%d persisted the transient marker %q\n"+
+						"  value: %s\n"+
+						"These are stripped by performPendingRevoke and must never be stored: a crash "+
+						"or a dead context between the two writes leaves them behind, and the next "+
+						"revoke then targets a key id that is already gone.",
+						path, i+1, marker, plain)
+				}
+			}
+		}
 	}
 
 	if want.logStatus != "" {
