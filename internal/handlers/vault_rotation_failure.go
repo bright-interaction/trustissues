@@ -104,7 +104,13 @@ func recordRotationFailure(
 //
 // Best-effort by design: a no-op when no channel subscribes, and it never
 // panics the sweep.
-func dispatchRotationFailure(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+// A var for the same reason as dispatchRotationAlert: the rotation matrix asserts
+// that an operator was actually notified, and there are TWO dispatchers (this one
+// fires EventRotationFailed, the other EventRotationPartial). A recorder that
+// swaps only one of them reports "nobody was told" for a path that did tell them.
+var dispatchRotationFailure = dispatchRotationFailureReal
+
+func dispatchRotationFailureReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("vault rotation: failure alert dispatch panicked", "recover", r)
