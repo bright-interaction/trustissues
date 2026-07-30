@@ -1,0 +1,36 @@
+[
+ {"id":"disabled-check-removed","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"the disabled-account gate; without it a disabled user keeps every grant",
+  "old":"\t\tif u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil || u.Disabled != 0 {",
+  "new":"\t\tif u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil && u.Disabled != 0 {"},
+
+ {"id":"viewer-gets-manage","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"privilege inflation: a viewer must not manage",
+  "old":"\t\tcase collRoleViewer:\n\t\t\treturn entryGrant{read: true, use: true}",
+  "new":"\t\tcase collRoleViewer:\n\t\t\treturn entryGrant{read: true, use: true, manage: true}"},
+
+ {"id":"removed-creator-regains-use","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"THE eighth door: a removed creator keeps residual READ but must never SPEND again",
+  "old":"\tif isCreator {\n\t\treturn entryGrant{read: true}",
+  "new":"\tif isCreator {\n\t\treturn entryGrant{read: true, use: true}"},
+
+ {"id":"removed-creator-regains-manage","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"same row, the manage bit",
+  "old":"\tif isCreator {\n\t\treturn entryGrant{read: true}",
+  "new":"\tif isCreator {\n\t\treturn entryGrant{read: true, manage: true}"},
+
+ {"id":"non-member-creator-inflation","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"a creator outside any collection: the personal-ownership row",
+  "old":"\t\tif isCreator {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}",
+  "new":"\t\tif isCreator {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}\n\t\t}\n\t\tif true {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}"},
+
+ {"id":"admin-bypasses-disabled","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"ordering: is the disabled gate really BEFORE the admin shortcut?",
+  "old":"\tif isAdmin {\n\t\treturn entryGrant{read: true, use: true, manage: true}",
+  "new":"\tif isAdmin || true {\n\t\treturn entryGrant{read: true, use: true, manage: true}"},
+
+ {"id":"use-shim-returns-read","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault_grant.go",
+  "why":"the read-vs-use distinction: if the use shim answers read, every spend path re-opens",
+  "old":"func (h *VaultHandler) entryCurrentlyUsableBy(",
+  "new":"func (h *VaultHandler) entryCurrentlyUsableByABLATED("}
+]

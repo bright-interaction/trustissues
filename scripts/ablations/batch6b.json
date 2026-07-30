@@ -1,0 +1,6 @@
+[
+ {"id":"helper-classifies-nothing","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/auth.go",
+  "why":"the shared decision itself: if the helper never fires, all five doors reopen at once",
+  "old":"\tif !errors.Is(verifyErr, passwordhash.ErrBusy) {\n\t\treturn false\n\t}",
+  "new":"\tif !errors.Is(verifyErr, passwordhash.ErrBusy) || true {\n\t\treturn false\n\t}"}
+]

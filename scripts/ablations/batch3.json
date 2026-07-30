@@ -1,0 +1,20 @@
+[
+ {
+  "id": "drop-quoted-local-support",
+  "mech": "shield",
+  "test": "Corpus",
+  "file": "internal/shield/redact.go",
+  "why": "the fourth route into the partial-leak class: domain matched, local part left in the clear",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
+  "new": "[\\p{L}\\p{M}0-9._%+\\-]+@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}"
+ },
+ {
+  "id": "drop-p-M-again",
+  "mech": "shield",
+  "test": "Corpus",
+  "file": "internal/shield/redact.go",
+  "why": "the third route, re-verified after adding 19 new corpus classes",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9._%+\\-]+)@[\\p{L}0-9.\\-]+\\.[\\p{L}]{2,}"
+ }
+]

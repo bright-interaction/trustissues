@@ -1,0 +1,326 @@
+[
+ {
+  "id": "receiver-direct-h-queries",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "the canonical form the guard was written for",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\t_, _ = h.queries.CountVaultEntriesV1(ctx)\n"
+ },
+ {
+  "id": "argument-pass-h-queries",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "the second original bug: handing the pool to a helper",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\t_ = ablationTakesPool(ctx, h.queries)\n"
+ },
+ {
+  "id": "banned-LogActivity-by-name",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "the by-name ban",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\tLogActivity(h.queries, nil, \"ablation\", \"x\")\n"
+ },
+ {
+  "id": "local-alias-inside-window",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "pool := h.queries then pool.Foo(); the receiver is an Ident, not a SelectorExpr",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\tpool := h.queries\n\t_, _ = pool.CountVaultEntriesV1(ctx)\n"
+ },
+ {
+  "id": "alias-declared-before-window",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "the alias is created OUTSIDE the window, so a positional scan for h.queries cannot see it",
+  "old": "\ttx, err := h.db.BeginTx(ctx, nil)\n",
+  "new": "\tpoolEarly := h.queries\n\ttx, err := h.db.BeginTx(ctx, nil)\n\t_, _ = poolEarly.CountVaultEntriesV1(ctx)\n"
+ },
+ {
+  "id": "struct-literal-field",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "pool handed over inside a composite literal; a CompositeLit is not a CallExpr",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\tleak := rotationDeps{queries: h.queries, vault: h}\n\t_, _ = leak.queries.CountVaultEntriesV1(ctx)\n"
+ },
+ {
+  "id": "method-value-then-invoke",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "h.queries.Foo taken as a value, then invoked via the variable",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\tfn := h.queries.CountVaultEntriesV1\n\t_, _ = fn(ctx)\n"
+ },
+ {
+  "id": "closure-capture",
+  "mech": "tx-scope",
+  "file": "internal/handlers/vault.go",
+  "test": ".",
+  "why": "pool reached from a func literal declared inside the window",
+  "old": "\tqtx := h.queries.WithTx(tx)\n",
+  "new": "\tqtx := h.queries.WithTx(tx)\n\tfunc() { _, _ = h.queries.CountVaultEntriesV1(ctx) }()\n"
+ },
+ {
+  "id": "second-callsite-direct",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation.go",
+  "test": ".",
+  "why": "a second direct caller of the unchecked writer, the thing the chokepoint claims to prevent",
+  "old": "\t\tdeps := rotationDeps{queries: queries, vault: vaultHandler}\n",
+  "new": "\t\t_, _ = queries.RotateVaultEntryValueUnchecked(ctx, db.RotateVaultEntryValueUncheckedParams{})\n\t\tdeps := rotationDeps{queries: queries, vault: vaultHandler}\n"
+ },
+ {
+  "id": "empty-token-accepted",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "the guard that turns a missing CAS token into a hard error instead of a silent zero-row write",
+  "old": "\tif snap.EntryID == \"\" || snap.UpdatedAtText == \"\" {\n\t\treturn false, fmt.Errorf(\"%w (entry %q)\", errNoCASToken, snap.EntryID)\n\t}",
+  "new": "\tif snap.EntryID == \"\" {\n\t\treturn false, fmt.Errorf(\"%w (entry %q)\", errNoCASToken, snap.EntryID)\n\t}"
+ },
+ {
+  "id": "classify-unknown-as-auto",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "an unregistered provider misclassified as auto-rotating",
+  "old": "\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerUnknown, nil\n\t}",
+  "new": "\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerAuto, nil\n\t}"
+ },
+ {
+  "id": "classify-unknown-as-none",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "an unregistered provider misclassified as a local secret, which is the destructive one",
+  "old": "\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerUnknown, nil\n\t}",
+  "new": "\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerNone, nil\n\t}"
+ },
+ {
+  "id": "classify-reminder-as-auto",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "a reminder-only provider misclassified as able to rotate itself",
+  "old": "\tif !p.CanAutoRotate() {\n\t\treturn providerReminder, p\n\t}",
+  "new": "\tif false {\n\t\treturn providerReminder, p\n\t}"
+ },
+ {
+  "id": "mayGenerateLocally-always-true",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "the fail-closed belt over the local generator",
+  "old": "func (r providerRole) mayGenerateLocally() bool { return r == providerNone }",
+  "new": "func (r providerRole) mayGenerateLocally() bool { return true }"
+ },
+ {
+  "id": "happy-path-value-unchanged",
+  "mech": "rotation-matrix",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": ".",
+  "why": "the 3 original rows were never ablated: can valueChanged actually fail?",
+  "old": "\tn, err := res.RowsAffected()\n\tif err != nil {\n\t\treturn false, err\n\t}\n\treturn n > 0, nil",
+  "new": "\tn, err := res.RowsAffected()\n\tif err != nil {\n\t\treturn false, err\n\t}\n\t_ = n\n\treturn true, nil"
+ },
+ {
+  "id": "errSummary-never-recorded",
+  "mech": "rotation-matrix",
+  "file": "internal/handlers/vault_rotation_core.go",
+  "test": ".",
+  "why": "can errorRecorded actually fail across both drivers?",
+  "old": "\t\tLastRotationError: toNullString(errSummary),",
+  "new": "\t\tLastRotationError: toNullString(\"\"),"
+ },
+ {
+  "id": "log-never-appended",
+  "mech": "rotation-matrix",
+  "file": "internal/handlers/vault_rotation_core.go",
+  "test": ".",
+  "why": "can logStatus actually fail across both drivers?",
+  "old": "\tupdatedLog := AppendRotationLog(rec.RotationLog, RotationLogEntry{",
+  "new": "\tupdatedLog := rec.RotationLog\n\t_ = AppendRotationLog(rec.RotationLog, RotationLogEntry{"
+ },
+ {
+  "id": "alert-never-dispatched",
+  "mech": "rotation-matrix",
+  "file": "internal/handlers/vault_rotation_core.go",
+  "test": ".",
+  "why": "can alertWanted actually fail?",
+  "old": "\tif revokeAlert {\n\t\tdispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)\n\t}",
+  "new": "\tif false && revokeAlert {\n\t\tdispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)\n\t}"
+ },
+ {
+  "id": "drop-quoted-local-support",
+  "mech": "shield",
+  "test": ".",
+  "file": "internal/shield/redact.go",
+  "why": "the fourth route into the partial-leak class: domain matched, local part left in the clear",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
+  "new": "[\\p{L}\\p{M}0-9._%+\\-]+@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}"
+ },
+ {
+  "id": "drop-p-M-again",
+  "mech": "shield",
+  "test": ".",
+  "file": "internal/shield/redact.go",
+  "why": "the third route, re-verified after adding 19 new corpus classes",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9._%+\\-]+)@[\\p{L}0-9.\\-]+\\.[\\p{L}]{2,}"
+ },
+ {
+  "id": "disabled-check-removed",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "the disabled-account gate; without it a disabled user keeps every grant",
+  "old": "\t\tif u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil || u.Disabled != 0 {",
+  "new": "\t\tif u, uErr := h.queries.GetUserByID(ctx, userID); uErr != nil && u.Disabled != 0 {"
+ },
+ {
+  "id": "viewer-gets-manage",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "privilege inflation: a viewer must not manage",
+  "old": "\t\tcase collRoleViewer:\n\t\t\treturn entryGrant{read: true, use: true}",
+  "new": "\t\tcase collRoleViewer:\n\t\t\treturn entryGrant{read: true, use: true, manage: true}"
+ },
+ {
+  "id": "removed-creator-regains-use",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "THE eighth door: a removed creator keeps residual READ but must never SPEND again",
+  "old": "\tif isCreator {\n\t\treturn entryGrant{read: true}",
+  "new": "\tif isCreator {\n\t\treturn entryGrant{read: true, use: true}"
+ },
+ {
+  "id": "removed-creator-regains-manage",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "same row, the manage bit",
+  "old": "\tif isCreator {\n\t\treturn entryGrant{read: true}",
+  "new": "\tif isCreator {\n\t\treturn entryGrant{read: true, manage: true}"
+ },
+ {
+  "id": "non-member-creator-inflation",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "a creator outside any collection: the personal-ownership row",
+  "old": "\t\tif isCreator {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}",
+  "new": "\t\tif isCreator {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}\n\t\t}\n\t\tif true {\n\t\t\treturn entryGrant{read: true, use: true, manage: true}"
+ },
+ {
+  "id": "admin-bypasses-disabled",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault_grant.go",
+  "why": "ordering: is the disabled gate really BEFORE the admin shortcut?",
+  "old": "\tif isAdmin {\n\t\treturn entryGrant{read: true, use: true, manage: true}",
+  "new": "\tif isAdmin || true {\n\t\treturn entryGrant{read: true, use: true, manage: true}"
+ },
+ {
+  "id": "use-shim-answers-read",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault.go",
+  "why": "the read-vs-use distinction IS the eighth door; if the use shim answers .read, every spend path re-opens for a removed creator",
+  "old": "\treturn h.grantFor(ctx, userID, false, entryID).use",
+  "new": "\treturn h.grantFor(ctx, userID, false, entryID).read"
+ },
+ {
+  "id": "use-shim-admin-bypass",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault.go",
+  "why": "isAdmin false is deliberate here; flipping it makes every background spend privileged",
+  "old": "\treturn h.grantFor(ctx, userID, false, entryID).use",
+  "new": "\treturn h.grantFor(ctx, userID, true, entryID).use"
+ },
+ {
+  "id": "access-shim-returns-use-as-write",
+  "mech": "grant",
+  "test": ".",
+  "file": "internal/handlers/vault.go",
+  "why": "canWrite must be manage, not use; conflating them hands editing to viewers",
+  "old": "\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.manage",
+  "new": "\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.use"
+ },
+ {
+  "id": "vacuous-probe-WITH-before-half",
+  "mech": "grant-antivacuity",
+  "test": ".",
+  "file": "internal/handlers/access_revocation_test.go",
+  "why": "a probe that denies an ACTIVE editor makes the after-loop pass for free; the before-half must ABORT",
+  "old": "\t\t{name: \"grant.read\", run: func(t *testing.T, e *revocationEnv, u string) bool {\n\t\t\treturn e.h.grantFor(context.Background(), u, false, e.entryID).read\n\t\t}},",
+  "new": "\t\t{name: \"grant.read\", run: func(t *testing.T, e *revocationEnv, u string) bool {\n\t\t\treturn false // ABLATION: a probe that denies even an ACTIVE editor\n\t\t}},"
+ },
+ {
+  "id": "login-door-unclassified",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/auth.go",
+  "why": "door 1 of 5",
+  "old": "\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\treturn\n\t}",
+  "new": ""
+ },
+ {
+  "id": "totp-disable-door-unclassified",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/auth.go",
+  "why": "door 2 of 5, the one the guard found",
+  "old": "\tif capacityExhausted(w, r, verifyErr, \"totp.disable\") {\n\t\treturn\n\t}",
+  "new": ""
+ },
+ {
+  "id": "vault-reauth-doors-unclassified",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/vault.go",
+  "why": "doors 3 to 5, the reauth gates sharing login_attempts",
+  "old": "\t\tif capacityExhausted(w, r, verifyErr, \"vault.reauth\") {\n\t\t\treturn\n\t\t}\n",
+  "new": ""
+ },
+ {
+  "id": "helper-does-not-return",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/auth.go",
+  "why": "a 503 that falls through to recordFailure anyway is cosmetic",
+  "old": "\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\treturn\n\t}",
+  "new": "\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\t_ = verifyErr\n\t}"
+ },
+ {
+  "id": "helper-classifies-nothing",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/auth.go",
+  "why": "the shared decision itself",
+  "old": "\tif !errors.Is(verifyErr, passwordhash.ErrBusy) {\n\t\treturn false\n\t}",
+  "new": "\tif true {\n\t\treturn false\n\t}"
+ },
+ {
+  "id": "helper-classifies-nothing",
+  "mech": "lockout",
+  "test": ".",
+  "file": "internal/handlers/auth.go",
+  "why": "the shared decision itself: if the helper never fires, all five doors reopen at once",
+  "old": "\tif !errors.Is(verifyErr, passwordhash.ErrBusy) {\n\t\treturn false\n\t}",
+  "new": "\tif !errors.Is(verifyErr, passwordhash.ErrBusy) || true {\n\t\treturn false\n\t}"
+ }
+]

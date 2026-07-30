@@ -1,0 +1,19 @@
+[
+ {"id":"login-door-unclassified","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/auth.go",
+  "why":"door 1 of 5",
+  "old":"\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\treturn\n\t}","new":""},
+ {"id":"totp-disable-door-unclassified","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/auth.go",
+  "why":"door 2 of 5, the one the guard found",
+  "old":"\tif capacityExhausted(w, r, verifyErr, \"totp.disable\") {\n\t\treturn\n\t}","new":""},
+ {"id":"vault-reauth-doors-unclassified","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/vault.go",
+  "why":"doors 3 to 5, the reauth gates sharing login_attempts",
+  "old":"\t\tif capacityExhausted(w, r, verifyErr, \"vault.reauth\") {\n\t\t\treturn\n\t\t}\n","new":""},
+ {"id":"helper-does-not-return","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/auth.go",
+  "why":"a 503 that falls through to recordFailure anyway is cosmetic",
+  "old":"\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\treturn\n\t}",
+  "new":"\tif capacityExhausted(w, r, verifyErr, \"auth.login\") {\n\t\t_ = verifyErr\n\t}"},
+ {"id":"helper-classifies-nothing","mech":"lockout","test":"TestCapacityErrorIsNeverAFailedLoginAttempt","file":"internal/handlers/auth.go",
+  "why":"the shared decision itself",
+  "old":"\tif !errors.Is(verifyErr, passwordhash.ErrBusy) {\n\t\treturn false\n\t}",
+  "new":"\tif true {\n\t\treturn false\n\t}"}
+]

@@ -1,0 +1,41 @@
+[
+ {"id":"receiver-direct-h-queries","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"the canonical form the guard was written for",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\t_, _ = h.queries.CountVaultEntriesV1(ctx)\n"},
+
+ {"id":"argument-pass-h-queries","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"the second original bug: handing the pool to a helper",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\t_ = ablationTakesPool(ctx, h.queries)\n"},
+
+ {"id":"banned-LogActivity-by-name","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"the by-name ban",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\tLogActivity(h.queries, nil, \"ablation\", \"x\")\n"},
+
+ {"id":"local-alias-inside-window","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"pool := h.queries then pool.Foo(); the receiver is an Ident, not a SelectorExpr",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\tpool := h.queries\n\t_, _ = pool.CountVaultEntriesV1(ctx)\n"},
+
+ {"id":"alias-declared-before-window","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"the alias is created OUTSIDE the window, so a positional scan for h.queries cannot see it",
+  "old":"\ttx, err := h.db.BeginTx(ctx, nil)\n",
+  "new":"\tpoolEarly := h.queries\n\ttx, err := h.db.BeginTx(ctx, nil)\n\t_, _ = poolEarly.CountVaultEntriesV1(ctx)\n"},
+
+ {"id":"struct-literal-field","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"pool handed over inside a composite literal; a CompositeLit is not a CallExpr",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\tleak := rotationDeps{queries: h.queries, vault: h}\n\t_, _ = leak.queries.CountVaultEntriesV1(ctx)\n"},
+
+ {"id":"method-value-then-invoke","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"h.queries.Foo taken as a value, then invoked via the variable",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\tfn := h.queries.CountVaultEntriesV1\n\t_, _ = fn(ctx)\n"},
+
+ {"id":"closure-capture","mech":"tx-scope","file":"internal/handlers/vault.go","test":"TestNothingReachesThePoolInsideATransaction",
+  "why":"pool reached from a func literal declared inside the window",
+  "old":"\tqtx := h.queries.WithTx(tx)\n",
+  "new":"\tqtx := h.queries.WithTx(tx)\n\tfunc() { _, _ = h.queries.CountVaultEntriesV1(ctx) }()\n"}
+]

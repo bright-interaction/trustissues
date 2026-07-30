@@ -1,0 +1,11 @@
+[
+ {
+  "id": "vacuous-probe-WITH-before-half",
+  "mech": "grant-antivacuity",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/access_revocation_test.go",
+  "why": "a probe that denies an ACTIVE editor makes the after-loop pass for free; the before-half must ABORT",
+  "old": "\t\t{name: \"grant.read\", run: func(t *testing.T, e *revocationEnv, u string) bool {\n\t\t\treturn e.h.grantFor(context.Background(), u, false, e.entryID).read\n\t\t}},",
+  "new": "\t\t{name: \"grant.read\", run: func(t *testing.T, e *revocationEnv, u string) bool {\n\t\t\treturn false // ABLATION: a probe that denies even an ACTIVE editor\n\t\t}},"
+ }
+]

@@ -1,0 +1,50 @@
+[
+ {"id":"second-callsite-direct","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation.go","test":"TestRotateValueHasOneCallSite",
+  "why":"a second direct caller of the unchecked writer, the thing the chokepoint claims to prevent",
+  "old":"\t\tdeps := rotationDeps{queries: queries, vault: vaultHandler}\n",
+  "new":"\t\t_, _ = queries.RotateVaultEntryValueUnchecked(ctx, db.RotateVaultEntryValueUncheckedParams{})\n\t\tdeps := rotationDeps{queries: queries, vault: vaultHandler}\n"},
+
+ {"id":"empty-token-accepted","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract|TestManualRotate",
+  "why":"the guard that turns a missing CAS token into a hard error instead of a silent zero-row write",
+  "old":"\tif snap.EntryID == \"\" || snap.UpdatedAtText == \"\" {\n\t\treturn false, fmt.Errorf(\"%w (entry %q)\", errNoCASToken, snap.EntryID)\n\t}",
+  "new":"\tif snap.EntryID == \"\" {\n\t\treturn false, fmt.Errorf(\"%w (entry %q)\", errNoCASToken, snap.EntryID)\n\t}"},
+
+ {"id":"classify-unknown-as-auto","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract",
+  "why":"an unregistered provider misclassified as auto-rotating",
+  "old":"\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerUnknown, nil\n\t}",
+  "new":"\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerAuto, nil\n\t}"},
+
+ {"id":"classify-unknown-as-none","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract",
+  "why":"an unregistered provider misclassified as a local secret, which is the destructive one",
+  "old":"\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerUnknown, nil\n\t}",
+  "new":"\tp, ok := ProviderRegistry[name]\n\tif !ok {\n\t\treturn providerNone, nil\n\t}"},
+
+ {"id":"classify-reminder-as-auto","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract|TestManualRotateRefusesReminderOnly",
+  "why":"a reminder-only provider misclassified as able to rotate itself",
+  "old":"\tif !p.CanAutoRotate() {\n\t\treturn providerReminder, p\n\t}",
+  "new":"\tif false {\n\t\treturn providerReminder, p\n\t}"},
+
+ {"id":"mayGenerateLocally-always-true","mech":"cas-chokepoint","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract",
+  "why":"the fail-closed belt over the local generator",
+  "old":"func (r providerRole) mayGenerateLocally() bool { return r == providerNone }",
+  "new":"func (r providerRole) mayGenerateLocally() bool { return true }"},
+
+ {"id":"happy-path-value-unchanged","mech":"rotation-matrix","file":"internal/handlers/vault_rotation_cas.go","test":"TestRotationContract",
+  "why":"the 3 original rows were never ablated: can valueChanged actually fail?",
+  "old":"\tn, err := res.RowsAffected()\n\tif err != nil {\n\t\treturn false, err\n\t}\n\treturn n > 0, nil",
+  "new":"\tn, err := res.RowsAffected()\n\tif err != nil {\n\t\treturn false, err\n\t}\n\t_ = n\n\treturn true, nil"},
+
+ {"id":"errSummary-never-recorded","mech":"rotation-matrix","file":"internal/handlers/vault_rotation_core.go","test":"TestRotationContract",
+  "why":"can errorRecorded actually fail across both drivers?",
+  "old":"\t\tLastRotationError: toNullString(errSummary),","new":"\t\tLastRotationError: toNullString(\"\"),"},
+
+ {"id":"log-never-appended","mech":"rotation-matrix","file":"internal/handlers/vault_rotation_core.go","test":"TestRotationContract",
+  "why":"can logStatus actually fail across both drivers?",
+  "old":"\tupdatedLog := AppendRotationLog(rec.RotationLog, RotationLogEntry{",
+  "new":"\tupdatedLog := rec.RotationLog\n\t_ = AppendRotationLog(rec.RotationLog, RotationLogEntry{"},
+
+ {"id":"alert-never-dispatched","mech":"rotation-matrix","file":"internal/handlers/vault_rotation_core.go","test":"TestRotationContract",
+  "why":"can alertWanted actually fail?",
+  "old":"\tif revokeAlert {\n\t\tdispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)\n\t}",
+  "new":"\tif false && revokeAlert {\n\t\tdispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)\n\t}"}
+]
