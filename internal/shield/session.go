@@ -414,7 +414,18 @@ func (s *Session) shieldAny(ctx context.Context, v any) (any, error) {
 func (s *Session) shieldAnyUnderKey(ctx context.Context, key string, v any) (any, error) {
 	switch t := v.(type) {
 	case string:
-		if dereferencedURLKeys[key] {
+		// The exemption is for URLs the provider has to FETCH, so it is gated on
+		// the value actually being one. Keying it on the enclosing name alone
+		// exempted any content that happened to sit under a url-ish key:
+		//
+		//	{"url":"anna@example.se"}              -> unredacted
+		//	{"url":["anna@example.se","+46 70..."]} -> every element unredacted
+		//
+		// and because an array inherits its parent key, that covered every string
+		// leaf at any depth beneath url, image_url, audio_url, video_url,
+		// document_url, file_url, source_url and server_url. A caller putting a
+		// customer list under "source_url" got no redaction at all.
+		if dereferencedURLKeys[key] && looksLikeDereferenceableURL(t) {
 			return t, nil
 		}
 		return s.RedactString(ctx, t)
@@ -437,7 +448,26 @@ func (s *Session) shieldAnyUnderKey(ctx context.Context, key string, v any) (any
 			if err != nil {
 				return nil, err
 			}
-			out[k] = r
+			// The KEY is content too. The walker used to recurse into values only
+			// and copy keys straight through, so an address, phone number,
+			// personnummer or IBAN used as an object key egressed verbatim:
+			//
+			//	{"anna@example.se":"note about the client"}  -> unchanged
+			//
+			// That shape is not exotic. A per-customer aggregation keys on the
+			// customer, and a tool_use.input object or an input_schema.properties
+			// map carried in conversation history can key on anything the caller
+			// chose. Redacting is a no-op for ordinary schema names because they do
+			// not match any pattern.
+			//
+			// unshieldAny restores keys symmetrically; the two must always be
+			// changed together or the round-trip silently stops returning the
+			// original document.
+			outKey, kErr := s.RedactString(ctx, k)
+			if kErr != nil {
+				return nil, kErr
+			}
+			out[outKey] = r
 		}
 		return out, nil
 	default:
@@ -483,7 +513,14 @@ func (s *Session) unshieldAny(ctx context.Context, v any) (any, error) {
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
-			out[k] = r
+			// Keys are shielded (see shieldAnyUnderKey), so they must be unshielded
+			// too. Restoring values but not keys would return a document whose keys
+			// are still markers.
+			outKey, kErr := s.UnshieldString(ctx, k)
+			if kErr != nil && firstErr == nil {
+				firstErr = kErr
+			}
+			out[outKey] = r
 		}
 		return out, firstErr
 	default:
@@ -701,4 +738,17 @@ func extractHint(kind Kind, raw, key string) string {
 		}
 	}
 	return ""
+}
+
+// looksLikeDereferenceableURL reports whether a value under a url-ish key is
+// actually something a provider would fetch.
+//
+// Deliberately narrow: an absolute http(s) URL or a data: URI. The exemption
+// exists so Shield does not corrupt a link or an inline attachment the provider
+// must dereference, and nothing else under those keys has that justification.
+func looksLikeDereferenceableURL(v string) bool {
+	t := strings.TrimSpace(v)
+	return strings.HasPrefix(t, "http://") ||
+		strings.HasPrefix(t, "https://") ||
+		strings.HasPrefix(t, "data:")
 }
