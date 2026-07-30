@@ -1,7 +1,16 @@
 [
- {"id":"response-fetch-aborts-outcome","mech":"rotation-postcas","test":"TestRotationContract","file":"internal/handlers/vault.go",
-  "pkg":"./internal/handlers/",
-  "why":"the original bug: a cosmetic read returned 500 and skipped delivery, the log, the error field and the alert on a rotation that had already committed and already revoked the old key",
-  "old":"\tentry := vaultEntryFull{}\n\tif row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {\n\t\tentry.vaultEntryMeta = h.vaultMetaFromGetRow(row)\n\t} else {",
-  "new":"\tentry := vaultEntryFull{}\n\tif row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {\n\t\tentry.vaultEntryMeta = h.vaultMetaFromGetRow(row)\n\t} else if writeInternalError(w, r, \"internal server error\"); true {\n\t\treturn\n\t} else {"}
+ {"id":"notify-target-dispatches-nothing","mech":"notify-only","test":"TestRotationContract","file":"internal/handlers/vault_rotation_core.go",
+  "why":"the original bug: a Notify-only target transmitted nothing and reported a clean success anyway",
+  "old":"\talerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(\n\t\talerts.EventRotationSucceeded, \"\", \"\",\n\t\tmap[string]string{\"secret\": entryName, \"detail\": detail},\n\t)",
+  "new":"\t_ = entryName\n\t_ = detail"},
+
+ {"id":"notify-event-disabled-by-default","mech":"notify-only","test":"TestRotationContract","file":"internal/handlers/notifications.go",
+  "why":"a default-off success event makes the notify target silently do nothing again",
+  "old":"\talerts.EventRotationSucceeded: true,",
+  "new":"\talerts.EventRotationSucceeded: false,"},
+
+ {"id":"provider-body-unbounded","mech":"body-limit","test":"TestProviderBodyIsActuallyTruncated","file":"internal/handlers/vault_providers.go",
+  "why":"any upstream answering with an unbounded body could drive the server out of memory",
+  "old":"\treturn io.ReadAll(io.LimitReader(resp.Body, maxProviderBody))",
+  "new":"\treturn io.ReadAll(resp.Body)"}
 ]
