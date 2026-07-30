@@ -638,7 +638,31 @@ func (h *UserHandler) ResendInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go h.trySendInvitationEmail(row.Email, row.Name, h.openInviteCode(row.Code))
+	// openInviteCode returns "" when the stored code will not decrypt, and its own
+	// doc says the caller must render that as such rather than as a blank code. This
+	// call site did not: it mailed the invitee a branded email containing an EMPTY
+	// setup code, told the admin 200 "invitation email queued", and left nothing in
+	// the activity trail. The only evidence was one slog line.
+	//
+	// The invitation is unrecoverable through the product from there: redemption keys
+	// off code_hash and the plaintext was shown once at creation, so nobody can
+	// supply the code again. Sending the mail is the harm, because it burns the
+	// invitee's trust in a link that cannot work.
+	//
+	// Refuse instead, and say what to do. Revoking and re-inviting mints a fresh code.
+	code := h.openInviteCode(row.Code)
+	if code == "" {
+		logError(r, "invitations.resend: stored code did not decrypt, refusing to mail a blank code",
+			"invitation", row.ID, "email", row.Email)
+		LogActivityFromRequest(h.queries, r, "invitation.resend_failed",
+			fmt.Sprintf("Could not resend the invitation for %s: the stored code is unreadable", row.Email))
+		writeError(w, r, http.StatusConflict, "code_unreadable",
+			"this invitation's code could not be read, so no email was sent. Revoke it and invite "+
+				"the person again to mint a fresh code.")
+		return
+	}
+
+	go h.trySendInvitationEmail(row.Email, row.Name, code)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "invitation email queued"})
 }
 
@@ -786,6 +810,23 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 // It reads SMTP settings from the database; if SMTP is not configured it
 // silently returns.
 func (h *UserHandler) trySendInvitationEmail(toEmail, name, code string) {
+	// Never mail a blank setup code.
+	//
+	// The resend path is fixed at its own call site with a 409 the admin can act on,
+	// and this is the belt: every current and future caller passes a code through
+	// here, and a branded email containing an empty code is worse than no email at
+	// all. It burns the invitee's trust in a link that cannot work, and the
+	// invitation is unrecoverable through the product because redemption keys off
+	// code_hash and the plaintext was only ever shown once.
+	//
+	// One property, several doors, which is the shape that keeps recurring in this
+	// codebase: two call sites today and nothing stopping a third.
+	if strings.TrimSpace(code) == "" {
+		slog.Error("invitations: refusing to send an invitation email with an empty setup code",
+			"to", toEmail)
+		return
+	}
+
 	ctx := context.Background()
 
 	scanSetting := func(key string) string {
