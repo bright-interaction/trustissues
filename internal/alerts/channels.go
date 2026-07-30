@@ -40,10 +40,16 @@ const (
 
 // Event type constants for Trustissues alerts.
 const (
-	EventRotationPartial = "vault.rotation_partial"
-	EventRotationFailed  = "vault.rotation_failed"
-	EventSecretExpiring  = "vault.secret_expiring"
-	EventTest            = "test.notification"
+	// EventRotationSucceeded exists because the "notify" rotation target had nothing
+	// to fire. The catalogue held only failure events, so an operator who configured
+	// "Notify only" (whose entire purpose is "tell me, I will update the consumer
+	// myself") was told nothing: the credential rotated, the predecessor was revoked
+	// upstream, and the one person who needed to act never heard.
+	EventRotationSucceeded = "vault.rotation_succeeded"
+	EventRotationPartial   = "vault.rotation_partial"
+	EventRotationFailed    = "vault.rotation_failed"
+	EventSecretExpiring    = "vault.secret_expiring"
+	EventTest              = "test.notification"
 )
 
 // ConfigDecrypter decrypts encrypted channel configs. The vault handler

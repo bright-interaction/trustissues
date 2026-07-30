@@ -1,22 +1,16 @@
 [
- {
-  "id": "hint-level-unvalidated",
-  "mech": "config",
-  "test": "TestHintLevelTyposAreRefused",
-  "file": "internal/config/config.go",
-  "why": "the original bug: a misspelled level silently becomes the MOST verbose one",
-  "old": "\tif !shield.ValidHintLevel(c.ShieldHintLevel) {",
-  "new": "\tif false && !shield.ValidHintLevel(c.ShieldHintLevel) {",
-  "pkg": "./internal/config/"
- },
- {
-  "id": "validhintlevel-accepts-anything",
-  "mech": "config",
-  "test": "TestHintLevelTyposAreRefused",
-  "file": "internal/shield/shield.go",
-  "why": "the predicate itself",
-  "old": "func ValidHintLevel(s string) bool {\n\tfor _, n := range HintLevelNames {",
-  "new": "func ValidHintLevel(s string) bool {\n\tif true {\n\t\treturn true\n\t}\n\tfor _, n := range HintLevelNames {",
-  "pkg": "./internal/config/"
- }
+ {"id":"sendgrid-successor-loses-key-management","mech":"successor-scopes","test":"TestMintedSuccessorCanSustainTheRotationChain","file":"internal/handlers/vault_providers.go",
+  "why":"the original bug: the minted key got mail scopes only, so its own revoke, its Validate and the next mint all 403",
+  "old":"\t\t[]string{\"api_keys.create\", \"api_keys.read\", \"api_keys.delete\"})",
+  "new":"\t\tnil)"},
+
+ {"id":"backblaze-successor-loses-key-management","mech":"successor-scopes","test":"TestMintedSuccessorCanSustainTheRotationChain","file":"internal/handlers/vault_providers.go",
+  "why":"b2_create_key needs writeKeys and b2_delete_key needs deleteKeys; without them rotation works exactly once",
+  "old":"\t\t[]string{\"writeKeys\", \"deleteKeys\", \"listKeys\"})",
+  "new":"\t\tnil)"},
+
+ {"id":"successor-override-drops-required","mech":"successor-scopes","test":"TestMintedSuccessorCanSustainTheRotationChain","file":"internal/handlers/vault_providers.go",
+  "why":"an operator-declared scope list must still carry the management scopes, or widening the key re-breaks the chain",
+  "old":"\tfor _, s := range append(append([]string{}, declared...), required...) {",
+  "new":"\tfor _, s := range declared {"}
 ]

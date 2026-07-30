@@ -194,6 +194,21 @@ export default function UsersPage() {
   }
 
   function copyInviteLink(inv: Invitation) {
+    // An unreadable stored code comes back as an EMPTY string.
+    //
+    // The server returns "" from openInviteCode when the encrypted column will not
+    // decrypt, and this built a link from it anyway and reported success, so the admin
+    // sent a colleague a URL that cannot work and was told it had worked. The
+    // invitation is unrecoverable through the product (redemption keys off code_hash
+    // and the plaintext was shown once at creation), so the only fix is to revoke and
+    // re-invite. ResendInvitation already refuses this exact condition server-side;
+    // this was the third door onto the same state.
+    if (!inv.code) {
+      toast.error(
+        'This invitation\u2019s code could not be read, so no link was copied. Revoke it and invite the person again.'
+      );
+      return;
+    }
     const link = `${window.location.origin}/invite?code=${encodeURIComponent(inv.code)}`;
     navigator.clipboard
       .writeText(link)

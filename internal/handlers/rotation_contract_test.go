@@ -99,7 +99,10 @@ type rotationCase struct {
 	// corruptTargets makes rotation_targets undecryptable, which used to read as
 	// "no targets configured" and produce a clean success with no delivery.
 	corruptTargets bool
-	want           rotationOutcome
+	// notifyTarget adds a "Notify only" delivery target, whose entire purpose is to
+	// tell the operator so they can update a consumer by hand.
+	notifyTarget bool
+	want         rotationOutcome
 	// wantManualStatus is the HTTP status the manual path must return. The sweep
 	// has no HTTP surface, which is why this is not in rotationOutcome.
 	wantManualStatus int
@@ -200,6 +203,24 @@ func rotationCases() []rotationCase {
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
 				metaWrites: 1,
+			},
+		},
+		{
+			// A "Notify only" target must actually notify.
+			//
+			// It transmits nothing, so the delivery loop skips it, and its comment
+			// claimed the caller handled the notification. No caller did, and the
+			// alerts catalogue had no success event at all, so the one target type
+			// whose entire purpose is notification never notified anybody: the
+			// credential rotated, the predecessor was revoked, and the person who had
+			// asked to be told heard nothing.
+			name:             "notify-only target",
+			provider:         "shared-secret",
+			sweepApplicable:  true,
+			notifyTarget:     true,
+			wantManualStatus: http.StatusOK,
+			want: rotationOutcome{
+				valueChanged: true, errorRecorded: false, logStatus: "success", alertWanted: true,
 			},
 		},
 		{
@@ -390,16 +411,20 @@ func installRotationFakes(t *testing.T) *alertRecorder {
 	// not the other reports "nobody was notified" about a path that did notify, which
 	// is a false finding pointing at working code.
 	rec := &alertRecorder{}
-	prevAlert, prevFail := dispatchRotationAlert, dispatchRotationFailure
+	prevAlert, prevFail, prevOK := dispatchRotationAlert, dispatchRotationFailure, dispatchRotationSuccess
 	dispatchRotationAlert = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
 		rec.record("partial: " + detail)
 	}
 	dispatchRotationFailure = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
 		rec.record("failed: " + detail)
 	}
+	dispatchRotationSuccess = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+		rec.record("succeeded: " + detail)
+	}
 	t.Cleanup(func() {
 		dispatchRotationAlert = prevAlert
 		dispatchRotationFailure = prevFail
+		dispatchRotationSuccess = prevOK
 	})
 	return rec
 }
@@ -441,6 +466,17 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 		`UPDATE vault_entries SET last_rotated_at = datetime('now','-30 days'),
 		 updated_at = datetime('now','-1 hour') WHERE id = ?`, entryID); err != nil {
 		t.Fatalf("age entry: %v", err)
+	}
+
+	if tc.notifyTarget {
+		enc, encErr := h.encryptColumn(`[{"type":"notify"}]`)
+		if encErr != nil {
+			t.Fatalf("encrypt targets: %v", encErr)
+		}
+		if _, err := h.db.Exec(`UPDATE vault_entries SET rotation_targets = ? WHERE id = ?`,
+			enc, entryID); err != nil {
+			t.Fatalf("seed notify target: %v", err)
+		}
 	}
 
 	if tc.corruptTargets {
