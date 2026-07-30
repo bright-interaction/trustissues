@@ -102,7 +102,19 @@ var redactPatterns = []redactPattern{
 		// replaced by an explicit "not already part of an address" check in the
 		// character class itself: \b would not fire before "Å" anyway, because
 		// the byte before it is not an ASCII word character.
-		re:   regexp.MustCompile(`[\p{L}0-9._%+\-]+@[\p{L}0-9.\-]+\.[\p{L}]{2,}`),
+		// \p{M} (combining marks) is as load-bearing as \p{L}.
+		//
+		// The first fix swapped the ASCII class for \p{L} and I treated the class
+		// as closed. It was not: it only moved the boundary from "ASCII letter" to
+		// "composed letter". In NFD, "Å" is A + U+030A COMBINING RING ABOVE, and
+		// that mark is \p{M}, so a decomposed Swedish name leaks EXACTLY as the
+		// ASCII class did, on text that renders identically on screen. Devanagari
+		// matras (राहुल) and Vietnamese NFD (nguyễn) have the same shape and are
+		// not edge cases in either script.
+		//
+		// Third iteration on this one pattern. The lesson: widening a character
+		// class is not the same as covering a class of input.
+		re:   regexp.MustCompile(`[\p{L}\p{M}0-9._%+\-]+@[\p{L}\p{M}0-9.\-]+\.[\p{L}\p{M}]{2,}`),
 		hint: []string{"domain", "len"},
 	},
 	{
@@ -177,7 +189,7 @@ var redactPatterns = []redactPattern{
 		// against knownSuffixes, which lists ASCII TLDs. A fully non-ASCII TLD
 		// therefore still will not tokenize; that is a recall gap, not a partial
 		// leak, and partial leaks are the failure worth removing first.
-		re: regexp.MustCompile(`(?:[\p{L}0-9](?:[\p{L}0-9-]{0,61}[\p{L}0-9])?\.)+[a-zA-Z]{2,63}\b`),
+		re: regexp.MustCompile(`(?:[\p{L}\p{M}0-9](?:[\p{L}\p{M}0-9-]{0,61}[\p{L}\p{M}0-9])?\.)+[a-zA-Z]{2,63}\b`),
 	},
 }
 

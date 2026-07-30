@@ -15,6 +15,11 @@ email	forward to first.last+tag@sub.example.co.uk please
 # helpfully carried the domain. Swedish names are this product's common case.
 email	mail Åsa.Öberg@example.se today
 email	mail Jörg.Müller@firma.de today
+# NFD-decomposed: combining marks are \p{M}, not \p{L}, so the first Unicode
+# fix still leaked the prefix on text that renders identically to the NFC form.
+email	mail Åsa.Öberg@example.se today
+email	mail राहुल@example.com today
+email	mail nguyễn@example.com today
 phone	call me on 070-123 45 67 tomorrow
 phone	the office is 08-123 456 78
 phone	international is +46 70 123 45 67
