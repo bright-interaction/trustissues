@@ -328,12 +328,35 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	// token minted before the owner tightened the allow-list (enforcement was
 	// issue-time only) to the current policy. Skipped when the secret has no
 	// allow-list (nothing to tighten against).
-	if patterns := h.currentDestinationPatterns(ctx, tok.SecretID); len(patterns) > 0 {
-		if !destMatches(patterns, host, upstreamPath) {
-			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_not_in_current_allowlist", tok.Nonce)
-			writeError(w, r, http.StatusForbidden, "destination_mismatch", "destination is not in the secret's current allow-list")
-			return
-		}
+	// The secret's CURRENT allow-list is the ceiling, and an EMPTY one means no agent
+	// access at all.
+	//
+	// This used to be guarded by len(patterns) > 0, so the check was skipped exactly
+	// when the list was empty. Clearing the allow-list is the ONLY way the product
+	// offers to revoke an agent's access to one secret, so the single action meaning
+	// "revoke everything" was the one case not enforced, while merely tightening from
+	// three hosts to one WAS. Every token already outstanding (TTL up to 600s) kept
+	// spending the credential.
+	//
+	// Denying on empty is exactly consistent with issuance, which already refuses:
+	// "this secret has no agent destination allow-list, so no capability token can be
+	// minted for it". A token for a pattern-less secret could never legitimately
+	// exist, so nothing is lost by rejecting one.
+	//
+	// A read error denies too. It used to return nil and skip, so a transient database
+	// error opened the gate.
+	patterns, patErr := h.currentDestinationPatterns(ctx, tok.SecretID)
+	if patErr != nil {
+		slog.Error("capability.proxy: could not read the secret's current allow-list, denying",
+			"secret_id", tok.SecretID, "error", patErr)
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "allowlist_unreadable", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_mismatch", "the secret's current allow-list could not be read")
+		return
+	}
+	if len(patterns) == 0 || !destMatches(patterns, host, upstreamPath) {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_not_in_current_allowlist", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_mismatch", "destination is not in the secret's current allow-list")
+		return
 	}
 	if !capability.MethodMatches(tok, r.Method) {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "method_mismatch", tok.Nonce)
@@ -776,13 +799,20 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 // currentDestinationPatterns returns the secret's current destination allow-list,
 // used to re-validate a capability token against the owner's live policy at proxy
 // time. Returns nil on any error or when unset (caller treats nil as "no ceiling").
-func (h *CapabilityHandler) currentDestinationPatterns(ctx context.Context, secretID string) []string {
-	var raw string
+// currentDestinationPatterns reads the secret's CURRENT agent allow-list.
+//
+// It returns an error rather than an empty slice on failure, because the caller
+// treats "no patterns" as a policy decision and the two must not be confused. The
+// old signature returned nil for a query error, a deleted row and a genuinely empty
+// list alike, and the caller skipped its re-check for all three: a transient database
+// error opened the gate.
+func (h *CapabilityHandler) currentDestinationPatterns(ctx context.Context, secretID string) ([]string, error) {
+	var raw sql.NullString
 	if err := h.db.QueryRowContext(ctx,
 		`SELECT destination_patterns FROM vault_entries WHERE id = ?`, secretID).Scan(&raw); err != nil {
-		return nil
+		return nil, err
 	}
-	return parseDestinationPatterns(raw)
+	return parseDestinationPatterns(raw.String), nil
 }
 
 func splitHostPath(dest string) (host, path string) {
@@ -792,53 +822,54 @@ func splitHostPath(dest string) (host, path string) {
 	return dest, ""
 }
 
-// destMatches reports whether host+path is allowed by at least one of the
-// given destination patterns. It is a superset of capability.DestMatches: the
-// package matcher understands exact and trailing "/*" path globs but NOT a
-// leading "*." host wildcard, so provider presets like "*.grafana.net/*",
-// "*.auth0.com/*", and "*.supabase.co/*" would never match their per-tenant
-// hosts. Every production destination check routes through here so those
-// presets work; the exact/trailing-glob cases still delegate to the audited
-// package matcher to avoid re-implementing (and diverging from) its grammar.
+// destMatches reports whether host+path is allowed by at least one of the given
+// destination patterns.
+//
+// A HOST-WILDCARDED pattern is refused here, which makes this agree with
+// validateDestinations rather than being a superset of it.
+//
+// The two used to disagree: the validator rejects any "*" in a host, and this
+// matcher honoured a leading "*." via leadingWildcardMatch. So a stored row carrying
+// "*.supabase.co/*" (written by an older binary, by hand, or restored from an old
+// backup) was still enforced as a valid ceiling even though the product would refuse
+// to save it today, and nothing normalised existing rows. capability_providers.go
+// spells out why that shape is dangerous: anyone can register
+// attacker.supabase.co, and a token minted for one tenant's key would happily send
+// it there.
+//
+// Nothing needs the wildcard any more. The three presets that once required it
+// (grafana, auth0, supabase) ship a tenant placeholder instead, and
+// ExpandCapabilityDestinations refuses a "*" in a substituted tenant value, so no
+// code path emits one. Refusing at MATCH time is what closes the gap for rows that
+// already exist, since a validator only guards new writes.
+//
+// The exact and trailing-glob cases still delegate to the audited package matcher,
+// so its grammar is not re-implemented here.
 func destMatches(dests []string, host, path string) bool {
-	if capability.DestMatches(capability.Token{Dests: dests}, host, path) {
-		return true
-	}
-	dest := strings.ToLower(host + path)
+	safe := make([]string, 0, len(dests))
 	for _, pat := range dests {
-		if leadingWildcardMatch(strings.ToLower(pat), dest) {
-			return true
+		if hostIsWildcarded(pat) {
+			slog.Warn("capability: ignoring a stored destination whose host is wildcarded; "+
+				"it would allow every sibling domain on that suffix", "pattern", pat)
+			continue
 		}
+		safe = append(safe, pat)
 	}
-	return false
+	if len(safe) == 0 {
+		return false
+	}
+	return capability.DestMatches(capability.Token{Dests: safe}, host, path)
 }
 
-// leadingWildcardMatch matches a "*."-prefixed host preset such as
-// "*.grafana.net/*" against a concrete "host/path" dest. The wildcard covers
-// one or more subdomain labels: it matches "stack.grafana.net/..." and
-// "eu.stack.grafana.net/..." but never the apex "grafana.net", nor a sibling
-// suffix like "notgrafana.net", nor "grafana.net.evil.com". A pattern without a
-// leading "*." returns false here (handled by capability.DestMatches instead).
-// The path portion is matched with the same trailing-"/*" grammar the package
-// matcher uses, so "*.host/*" and "*.host/v1" behave like their non-wildcard
-// counterparts.
-func leadingWildcardMatch(pat, dest string) bool {
-	if !strings.HasPrefix(pat, "*.") {
-		return false
+// hostIsWildcarded reports whether a destination pattern wildcards its HOST, which
+// is the shape validateDestinations refuses. A "*" in the PATH is a legitimate
+// trailing glob and is left alone.
+func hostIsWildcarded(pat string) bool {
+	host := pat
+	if i := strings.Index(pat, "/"); i >= 0 {
+		host = pat[:i]
 	}
-	patHost, patPath := splitHostPath(pat)
-	destHost, destPath := splitHostPath(dest)
-	suffix := patHost[1:] // ".grafana.net"
-	// Require at least one non-empty label before the suffix so the apex and
-	// bare-suffix impostors ("notgrafana.net") do not match.
-	if len(destHost) <= len(suffix) || !strings.HasSuffix(destHost, suffix) {
-		return false
-	}
-	if strings.HasSuffix(patPath, "/*") {
-		prefix := strings.TrimSuffix(patPath, "/*")
-		return destPath == prefix || strings.HasPrefix(destPath, prefix+"/")
-	}
-	return destPath == patPath || strings.HasPrefix(destPath, patPath+"/")
+	return strings.Contains(host, "*")
 }
 
 func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID string) ([]byte, InjectionSpec, error) {
