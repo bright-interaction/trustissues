@@ -409,25 +409,20 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		}
 
 		secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey)
-		if !totp.ValidateCode(secret, req.TOTPCode) {
-			// Try recovery code
-			var hashedCodes []string
-			if rc := nullStringToString(totpState.TotpRecoveryCodes); rc != "" {
-				json.Unmarshal([]byte(rc), &hashedCodes)
-			}
-			remaining, valid := totp.ValidateRecoveryCode(hashedCodes, req.TOTPCode)
-			if !valid {
+		// spendTOTPStep, not ValidateCode: the code is accepted only if its time step
+		// can also be CONSUMED, which makes a captured code unusable twice inside its
+		// own 60-second window.
+		if !spendTOTPStep(r.Context(), h.queries, row.ID, secret, req.TOTPCode) {
+			// A recovery code is accepted ONLY if it is also durably spent.
+			//
+			// This was a read-modify-write with a plain UPDATE, and the login
+			// continued even when the write failed. Each code is a standalone 64-bit
+			// 2FA bypass, so a code already redeemed and crossed off a printed list
+			// stayed a working second factor. See consumeRecoveryCode.
+			if !consumeRecoveryCode(r.Context(), h.queries, row.ID, req.TOTPCode) {
 				recordFailure()
 				writeUnauthorized(w, r, "invalid 2FA code")
 				return
-			}
-			// Recovery code used: update stored codes
-			updatedCodes := mustMarshalJSON(remaining)
-			if dbErr := h.queries.UpdateRecoveryCodes(r.Context(), db.UpdateRecoveryCodesParams{
-				TotpRecoveryCodes: sql.NullString{String: string(updatedCodes), Valid: true},
-				ID:                row.ID,
-			}); dbErr != nil {
-				logError(r, "login: failed to update recovery codes", "error", dbErr)
 			}
 		}
 	}
@@ -728,7 +723,8 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Code string `json:"code"`
+		Code     string `json:"code"`
+		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeBadRequest(w, r, "code is required")
@@ -739,6 +735,39 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logError(r, "totp.verify: failed to query user email", "error", err)
 		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	// ENABLING 2FA requires the password, not just a session.
+	//
+	// Enrolment used to need only a live session or API key. Turning 2FA ON is an
+	// irreversible-by-the-owner act: after it, login demands a code the owner does not
+	// have, TOTPDisable demands a live code they cannot produce, the recovery codes
+	// were returned to whoever enrolled, and no admin route exists to reset another
+	// user's 2FA. So anyone holding a stolen session, or the vault_only extension API
+	// key handed out by the PUBLIC invite-redemption endpoint, could permanently lock
+	// the owner out of their own vault without ever knowing the password.
+	//
+	// Requiring the password here is what makes that impossible: the one credential a
+	// session thief does not have is the one that gates the irreversible action.
+	// Disabling already required it; enabling did not, which was the asymmetry.
+	passwordHash, phErr := h.queries.GetPasswordHashByUserID(r.Context(), userID)
+	if phErr != nil {
+		logError(r, "totp.verify: failed to query password hash", "error", phErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	pwOK, pwErr := passwordhash.Verify(req.Password, passwordHash)
+	if capacityExhausted(w, r, pwErr, "totp.verify") {
+		return
+	}
+	if pwErr != nil || !pwOK {
+		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
+			Email: userEmail, IpAddress: middleware.ClientIP(r), Success: 0,
+		}); dbErr != nil {
+			logError(r, "totp.verify: failed to record attempt", "error", dbErr)
+		}
+		writeUnauthorized(w, r, "your password is required to enable two-factor authentication")
 		return
 	}
 
@@ -878,11 +907,25 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	// A RECOVERY CODE is accepted here, not only a live authenticator code.
+	//
+	// It used to demand a live code, which made the advertised recovery mechanism a
+	// dead end: a user who loses their authenticator can log in with recovery codes
+	// (8 of them) but could never turn 2FA off, so after the eighth the account was
+	// permanently unauthenticatable, with no admin route to reset it. Recovery codes
+	// bought 8 more logins and nothing else.
+	//
+	// The password has already been verified above, so accepting a recovery code here
+	// requires BOTH factors: something known and something issued at enrolment. That
+	// is the same bar as a normal disable.
 	secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey)
-	if !totp.ValidateCode(secret, req.Code) {
-		recordFailure()
-		writeUnauthorized(w, r, "invalid 2FA code")
-		return
+	if !spendTOTPStep(r.Context(), h.queries, userID, secret, req.Code) {
+		if !consumeRecoveryCode(r.Context(), h.queries, userID, req.Code) {
+			recordFailure()
+			writeUnauthorized(w, r, "invalid 2FA or recovery code")
+			return
+		}
+		logError(r, "totp.disable: 2FA removed with a recovery code", "user_id", userID)
 	}
 
 	// Honour the vault policy. "Require two-factor authentication for all users"

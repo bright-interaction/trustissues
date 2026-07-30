@@ -1,0 +1,14 @@
+[
+ {"id":"enrol-without-password","mech":"2fa","test":"TestEnabling2FARequiresThePassword","file":"internal/handlers/auth.go","pkg":"./internal/handlers/",
+  "why":"a stolen session could permanently lock the owner out of their own vault",
+  "old":"\tif pwErr != nil || !pwOK {","new":"\tif pwErr != nil && !pwOK && false {"},
+
+ {"id":"recovery-cannot-disable","mech":"2fa","test":"TestARecoveryCodeCanRemove2FA","file":"internal/handlers/auth.go","pkg":"./internal/handlers/",
+  "why":"recovery codes bought 8 logins and could never remove 2FA",
+  "old":"\t\tif !consumeRecoveryCode(r.Context(), h.queries, userID, req.Code) {",
+  "new":"\t\tif true || !consumeRecoveryCode(r.Context(), h.queries, userID, req.Code) {"},
+
+ {"id":"recovery-lost-update","mech":"2fa","test":"TestARecoveryCodeIsSpentExactlyOnce","file":"internal/handlers/auth_totp_recovery.go","pkg":"./internal/handlers/",
+  "why":"a redeemed recovery code stayed a working 2FA bypass",
+  "old":"\t\tif n > 0 {\n\t\t\treturn true\n\t\t}","new":"\t\tif n >= 0 {\n\t\t\treturn true\n\t\t}"}
+]

@@ -10,6 +10,50 @@ import (
 	"database/sql"
 )
 
+const cASRecoveryCodes = `-- name: CASRecoveryCodes :execresult
+UPDATE users SET totp_recovery_codes = ?
+WHERE id = ? AND COALESCE(totp_recovery_codes, '') = ?
+`
+
+type CASRecoveryCodesParams struct {
+	TotpRecoveryCodes   sql.NullString `json:"totp_recovery_codes"`
+	ID                  string         `json:"id"`
+	TotpRecoveryCodes_2 sql.NullString `json:"totp_recovery_codes_2"`
+}
+
+// Compare-and-swap on the recovery-code list.
+//
+// Consumption was a read-modify-write: read the JSON array, drop the used code, write
+// the whole column back. With a plain UPDATE that is a lost update, and each code is a
+// standalone 64-bit 2FA bypass, so a code the user has already redeemed and crossed off
+// their printed list stays a working second factor.
+//
+// Two ways in: two concurrent logins each carrying a code both read before either
+// writes, and a failed persist that still completed the login. Comparing the column
+// itself means the second writer loses and retries against the winner's list.
+func (q *Queries) CASRecoveryCodes(ctx context.Context, arg CASRecoveryCodesParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, cASRecoveryCodes, arg.TotpRecoveryCodes, arg.ID, arg.TotpRecoveryCodes_2)
+}
+
+const claimTOTPStep = `-- name: ClaimTOTPStep :execresult
+UPDATE users SET totp_last_step = ?
+WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)
+`
+
+type ClaimTOTPStepParams struct {
+	TotpLastStep   sql.NullInt64 `json:"totp_last_step"`
+	ID             string        `json:"id"`
+	TotpLastStep_2 sql.NullInt64 `json:"totp_last_step_2"`
+}
+
+// Spend a TOTP time step, monotonically.
+//
+// Affects zero rows when the step has already been used (or an older one is being
+// replayed), which is how a captured code stops being reusable inside its own window.
+func (q *Queries) ClaimTOTPStep(ctx context.Context, arg ClaimTOTPStepParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, claimTOTPStep, arg.TotpLastStep, arg.ID, arg.TotpLastStep_2)
+}
+
 const countAdmins = `-- name: CountAdmins :one
 SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0
 `
