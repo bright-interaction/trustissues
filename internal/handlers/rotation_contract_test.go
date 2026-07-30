@@ -59,6 +59,10 @@ type rotationOutcome struct {
 	// read is clean with the bug fully present. Only counting the writes, and
 	// inspecting each version, can see it.
 	metaWrites int
+	// rowDeleted means the entry is gone by assert time, so the DB-derived
+	// post-conditions cannot be read. Only the out-of-band ones (the alert) are
+	// checked, and the alert assertion is what keeps the row from being vacuous.
+	rowDeleted bool
 }
 
 type rotationCase struct {
@@ -80,7 +84,10 @@ type rotationCase struct {
 	// has already committed. Everything after that point must still complete: the
 	// revoke, the meta write, and the outcome record.
 	callerDiesAfterCAS bool
-	want               rotationOutcome
+	// deleteDuringPostCAS removes the row inside the post-commit window, which is
+	// what makes the response fetch fail on a rotation that already happened.
+	deleteDuringPostCAS bool
+	want                rotationOutcome
 	// wantManualStatus is the HTTP status the manual path must return. The sweep
 	// has no HTTP surface, which is why this is not in rotationOutcome.
 	wantManualStatus int
@@ -177,6 +184,27 @@ func rotationCases() []rotationCase {
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
 				metaWrites: 1,
+			},
+		},
+		{
+			// The entry is deleted inside the post-commit window.
+			//
+			// The value is already rotated and the predecessor key is already
+			// destroyed upstream, so the outcome MUST still be recorded: the
+			// response body is cosmetic and its absence is not a reason to skip
+			// delivery, the log, the error field and the alert. Delete needs no
+			// re-auth, so a second tab or another collection editor reaches this.
+			name:                "entry deleted inside the post-commit window",
+			provider:            revokeFailProvider,
+			sweepApplicable:     false,
+			deleteDuringPostCAS: true,
+			wantManualStatus:    http.StatusOK,
+			want: rotationOutcome{
+				// valueChanged and the log are unreadable once the row is gone, so the
+				// assertion is the ALERT: the operator must be told that a rotation
+				// committed and could not be finished. Before the fix the handler
+				// returned 500 from the response fetch and dispatched nothing.
+				rowDeleted: true, alertWanted: true,
 			},
 		},
 		{
@@ -387,13 +415,22 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 
 	env := &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}
 
-	if tc.callerDiesAfterCAS {
+	if tc.callerDiesAfterCAS || tc.deleteDuringPostCAS {
 		// The revoke runs FIRST in the post-CAS phase, so a sink that cancels the
 		// caller lands the cancellation squarely in the window under test: the meta
 		// write and every outcome write come after it.
 		sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			if env.killCaller != nil {
+			// The revoke runs FIRST in the post-CAS phase, so whatever this handler
+			// does lands squarely inside the window under test.
+			if tc.callerDiesAfterCAS && env.killCaller != nil {
 				env.killCaller()
+			}
+			if tc.deleteDuringPostCAS {
+				// Exactly what a second tab calling DELETE does: a hard delete with
+				// no re-auth, mid-rotation.
+				if _, dErr := h.db.Exec(`DELETE FROM vault_entries WHERE id = ?`, entryID); dErr != nil {
+					t.Errorf("ablation delete failed: %v", dErr)
+				}
 			}
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
@@ -485,7 +522,22 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 
 	row, err := e.queries.GetVaultEntryForRotation(ctx, e.entryID)
 	if err != nil {
-		t.Fatalf("%s: reload: %v", path, err)
+		if !want.rowDeleted {
+			t.Fatalf("%s: reload: %v", path, err)
+		}
+		// The row is gone by design for this case. Everything below reads it, so
+		// only the out-of-band assertions apply.
+		if got := e.alerts.count() > 0; got != want.alertWanted {
+			t.Errorf("%s: rotation alert dispatched=%v, want %v (events: %v)\n"+
+				"The rotation COMMITTED and the predecessor key was destroyed upstream. If the "+
+				"row then vanished, the one remaining way to tell anyone is the alert.",
+				path, got, want.alertWanted, e.alerts.events)
+		}
+		return
+	}
+	if want.rowDeleted {
+		t.Fatalf("%s: the row was expected to be gone by assert time but is still present, "+
+			"so this case is not exercising the post-commit-window deletion it claims to", path)
 	}
 	plain, err := e.h.DecryptValue(row.EncryptedValue, row.Nonce, 2)
 	if err != nil {

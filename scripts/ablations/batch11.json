@@ -1,0 +1,7 @@
+[
+ {"id":"response-fetch-aborts-outcome","mech":"rotation-postcas","test":"TestRotationContract","file":"internal/handlers/vault.go",
+  "pkg":"./internal/handlers/",
+  "why":"the original bug: a cosmetic read returned 500 and skipped delivery, the log, the error field and the alert on a rotation that had already committed and already revoked the old key",
+  "old":"\tentry := vaultEntryFull{}\n\tif row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {\n\t\tentry.vaultEntryMeta = h.vaultMetaFromGetRow(row)\n\t} else {",
+  "new":"\tentry := vaultEntryFull{}\n\tif row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {\n\t\tentry.vaultEntryMeta = h.vaultMetaFromGetRow(row)\n\t} else if writeInternalError(w, r, \"internal server error\"); true {\n\t\treturn\n\t} else {"}
+]
