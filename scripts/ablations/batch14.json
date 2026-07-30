@@ -1,0 +1,22 @@
+[
+ {
+  "id": "log-write-from-snapshot",
+  "mech": "rotation-log",
+  "test": "TestConcurrentRotationLogAppendsDoNotLoseEachOther",
+  "file": "internal/handlers/vault_rotation_core.go",
+  "pkg": "./internal/handlers/",
+  "why": "the original bug: append from a caller-supplied snapshot with a plain UPDATE = lost update",
+  "old": "\t\t\tRotationLog:   toNullString(AppendRotationLog(current, entry)),",
+  "new": "\t\t\tRotationLog:   toNullString(AppendRotationLog(\"\", entry)),"
+ },
+ {
+  "id": "trim-dropped",
+  "mech": "rotation-log",
+  "test": "TestRotationLogAppendKeepsTheTrim",
+  "file": "internal/handlers/vault_providers.go",
+  "pkg": "./internal/handlers/",
+  "why": "an audit column that grows without bound is its own problem",
+  "old": "\tif len(log) > 50 {\n\t\tlog = log[len(log)-50:]\n\t}",
+  "new": ""
+ }
+]

@@ -92,6 +92,34 @@ func (q *Queries) AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVault
 	return i, err
 }
 
+const cASVaultEntryRotationLog = `-- name: CASVaultEntryRotationLog :execresult
+UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND COALESCE(rotation_log, '') = ?
+`
+
+type CASVaultEntryRotationLogParams struct {
+	RotationLog   sql.NullString `json:"rotation_log"`
+	ID            string         `json:"id"`
+	RotationLog_2 sql.NullString `json:"rotation_log_2"`
+}
+
+// Compare-and-swap on the rotation_log column itself.
+//
+// rotation_log is read-modify-written: the caller unmarshals the array, appends one
+// entry, trims to 50 and writes the whole column back. With a plain UPDATE that is a
+// lost update. The sweep takes its snapshot at pass start and can be up to 90s per
+// earlier entry behind, so a user clicking Rotate on the same entry mid-pass had
+// their successful rotation ERASED from history and replaced by the sweep's
+// conflict error, complete with an alert about a rotation that had actually
+// succeeded.
+//
+// Comparing the column rather than updated_at is deliberate: updated_at is bumped by
+// every neighbouring write, so it would spuriously fail here, and it is stored as
+// literal text which has already caused three rounds of CAS bugs on this table.
+func (q *Queries) CASVaultEntryRotationLog(ctx context.Context, arg CASVaultEntryRotationLogParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, cASVaultEntryRotationLog, arg.RotationLog, arg.ID, arg.RotationLog_2)
+}
+
 const countVaultEntriesV1 = `-- name: CountVaultEntriesV1 :one
 
 
@@ -338,6 +366,17 @@ func (q *Queries) GetVaultEntryOwner(ctx context.Context, id string) (string, er
 	var user_id string
 	err := row.Scan(&user_id)
 	return user_id, err
+}
+
+const getVaultEntryRotationLog = `-- name: GetVaultEntryRotationLog :one
+SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?
+`
+
+func (q *Queries) GetVaultEntryRotationLog(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getVaultEntryRotationLog, id)
+	var rotation_log string
+	err := row.Scan(&rotation_log)
+	return rotation_log, err
 }
 
 const getVaultEntryTargets = `-- name: GetVaultEntryTargets :one
