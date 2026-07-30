@@ -1,13 +1,18 @@
 package handlers
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/brightinteraction/trustissues/internal/passwordhash"
 )
 
 // TestCapacityErrorIsNeverAFailedLoginAttempt pins a contract that was written
@@ -178,4 +183,54 @@ func callsCapacityHelper(e ast.Expr) bool {
 		return !found
 	})
 	return found
+}
+
+// TestCapacityExhaustedBehaviour tests the shared decision itself, which the
+// positional guard above structurally cannot.
+//
+// That guard asserts every password-check site ROUTES THROUGH capacityExhausted.
+// It says nothing about whether the helper does anything. An ablation gutting the
+// helper so it always returns false reopened all five lockout doors at once and the
+// positional guard passed completely clean.
+//
+// That is the inherent limit of a structural check, and consolidating five copies
+// into one decision made it sharper: the single point is now a single point of
+// failure. So the two tests are complements, not alternatives. Structure for the
+// call sites, behaviour for the decision.
+func TestCapacityExhaustedBehaviour(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+
+	t.Run("ErrBusy is handled and reported", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		if !capacityExhausted(rec, req, passwordhash.ErrBusy, "test") {
+			t.Fatal("returned false for ErrBusy, so every caller falls through to " +
+				"counting a failed attempt: the lockout vector is fully open")
+		}
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d (capacity is not a credential failure)",
+				rec.Code, http.StatusServiceUnavailable)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Error("no Retry-After header; the client has nothing to back off against")
+		}
+	})
+
+	t.Run("a wrong password is NOT handled", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		if capacityExhausted(rec, req, errors.New("hash mismatch"), "test") {
+			t.Error("returned true for an ordinary verify failure, so a genuinely wrong " +
+				"password would answer 503 and never be counted: that turns the lockout off " +
+				"entirely and hands an attacker unlimited guesses")
+		}
+		if rec.Code != http.StatusOK { // untouched recorder
+			t.Errorf("wrote a response for a non-capacity error (status %d)", rec.Code)
+		}
+	})
+
+	t.Run("nil is NOT handled", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		if capacityExhausted(rec, req, nil, "test") {
+			t.Error("returned true for a nil error, so a SUCCESSFUL verify would answer 503")
+		}
+	})
 }
