@@ -85,7 +85,12 @@ def ablate(spec):
         # -timeout is not optional. One ablation raised a wait to 24h and hung the
         # whole sweep; a hang is not a result. A timeout counts as CAUGHT only if the
         # guard is what timed out, so it is reported separately.
-        rc, out = run(f"go test ./{os.path.dirname(spec['file'])}/ -count=1 -timeout 120s 2>&1")
+        # A spec may name the package to test, because the guard for a property is
+        # not always in the package that implements it: ablating shield.ValidHintLevel
+        # is caught by a test in internal/config, and running only the edited file's
+        # package reported MISSED. Default stays the edited file's package.
+        pkg = spec.get("pkg") or "./" + os.path.dirname(spec["file"]) + "/"
+        rc, out = run(f"go test {pkg} -count=1 -timeout 120s 2>&1")
         if "panic: test timed out" in out:
             return {**spec, "result": "TIMEOUT", "detail": "the ablated code hangs; treat as caught only if a guard bounds it"}
         if rc != 0:

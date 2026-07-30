@@ -1,0 +1,22 @@
+[
+ {
+  "id": "hint-level-unvalidated",
+  "mech": "config",
+  "test": "TestHintLevelTyposAreRefused",
+  "file": "internal/config/config.go",
+  "why": "the original bug: a misspelled level silently becomes the MOST verbose one",
+  "old": "\tif !shield.ValidHintLevel(c.ShieldHintLevel) {",
+  "new": "\tif false && !shield.ValidHintLevel(c.ShieldHintLevel) {",
+  "pkg": "./internal/config/"
+ },
+ {
+  "id": "validhintlevel-accepts-anything",
+  "mech": "config",
+  "test": "TestHintLevelTyposAreRefused",
+  "file": "internal/shield/shield.go",
+  "why": "the predicate itself",
+  "old": "func ValidHintLevel(s string) bool {\n\tfor _, n := range HintLevelNames {",
+  "new": "func ValidHintLevel(s string) bool {\n\tif true {\n\t\treturn true\n\t}\n\tfor _, n := range HintLevelNames {",
+  "pkg": "./internal/config/"
+ }
+]

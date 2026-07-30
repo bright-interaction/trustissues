@@ -1,0 +1,11 @@
+[
+ {"id":"probe3-columncrypto-only","mech":"keycheck","test":"TestProbe3SeesEveryCryptoFamily","file":"internal/handlers/vault_keycheck.go",
+  "why":"the original bug: one prefix check over three families, so 2 of 3 were skipped",
+  "old":"\t\tcase \"vaultcolumn\":\n\t\t\tif !strings.HasPrefix(b.Blob, vaultColumnEncPrefix) {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\thasCiphertext = true\n\t\t\tif vaultColumnOpens(b.Blob, vaultKey) {\n\t\t\t\treturn true, true, nil\n\t\t\t}",
+  "new":"\t\tcase \"vaultcolumn\":\n\t\t\tif !columncrypto.IsEncrypted(b.Blob) {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\thasCiphertext = true"},
+
+ {"id":"probe3-rawgcm-skipped","mech":"keycheck","test":"TestProbe3SeesEveryCryptoFamily","file":"internal/handlers/vault_keycheck.go",
+  "why":"raw AES-GCM has no marker at all, so a prefix check skipped it entirely",
+  "old":"\t\tcase \"rawgcm\":",
+  "new":"\t\tcase \"rawgcm-disabled\":"}
+]

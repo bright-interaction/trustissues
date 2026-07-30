@@ -1,0 +1,17 @@
+[
+ {"id":"trust-shape-not-authenticity","mech":"shield-marker","test":"TestForgedMarkersDoNotDisableRedaction","file":"internal/shield/redact.go",
+  "why":"the original bug: protect any marker-SHAPED span, forged or not",
+  "old":"\t\tif !trusted[s[sp[4]:sp[5]]] {\n\t\t\tcontinue // not ours: leave it in the scannable region\n\t\t}",
+  "new":"\t\tif false {\n\t\t\tcontinue\n\t\t}"},
+
+ {"id":"resolve-failure-fails-open","mech":"shield-marker","test":"TestForgedMarkersDoNotDisableRedaction","file":"internal/shield/redact.go",
+  "why":"a store hiccup must NOT silently disable redaction",
+  "old":"\t\tif _, err := s.Resolve(ctx, tokenID); err == nil {\n\t\t\ttrusted[tokenID] = true\n\t\t}",
+  "new":"\t\tif _, err := s.Resolve(ctx, tokenID); err != nil {\n\t\t\ttrusted[tokenID] = true\n\t\t}"},
+
+ {"id":"minted-markers-not-trusted","mech":"shield-marker","test":"TestOurOwnMarkersAreStillProtected",
+  "file":"internal/shield/redact.go",
+  "why":"the OTHER direction: if we stop trusting our own markers, a later broad pattern corrupts the round-trip",
+  "old":"\t\t\t\tif g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {\n\t\t\t\t\ttrusted[g[2]] = true\n\t\t\t\t}",
+  "new":""}
+]

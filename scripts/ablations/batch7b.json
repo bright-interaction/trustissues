@@ -1,0 +1,6 @@
+[
+ {"id":"minted-markers-not-trusted","mech":"shield-marker","test":"TestOurOwnMarkersAreStillProtected","file":"internal/shield/redact.go",
+  "why":"the OTHER direction: stop trusting our OWN markers and a later broad pattern corrupts the round-trip. Without this the fix could pass by protecting nothing.",
+  "old":"\t\t\tif g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {\n\t\t\t\ttrusted[g[2]] = true\n\t\t\t}\n",
+  "new":""}
+]

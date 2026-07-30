@@ -1,0 +1,16 @@
+[
+ {"id":"email-back-after-personnummer","mech":"shield-order","test":"TestAnAddressIsNeverSplit","file":"internal/shield/redact.go",
+  "why":"the 5th leak route: a narrower pattern claims part of the local part and the rest is left bare",
+  "old":"\t\tre:   regexp.MustCompile(`\\b(?:19|20)?\\d{6}[-\\s]?\\d{4}\\b`),",
+  "new":"\t\tre:   regexp.MustCompile(`(?:19|20)?\\d{6}[-\\s]?\\d{4}`),"},
+
+ {"id":"drop-ipv4-literal-domain","mech":"shield-order","test":"TestAnAddressIsNeverSplit","file":"internal/shield/redact.go",
+  "why":"user@192.168.1.1 could not match at all, so the IP pattern took the domain and left the local part bare",
+  "old":"`(?:\\[[0-9A-Fa-f:.]{2,45}\\]|(?:\\d{1,3}\\.){3}\\d{1,3}|[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,})`",
+  "new":"`(?:[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,})`"},
+
+ {"id":"drop-p-M-fifth-check","mech":"shield-order","test":"TestAnAddressIsNeverSplit","file":"internal/shield/redact.go",
+  "why":"route 2 re-verified against the generated matrix rather than hand-written lines",
+  "old":"(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@",
+  "new":"(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9._%+\\-]+)@"}
+]

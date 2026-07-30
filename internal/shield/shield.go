@@ -149,8 +149,37 @@ const (
 	HintNone
 )
 
+// HintLevelNames lists every accepted TRUSTISSUES_SHIELD_HINT_LEVEL value, in
+// decreasing order of disclosure. Exported so config validation can reject an
+// unrecognised value and name the alternatives instead of guessing for the
+// operator.
+var HintLevelNames = []string{"full", "bucketed", "minimal", "none"}
+
+// ValidHintLevel reports whether s is a recognised level.
+//
+// This exists because ParseHintLevel falls back to HintFull, the MOST verbose
+// level, for anything it does not recognise. That default is right for a value
+// that was never set, and dangerous for one that was set and misspelled: an
+// operator writing "None", "nonw" or "minimum" is trying to REDUCE what leaves the
+// building, and silently got the maximum instead (email domain, exact value length,
+// personnummer century, all egressed to the model provider). It was the only Shield
+// setting with no validation.
+//
+// So the parse stays lenient and the CONFIG refuses. A typo is a startup error, in
+// the same spirit as the required-secret checks: never silently weaken a protection
+// because an input was malformed.
+func ValidHintLevel(s string) bool {
+	for _, n := range HintLevelNames {
+		if s == n {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseHintLevel maps env-var strings to a HintLevel. Unknown values
 // fall back to HintFull (safe default that preserves the v1 surface).
+// Callers that read operator input must gate on ValidHintLevel first.
 func ParseHintLevel(s string) HintLevel {
 	switch s {
 	case "bucketed":
