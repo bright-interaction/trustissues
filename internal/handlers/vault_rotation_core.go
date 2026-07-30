@@ -200,3 +200,7 @@ func foldRevokeOutcome(status, errSummary, revokeWarn string) (outStatus, outSum
 	}
 	return status, errSummary, true
 }
+
+// ablationTakesPool exists only so the tx-scope ablation can pass the pool to a
+// helper the way seedCapabilityDefaults did. Not called in production.
+func ablationTakesPool(_ context.Context, _ *db.Queries) error { return nil }

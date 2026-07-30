@@ -104,3 +104,42 @@ func TestPersistRotatedValueRefusesAMissingToken(t *testing.T) {
 		t.Fatalf("a valid snapshot did not apply: applied=%v err=%v", applied, err)
 	}
 }
+
+// TestMayGenerateLocallyIsExhaustive pins the fail-closed belt over the local
+// secret generator.
+//
+// An ablation sweep flipped mayGenerateLocally to `return true` and the entire
+// suite stayed green, because the switch on providerRole in the handler already
+// returns for every non-local role before the belt is reached. That is what a belt
+// IS, and it is exactly why it needs its own test: it is unreachable while the
+// braces hold, so the only thing standing behind a future fifth role is a line of
+// code nothing exercises.
+//
+// Enumerated explicitly rather than looped over a range, so ADDING a role makes
+// this fail to compile-or-pass until someone decides which side it belongs on.
+func TestMayGenerateLocallyIsExhaustive(t *testing.T) {
+	cases := []struct {
+		role providerRole
+		name string
+		want bool
+	}{
+		{providerNone, "providerNone", true},
+		{providerAuto, "providerAuto", false},
+		{providerReminder, "providerReminder", false},
+		{providerUnknown, "providerUnknown", false},
+	}
+	for _, c := range cases {
+		if got := c.role.mayGenerateLocally(); got != c.want {
+			t.Errorf("%s.mayGenerateLocally() = %v, want %v\n"+
+				"Only an entry with NO provider is a local secret this server may regenerate. "+
+				"Saying yes for any other role overwrites a real upstream credential with random "+
+				"bytes and reports success.", c.name, got, c.want)
+		}
+	}
+	// A new role must not silently default to "may generate". iota ordering makes
+	// the highest known role the boundary.
+	if next := providerUnknown + 1; next.mayGenerateLocally() {
+		t.Errorf("an unrecognised providerRole (%d) may generate locally; the predicate must "+
+			"name the permitted role rather than exclude the forbidden ones", int(next))
+	}
+}

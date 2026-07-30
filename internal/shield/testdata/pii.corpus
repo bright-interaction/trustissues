@@ -36,3 +36,34 @@ secret	github token ghp_a123456789012345678901 committed
 hostname	connect to crm.example.com now
 hostname	host.internal is unreachable
 hostname	connect to skåne-db.example.se now
+
+# --- round-14 input classes (2026-07-30) ---
+# Probed 19 shapes for the PARTIAL-LEAK failure that recurred three times on the
+# email pattern (ASCII class, then \p{L}, then \p{L}\p{M}). All 19 came back
+# clean, so these are here as regression pins rather than as fixes: each one
+# exercises the pattern in a way no other corpus line does.
+#
+# Right-to-left and bidi. An RTL local part is ordinary in Arabic and Hebrew.
+email	mail محمد@example.com today
+email	mail דוד@example.co.il today
+email	mail a‮b@example.com today
+# Zero-width characters: invisible on screen, and a classic way past a pattern.
+email	mail jo‍hn@example.com today
+email	mail jo‌hn@example.com today
+email	mail jo​hn@example.com today
+# Structural embeddings: the address is real, just wrapped.
+email	see https://site.test/u/anna.svensson@example.se/profile
+email	{"to":"anna.svensson@example.se","ok":true}
+email	From: Anna <anna.svensson@example.se>
+email	click mailto:anna.svensson@example.se now
+# Local-part shapes the character class has to survive.
+email	mail anna+invoices@example.se today
+email	mail "anna svensson"@example.se today
+email	mail aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.se today
+email	mail anna..svensson@example.se today
+# IDN, both forms. Verified equivalent: the two .example misses during probing
+# were knownSuffixes refusing an unlisted TLD, not an IDN problem.
+hostname	visit bücher.com today
+hostname	visit xn--bcher-kva.com today
+hostname	visit example.com. today
+hostname	visit EXAMPLE.COM today

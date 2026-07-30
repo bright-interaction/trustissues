@@ -115,7 +115,24 @@ var redactPatterns = []redactPattern{
 		// Third iteration on this one pattern. The lesson: widening a character
 		// class is not the same as covering a class of input. The corpus lines in
 		// testdata/pii.corpus are the real fix; NFC vs NFD is invisible to the eye.
-		re:   regexp.MustCompile(`[\p{L}\p{M}0-9._%+\-]+@[\p{L}\p{M}0-9.\-]+\.[\p{L}\p{M}]{2,}`),
+		// A QUOTED local part is legal (RFC 5321) and the unquoted class cannot
+		// match it, because it contains a space.
+		//
+		// That mattered far more than the rarity suggests. When the email pattern
+		// fails, the ordered bank falls through to the HOSTNAME pattern, which
+		// happily matches the domain half, so:
+		//
+		//	mail "anna svensson"@example.se  ->  mail "anna svensson"@[shield:hostname:...]
+		//
+		// The name is left in the clear AND the output looks redacted, which is the
+		// worst combination available. Same failure class as the three earlier
+		// partial leaks, reached by a different route: not a gap in which LETTERS
+		// the local part may contain, but in its overall shape.
+		//
+		// Generalised as an invariant in corpus_normalization_test.go: no marker may
+		// ever be preceded by "@", because that always means an address was matched
+		// from the domain inwards and its local part survived.
+		re:   regexp.MustCompile(`(?:"[^"\r\n]{1,64}"|[\p{L}\p{M}0-9._%+\-]+)@[\p{L}\p{M}0-9.\-]+\.[\p{L}\p{M}]{2,}`),
 		hint: []string{"domain", "len"},
 	},
 	{
