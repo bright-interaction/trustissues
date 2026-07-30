@@ -2302,7 +2302,20 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 				rotationMethod, providerName, meta.Name, userID))
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
-		writeJSON(w, http.StatusOK, vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: newValue})
+		// Re-read so the response carries the outcome we JUST recorded.
+		//
+		// This used to return the PRE-rotation snapshot, so last_rotation_error came
+		// back empty even though "rotated but NOT delivered" had just been written to
+		// it. The client then had nothing to render and showed a clean success, which
+		// silently undid the whole point of recording a partial outcome. A fix that
+		// writes the truth to the database and hands the caller a stale copy of it is
+		// only half a fix.
+		out := vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: newValue}
+		if fresh, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {
+			out.vaultEntryMeta = h.vaultMetaFromGetRow(fresh)
+			out.Value = newValue
+		}
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
 

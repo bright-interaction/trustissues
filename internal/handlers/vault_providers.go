@@ -203,6 +203,45 @@ const (
 	pendingRevokeURL    = "pending_revoke_url"
 )
 
+// successorScopes builds the scope/capability list for a newly minted key: the
+// operator's own list from provider_meta when set (comma or space separated),
+// otherwise the provider's default, always unioned with the scopes the rotation
+// chain itself depends on.
+//
+// The union is NOT a privilege escalation. The mint authenticates as the
+// CURRENT key, so the current key demonstrably already holds these scopes;
+// minting a successor without them is a silent DEMOTION that ends the chain.
+// That is exactly what SendGrid and Backblaze did, and each broke after one
+// rotation in three places at once:
+//
+//   - the deferred revoke runs as the NEW key, so it 403s and the predecessor
+//     stays live at the provider forever
+//   - the NEXT rotation's own mint 403s, so auto-rotation is dead
+//   - Validate lists keys, so it reports a freshly minted key as invalid
+//
+// The operator override exists because the hardcoded defaults also discarded
+// whatever the predecessor could actually do: a SendGrid key used for stats or
+// marketing came back able only to send mail.
+func successorScopes(meta map[string]string, metaKey string, fallback, required []string) []string {
+	declared := fallback
+	if raw := strings.TrimSpace(meta[metaKey]); raw != "" {
+		declared = strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '\n'
+		})
+	}
+	seen := make(map[string]bool, len(declared)+len(required))
+	out := make([]string, 0, len(declared)+len(required))
+	for _, s := range append(append([]string{}, declared...), required...) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 // deferRevokeOldProviderKey records a revoke to run AFTER the caller has stored
 // the new value, instead of performing it inline.
 //
@@ -334,6 +373,30 @@ func providerGet(ctx context.Context, url, authHeader string) (int, error) {
 // AUTO-ROTATE PROVIDERS
 // ════════════════════════════════════════════════════════════════════════════
 
+// maxProviderBody bounds a provider response. Every one of these is a small JSON
+// object carrying a key or an id; a megabyte is already far more than any of them
+// sends, and the point is that an upstream cannot choose the number.
+const maxProviderBody = 1 << 20
+
+// readProviderBody reads a provider's response with a hard ceiling.
+//
+// All 16 read sites in this file used io.ReadAll(resp.Body), which lets the UPSTREAM
+// decide how much memory this process allocates. That matters more here than in a
+// typical client: several providers (grafana, zitadel, forgejo, datadog, supabase)
+// talk to an operator-supplied instance URL, so the host is not always a vendor, and
+// this is a single-process secrets manager. An OOM kill landing AFTER a successful
+// mint leaves the credential created upstream with nothing stored and nothing
+// recorded, which is the same stranded-secret state the rotation work has been closing
+// all along, reached by exhaustion instead of by logic.
+//
+// The AI gateway already bounds its upstream reads with io.LimitReader; this file
+// simply never adopted it. Errors are deliberately swallowed the way the original
+// io.ReadAll calls were: every caller checks the status code and unmarshals, so a
+// truncated body surfaces as a parse failure rather than as a silent success.
+func readProviderBody(resp *http.Response) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(resp.Body, maxProviderBody))
+}
+
 // ─── Cloudflare ─────────────────────────────────────────────────────────────
 
 // cloudflareAPIBase is the Cloudflare v4 API root (in dockyard this lives in
@@ -396,7 +459,7 @@ func (p *CloudflareTokenProvider) getTokenID(ctx context.Context, token string) 
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	var result struct {
 		Success bool `json:"success"`
 		Result  struct {
@@ -424,7 +487,7 @@ func (p *CloudflareTokenProvider) rollToken(ctx context.Context, currentToken, t
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	var result struct {
 		Success bool                       `json:"success"`
 		Result  string                     `json:"result"`
@@ -470,7 +533,7 @@ func (p *VercelTokenProvider) Rotate(ctx context.Context, currentKey string, met
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -518,7 +581,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -563,7 +626,13 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	if name == "" {
 		name = "rotated-" + time.Now().Format("20060102-150405")
 	}
-	payload, _ := json.Marshal(map[string]any{"name": name, "scopes": []string{"mail.send", "sender_verification"}})
+	// api_keys.* is what keeps the chain alive: create for the next rotation's
+	// mint, delete for this rotation's revoke of the predecessor, read for
+	// Validate. See successorScopes.
+	scopes := successorScopes(meta, "scopes",
+		[]string{"mail.send", "sender_verification"},
+		[]string{"api_keys.create", "api_keys.read", "api_keys.delete"})
+	payload, _ := json.Marshal(map[string]any{"name": name, "scopes": scopes})
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.sendgrid.com/v3/api_keys", strings.NewReader(string(payload)))
 	if err != nil {
 		return "", err
@@ -575,7 +644,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -642,7 +711,7 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -747,7 +816,7 @@ func (p *LinodeProvider) Rotate(ctx context.Context, currentKey string, meta map
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -795,7 +864,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -861,7 +930,7 @@ func (p *DatadogProvider) Rotate(ctx context.Context, currentKey string, meta ma
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -934,7 +1003,7 @@ func (p *GrafanaProvider) Rotate(ctx context.Context, currentKey string, meta ma
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -984,7 +1053,7 @@ func (p *FastlyProvider) Rotate(ctx context.Context, currentKey string, meta map
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -1046,7 +1115,7 @@ func (p *Auth0Provider) Rotate(ctx context.Context, currentKey string, meta map[
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -1118,7 +1187,7 @@ func (p *ZitadelProvider) Rotate(ctx context.Context, currentKey string, meta ma
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -1160,10 +1229,17 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 		return "", fmt.Errorf("key_id and account_id required in provider_meta")
 	}
 	name := "rotated-" + time.Now().Format("20060102")
+	// writeKeys is what b2_create_key itself requires and deleteKeys what
+	// b2_delete_key requires, so without them this mint is the last one that can
+	// ever succeed and backblazeRevokeOldKey below can never delete anything.
+	// See successorScopes.
+	caps := successorScopes(meta, "capabilities",
+		[]string{"listBuckets", "readFiles", "writeFiles", "deleteFiles", "listFiles"},
+		[]string{"writeKeys", "deleteKeys", "listKeys"})
 	payload, _ := json.Marshal(map[string]any{
 		"accountId":    accountID,
 		"keyName":      name,
-		"capabilities": []string{"listBuckets", "readFiles", "writeFiles", "deleteFiles", "listFiles"},
+		"capabilities": caps,
 	})
 	auth := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + currentKey))
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.backblazeb2.com/b2api/v3/b2_create_key", strings.NewReader(string(payload)))
@@ -1177,7 +1253,7 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 200 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}
@@ -1222,7 +1298,7 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 		meta["last_revoke_error"] = "b2 authorize: " + err.Error()
 		return
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		meta["last_revoke_error"] = fmt.Sprintf("b2 authorize: HTTP %d", resp.StatusCode)
@@ -1314,7 +1390,7 @@ func (p *ForgejoProvider) Rotate(ctx context.Context, currentKey string, meta ma
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readProviderBody(resp)
 	if resp.StatusCode != 201 {
 		return "", newUpstreamHTTPError(resp.StatusCode, body)
 	}

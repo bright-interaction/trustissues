@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/brightinteraction/trustissues/internal/alerts"
 	"github.com/brightinteraction/trustissues/internal/db"
 )
 
@@ -132,6 +133,19 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 	status, errSummary, revokeAlert := foldRevokeOutcome(status, errSummary, rec.RevokeWarn)
 	if revokeAlert {
 		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)
+	}
+
+	// Honour a "Notify only" target. It transmits nothing, so the delivery loop
+	// rightly skips it, and its comment claimed the caller handled the notification.
+	// No caller did, and there was no success event to fire even if one had wanted to,
+	// so an operator who configured "tell me, I will update the consumer myself" was
+	// told nothing while the credential rotated and the predecessor was revoked.
+	//
+	// Only on a clean success: a partial or failed rotation already alarms above, and
+	// firing both would tell the operator it worked and did not work.
+	if status == "success" && hasNotifyTarget(rec.Targets) {
+		dispatchRotationSuccess(ctx, deps.queries, deps.vault, rec.EntryName,
+			"rotated successfully; update any consumer you manage yourself")
 	}
 
 	if err := deps.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
@@ -291,4 +305,36 @@ func appendRotationLog(ctx context.Context, deps rotationDeps, entryID, entryNam
 	}
 	slog.Error("vault rotation: gave up appending to rotation_log after concurrent writes",
 		"entry", entryName, "attempts", rotationLogCASAttempts)
+}
+
+// dispatchRotationSuccess fires the notification a "Notify only" target asks for.
+//
+// A var, like the other two dispatchers, so the rotation matrix can observe it.
+var dispatchRotationSuccess = dispatchRotationSuccessReal
+
+func dispatchRotationSuccessReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("vault rotation: success notification panicked", "recover", r)
+		}
+	}()
+	alerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(
+		alerts.EventRotationSucceeded, "", "",
+		map[string]string{"secret": entryName, "detail": detail},
+	)
+}
+
+// hasNotifyTarget reports whether the entry asked to be told about a rotation.
+//
+// "notify" is skipped by the delivery loop (it transmits nothing, so there is nothing
+// to deliver) and the loop's comment said notification "is handled separately by the
+// caller". No caller handled it, and the alerts catalogue had no success event at all,
+// so the one target type whose entire purpose is notification never notified anybody.
+func hasNotifyTarget(targets []RotationTarget) bool {
+	for _, t := range targets {
+		if t.Type == "notify" {
+			return true
+		}
+	}
+	return false
 }

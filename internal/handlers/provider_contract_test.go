@@ -187,3 +187,114 @@ func TestTwilioRefusesAKeyItCannotPair(t *testing.T) {
 		t.Errorf("key_sid was set to %q from a response that had none", meta["key_sid"])
 	}
 }
+
+// TestMintedSuccessorCanSustainTheRotationChain locks the round-15 finding that a
+// rotated key was minted WITHOUT the permission its own maintenance requires.
+//
+// SendGrid asked for ["mail.send","sender_verification"] and Backblaze for the five
+// bucket capabilities. Neither set includes key management, and the docs are explicit
+// that the caller's own credential is what is checked: b2_create_key "must have the
+// writeKeys capability", b2_delete_key needs deleteKeys, POST /v3/api_keys needs
+// api_keys.create, DELETE needs api_keys.delete, GET needs api_keys.read.
+//
+// So each of these providers auto-rotated exactly ONCE and then broke three ways at
+// the same time, all of them silent:
+//
+//	the deferred revoke authenticates as the NEW key (performPendingRevoke), 403s,
+//	  and the predecessor stays live at the provider forever
+//	the NEXT rotation's mint 403s, so the schedule fails on every pass afterwards
+//	Validate lists keys, so the product reports the key it just minted as invalid
+//
+// This is not an escalation to guard against: the mint authenticates as the CURRENT
+// key, so the current key already held these scopes. Minting without them is a
+// demotion. The assertion is on the REQUEST BODY because that is the contract with the
+// provider, and a second rotation is driven through to prove the chain survives.
+func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
+	t.Run("sendgrid", func(t *testing.T) {
+		var scopes []string
+		mint := 0
+		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			var in struct {
+				Scopes []string `json:"scopes"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			scopes = in.Scopes
+			mint++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"api_key":    "SG.new",
+				"api_key_id": "id" + strings.Repeat("x", mint),
+			})
+		})
+		p := &SendGridProvider{}
+		meta := map[string]string{}
+		if _, err := p.Rotate(context.Background(), "SG.old", meta); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		for _, want := range []string{"api_keys.create", "api_keys.read", "api_keys.delete"} {
+			if !hasScope(scopes, want) {
+				t.Errorf("minted key lacks %q (got %v).\n"+
+					"Without it the deferred revoke 403s and the predecessor stays live, the next "+
+					"rotation cannot mint, and Validate calls its own fresh key invalid.", want, scopes)
+			}
+		}
+		if !hasScope(scopes, "mail.send") {
+			t.Errorf("the key lost the purpose it exists for: %v", scopes)
+		}
+
+		// The operator's own scope list must be honoured AND still carry the
+		// management scopes, or widening the key re-breaks the chain.
+		meta2 := map[string]string{"scopes": "mail.send, stats.read"}
+		if _, err := p.Rotate(context.Background(), "SG.old", meta2); err != nil {
+			t.Fatalf("rotate with declared scopes: %v", err)
+		}
+		if !hasScope(scopes, "stats.read") {
+			t.Errorf("the operator's declared scopes were ignored: %v", scopes)
+		}
+		if !hasScope(scopes, "api_keys.create") {
+			t.Errorf("declaring scopes dropped key management: %v", scopes)
+		}
+	})
+
+	t.Run("backblaze", func(t *testing.T) {
+		var caps []string
+		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			var in struct {
+				Capabilities []string `json:"capabilities"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if len(in.Capabilities) > 0 {
+				caps = in.Capabilities
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"applicationKey": "K0new", "applicationKeyId": "0021new",
+				"apiUrl": "http://127.0.0.1", "authorizationToken": "tok",
+			})
+		})
+		p := &BackblazeProvider{}
+		meta := map[string]string{"key_id": "0021old", "account_id": "acct"}
+		if _, err := p.Rotate(context.Background(), "K0old", meta); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		for _, want := range []string{"writeKeys", "deleteKeys"} {
+			if !hasScope(caps, want) {
+				t.Errorf("minted key lacks %q (got %v).\n"+
+					"b2_create_key requires writeKeys and b2_delete_key requires deleteKeys, so this "+
+					"key can neither be rotated again nor delete its predecessor.", want, caps)
+			}
+		}
+		if !hasScope(caps, "readFiles") {
+			t.Errorf("the key lost its storage capabilities: %v", caps)
+		}
+	})
+}
+
+func hasScope(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

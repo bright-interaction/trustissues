@@ -36,12 +36,16 @@ func NewNotificationChannelsHandler(queries *db.Queries, encrypter ConfigEncrypt
 var validChannelTypes = map[string]bool{"webhook": true, "slog": true}
 
 var validChannelEvents = map[string]bool{
-	alerts.EventRotationPartial: true,
-	alerts.EventRotationFailed:  true,
-	alerts.EventSecretExpiring:  true,
+	alerts.EventRotationSucceeded: true,
+	alerts.EventRotationPartial:   true,
+	alerts.EventRotationFailed:    true,
+	alerts.EventSecretExpiring:    true,
 }
 
-const defaultChannelEvents = "vault.rotation_partial,vault.rotation_failed,vault.secret_expiring"
+// rotation_succeeded is default-ON: a "Notify only" target is useless without it, and
+// an operator who does not want success noise can untick it per channel. Defaulting it
+// off would recreate the silent no-op it exists to fix.
+const defaultChannelEvents = "vault.rotation_succeeded,vault.rotation_partial,vault.rotation_failed,vault.secret_expiring"
 
 type notificationChannelResponse struct {
 	ID        string `json:"id"`

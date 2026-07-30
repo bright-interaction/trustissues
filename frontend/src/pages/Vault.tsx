@@ -1342,7 +1342,20 @@ export default function Vault() {
     mutationFn: ({ id, password }: { id: string; password: string }) => vaultApi.rotate(id, password),
     onSuccess: (data) => {
       setRotatedValue({ id: data.id, value: data.value ?? '' });
-      toast.success('Secret rotated');
+      // A 200 does not mean the rotation was clean.
+      //
+      // The server returns 200 for a rotation that committed but could not be
+      // delivered (rotation_targets unreadable) or whose predecessor could not be
+      // revoked, and records the reason in last_rotation_error. Toasting an
+      // unconditional success, and then coercing that field to '' below, erased the
+      // ONE record the server had written: the row rendered green, no "Rotation error"
+      // pill appeared, and the operator was told a rotation worked while every
+      // consumer still held a revoked key.
+      if (data.last_rotation_error) {
+        toast.error(`Rotated, but not complete: ${data.last_rotation_error}`);
+      } else {
+        toast.success('Secret rotated');
+      }
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       // Rotate was the only mutation that did not refresh the unlocked list.
       // vaultEntries holds the decrypted values from unlock, and invalidating
@@ -1359,7 +1372,10 @@ export default function Vault() {
                 value: data.value ?? e.value,
                 last_rotated_at: data.last_rotated_at ?? e.last_rotated_at,
                 rotation_status: data.rotation_status ?? e.rotation_status,
-                last_rotation_error: data.last_rotation_error ?? '',
+                // NOT `?? ''`: an absent field must keep whatever the row already
+                // had rather than being blanked, and a present one must survive.
+                last_rotation_error:
+                  data.last_rotation_error ?? e.last_rotation_error ?? '',
               }
             : e
         )
@@ -1503,7 +1519,17 @@ export default function Vault() {
     data.username = editForm.username;
     data.category = editForm.category;
     data.notes = editForm.notes;
-    data.rotation_interval_days = editForm.rotation_interval_days ? Number(editForm.rotation_interval_days) : null;
+    // The interval has TWO editors: this field and the rotation panel, which renders
+    // outside the edit/display ternary and so can be used while the edit form is open.
+    // The panel's save has to write back into this form (see onScheduleSaved), or the
+    // stale seeded value below lands as NULL: the row becomes auto_rotate=1 with
+    // rotation_interval_days NULL, ListVaultEntriesNeedingRotation requires
+    // `rotation_interval_days > 0`, and the sweep then skips the entry forever while
+    // the UI still shows a schedule. Silently disabling the automation the operator
+    // just switched on.
+    data.rotation_interval_days = editForm.rotation_interval_days
+      ? Number(editForm.rotation_interval_days)
+      : null;
     data.expires_at = editForm.expires_at || null;
     // Always send the array: it replaces the whole set, so removing every row
     // clears the entry's custom fields.
@@ -2390,11 +2416,22 @@ export default function Vault() {
                     {rotationPanelId === entry.id && (
                       <RotationManager
                         entry={entry}
-                        onScheduleSaved={(patch) =>
+                        onScheduleSaved={(patch) => {
                           setVaultEntries((prev) =>
                             prev.map((e) => (e.id === entry.id ? { ...e, ...patch } : e))
-                          )
-                        }
+                          );
+                          // Keep the edit form in sync. It holds its own copy of the
+                          // interval, seeded when it opened, and saving it writes that
+                          // copy back. Without this the panel's new schedule is
+                          // overwritten with NULL and the sweep stops seeing the entry.
+                          if (editingEntryId === entry.id) {
+                            setEditForm((f) => ({
+                              ...f,
+                              rotation_interval_days:
+                                patch.rotation_interval_days?.toString() ?? '',
+                            }));
+                          }
+                        }}
                       />
                     )}
                   </div>
