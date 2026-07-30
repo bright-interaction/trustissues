@@ -76,7 +76,11 @@ type rotationCase struct {
 	// broken CAS token (a NULL updated_at would instead make the due query fail
 	// its scan and abort the sweep driver, testing nothing).
 	failPersist bool
-	want        rotationOutcome
+	// callerDiesAfterCAS cancels the caller's context at the moment the rotation
+	// has already committed. Everything after that point must still complete: the
+	// revoke, the meta write, and the outcome record.
+	callerDiesAfterCAS bool
+	want               rotationOutcome
 	// wantManualStatus is the HTTP status the manual path must return. The sweep
 	// has no HTTP surface, which is why this is not in rotationOutcome.
 	wantManualStatus int
@@ -155,6 +159,27 @@ func rotationCases() []rotationCase {
 			},
 		},
 		{
+			// The caller goes away the instant the value is committed.
+			//
+			// A closed tab, a client timeout or a proxy hang-up. The rotation has
+			// already happened, so the bookkeeping is not optional: without it the
+			// entry reads as freshly rotated and clean while the old key is still
+			// live upstream and the successor's id was never stored.
+			//
+			// Same assertions as the revoke-failure row, because the revoke here
+			// fails too (dead context, then an unreachable host). What this row adds
+			// is that a dead CALLER changes none of it.
+			name:               "caller goes away right after the value is committed",
+			provider:           revokeFailProvider,
+			sweepApplicable:    true,
+			callerDiesAfterCAS: true,
+			wantManualStatus:   http.StatusOK,
+			want: rotationOutcome{
+				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
+				metaWrites: 1,
+			},
+		},
+		{
 			// The new value IS stored, but the predecessor key could not be
 			// destroyed upstream, so both keys are still live.
 			//
@@ -188,6 +213,11 @@ const revokeFailProvider = "test-revoke-fails"
 // no network and no httptest server. Precedent: TestDeferredRevokeFailureIsNeverSilent.
 const unreachableRevokeURL = "http://10.0.0.1/keys/old"
 
+// revokeTargetURL is where the fake provider aims its deferred revoke. Rows that
+// need to observe the revoke (rather than just have it fail) point this at an
+// httptest sink. Reset by installRotationFakes.
+var revokeTargetURL = unreachableRevokeURL
+
 type revokeFailingProvider struct{}
 
 func (p *revokeFailingProvider) Name() string                            { return revokeFailProvider }
@@ -202,7 +232,7 @@ func (p *revokeFailingProvider) Rotate(_ context.Context, _ string, meta map[str
 	// Mint a successor, then register the revoke of the predecessor exactly the
 	// way resend/sendgrid/neon do.
 	meta["key_id"] = "new-" + randomHex(4)
-	deferRevokeOldProviderKey(meta, "DELETE", unreachableRevokeURL)
+	deferRevokeOldProviderKey(meta, "DELETE", revokeTargetURL)
 	return "ROTATED-" + randomHex(8), nil
 }
 
@@ -213,7 +243,7 @@ func TestRotationContract(t *testing.T) {
 		tc := tc
 		t.Run("manual/"+tc.name, func(t *testing.T) {
 			env := newRotationEnv(t, tc)
-			rec := env.driveManual(t)
+			rec := env.driveManual(t, tc)
 			if rec.Code != tc.wantManualStatus {
 				t.Fatalf("manual rotate returned %d, want %d: %s",
 					rec.Code, tc.wantManualStatus, rec.Body.String())
@@ -226,7 +256,7 @@ func TestRotationContract(t *testing.T) {
 				t.Skip("the due query cannot select this entry shape (needs provider + auto_rotate + interval)")
 			}
 			env := newRotationEnv(t, tc)
-			env.driveSweep(t)
+			env.driveSweep(t, tc)
 			env.assertOutcome(t, "sweep", tc.want)
 		})
 	}
@@ -240,6 +270,10 @@ type rotationEnv struct {
 	entryID string
 	before  string // plaintext before rotation
 	alerts  *alertRecorder
+	// killCaller is set for the callerDiesAfterCAS row. The httptest revoke sink
+	// invokes it, which cancels the request context at a point where the rotation
+	// has already committed.
+	killCaller func()
 }
 
 // alertRecorder counts rotation alerts. Pointer-shared with the swapped
@@ -267,6 +301,9 @@ func (a *alertRecorder) count() int {
 // TestProviderRegistryReducedSet walks every entry and would fail on a leaked one.
 func installRotationFakes(t *testing.T) *alertRecorder {
 	t.Helper()
+
+	revokeTargetURL = unreachableRevokeURL
+	t.Cleanup(func() { revokeTargetURL = unreachableRevokeURL })
 
 	ProviderRegistry[revokeFailProvider] = &revokeFailingProvider{}
 	providerLabels[revokeFailProvider] = "Revoke-failing test provider"
@@ -348,6 +385,28 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 		t.Cleanup(func() { _, _ = h.db.Exec(`DROP TRIGGER IF EXISTS capture_meta`) })
 	}
 
+	env := &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}
+
+	if tc.callerDiesAfterCAS {
+		// The revoke runs FIRST in the post-CAS phase, so a sink that cancels the
+		// caller lands the cancellation squarely in the window under test: the meta
+		// write and every outcome write come after it.
+		sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if env.killCaller != nil {
+				env.killCaller()
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(sink.Close)
+		revokeTargetURL = sink.URL + "/keys/old"
+
+		// The guarded client blocks loopback at dial time, which is correct in
+		// production and useless for reaching a test server.
+		prevHTTP := providerHTTP
+		providerHTTP = &http.Client{}
+		t.Cleanup(func() { providerHTTP = prevHTTP })
+	}
+
 	if tc.failPersist {
 		// Fail exactly the write that stores the rotated value, and nothing else.
 		//
@@ -364,19 +423,30 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 		t.Cleanup(func() { _, _ = h.db.Exec(`DROP TRIGGER IF EXISTS fail_rotate_persist`) })
 	}
 
-	return &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}
+	return env
 }
 
-func (e *rotationEnv) driveManual(t *testing.T) *httptest.ResponseRecorder {
+func (e *rotationEnv) driveManual(t *testing.T, tc rotationCase) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	e.h.Rotate(rec, vaultAuthzRequest("POST", "/api/vault/"+e.entryID+"/rotate",
-		e.owner, "user", e.entryID, `{"password":"`+rotationTestPassword+`"}`))
+	req := vaultAuthzRequest("POST", "/api/vault/"+e.entryID+"/rotate",
+		e.owner, "user", e.entryID, `{"password":"`+rotationTestPassword+`"}`)
+
+	if tc.callerDiesAfterCAS {
+		// Give the request a context we can kill, and hand the cancel to the revoke
+		// sink so it fires once the rotation has already committed.
+		reqCtx, cancel := context.WithCancel(req.Context())
+		e.killCaller = cancel
+		t.Cleanup(cancel)
+		req = req.WithContext(reqCtx)
+	}
+
+	e.h.Rotate(rec, req)
 	e.h.WaitForDelivery(5 * 1e9) // 5s, drains the detached delivery goroutine
 	return rec
 }
 
-func (e *rotationEnv) driveSweep(t *testing.T) {
+func (e *rotationEnv) driveSweep(t *testing.T, tc rotationCase) {
 	t.Helper()
 	ctx := context.Background()
 	due, err := e.queries.ListVaultEntriesNeedingRotation(ctx)
@@ -396,7 +466,16 @@ func (e *rotationEnv) driveSweep(t *testing.T) {
 		t.Fatalf("ABORT: entry %s is not in the due list (%d due), so the sweep would be a no-op "+
 			"and this case would assert nothing", e.entryID, len(due))
 	}
-	rotateOneEntry(ctx, e.queries, e.h, *row)
+	passCtx := ctx
+	if tc.callerDiesAfterCAS {
+		// The sweep's equivalent of a dead caller is a dead PASS context. Its
+		// context.WithoutCancel must survive it, which is the same property the
+		// handler now has.
+		dead, cancel := context.WithCancel(ctx)
+		cancel()
+		passCtx = dead
+	}
+	rotateOneEntry(passCtx, e.queries, e.h, *row)
 }
 
 // assertOutcome applies the SAME post-conditions regardless of which path ran.
