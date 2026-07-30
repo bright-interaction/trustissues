@@ -199,12 +199,31 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row, err := h.queries.CreateUser(r.Context(), db.CreateUserParams{
+	// Atomic: the "is this the first run" test happens INSIDE the insert.
+	//
+	// The CountUsers check above still runs, because it gives an honest 409 for the
+	// ordinary case, but it is no longer what enforces the rule. The gap between that
+	// check and this write contains the body decode, and the server's ReadTimeout is
+	// 30s, so a client that trickles its body holds the window open for as long as it
+	// likes. Proven with a test: a request that passed the count==0 gate and then
+	// stalled mid-body still created an account after a legitimate operator completed
+	// setup, giving 2 users and 2 ADMINS. Register is unauthenticated, so that is a
+	// full takeover of a fresh instance by anyone who can reach it during setup.
+	//
+	// sql.ErrNoRows here means the WHERE NOT EXISTS matched nothing, i.e. somebody
+	// else completed setup while this request was still arriving. That is the same
+	// answer as the pre-check: setup is done.
+	row, err := h.queries.CreateFirstAdmin(r.Context(), db.CreateFirstAdminParams{
 		Email:        req.Email,
 		PasswordHash: hash,
 		Name:         toNullString(req.Name),
-		Role:         "admin",
 	})
+	if errors.Is(err, sql.ErrNoRows) {
+		logError(r, "register: setup completed while this registration was in flight, refusing",
+			"email", req.Email)
+		writeConflict(w, r, "setup already completed")
+		return
+	}
 	if err != nil {
 		logError(r, "register: failed to create user", "error", err)
 		writeInternalError(w, r, "failed to create user")
