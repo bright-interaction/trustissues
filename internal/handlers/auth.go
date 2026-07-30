@@ -234,6 +234,34 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 
 // Login handles POST /api/auth/login - user authentication with lockout
 // (5 failed attempts per email / 15 min, 20 per IP) and optional TOTP 2FA.
+
+// capacityExhausted answers 503 and reports true when a passwordhash.Verify
+// failure was SERVER CAPACITY rather than a wrong password.
+//
+// Every site that checks a password must call this before treating the failure as
+// a credential error, and the reason is not cosmetic. Where failed attempts are
+// counted (login, TOTP disable) conflating the two is an account-lockout vector:
+// saturate the hash semaphore, spray requests at an address, and the account locks
+// out on capacity errors with nothing guessed. Where they are not counted (change
+// password, the vault reauth gates) it still tells a user their password is wrong
+// when the server is merely busy, which sends them to reset a credential that was
+// always correct.
+//
+// It exists as ONE function because the property was fixed on the login path and
+// missed on the five siblings, which is the shape that keeps recurring in this
+// codebase: one security property, several doors. TestCapacityErrorIsNeverAFailed\
+// LoginAttempt enforces that every Verify site routes through here.
+func capacityExhausted(w http.ResponseWriter, r *http.Request, verifyErr error, logPrefix string) bool {
+	if !errors.Is(verifyErr, passwordhash.ErrBusy) {
+		return false
+	}
+	logError(r, logPrefix+": hash capacity exhausted", "error", verifyErr)
+	w.Header().Set("Retry-After", "2")
+	writeError(w, r, http.StatusServiceUnavailable, "server_busy",
+		"the server is at capacity verifying passwords; retry shortly")
+	return true
+}
+
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
 	var req loginRequest
@@ -314,15 +342,9 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok, verifyErr := passwordhash.Verify(req.Password, row.PasswordHash)
-	if errors.Is(verifyErr, passwordhash.ErrBusy) {
-		// Server capacity, not a wrong password. Reporting it as a failed
-		// attempt would be a lie AND an account-lockout vector: an attacker
-		// saturating the hash semaphore could drive any account to its lockout
-		// threshold without ever guessing a password.
-		logError(r, "auth.login: hash capacity exhausted", "error", verifyErr)
-		w.Header().Set("Retry-After", "2")
-		writeError(w, r, http.StatusServiceUnavailable, "server_busy",
-			"the server is at capacity verifying passwords; retry shortly")
+	// Server capacity is not a wrong password, and counting it as a failed attempt
+	// would be an account-lockout vector. See capacityExhausted.
+	if capacityExhausted(w, r, verifyErr, "auth.login") {
 		return
 	}
 	if verifyErr != nil || !ok {
@@ -563,6 +585,9 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok, verifyErr := passwordhash.Verify(req.CurrentPassword, passwordHash)
+	if capacityExhausted(w, r, verifyErr, "auth.change_password") {
+		return
+	}
 	if verifyErr != nil || !ok {
 		writeUnauthorized(w, r, "current password is incorrect")
 		return
@@ -809,6 +834,19 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok, verifyErr := passwordhash.Verify(req.Password, passwordHash)
+	// Same contract as login, and it was missing here.
+	//
+	// This path counts failed attempts against the same 5-attempt lockout above, so
+	// reporting hash-capacity exhaustion as a bad password is the same
+	// account-lockout vector: saturate the semaphore, spray requests, and the
+	// account locks out on server-capacity errors with nothing guessed.
+	//
+	// The login path was fixed and this sibling was not, which is the shape that
+	// keeps recurring here: one security property, several doors. Found by a
+	// positional guard, not by reading.
+	if capacityExhausted(w, r, verifyErr, "totp.disable") {
+		return
+	}
 	if verifyErr != nil || !ok {
 		recordFailure()
 		writeUnauthorized(w, r, "invalid password")

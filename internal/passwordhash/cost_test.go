@@ -174,3 +174,34 @@ func TestBusyRatherThanQueueingForever(t *testing.T) {
 		t.Errorf("waited %v before giving up, budget is %v", elapsed, hashWait)
 	}
 }
+
+// TestHashSlotsBoundIsPinnedToAValue guards the NUMBER, not just the mechanism.
+//
+// TestBusyRatherThanQueueingForever fills cap(hashSlots), so it adapts to whatever
+// the cap happens to be and passes just as happily at 4096 as at 4. An ablation
+// raising the bound to 4096 went completely undetected, and 4096 concurrent Argon2
+// computations at 64 MiB each is 256 GB of resident memory: the exact resource
+// exhaustion the semaphore was added to prevent, with a green suite.
+//
+// So the value gets asserted directly, with the memory arithmetic in the failure
+// message, because the next person to touch it needs the reason and not just the
+// number.
+func TestHashSlotsBoundIsPinnedToAValue(t *testing.T) {
+	const (
+		memPerHashMiB = 64 // Argon2id parameter in this package
+		sanityCeiling = 16 // 16 * 64 MiB = 1 GiB of hashing, already generous
+	)
+	got := cap(hashSlots)
+	if got < 1 || got > sanityCeiling {
+		t.Errorf("cap(hashSlots) = %d, want 1..%d\n"+
+			"Each concurrent hash reserves ~%d MiB, so %d slots reserve ~%d MiB. Raising this "+
+			"bound trades a bounded 503 under load for an unbounded memory blow-up, and the "+
+			"saturation test cannot see it because it fills cap(hashSlots) whatever that is.",
+			got, sanityCeiling, memPerHashMiB, got, got*memPerHashMiB)
+	}
+	if hashWait <= 0 || hashWait > 10*time.Second {
+		t.Errorf("hashWait = %v, want a small positive budget\n"+
+			"An unbounded wait does not remove the exhaustion, it moves it from Argon2 buffers "+
+			"to goroutines: every waiter holds its whole request.", hashWait)
+	}
+}
