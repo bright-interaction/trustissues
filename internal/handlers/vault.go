@@ -1835,6 +1835,12 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
+		// login_attempts rows that reauthLocked counts, so counting it here is the
+		// same lockout vector as on login. See capacityExhausted.
+		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
+			return
+		}
 		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
@@ -1933,6 +1939,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
+		// login_attempts rows that reauthLocked counts, so counting it here is the
+		// same lockout vector as on login. See capacityExhausted.
+		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
+			return
+		}
 		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
@@ -2321,6 +2333,12 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
+		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
+		// login_attempts rows that reauthLocked counts, so counting it here is the
+		// same lockout vector as on login. See capacityExhausted.
+		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
+			return
+		}
 		h.recordReauthFailure(ctx, r, email)
 		writeForbidden(w, r, "incorrect password")
 		return
