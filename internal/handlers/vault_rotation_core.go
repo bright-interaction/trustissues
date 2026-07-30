@@ -140,19 +140,17 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 	}); err != nil {
 		slog.Error("vault rotation: persist last_rotation_error failed", "entry", rec.EntryName, "error", err)
 	}
-	updatedLog := AppendRotationLog(rec.RotationLog, RotationLogEntry{
+	// Appended under a compare-and-swap, NOT from rec.RotationLog. That snapshot can
+	// be 90s stale on the sweep, which used to erase a concurrent manual rotation's
+	// history entry and stamp this pass's conflict error over a rotation that had
+	// actually succeeded. See appendRotationLog.
+	appendRotationLog(ctx, deps, rec.EntryID, rec.EntryName, RotationLogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    status,
 		Provider:  rec.Provider,
 		Error:     errSummary,
 		Method:    rec.Method,
 	})
-	if err := deps.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-		RotationLog: toNullString(updatedLog),
-		ID:          rec.EntryID,
-	}); err != nil {
-		slog.Error("vault rotation: persist rotation_log failed", "entry", rec.EntryName, "error", err)
-	}
 	return status, errSummary
 }
 
@@ -234,17 +232,63 @@ func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, 
 	}); err != nil {
 		slog.Error("vault rotation: persist last_rotation_error failed", "entry", rec.EntryName, "error", err)
 	}
-	updatedLog := AppendRotationLog(rec.RotationLog, RotationLogEntry{
+	appendRotationLog(ctx, deps, rec.EntryID, rec.EntryName, RotationLogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    "partial",
 		Provider:  rec.Provider,
 		Error:     undeliverableMsg,
 		Method:    rec.Method,
 	})
-	if err := deps.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-		RotationLog: toNullString(updatedLog),
-		ID:          rec.EntryID,
-	}); err != nil {
-		slog.Error("vault rotation: persist rotation_log failed", "entry", rec.EntryName, "error", err)
+}
+
+// rotationLogCASAttempts bounds the retry. Contention here is two rotations of ONE
+// entry overlapping, so the loop converges immediately in practice; the bound exists
+// so a pathological case degrades to a logged miss rather than spinning.
+const rotationLogCASAttempts = 4
+
+// appendRotationLog adds one entry to an entry's rotation_log without losing a
+// concurrent append.
+//
+// It re-reads the column inside the loop rather than trusting a caller-supplied
+// snapshot, which is the actual defect: the sweep snapshots at pass start and can be
+// 90s behind by the time it writes, so a user clicking Rotate mid-pass had their
+// successful rotation erased from history and replaced by the sweep's conflict error,
+// with an alert fired about a rotation that had in fact succeeded. The user saw a red
+// error on the entry they had just correctly rotated.
+//
+// A failure to converge is logged and dropped rather than propagated: this is the
+// audit trail for a rotation that has ALREADY committed, so refusing the caller
+// would be worse than a missing history line. The value, last_rotation_error and the
+// alert are all written elsewhere.
+func appendRotationLog(ctx context.Context, deps rotationDeps, entryID, entryName string, entry RotationLogEntry) {
+	for attempt := 0; attempt < rotationLogCASAttempts; attempt++ {
+		current, err := deps.queries.GetVaultEntryRotationLog(ctx, entryID)
+		if err != nil {
+			slog.Error("vault rotation: read rotation_log failed", "entry", entryName, "error", err)
+			return
+		}
+		res, err := deps.queries.CASVaultEntryRotationLog(ctx, db.CASVaultEntryRotationLogParams{
+			RotationLog:   toNullString(AppendRotationLog(current, entry)),
+			ID:            entryID,
+			RotationLog_2: toNullString(current),
+		})
+		if err != nil {
+			slog.Error("vault rotation: persist rotation_log failed", "entry", entryName, "error", err)
+			return
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			slog.Error("vault rotation: rotation_log rows affected", "entry", entryName, "error", err)
+			return
+		}
+		if n > 0 {
+			return
+		}
+		// Someone else appended between the read and the write. Re-read and redo the
+		// append on top of THEIR entry rather than over it.
+		slog.Info("vault rotation: rotation_log changed under us, retrying the append",
+			"entry", entryName, "attempt", attempt+1)
 	}
+	slog.Error("vault rotation: gave up appending to rotation_log after concurrent writes",
+		"entry", entryName, "attempts", rotationLogCASAttempts)
 }

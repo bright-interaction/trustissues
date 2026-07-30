@@ -54,6 +54,20 @@ type Querier interface {
 	// SHA-256 key and would not decrypt under the current derivation even when the
 	// configured key is correct.
 	AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVaultEntryRow, error)
+	// Compare-and-swap on the rotation_log column itself.
+	//
+	// rotation_log is read-modify-written: the caller unmarshals the array, appends one
+	// entry, trims to 50 and writes the whole column back. With a plain UPDATE that is a
+	// lost update. The sweep takes its snapshot at pass start and can be up to 90s per
+	// earlier entry behind, so a user clicking Rotate on the same entry mid-pass had
+	// their successful rotation ERASED from history and replaced by the sweep's
+	// conflict error, complete with an alert about a rotation that had actually
+	// succeeded.
+	//
+	// Comparing the column rather than updated_at is deliberate: updated_at is bumped by
+	// every neighbouring write, so it would spuriously fail here, and it is stored as
+	// literal text which has already caused three rounds of CAS bugs on this table.
+	CASVaultEntryRotationLog(ctx context.Context, arg CASVaultEntryRotationLogParams) (sql.Result, error)
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	// Backs the "vault.*" style category filters. The UI has always offered them,
@@ -221,6 +235,7 @@ type Querier interface {
 	// Ownership check
 	// ============================================================================
 	GetVaultEntryOwner(ctx context.Context, id string) (string, error)
+	GetVaultEntryRotationLog(ctx context.Context, id string) (string, error)
 	GetVaultEntryTargets(ctx context.Context, id string) (sql.NullString, error)
 	// ============================================================================
 	// Import - bulk insert (used inside transaction)

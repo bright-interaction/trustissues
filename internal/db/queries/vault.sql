@@ -217,6 +217,26 @@ UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
 -- name: UpdateVaultEntryRotationLog :exec
 UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: GetVaultEntryRotationLog :one
+SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?;
+
+-- name: CASVaultEntryRotationLog :execresult
+-- Compare-and-swap on the rotation_log column itself.
+--
+-- rotation_log is read-modify-written: the caller unmarshals the array, appends one
+-- entry, trims to 50 and writes the whole column back. With a plain UPDATE that is a
+-- lost update. The sweep takes its snapshot at pass start and can be up to 90s per
+-- earlier entry behind, so a user clicking Rotate on the same entry mid-pass had
+-- their successful rotation ERASED from history and replaced by the sweep's
+-- conflict error, complete with an alert about a rotation that had actually
+-- succeeded.
+--
+-- Comparing the column rather than updated_at is deliberate: updated_at is bumped by
+-- every neighbouring write, so it would spuriously fail here, and it is stored as
+-- literal text which has already caused three rounds of CAS bugs on this table.
+UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND COALESCE(rotation_log, '') = ?;
+
 -- name: UpdateVaultEntryRotationTargets :exec
 UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
