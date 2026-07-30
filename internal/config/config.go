@@ -12,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/brightinteraction/trustissues/internal/shield"
 )
 
 // Config holds all application configuration loaded from environment variables.
@@ -123,6 +125,17 @@ func (c *Config) Validate() error {
 		errs = append(errs, "TRUSTISSUES_JWT_SECRET must be at least 32 characters")
 	} else if isWeakSecret(c.JWTSecret) {
 		errs = append(errs, "TRUSTISSUES_JWT_SECRET looks like a placeholder or low-entropy value (generate a real one: openssl rand -hex 32)")
+	}
+
+	// An unrecognised hint level must not silently become the most verbose one.
+	// See shield.ValidHintLevel: a misspelled "none" used to egress the full
+	// value-derived metadata it was set to suppress.
+	if !shield.ValidHintLevel(c.ShieldHintLevel) {
+		errs = append(errs, fmt.Sprintf(
+			"TRUSTISSUES_SHIELD_HINT_LEVEL must be one of %s (got %q); an unrecognised value "+
+				"would fall back to the most verbose level and egress the metadata you were "+
+				"trying to suppress",
+			strings.Join(shield.HintLevelNames, ", "), c.ShieldHintLevel))
 	}
 
 	if c.VaultKey == "" {
