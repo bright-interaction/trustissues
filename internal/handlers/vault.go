@@ -2183,6 +2183,30 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PAST THIS LINE THE ROTATION HAS COMMITTED, so the caller's context must no
+	// longer be able to stop the work.
+	//
+	// Everything after the CAS ran on r.Context(): the upstream revoke of the old
+	// key, the provider_meta write carrying the successor's key id, the response
+	// fetch, and both outcome writes. A browser tab closed, a client timeout, or a
+	// proxy hang-up cancels that context, and sqlc's generated ExecContext fails
+	// immediately on a done context. So the value was durably rotated while the
+	// revoke never fired, the successor's key id was never stored, and NOTHING was
+	// recorded: no last_rotation_error, no rotation_log entry, no alert. The entry
+	// then looks freshly rotated and clean, with both keys live upstream and the
+	// next revoke aimed at a stale id.
+	//
+	// The pre-CAS work deliberately keeps r.Context(), so an abandoned request
+	// still stops before anything is minted. The seam is exactly here, which is
+	// also where the shared core will take over.
+	//
+	// The sweep has done this since round 8 (vault_rotation.go:115) for the same
+	// reason: an entry must be able to write its own outcome even when the caller
+	// that triggered it is gone.
+	postCtx, cancelPost := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
+	defer cancelPost()
+	ctx = postCtx
+
 	// One fact, collected from both places a revoke can fail, folded into the
 	// final status exactly once at the end.
 	//
