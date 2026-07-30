@@ -1,29 +1,11 @@
 [
- {
-  "id": "keys-not-redacted",
-  "mech": "shield-json",
-  "test": "TestShieldJSONRedactsKeysAndNonURLLeaves",
-  "file": "internal/shield/session.go",
-  "why": "PII used as an object key egressed verbatim",
-  "old": "\t\t\toutKey, kErr := s.RedactString(ctx, k)",
-  "new": "\t\t\toutKey, kErr := k, error(nil)"
- },
- {
-  "id": "url-exemption-by-name-only",
-  "mech": "shield-json",
-  "test": "TestShieldJSONRedactsKeysAndNonURLLeaves",
-  "file": "internal/shield/session.go",
-  "why": "exempting on the key NAME alone leaked every leaf beneath it, arrays included",
-  "old": "\t\tif dereferencedURLKeys[key] && looksLikeDereferenceableURL(t) {",
-  "new": "\t\tif dereferencedURLKeys[key] {"
- },
- {
-  "id": "unshield-skips-keys",
-  "mech": "shield-json",
-  "test": "TestShieldJSONRoundTripsAPIIKey",
-  "file": "internal/shield/session.go",
-  "why": "redacting keys without restoring them hands back a document whose keys are markers",
-  "old": "\t\t\toutKey, kErr := s.UnshieldString(ctx, k)",
-  "new": "\t\t\toutKey, kErr := k, error(nil)"
- }
+ {"id":"body-limit-present-but-useless","mech":"body-limit","test":"TestProviderBodyIsActuallyTruncated","file":"internal/handlers/vault_providers.go",
+  "why":"keeps io.LimitReader so the SOURCE guard still passes; only a behavioural guard can see that the bound does nothing",
+  "old":"maxProviderBody = 1 << 20",
+  "new":"maxProviderBody = 1 << 40"},
+
+ {"id":"success-event-not-in-default-set","mech":"notify-only","test":"TestSuccessEventIsSubscribedByDefaultAndValid","file":"internal/handlers/notifications.go",
+  "why":"every channel an operator creates then silently fails to subscribe, and notify-only is a no-op again",
+  "old":"const defaultChannelEvents = \"vault.rotation_succeeded,vault.rotation_partial,vault.rotation_failed,vault.secret_expiring\"",
+  "new":"const defaultChannelEvents = \"vault.rotation_partial,vault.rotation_failed,vault.secret_expiring\""}
 ]
