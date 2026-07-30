@@ -103,6 +103,22 @@ type Querier interface {
 	// Collections CRUD
 	// ============================================================================
 	CreateCollection(ctx context.Context, arg CreateCollectionParams) error
+	// The first-run admin, created ONLY while the users table is empty.
+	//
+	// Register used to read CountUsers, then decode the request body, then INSERT, with
+	// no transaction and no recheck. The gap between the check and the write is not
+	// instantaneous and it is ATTACKER-EXTENDABLE: the body decode sits inside it and the
+	// server's ReadTimeout is 30s, so a client that trickles its body holds the window
+	// open for as long as it likes.
+	//
+	// Proven, not theorised: a request that passed the count==0 gate and then stalled
+	// mid-body still created an account after a legitimate operator completed setup,
+	// giving 2 users / 2 admins. Register is UNAUTHENTICATED and mints an ADMIN, so that
+	// is a full takeover of a fresh instance by anyone who can reach it during setup.
+	//
+	// The check and the insert are now one statement, so there is no window at all.
+	// A caller that affects zero rows must treat that as "setup already completed".
+	CreateFirstAdmin(ctx context.Context, arg CreateFirstAdminParams) (CreateFirstAdminRow, error)
 	// code holds the vault-key ciphertext (resend has to email the original), and
 	// code_hash is what redemption looks up. See migration 00030.
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)

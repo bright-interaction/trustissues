@@ -1,0 +1,6 @@
+[
+ {"id":"register-nonatomic-first-admin","mech":"auth","test":"TestRegisterRaceWithATrickledBody","file":"internal/handlers/auth.go","pkg":"./internal/handlers/",
+  "why":"unauthenticated admin creation surviving setup completion",
+  "old":"\trow, err := h.queries.CreateFirstAdmin(r.Context(), db.CreateFirstAdminParams{\n\t\tEmail:        req.Email,\n\t\tPasswordHash: hash,\n\t\tName:         toNullString(req.Name),\n\t})",
+  "new":"\trow, err := h.queries.CreateUser(r.Context(), db.CreateUserParams{\n\t\tEmail:        req.Email,\n\t\tPasswordHash: hash,\n\t\tName:         toNullString(req.Name),\n\t\tRole:         \"admin\",\n\t})"}
+]
