@@ -132,10 +132,14 @@ export const api = {
     sessions: () => request<LoginAttempt[]>('/auth/sessions'),
     totpSetup: () =>
       request<TOTPSetupResponse>('/auth/totp/setup', { method: 'POST' }),
-    totpVerify: (code: string) =>
+    // The password is required to ENABLE 2FA, not just a session. Turning it on is
+    // irreversible by the owner (login then needs a code, disable needs a code, the
+    // recovery codes go to whoever enrolled, and no admin can reset it), so a stolen
+    // session alone must not be able to do it.
+    totpVerify: (code: string, password: string) =>
       request<TOTPVerifyResponse>('/auth/totp/verify', {
         method: 'POST',
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code, password }),
       }),
     totpDisable: (password: string, code: string) =>
       request<{ message: string }>('/auth/totp/disable', {

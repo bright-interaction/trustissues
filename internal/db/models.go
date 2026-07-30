@@ -163,6 +163,7 @@ type User struct {
 	TotpSecret         sql.NullString `json:"totp_secret"`
 	TotpEnabled        sql.NullInt64  `json:"totp_enabled"`
 	TotpRecoveryCodes  sql.NullString `json:"totp_recovery_codes"`
+	TotpLastStep       sql.NullInt64  `json:"totp_last_step"`
 	SessionsValidAfter int64          `json:"sessions_valid_after"`
 	CreatedAt          sql.NullTime   `json:"created_at"`
 	UpdatedAt          sql.NullTime   `json:"updated_at"`

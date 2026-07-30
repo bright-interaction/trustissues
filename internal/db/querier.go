@@ -54,6 +54,17 @@ type Querier interface {
 	// SHA-256 key and would not decrypt under the current derivation even when the
 	// configured key is correct.
 	AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVaultEntryRow, error)
+	// Compare-and-swap on the recovery-code list.
+	//
+	// Consumption was a read-modify-write: read the JSON array, drop the used code, write
+	// the whole column back. With a plain UPDATE that is a lost update, and each code is a
+	// standalone 64-bit 2FA bypass, so a code the user has already redeemed and crossed off
+	// their printed list stays a working second factor.
+	//
+	// Two ways in: two concurrent logins each carrying a code both read before either
+	// writes, and a failed persist that still completed the login. Comparing the column
+	// itself means the second writer loses and retries against the winner's list.
+	CASRecoveryCodes(ctx context.Context, arg CASRecoveryCodesParams) (sql.Result, error)
 	// Compare-and-swap on the rotation_log column itself.
 	//
 	// rotation_log is read-modify-written: the caller unmarshals the array, appends one
@@ -68,6 +79,11 @@ type Querier interface {
 	// every neighbouring write, so it would spuriously fail here, and it is stored as
 	// literal text which has already caused three rounds of CAS bugs on this table.
 	CASVaultEntryRotationLog(ctx context.Context, arg CASVaultEntryRotationLogParams) (sql.Result, error)
+	// Spend a TOTP time step, monotonically.
+	//
+	// Affects zero rows when the step has already been used (or an older one is being
+	// replayed), which is how a captured code stops being reusable inside its own window.
+	ClaimTOTPStep(ctx context.Context, arg ClaimTOTPStepParams) (sql.Result, error)
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	// Backs the "vault.*" style category filters. The UI has always offered them,

@@ -88,6 +88,8 @@ function AccountTab() {
     qr_uri: string;
   } | null>(null);
   const [totpVerifyCode, setTotpVerifyCode] = useState('');
+  // Enabling 2FA requires the account password: see api.auth.totpVerify.
+  const [totpEnablePassword, setTotpEnablePassword] = useState('');
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [disableForm, setDisableForm] = useState({ password: '', code: '' });
   const [showDisable, setShowDisable] = useState(false);
@@ -124,7 +126,8 @@ function AccountTab() {
   });
 
   const totpVerifyMutation = useMutation({
-    mutationFn: (code: string) => api.auth.totpVerify(code),
+    mutationFn: ({ code, password }: { code: string; password: string }) =>
+      api.auth.totpVerify(code, password),
     onSuccess: async (data) => {
       setTotpSetupData(null);
       setTotpVerifyCode('');
@@ -305,10 +308,22 @@ function AccountTab() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                totpVerifyMutation.mutate(totpVerifyCode);
+                totpVerifyMutation.mutate({
+                  code: totpVerifyCode,
+                  password: totpEnablePassword,
+                });
               }}
-              className="flex items-center gap-2"
+              className="flex flex-col gap-2 sm:flex-row sm:items-center"
             >
+              <input
+                type="password"
+                autoComplete="current-password"
+                placeholder="Your password"
+                value={totpEnablePassword}
+                onChange={(e) => setTotpEnablePassword(e.target.value)}
+                required
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm sm:w-44"
+              />
               <input
                 type="text"
                 inputMode="numeric"
@@ -358,7 +373,12 @@ function AccountTab() {
                 />
                 <input
                   type="text"
-                  inputMode="numeric"
+                  // NOT inputMode="numeric": this field accepts a recovery code too,
+                  // and those are hex (see totp.GenerateRecoveryCodes). A numeric
+                  // keypad made the documented recovery path awkward to actually use
+                  // on a phone, which is the device you reach for when your
+                  // authenticator is gone.
+                  autoComplete="one-time-code"
                   value={disableForm.code}
                   onChange={(e) =>
                     setDisableForm({ ...disableForm, code: e.target.value })

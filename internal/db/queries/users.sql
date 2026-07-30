@@ -85,5 +85,27 @@ UPDATE users SET totp_enabled = 0, totp_secret = '', totp_recovery_codes = '' WH
 -- name: UpdateRecoveryCodes :exec
 UPDATE users SET totp_recovery_codes = ? WHERE id = ?;
 
+-- name: CASRecoveryCodes :execresult
+-- Compare-and-swap on the recovery-code list.
+--
+-- Consumption was a read-modify-write: read the JSON array, drop the used code, write
+-- the whole column back. With a plain UPDATE that is a lost update, and each code is a
+-- standalone 64-bit 2FA bypass, so a code the user has already redeemed and crossed off
+-- their printed list stays a working second factor.
+--
+-- Two ways in: two concurrent logins each carrying a code both read before either
+-- writes, and a failed persist that still completed the login. Comparing the column
+-- itself means the second writer loses and retries against the winner's list.
+UPDATE users SET totp_recovery_codes = ?
+WHERE id = ? AND COALESCE(totp_recovery_codes, '') = ?;
+
 -- name: ListUsersWithTOTPSecret :many
 SELECT id, totp_secret FROM users WHERE totp_secret != '';
+
+-- name: ClaimTOTPStep :execresult
+-- Spend a TOTP time step, monotonically.
+--
+-- Affects zero rows when the step has already been used (or an older one is being
+-- replayed), which is how a captured code stops being reusable inside its own window.
+UPDATE users SET totp_last_step = ?
+WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?);

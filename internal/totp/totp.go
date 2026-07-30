@@ -74,7 +74,23 @@ func GenerateCode(secret string, t time.Time) (string, error) {
 
 // ValidateCode checks a user-supplied code against the current and
 // previous time steps, allowing a one-step tolerance for clock drift.
+//
+// Prefer ValidateCodeStep at any call site that can record the step. This form
+// cannot tell the caller WHICH step matched, so it cannot be made single-use, and a
+// captured code stays replayable for the whole 60-second window.
 func ValidateCode(secret string, code string) bool {
+	_, ok := ValidateCodeStep(secret, code)
+	return ok
+}
+
+// ValidateCodeStep is ValidateCode plus the time step that matched, so the caller can
+// spend it and refuse a replay.
+//
+// The window exists for clock drift and is not the problem; the problem was that
+// nothing recorded which step had been used, so one observed code was good for the
+// rest of its window: as many sessions as an attacker wanted, plus removing 2FA. The
+// step is monotonic, so claiming it also rejects a replay of the drift step.
+func ValidateCodeStep(secret string, code string) (int64, bool) {
 	now := time.Now()
 	for _, offset := range []int64{0, -1} {
 		t := now.Add(time.Duration(offset*timeStep) * time.Second)
@@ -83,10 +99,10 @@ func ValidateCode(secret string, code string) bool {
 			continue
 		}
 		if hmac.Equal([]byte(expected), []byte(code)) {
-			return true
+			return t.Unix() / timeStep, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // GenerateOTPAuthURI returns an otpauth:// URI that can be rendered
