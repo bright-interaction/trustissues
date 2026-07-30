@@ -64,7 +64,12 @@ type rotationCase struct {
 	// explicit about this is the point: a symmetric cross product would be a
 	// lie, and pretending otherwise is how a matrix gives false confidence.
 	sweepApplicable bool
-	want            rotationOutcome
+	// failPersist injects a failure into the ONE write that stores the rotated
+	// value, so the branch that reports a persist error can be reached without a
+	// broken CAS token (a NULL updated_at would instead make the due query fail
+	// its scan and abort the sweep driver, testing nothing).
+	failPersist bool
+	want        rotationOutcome
 	// wantManualStatus is the HTTP status the manual path must return. The sweep
 	// has no HTTP surface, which is why this is not in rotationOutcome.
 	wantManualStatus int
@@ -110,7 +115,10 @@ func rotationCases() []rotationCase {
 			provider:         "internal:postgres",
 			sweepApplicable:  true,
 			wantManualStatus: http.StatusConflict,
-			want:             rotationOutcome{valueChanged: false, errorRecorded: true, logStatus: "error"},
+			// alertWanted because an entry that can NEVER rotate is exactly what an
+			// operator has to be told about: nothing else will ever mention it, and
+			// the secret sits there going stale forever.
+			want: rotationOutcome{valueChanged: false, errorRecorded: true, logStatus: "error", alertWanted: true},
 		},
 		{
 			// Reminder-only: the provider exists but cannot rotate itself. Same
@@ -123,18 +131,35 @@ func rotationCases() []rotationCase {
 			want:             rotationOutcome{valueChanged: false, errorRecorded: false, logStatus: "reminder"},
 		},
 		{
+			// The rotated value cannot be written at all.
+			//
+			// A provider-backed entry has already minted its successor upstream by
+			// the time this fails, and the handler discards the meta holding its key
+			// id, so the new key exists at the provider with nobody holding it. The
+			// sweep records rotFailPersist; manual returned 500 and recorded nothing,
+			// leaving the entry looking untouched in the UI.
+			name:             "the rotated value cannot be written",
+			provider:         "shared-secret",
+			sweepApplicable:  true,
+			failPersist:      true,
+			wantManualStatus: http.StatusInternalServerError,
+			want: rotationOutcome{
+				valueChanged: false, errorRecorded: true, logStatus: "error", alertWanted: true,
+			},
+		},
+		{
 			// The new value IS stored, but the predecessor key could not be
 			// destroyed upstream, so both keys are still live.
 			//
-			// The rotation is therefore NOT a success, and this is the ordinary
-			// happy path plus one failed HTTP call, not a rare condition: resend,
-			// sendgrid and neon all defer a DELETE for the old key, and that DELETE
-			// authenticates with the NEW key, which providers routinely reject
-			// until permissions propagate.
+			// The rotation is therefore NOT a success, and this is the ordinary happy
+			// path plus one failed HTTP call, not a rare condition: resend, sendgrid
+			// and neon all defer a DELETE for the old key, and that DELETE
+			// authenticates with the NEW key, which providers routinely reject until
+			// permissions propagate.
 			//
-			// Manual recorded the failure and then overwrote it with success, with
-			// no alert. The operator most likely to hit this is the one rotating a
-			// key they believe is compromised.
+			// Manual recorded the failure and then overwrote it with success, with no
+			// alert. The operator most likely to hit this is the one rotating a key
+			// they believe is compromised.
 			name:             "old key revoke fails, predecessor still live",
 			provider:         revokeFailProvider,
 			sweepApplicable:  true,
@@ -179,7 +204,7 @@ func TestRotationContract(t *testing.T) {
 	for _, tc := range rotationCases() {
 		tc := tc
 		t.Run("manual/"+tc.name, func(t *testing.T) {
-			env := newRotationEnv(t, tc.provider)
+			env := newRotationEnv(t, tc)
 			rec := env.driveManual(t)
 			if rec.Code != tc.wantManualStatus {
 				t.Fatalf("manual rotate returned %d, want %d: %s",
@@ -192,7 +217,7 @@ func TestRotationContract(t *testing.T) {
 			if !tc.sweepApplicable {
 				t.Skip("the due query cannot select this entry shape (needs provider + auto_rotate + interval)")
 			}
-			env := newRotationEnv(t, tc.provider)
+			env := newRotationEnv(t, tc)
 			env.driveSweep(t)
 			env.assertOutcome(t, "sweep", tc.want)
 		})
@@ -242,22 +267,34 @@ func installRotationFakes(t *testing.T) *alertRecorder {
 		delete(providerLabels, revokeFailProvider)
 	})
 
+	// BOTH dispatchers. dispatchRotationAlert fires EventRotationPartial (a
+	// rotation that stored its value but was not fully clean); recordRotationFailure
+	// goes through dispatchRotationFailure for EventRotationFailed. Swapping one and
+	// not the other reports "nobody was notified" about a path that did notify, which
+	// is a false finding pointing at working code.
 	rec := &alertRecorder{}
-	prev := dispatchRotationAlert
+	prevAlert, prevFail := dispatchRotationAlert, dispatchRotationFailure
 	dispatchRotationAlert = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
-		rec.record(detail)
+		rec.record("partial: " + detail)
 	}
-	t.Cleanup(func() { dispatchRotationAlert = prev })
+	dispatchRotationFailure = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+		rec.record("failed: " + detail)
+	}
+	t.Cleanup(func() {
+		dispatchRotationAlert = prevAlert
+		dispatchRotationFailure = prevFail
+	})
 	return rec
 }
 
 const rotationTestPassword = "CorrectHorseBatteryStaple1!"
 
-func newRotationEnv(t *testing.T, provider string) *rotationEnv {
+func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 	t.Helper()
 	h, queries := newCollectionAuthzEnv(t)
 	ctx := context.Background()
 	rec := installRotationFakes(t)
+	provider := tc.provider
 
 	owner := mustUser(t, queries, fmt.Sprintf("rot-%s@example.com", randomHex(6)), "user", rotationTestPassword)
 	entryID := "rot-" + randomHex(6)
@@ -287,6 +324,22 @@ func newRotationEnv(t *testing.T, provider string) *rotationEnv {
 		`UPDATE vault_entries SET last_rotated_at = datetime('now','-30 days'),
 		 updated_at = datetime('now','-1 hour') WHERE id = ?`, entryID); err != nil {
 		t.Fatalf("age entry: %v", err)
+	}
+
+	if tc.failPersist {
+		// Fail exactly the write that stores the rotated value, and nothing else.
+		//
+		// Scoped to encrypted_value on purpose: UpdateVaultEntryRotationError and
+		// UpdateVaultEntryRotationLog never SET that column, so the bookkeeping the
+		// failure path is supposed to perform still succeeds and can be asserted.
+		// That is the difference between testing the error branch and testing a
+		// database that refuses everything.
+		if _, err := h.db.Exec(`CREATE TRIGGER fail_rotate_persist
+			BEFORE UPDATE OF encrypted_value ON vault_entries
+			BEGIN SELECT RAISE(ABORT, 'injected persist failure'); END`); err != nil {
+			t.Fatalf("install persist-failure trigger: %v", err)
+		}
+		t.Cleanup(func() { _, _ = h.db.Exec(`DROP TRIGGER IF EXISTS fail_rotate_persist`) })
 	}
 
 	return &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}

@@ -2155,7 +2155,15 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	applied, err := persistRotatedValue(ctx, h.queries,
 		snapshotFromRotationRow(id, entryRow.UpdatedAtText), encrypted, nonce)
 	if err != nil {
+		// Same hazard as the CAS-miss branch just below, and it recorded nothing.
+		// A provider-backed rotation has ALREADY minted the successor upstream by
+		// this point, and pendingProviderMeta (which holds its key id) is discarded
+		// on return, so nobody holds the new key and nothing in the product says so.
+		// The sweep records rotFailPersist here; this path returned 500 and left the
+		// entry looking untouched.
 		logError(r, "vault.rotate: update failed", "error", err)
+		recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+			entryRow.RotationLog.String, rotFailPersist, rotationMethod, &userID)
 		writeInternalError(w, r, "failed to update secret")
 		return
 	}
