@@ -237,13 +237,34 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 		return in, nil
 	}
 	out := in
+
+	// Which marker-shaped spans in the INPUT are actually ours.
+	//
+	// Skipping redaction inside markers is necessary (see replaceOutsideMarkers)
+	// but it used to trust the marker's SHAPE. MarkerPattern's hint group is
+	// `[^\]]*`, unbounded, so any text wrapped in a forged marker was preserved
+	// verbatim and never scanned:
+	//
+	//	in:  [shield:email:tok_dead:contact anna@example.se key sk_live_ABC...]
+	//	out: [shield:email:tok_dead:contact anna@example.se key sk_live_ABC...]
+	//
+	// Both the address and the secret egressed to the model in full, while the
+	// same text unwrapped was correctly tokenized. tok_dead is trivial to forge
+	// because nothing checked it against the store, so anyone able to influence
+	// text on its way to an LLM could switch redaction off for that span.
+	//
+	// Authenticity, not shape: a span is protected only if we issued its token.
+	// Resolved ONCE per call rather than once per pattern, because redactPatterns
+	// is long and the SQL store would otherwise do a query per pattern per marker.
+	trusted := s.ourMarkerTokens(ctx, in)
+
 	for _, p := range redactPatterns {
 		var firstErr error
 		// Apply each pattern only OUTSIDE existing [shield:...] markers. Earlier
 		// patterns (email etc.) emit markers whose hint can contain values a
 		// later, more general pattern (hostname/IP) would otherwise re-match and
 		// corrupt, breaking the unshield round-trip.
-		out = replaceOutsideMarkers(out, p.re, func(match string) string {
+		out = replaceOutsideMarkers(out, p.re, trusted, func(match string) string {
 			// The hostname pattern is broad; don't tokenize things that are
 			// really filenames or code identifiers (config.json, main.go,
 			// docker-compose.yml, strings.HasPrefix) which show up heavily in
@@ -281,6 +302,14 @@ func (s *Session) RedactString(ctx context.Context, in string) (string, error) {
 					firstErr = err
 				}
 				return match
+			}
+			// Trust the marker we just minted, so the NEXT pattern in the loop
+			// leaves it alone. Without this, protection would only cover markers
+			// present in the original input and a later broad pattern (hostname,
+			// IP) would re-match inside this one's hint and corrupt the round-trip,
+			// which is the whole reason replaceOutsideMarkers exists.
+			if g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {
+				trusted[g[2]] = true
 			}
 			return marker
 		})
@@ -422,21 +451,61 @@ func hostSignal(s string) bool {
 }
 
 // replaceOutsideMarkers runs re.ReplaceAllStringFunc over every part of s that
-// is NOT inside an existing [shield:...] marker, leaving markers verbatim.
-func replaceOutsideMarkers(s string, re *regexp.Regexp, repl func(string) string) string {
-	spans := MarkerPattern.FindAllStringIndex(s, -1)
+// is NOT inside a marker WE issued, leaving our markers verbatim.
+//
+// trusted holds the token ids this session minted or verified against the store.
+// A marker-shaped span whose token is not in there is ordinary attacker- or
+// user-supplied text that happens to look like a marker, so the pattern runs over
+// it like anything else. Trusting the shape alone let a forged marker with an
+// unbounded hint carry an address and an API key straight through to the model.
+func replaceOutsideMarkers(s string, re *regexp.Regexp, trusted map[string]bool, repl func(string) string) string {
+	spans := MarkerPattern.FindAllStringSubmatchIndex(s, -1)
 	if len(spans) == 0 {
 		return re.ReplaceAllStringFunc(s, repl)
 	}
 	var b strings.Builder
 	last := 0
 	for _, sp := range spans {
+		// sp is [full0,full1, kind0,kind1, tok0,tok1, ...]; group 2 is the token.
+		if len(sp) < 6 || sp[4] < 0 {
+			continue
+		}
+		if !trusted[s[sp[4]:sp[5]]] {
+			continue // not ours: leave it in the scannable region
+		}
 		b.WriteString(re.ReplaceAllStringFunc(s[last:sp[0]], repl))
-		b.WriteString(s[sp[0]:sp[1]]) // keep the marker untouched
+		b.WriteString(s[sp[0]:sp[1]]) // keep our own marker untouched
 		last = sp[1]
 	}
 	b.WriteString(re.ReplaceAllStringFunc(s[last:], repl))
 	return b.String()
+}
+
+// ourMarkerTokens returns the token ids in s that this session can actually
+// resolve, i.e. the markers we issued rather than ones shaped like it.
+//
+// A resolve failure is treated as "not ours", which fails CLOSED: the span stays
+// scannable and gets redacted. The opposite default would mean a store hiccup
+// silently disables redaction, which is the failure this whole function exists to
+// prevent.
+func (s *Session) ourMarkerTokens(ctx context.Context, in string) map[string]bool {
+	trusted := make(map[string]bool)
+	if !strings.Contains(in, "[shield:") {
+		return trusted
+	}
+	for _, g := range MarkerPattern.FindAllStringSubmatch(in, -1) {
+		if len(g) < 3 {
+			continue
+		}
+		tokenID := g[2]
+		if trusted[tokenID] {
+			continue
+		}
+		if _, err := s.Resolve(ctx, tokenID); err == nil {
+			trusted[tokenID] = true
+		}
+	}
+	return trusted
 }
 
 // encodedBlobMinLen is the shortest string treated as an encoded binary blob.
