@@ -63,6 +63,15 @@ type rotationOutcome struct {
 	// post-conditions cannot be read. Only the out-of-band ones (the alert) are
 	// checked, and the alert assertion is what keeps the row from being vacuous.
 	rowDeleted bool
+	// logMethod is the Method the newest rotation_log entry must carry, "" to skip.
+	//
+	// Asserted because a user-clicked rotation of a provider-backed entry was
+	// recorded as "auto": the audit trail attributed a human action to the
+	// scheduler, and the failure path produced "Auto-rotation failed for X" while
+	// simultaneously naming the acting user. "auto" vs "manual" answers WHO
+	// TRIGGERED THIS, which is the only question an audit trail is asked about a
+	// secret.
+	logMethod string
 }
 
 type rotationCase struct {
@@ -87,7 +96,10 @@ type rotationCase struct {
 	// deleteDuringPostCAS removes the row inside the post-commit window, which is
 	// what makes the response fetch fail on a rotation that already happened.
 	deleteDuringPostCAS bool
-	want                rotationOutcome
+	// corruptTargets makes rotation_targets undecryptable, which used to read as
+	// "no targets configured" and produce a clean success with no delivery.
+	corruptTargets bool
+	want           rotationOutcome
 	// wantManualStatus is the HTTP status the manual path must return. The sweep
 	// has no HTTP surface, which is why this is not in rotationOutcome.
 	wantManualStatus int
@@ -107,7 +119,11 @@ func rotationCases() []rotationCase {
 			provider:         "shared-secret",
 			sweepApplicable:  true,
 			wantManualStatus: http.StatusOK,
-			want:             rotationOutcome{valueChanged: true, errorRecorded: false, logStatus: "success"},
+			// logMethod is per-driver, so it is set by the driver below rather than
+			// here: the same entry is "manual" when a person clicks and "auto" when
+			// the sweep picks it up. That is the one field the two paths MUST differ
+			// on, which is why it cannot be a shared constant.
+			want: rotationOutcome{valueChanged: true, errorRecorded: false, logStatus: "success"},
 		},
 		{
 			name:             "auto-rotating generated key",
@@ -184,6 +200,23 @@ func rotationCases() []rotationCase {
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
 				metaWrites: 1,
+			},
+		},
+		{
+			// rotation_targets will not decrypt.
+			//
+			// The value IS rotated and the predecessor IS revoked, so this is a
+			// PARTIAL rotation: every configured webhook and Actions secret still
+			// holds a credential that no longer works. It used to record a clean
+			// success with last_rotation_error NULL and no alert, because an
+			// undecryptable column degraded to "[]".
+			name:             "rotation_targets cannot be decrypted",
+			provider:         "shared-secret",
+			sweepApplicable:  true,
+			corruptTargets:   true,
+			wantManualStatus: http.StatusOK,
+			want: rotationOutcome{
+				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
 			},
 		},
 		{
@@ -270,22 +303,33 @@ func TestRotationContract(t *testing.T) {
 	for _, tc := range rotationCases() {
 		tc := tc
 		t.Run("manual/"+tc.name, func(t *testing.T) {
+			// The one post-condition that MUST differ between the paths, so it is
+			// derived from the driver rather than written in the case: the same entry
+			// is "manual" when a person clicks it and "auto" when the sweep takes it.
+			want := tc.want
+			if want.logStatus != "" {
+				want.logMethod = "manual"
+			}
 			env := newRotationEnv(t, tc)
 			rec := env.driveManual(t, tc)
 			if rec.Code != tc.wantManualStatus {
 				t.Fatalf("manual rotate returned %d, want %d: %s",
 					rec.Code, tc.wantManualStatus, rec.Body.String())
 			}
-			env.assertOutcome(t, "manual", tc.want)
+			env.assertOutcome(t, "manual", want)
 		})
 
 		t.Run("sweep/"+tc.name, func(t *testing.T) {
+			want := tc.want
+			if want.logStatus != "" {
+				want.logMethod = "auto"
+			}
 			if !tc.sweepApplicable {
 				t.Skip("the due query cannot select this entry shape (needs provider + auto_rotate + interval)")
 			}
 			env := newRotationEnv(t, tc)
 			env.driveSweep(t, tc)
-			env.assertOutcome(t, "sweep", tc.want)
+			env.assertOutcome(t, "sweep", want)
 		})
 	}
 }
@@ -397,6 +441,17 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 		`UPDATE vault_entries SET last_rotated_at = datetime('now','-30 days'),
 		 updated_at = datetime('now','-1 hour') WHERE id = ?`, entryID); err != nil {
 		t.Fatalf("age entry: %v", err)
+	}
+
+	if tc.corruptTargets {
+		// Ciphertext-shaped but undecryptable: the prefix makes decryptColumn try,
+		// and the body is not valid base64 under our key. Writing cleartext instead
+		// would take the "not encrypted, pass through" path and test nothing.
+		if _, err := h.db.Exec(
+			`UPDATE vault_entries SET rotation_targets = ? WHERE id = ?`,
+			"enc:v1:bm90LXJlYWxseS1jaXBoZXJ0ZXh0", entryID); err != nil {
+			t.Fatalf("corrupt rotation_targets: %v", err)
+		}
 	}
 
 	if tc.want.metaWrites > 0 {
@@ -610,6 +665,13 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 			t.Errorf("%s: rotation_log is empty, want a %q entry", path, want.logStatus)
 		} else if got := entries[len(entries)-1].Status; got != want.logStatus {
 			t.Errorf("%s: newest rotation_log status = %q, want %q", path, got, want.logStatus)
+		}
+		if want.logMethod != "" && len(entries) > 0 {
+			if got := entries[len(entries)-1].Method; got != want.logMethod {
+				t.Errorf("%s: newest rotation_log method = %q, want %q\n"+
+					"This field says WHO triggered the rotation. Recording a user's click as "+
+					"\"auto\" attributes a human action to the scheduler.", path, got, want.logMethod)
+			}
 		}
 	}
 }
