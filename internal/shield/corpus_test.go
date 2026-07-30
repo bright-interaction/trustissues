@@ -12,6 +12,24 @@ import (
 
 var anyMarker = regexp.MustCompile(`\[shield:[a-z_]+:tok_`)
 
+// A NOTE ON WHAT THESE CORPORA STRUCTURALLY CANNOT TEST.
+//
+// Both gates work by asserting on the presence or absence of a marker. That makes
+// them blind to any input which itself contains marker-shaped text, because the
+// assertion cannot tell a marker we issued from one the input supplied. A forged
+// marker wrapping real PII would satisfy TestPIICorpusIsTokenized perfectly: the
+// requested kind IS present, because the attacker wrote it.
+//
+// That was not hypothetical. Redaction used to skip any marker-SHAPED span, so
+// wrapping an address and an API key in [shield:email:tok_dead:...] passed both
+// through to the model verbatim, and neither corpus could construct the case.
+//
+// So marker forgery lives in marker_forgery_test.go, which asserts on the RAW
+// VALUES rather than on markers. Adding forged-marker lines here instead would
+// have been worse than adding nothing: a vacuously passing line reads like
+// coverage. When a class cannot be expressed as "this line must/must not produce a
+// marker", it does not belong in a corpus.
+
 // TestNoiseCorpusProducesNoMarkers is the precision gate.
 //
 // Six rounds of regex patching each widened a pattern to catch a true positive
