@@ -8,6 +8,66 @@ import (
 	"github.com/brightinteraction/trustissues/internal/db"
 )
 
+// providerRole is an entry's provider resolved ONCE, so no branch has to
+// re-derive it from the (name, found, CanAutoRotate) triple and get the
+// combination wrong.
+//
+// It exists because a branch written as `if p, ok := Registry[name]; ok && ...`
+// silently does nothing for a name that is not in the registry, and "does
+// nothing" in the manual rotate handler meant falling through to the local
+// generator. That overwrote a real upstream credential with 32 bytes of random
+// hex and answered 200. The scheduled sweep, reading the same row, refused it.
+//
+// The unknown case is not hypothetical. Trustissues is a fork of dockyard and
+// the fork deleted the five internal:* providers (see cred_rotation.go), while
+// nothing validates provider against the registry on write. A database carried
+// over from dockyard holds entries in exactly this state.
+//
+// Both rotation paths classify through here so the four states are enumerated in
+// one place and a new state cannot be handled by one path and forgotten by the
+// other.
+type providerRole int
+
+const (
+	// providerNone: no provider configured. A local secret this server owns, so
+	// generating a fresh value IS the rotation.
+	providerNone providerRole = iota
+	// providerAuto: in the registry and able to mint its own successor upstream.
+	providerAuto
+	// providerReminder: in the registry but rotation must happen in the
+	// provider's own dashboard. The server must not invent a value.
+	providerReminder
+	// providerUnknown: a provider name this build does not have. Same hazard as
+	// providerReminder and reached by a different route, which is why it is its
+	// own state rather than folded in.
+	providerUnknown
+)
+
+// classifyProvider resolves a provider name into its role plus the provider
+// itself (nil unless the name was found).
+func classifyProvider(name string) (providerRole, KeyProvider) {
+	if name == "" {
+		return providerNone, nil
+	}
+	p, ok := ProviderRegistry[name]
+	if !ok {
+		return providerUnknown, nil
+	}
+	if !p.CanAutoRotate() {
+		return providerReminder, p
+	}
+	return providerAuto, p
+}
+
+// mayGenerateLocally reports whether this server is entitled to invent a new
+// value for the entry. Only a provider-less entry qualifies.
+//
+// Read this as the single question every caller of generateToken on a rotation
+// path has to answer. The old code asked it implicitly, by falling through a
+// chain of negative branches, which is how two of the four roles ended up in the
+// generator.
+func (r providerRole) mayGenerateLocally() bool { return r == providerNone }
+
 // errNoCASToken is returned when a caller tries to persist a rotated value
 // without the token that proves which row version it read.
 //
