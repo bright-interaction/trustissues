@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/brightinteraction/trustissues/internal/alerts"
 	"github.com/brightinteraction/trustissues/internal/db"
 )
 
@@ -43,6 +45,13 @@ type rotationOutcome struct {
 	valueChanged  bool   // the stored ciphertext now decrypts to something new
 	errorRecorded bool   // last_rotation_error is non-empty
 	logStatus     string // status of the newest rotation_log entry, "" to skip
+	// alertWanted is whether a rotation alert must have been dispatched.
+	//
+	// Not folded into errorRecorded, because the revoke-failure bug produced
+	// THREE independent symptoms (error wiped, log said success, no alert) and a
+	// test asserting only the database would have caught two of them while
+	// leaving operators un-notified.
+	alertWanted bool
 }
 
 type rotationCase struct {
@@ -113,7 +122,55 @@ func rotationCases() []rotationCase {
 			wantManualStatus: http.StatusConflict,
 			want:             rotationOutcome{valueChanged: false, errorRecorded: false, logStatus: "reminder"},
 		},
+		{
+			// The new value IS stored, but the predecessor key could not be
+			// destroyed upstream, so both keys are still live.
+			//
+			// The rotation is therefore NOT a success, and this is the ordinary
+			// happy path plus one failed HTTP call, not a rare condition: resend,
+			// sendgrid and neon all defer a DELETE for the old key, and that DELETE
+			// authenticates with the NEW key, which providers routinely reject
+			// until permissions propagate.
+			//
+			// Manual recorded the failure and then overwrote it with success, with
+			// no alert. The operator most likely to hit this is the one rotating a
+			// key they believe is compromised.
+			name:             "old key revoke fails, predecessor still live",
+			provider:         revokeFailProvider,
+			sweepApplicable:  true,
+			wantManualStatus: http.StatusOK,
+			want: rotationOutcome{
+				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
+			},
+		},
 	}
+}
+
+// revokeFailProvider is a registered fake that rotates successfully and then
+// defers a revoke that cannot succeed.
+const revokeFailProvider = "test-revoke-fails"
+
+// unreachableRevokeURL is refused by providerHTTP at DIAL time (the guarded
+// client blocks private ranges), which makes the failure deterministic and needs
+// no network and no httptest server. Precedent: TestDeferredRevokeFailureIsNeverSilent.
+const unreachableRevokeURL = "http://10.0.0.1/keys/old"
+
+type revokeFailingProvider struct{}
+
+func (p *revokeFailingProvider) Name() string                            { return revokeFailProvider }
+func (p *revokeFailingProvider) CanAutoRotate() bool                     { return true }
+func (p *revokeFailingProvider) DashboardURL(_ map[string]string) string { return "" }
+
+func (p *revokeFailingProvider) Validate(_ context.Context, _ string, _ map[string]string) (bool, error) {
+	return true, nil
+}
+
+func (p *revokeFailingProvider) Rotate(_ context.Context, _ string, meta map[string]string) (string, error) {
+	// Mint a successor, then register the revoke of the predecessor exactly the
+	// way resend/sendgrid/neon do.
+	meta["key_id"] = "new-" + randomHex(4)
+	deferRevokeOldProviderKey(meta, "DELETE", unreachableRevokeURL)
+	return "ROTATED-" + randomHex(8), nil
 }
 
 // TestRotationContract drives every case through BOTH paths and applies the
@@ -149,6 +206,49 @@ type rotationEnv struct {
 	owner   string
 	entryID string
 	before  string // plaintext before rotation
+	alerts  *alertRecorder
+}
+
+// alertRecorder counts rotation alerts. Pointer-shared with the swapped
+// dispatchRotationAlert so both drivers observe the same counter, including the
+// manual path's detached delivery goroutine.
+type alertRecorder struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (a *alertRecorder) record(detail string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.events = append(a.events, detail)
+}
+
+func (a *alertRecorder) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.events)
+}
+
+// installRotationFakes registers the test provider and swaps the alert dispatcher,
+// restoring both. The registry is package-global, so the cleanup is not optional:
+// TestProviderRegistryReducedSet walks every entry and would fail on a leaked one.
+func installRotationFakes(t *testing.T) *alertRecorder {
+	t.Helper()
+
+	ProviderRegistry[revokeFailProvider] = &revokeFailingProvider{}
+	providerLabels[revokeFailProvider] = "Revoke-failing test provider"
+	t.Cleanup(func() {
+		delete(ProviderRegistry, revokeFailProvider)
+		delete(providerLabels, revokeFailProvider)
+	})
+
+	rec := &alertRecorder{}
+	prev := dispatchRotationAlert
+	dispatchRotationAlert = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+		rec.record(detail)
+	}
+	t.Cleanup(func() { dispatchRotationAlert = prev })
+	return rec
 }
 
 const rotationTestPassword = "CorrectHorseBatteryStaple1!"
@@ -157,6 +257,7 @@ func newRotationEnv(t *testing.T, provider string) *rotationEnv {
 	t.Helper()
 	h, queries := newCollectionAuthzEnv(t)
 	ctx := context.Background()
+	rec := installRotationFakes(t)
 
 	owner := mustUser(t, queries, fmt.Sprintf("rot-%s@example.com", randomHex(6)), "user", rotationTestPassword)
 	entryID := "rot-" + randomHex(6)
@@ -188,7 +289,7 @@ func newRotationEnv(t *testing.T, provider string) *rotationEnv {
 		t.Fatalf("age entry: %v", err)
 	}
 
-	return &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before}
+	return &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}
 }
 
 func (e *rotationEnv) driveManual(t *testing.T) *httptest.ResponseRecorder {
@@ -249,6 +350,13 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 	if recorded != want.errorRecorded {
 		t.Errorf("%s: last_rotation_error set=%v, want %v (%q)",
 			path, recorded, want.errorRecorded, meta.LastRotationError.String)
+	}
+
+	if got := e.alerts.count() > 0; got != want.alertWanted {
+		t.Errorf("%s: rotation alert dispatched=%v, want %v (events: %v)\n"+
+			"An operator who is not told is an operator who does not act. This is a "+
+			"separate symptom from the database record, deliberately.",
+			path, got, want.alertWanted, e.alerts.events)
 	}
 
 	if want.logStatus != "" {

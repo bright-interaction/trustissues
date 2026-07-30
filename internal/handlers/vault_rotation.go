@@ -282,16 +282,13 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// lands in last_rotation_error. Detail is in the logs.
 		if revokeWarn != "" {
 			slog.Error("vault rotation: old key revoke failed (predecessor still live)", "entry", entry.Name, "detail", revokeWarn)
-			if status == "success" {
-				status = "partial"
-			}
-			const revokeMsg = "old key not revoked (still live at provider); see server logs"
-			if errSummary == "" {
-				errSummary = revokeMsg
-			} else {
-				errSummary = errSummary + "; " + revokeMsg
-			}
-			dispatchRotationAlert(ctx, queries, vaultHandler, entry.Name, revokeMsg)
+		}
+		// The sweep already got this right; it now shares the rule rather than
+		// stating its own copy, so the manual path cannot drift away from it again.
+		var revokeAlert bool
+		status, errSummary, revokeAlert = foldRevokeOutcome(status, errSummary, revokeWarn)
+		if revokeAlert {
+			dispatchRotationAlert(ctx, queries, vaultHandler, entry.Name, revokeStillLiveMsg)
 		}
 
 		// Record outcome. last_rotation_error reflects delivery truth (empty on
