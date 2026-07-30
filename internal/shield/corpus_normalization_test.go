@@ -25,6 +25,24 @@ import (
 // been caught by this line.
 var markerGluedToText = regexp.MustCompile(`[\p{L}\p{M}\p{N}]\[shield:`)
 
+// markerAfterAtSign catches the OTHER half of the same failure, which the glued
+// check above cannot see.
+//
+// When the email pattern fails to match an address, the ordered bank falls through
+// to the hostname pattern, which matches the domain half quite happily:
+//
+//	mail "anna svensson"@example.se  ->  mail "anna svensson"@[shield:hostname:...]
+//
+// The local part survives in the clear and the output LOOKS redacted. The glued
+// check passes it because the character immediately before the marker is "@", not
+// a letter, so the leak sits one position further left than that regex looks.
+//
+// A marker preceded by "@" is never legitimate: it means an address was matched
+// from the domain inwards. Found by adding a quoted local part (legal per RFC
+// 5321) to the corpus, which is the fourth distinct route into this one failure
+// class, so state the invariant rather than keep patching the character class.
+var markerAfterAtSign = regexp.MustCompile(`@\[shield:`)
+
 // nfdDecompose rewrites precomposed Latin letters as base + combining mark.
 //
 // This is deliberately a small explicit table rather than golang.org/x/text/
@@ -116,6 +134,13 @@ func TestPIICorpusSurvivesUnicodeNormalization(t *testing.T) {
 			}
 			// The real assertion. A marker is present either way; the question is
 			// whether any of the original value survived in front of it.
+			if m := markerAfterAtSign.FindString(out); m != "" {
+				t.Errorf("%s form matched an address from the DOMAIN inwards, leaving its local "+
+					"part in the clear:\n  in:  %s\n  out: %s\n"+
+					"A marker preceded by \"@\" always means the email pattern failed and the "+
+					"hostname pattern picked up the second half. The output looks redacted and is not.",
+					v.form, v.text, out)
+			}
 			if m := markerGluedToText.FindString(out); m != "" {
 				t.Errorf("%s form leaked the prefix of a real value (%q sits against the marker):\n"+
 					"  in:  %s\n  out: %s\n"+
