@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -233,83 +232,27 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 
-		// The new value is now durably stored, so it is finally safe to destroy the
-		// old key upstream. A failure here leaves BOTH keys live, which is
-		// recoverable and is reported as a partial rotation below.
-		performPendingRevoke(ctx, meta, newValue)
-		revokeWarn := meta["last_revoke_error"]
-		delete(meta, "last_revoke_error")
+		// Everything from here is shared with the manual handler; see
+		// vault_rotation_core.go. This path used to hold its own copy of it, which is
+		// how the two drifted on five separate behaviours.
+		deps := rotationDeps{queries: queries, vault: vaultHandler}
+		revokeWarn := revokeOldKeyAndPersistMeta(ctx, deps, entry.ID, entry.Name, meta, newValue)
 
-		// Persist the meta Rotate mutated (new key id) so the NEXT rotation revokes
-		// the key we just minted instead of a stale predecessor id. Meta-only update
-		// preserves provider + auto_rotate. Best-effort: a failure here only means
-		// the next rotation may leave one extra key live, not a broken rotation.
-		if metaJSON, mErr := json.Marshal(meta); mErr == nil {
-			encMeta, encErr := vaultHandler.encryptColumn(string(metaJSON))
-			if encErr != nil {
-				slog.Error("vault rotation: encrypt provider_meta failed", "entry", entry.Name, "error", encErr)
-			} else if pErr := queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-				ProviderMeta: sql.NullString{String: encMeta, Valid: true},
-				ID:           entry.ID,
-			}); pErr != nil {
-				slog.Error("vault rotation: persist provider_meta failed", "entry", entry.Name, "error", pErr)
-			}
-		}
-
-		// Deliver the new key to configured targets BEFORE recording the
-		// outcome, so the rotation status reflects delivery truth. A target
-		// that fails to apply makes the rotation "partial" (visible + alarmed)
-		// instead of being silently logged as success.
 		targets := ParseRotationTargets(vaultHandler.decryptColumnOrLog(entry.RotationTargets.String, "[]", "rotation_targets"))
-		status := "success"
-		errSummary := ""
-		if len(targets) > 0 {
-			results := DeliverRotatedKey(ctx, queries, vaultHandler, entry.ID, entry.Name, oldValueCopy, newValue, targets, entry.UserID)
-			status, errSummary = summarizeDelivery(results)
-			slog.Info("vault rotation: delivery complete",
-				"entry", entry.Name,
-				"status", status,
-				"total_targets", len(targets))
-			if status != "success" {
-				slog.Error("vault rotation: delivery had failures", "entry", entry.Name, "detail", errSummary)
-				dispatchRotationAlert(ctx, queries, vaultHandler, entry.Name, errSummary)
-			}
-		}
-
-		// A failed old-key revoke means the predecessor is still live at the
-		// provider: downgrade to partial and alarm it, but with a STATIC message
-		// (the raw revoke error can embed the provider URL/id) so nothing sensitive
-		// lands in last_rotation_error. Detail is in the logs.
-		if revokeWarn != "" {
-			slog.Error("vault rotation: old key revoke failed (predecessor still live)", "entry", entry.Name, "detail", revokeWarn)
-		}
-		// The sweep already got this right; it now shares the rule rather than
-		// stating its own copy, so the manual path cannot drift away from it again.
-		var revokeAlert bool
-		status, errSummary, revokeAlert = foldRevokeOutcome(status, errSummary, revokeWarn)
-		if revokeAlert {
-			dispatchRotationAlert(ctx, queries, vaultHandler, entry.Name, revokeStillLiveMsg)
-		}
-
-		// Record outcome. last_rotation_error reflects delivery truth (empty on
-		// full success), and the log status is success or partial accordingly.
-		_ = queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-			LastRotationError: sql.NullString{String: errSummary, Valid: true},
-			ID:                entry.ID,
-		})
-		logEntry := RotationLogEntry{
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Status:    status,
-			Provider:  providerName,
-			Error:     errSummary,
-			Method:    "auto",
-		}
-		updatedLog := AppendRotationLog(entry.RotationLog.String, logEntry)
-		_ = queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-			RotationLog: sql.NullString{String: updatedLog, Valid: true},
-			ID:          entry.ID,
+		status, _ := recordRotationOutcome(ctx, deps, rotationRecord{
+			EntryID:     entry.ID,
+			EntryName:   entry.Name,
+			Provider:    providerName,
+			Method:      "auto",
+			UserID:      entry.UserID,
+			RotationLog: entry.RotationLog.String,
+			Targets:     targets,
+			OldValue:    oldValueCopy,
+			NewValue:    newValue,
+			RevokeWarn:  revokeWarn,
 		})
 
+		// Per-path by design: the sweep has no request to attribute the activity to.
 		LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf("Auto-rotated vault secret: %s (provider: %s, targets: %d, status: %s)", entry.Name, providerName, len(targets), status))
 		slog.Info("vault rotation: rotated", "provider", providerName, "entry", entry.Name, "status", status)
 	}

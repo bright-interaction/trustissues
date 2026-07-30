@@ -2220,43 +2220,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
 	}
 
-	// Revoke FIRST, then write provider_meta exactly once.
-	//
-	// This used to be two writes with the revoke between them, and
-	// the meta variable held back for the CAS was the SAME Go map as providerMeta
-	// (a map assignment, not a copy), so the FIRST write marshalled it while it
-	// still held
-	// pending_revoke_method and pending_revoke_url. Those are transient markers
-	// that vault_providers.go documents as never reaching the database, and they
-	// reached it on every provider-backed manual rotation. The second write then
-	// cleaned them, so the end state looked correct and only a crash, a timeout or
-	// a cancelled context in between left them behind, pointing a future revoke at
-	// a key id that is already gone. It also bumped updated_at twice for one
-	// logical change.
-	//
-	// The sweep has always done revoke-then-meta. This is that order.
-	if providerMeta != nil {
-		performPendingRevoke(ctx, providerMeta, newValue)
-		if warn := providerMeta["last_revoke_error"]; warn != "" {
-			delete(providerMeta, "last_revoke_error")
-			logError(r, "vault.rotate: old key revoke failed after persist (predecessor still live)", "entry", id, "detail", warn)
-			revokeWarn = warn
-		}
-		// The single meta write. performPendingRevoke has stripped the pending
-		// markers by now, so what lands is the successor's key id and nothing
-		// transient. Errors are logged rather than discarded: the next rotation
-		// revokes whatever id is in here, so losing this write silently means the
-		// next revoke targets a dead predecessor and the real one leaks.
-		if metaJSON, mErr := json.Marshal(providerMeta); mErr != nil {
-			logError(r, "vault.rotate: marshal provider_meta failed", "entry", id, "error", mErr)
-		} else if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr != nil {
-			logError(r, "vault.rotate: encrypt provider_meta failed", "entry", id, "error", eErr)
-		} else if pErr := h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-			ProviderMeta: toNullString(encMeta),
-			ID:           id,
-		}); pErr != nil {
-			logError(r, "vault.rotate: persist provider_meta failed", "entry", id, "error", pErr)
-		}
+	// Shared with the sweep from here. See vault_rotation_core.go.
+	deps := rotationDeps{queries: h.queries, vault: h}
+	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerMeta, newValue); warn != "" {
+		revokeWarn = warn
 	}
 
 	// Fetch updated entry for response
@@ -2279,70 +2246,40 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	rawTargets := h.decryptColumnOrLog(entryRow.RotationTargets.String, "[]", "rotation_targets")
 	targets := ParseRotationTargets(rawTargets)
 
+	rec := rotationRecord{
+		EntryID:     id,
+		EntryName:   entry.Name,
+		Provider:    providerName,
+		Method:      rotationMethod,
+		UserID:      userID,
+		RotationLog: entryRow.RotationLog.String,
+		Targets:     targets,
+		OldValue:    oldValue,
+		NewValue:    newValue,
+		RevokeWarn:  revokeWarn,
+	}
+
 	if len(targets) == 0 {
-		// No delivery to wait on, so the rotation is final now. It is only a
-		// success if the predecessor key actually died upstream.
-		status, errSummary, alert := foldRevokeOutcome("success", "", revokeWarn)
-		if alert {
-			dispatchRotationAlert(ctx, h.queries, h, entry.Name, revokeStillLiveMsg)
-		}
-		_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-			LastRotationError: toNullString(errSummary),
-			ID:                id,
-		})
-		rotationRow, _ := h.queries.GetVaultEntryForRotation(ctx, id)
-		updatedLog := AppendRotationLog(rotationRow.RotationLog.String, RotationLogEntry{
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Status:    status,
-			Provider:  providerName,
-			Error:     errSummary,
-			Method:    rotationMethod,
-		})
-		_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-			RotationLog: toNullString(updatedLog),
-			ID:          id,
-		})
+		// Nothing to deliver, so the outcome is already final.
+		recordRotationOutcome(ctx, deps, rec)
 	} else {
-		// Push the new value to configured targets in the background so the
-		// user gets immediate feedback. The goroutine then finalises the
-		// rotation_log with the REAL delivery+verify outcome (success or
-		// partial) and alarms on failure.
+		// Delivery can take minutes and the user needs the new value now, so the
+		// SAME core runs in a detached goroutine. This is the one genuine difference
+		// between the paths and the only reason the core is split in two.
+		//
+		// The log column is re-read inside the goroutine: the value-commit and the
+		// meta write have both landed by now, and reading a stale copy here would
+		// drop whatever they appended.
 		h.delivery.Add(1)
-		go func(eid, name, oldV, newV, uid, provider, method, revoke string, ts []RotationTarget) {
+		go func(rec rotationRecord) {
 			defer h.delivery.Done()
 			deliveryCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
-			results := DeliverRotatedKey(deliveryCtx, h.queries, h, eid, name, oldV, newV, ts, uid)
-			status, errSummary := summarizeDelivery(results)
-			slog.Info("vault.rotate: delivery complete", "entry", name, "status", status, "total_targets", len(ts))
-			if status != "success" {
-				slog.Error("vault.rotate: delivery had failures", "entry", name, "detail", errSummary)
-				dispatchRotationAlert(deliveryCtx, h.queries, h, name, errSummary)
+			if fresh, err := h.queries.GetVaultEntryForRotation(deliveryCtx, rec.EntryID); err == nil {
+				rec.RotationLog = fresh.RotationLog.String
 			}
-			// Same fold as the no-targets branch. Without it, a clean delivery
-			// wrote errSummary "" over the revoke failure and logged "success".
-			var revokeAlert bool
-			status, errSummary, revokeAlert = foldRevokeOutcome(status, errSummary, revoke)
-			if revokeAlert {
-				dispatchRotationAlert(deliveryCtx, h.queries, h, name, revokeStillLiveMsg)
-			}
-			_ = h.queries.UpdateVaultEntryRotationError(deliveryCtx, db.UpdateVaultEntryRotationErrorParams{
-				LastRotationError: toNullString(errSummary),
-				ID:                eid,
-			})
-			rotationRow, _ := h.queries.GetVaultEntryForRotation(deliveryCtx, eid)
-			updatedLog := AppendRotationLog(rotationRow.RotationLog.String, RotationLogEntry{
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
-				Status:    status,
-				Provider:  provider,
-				Error:     errSummary,
-				Method:    method,
-			})
-			_ = h.queries.UpdateVaultEntryRotationLog(deliveryCtx, db.UpdateVaultEntryRotationLogParams{
-				RotationLog: toNullString(updatedLog),
-				ID:          eid,
-			})
-		}(id, entry.Name, oldValue, newValue, userID, providerName, rotationMethod, revokeWarn, targets)
+			recordRotationOutcome(deliveryCtx, deps, rec)
+		}(rec)
 	}
 
 	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, entry.Name, userID, len(targets)))
