@@ -72,11 +72,16 @@ func init() {
 
 // ProviderInfo is the JSON-serializable info about a provider for the frontend.
 type ProviderInfo struct {
-	Name          string            `json:"name"`
-	Label         string            `json:"label"`
-	CanAutoRotate bool              `json:"can_auto_rotate"`
-	DashboardURL  string            `json:"dashboard_url"`
-	RequiredMeta  map[string]string `json:"required_meta"`
+	Name          string `json:"name"`
+	Label         string `json:"label"`
+	CanAutoRotate bool   `json:"can_auto_rotate"`
+	// RevokesPredecessor reports whether rotating this provider also destroys the
+	// key it replaces. False means BOTH keys stay live after a "successful"
+	// rotation, which an operator rotating a compromised credential has to know.
+	RevokesPredecessor bool              `json:"revokes_predecessor"`
+	PredecessorNote    string            `json:"predecessor_note,omitempty"`
+	DashboardURL       string            `json:"dashboard_url"`
+	RequiredMeta       map[string]string `json:"required_meta"`
 }
 
 var providerLabels = map[string]string{
@@ -116,6 +121,52 @@ var providerLabels = map[string]string{
 	"generated-key-32": "Generated AES-256 Key (32 ASCII chars)",
 }
 
+// predecessorFate declares, for every auto-rotating provider, whether rotation also
+// destroys the key it replaces.
+//
+// The product's promise is "the old key is dead and the new one works". Nine adapters
+// mint a successor and leave the predecessor live, and the rotation is still recorded
+// as a clean success with no alert, because the orchestration layer only knows about a
+// revoke that was QUEUED. An operator rotating a credential they believe is compromised
+// is therefore told it worked while the compromised key still authenticates.
+//
+// Whether each of these SHOULD revoke is a per-vendor API question that cannot be
+// settled by reading this repo: some vendors roll a token in place (nothing to revoke),
+// others create a second credential (the old one persists). So this table does not
+// guess. It records the fate as it stands, forces every new auto-rotating provider to
+// declare one, and surfaces it through ListProviders so the UI can tell the operator
+// what a rotation of this provider does and does not do.
+//
+// Anything false with a note starting "TODO" is an open question, not a decision.
+var predecessorFate = map[string]struct {
+	Revokes bool
+	Note    string
+}{
+	// Revoke the predecessor as part of rotation.
+	"backblaze": {true, ""},
+	"neon":      {true, ""},
+	"resend":    {true, ""},
+	"sendgrid":  {true, ""},
+	"twilio":    {true, ""},
+
+	// No upstream key exists, so there is nothing to revoke. Not a gap.
+	"shared-secret":    {false, "local secret: this server owns the value, there is no upstream key"},
+	"generated-key-32": {false, "local secret: this server owns the value, there is no upstream key"},
+
+	// Mint a successor and leave the predecessor live. Each needs its vendor API
+	// checked before a revoke can be written, which is why they are notes and not
+	// silent omissions.
+	"auth0":      {false, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
+	"cloudflare": {false, "TODO: verify whether token roll replaces the token in place (if so this is correct and the note should say so)"},
+	"datadog":    {false, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
+	"fastly":     {false, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
+	"forgejo":    {false, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
+	"grafana":    {false, "TODO: service-account tokens are additive; the old token id is not recorded so it cannot be deleted"},
+	"linode":     {false, "TODO: the old personal access token is not revoked; needs its id"},
+	"vercel":     {false, "TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded"},
+	"zitadel":    {false, "TODO: the old machine key is not deleted; needs the key id"},
+}
+
 func ListProviders() []ProviderInfo {
 	infos := make([]ProviderInfo, 0, len(ProviderRegistry))
 	for _, p := range ProviderRegistry {
@@ -123,11 +174,14 @@ func ListProviders() []ProviderInfo {
 		if label == "" {
 			label = p.Name()
 		}
+		fate := predecessorFate[p.Name()]
 		infos = append(infos, ProviderInfo{
-			Name:          p.Name(),
-			Label:         label,
-			CanAutoRotate: p.CanAutoRotate(),
-			DashboardURL:  p.DashboardURL(nil),
+			Name:               p.Name(),
+			Label:              label,
+			CanAutoRotate:      p.CanAutoRotate(),
+			RevokesPredecessor: fate.Revokes,
+			PredecessorNote:    fate.Note,
+			DashboardURL:       p.DashboardURL(nil),
 		})
 	}
 	return infos
@@ -577,7 +631,11 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	if err != nil {
 		return "", err
 	}
-	req.SetBasicAuth(accountSid, currentKey)
+	// Authenticate with the API Key SID once we have one. Twilio Basic auth is
+	// (AccountSid, AuthToken) OR (ApiKeySid, ApiKeySecret) and NEVER
+	// (AccountSid, ApiKeySecret), so an entry that has already rotated must present
+	// its key sid or every subsequent call 401s.
+	req.SetBasicAuth(twilioAuthUser(meta, accountSid), currentKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := providerHTTP.Do(req)
 	if err != nil {
@@ -598,7 +656,47 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	if result.Secret == "" {
 		return "", fmt.Errorf("empty secret returned")
 	}
+	// CRITICAL: record the NEW key's sid, and refuse the rotation if Twilio did not
+	// give us one.
+	//
+	// The sid used to be parsed and thrown away. Twilio Basic auth is
+	// (ApiKeySid, ApiKeySecret), so the vault ended up holding a secret whose sid
+	// existed nowhere in the product: Validate answered valid:false on a
+	// freshly-rotated entry, the NEXT rotation's own mint call 401'd and was recorded
+	// rotFailProvider on every pass forever, and every consumer the value was
+	// delivered to started failing auth. All of it recorded as status "success" with
+	// last_rotation_error NULL and no alert, because Twilio queued no revoke.
+	//
+	// Same rule Backblaze states above: leaving the id as the OLD one pairs it with
+	// the NEW secret and breaks auth immediately. Returning an error here is correct
+	// rather than storing an unusable value, because the orchestration layer's
+	// provider-failure path leaves the stored secret untouched.
+	if result.Sid == "" {
+		return "", fmt.Errorf("twilio returned a key with no sid; refusing to store a secret that cannot be paired")
+	}
+	oldSid := meta["key_sid"]
+	meta["key_sid"] = result.Sid
+	// Queue the predecessor's deletion. Only a PREVIOUS API key can be deleted; the
+	// account Auth Token is not a key and has no sid, which is why this is skipped on
+	// the first rotation.
+	if oldSid != "" && oldSid != result.Sid {
+		deferRevokeOldProviderKey(meta, "DELETE",
+			"https://api.twilio.com/2010-04-01/Accounts/"+accountSid+"/Keys/"+oldSid+".json")
+	}
 	return result.Secret, nil
+}
+
+// twilioAuthUser returns the Basic-auth username for a Twilio call.
+//
+// Before the first rotation the stored value is the account Auth Token, which pairs
+// with the AccountSid. After a rotation it is an API Key secret, which pairs with
+// that key's SK sid. Getting this wrong is not a degraded state but a hard 401 on
+// every call.
+func twilioAuthUser(meta map[string]string, accountSid string) string {
+	if sid := meta["key_sid"]; sid != "" {
+		return sid
+	}
+	return accountSid
 }
 
 func (p *TwilioProvider) Validate(ctx context.Context, key string, meta map[string]string) (bool, error) {
@@ -611,7 +709,9 @@ func (p *TwilioProvider) Validate(ctx context.Context, key string, meta map[stri
 	if err != nil {
 		return false, err
 	}
-	req.SetBasicAuth(accountSid, key)
+	// Same pairing rule as Rotate: an entry that has rotated holds an API Key secret
+	// and must authenticate with that key's sid, not the account sid.
+	req.SetBasicAuth(twilioAuthUser(meta, accountSid), key)
 	resp, err := providerHTTP.Do(req)
 	if err != nil {
 		return false, err
