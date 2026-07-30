@@ -1,0 +1,22 @@
+[
+ {
+  "id": "resend-mails-blank-code",
+  "mech": "invitations",
+  "test": "TestResendRefusesAnUnreadableInviteCode",
+  "file": "internal/handlers/users.go",
+  "pkg": "./internal/handlers/",
+  "why": "the original bug: a branded email with an EMPTY setup code plus a 200",
+  "old": "\tcode := h.openInviteCode(row.Code)\n\tif code == \"\" {",
+  "new": "\tcode := h.openInviteCode(row.Code)\n\tif false {"
+ },
+ {
+  "id": "sender-belt-removed",
+  "mech": "invitations",
+  "test": "TestSenderRefusesABlankCodeFirst",
+  "file": "internal/handlers/users.go",
+  "pkg": "./internal/handlers/",
+  "why": "the belt that covers every current and future caller",
+  "old": "\tif strings.TrimSpace(code) == \"\" {",
+  "new": "\tif false {"
+ }
+]
