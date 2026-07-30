@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/brightinteraction/trustissues/internal/columncrypto"
+	"github.com/brightinteraction/trustissues/internal/db"
 )
 
 // TestVaultKeyCheckRefusesAWrongKey locks the boot gate.
@@ -154,5 +155,117 @@ func TestSentinelStillBootstrapsOnAnEmptyDatabase(t *testing.T) {
 	}
 	if err := VerifyVaultKey(ctx, queries, "any-key-at-all"); err != nil {
 		t.Fatalf("a new install could not bootstrap: %v", err)
+	}
+}
+
+// TestProbe3SeesEveryCryptoFamily closes a hole in the guard that prevents data
+// loss, which makes it a guard on a guard.
+//
+// Probe 3's own comment says it "has to see every surface, not the two that
+// happened to exist when it was written". It then ran columncrypto.IsEncrypted
+// over all three, which is a prefix check for "tienc:v1:". Only
+// settings.smtp_password is written by columncrypto: invitations.code carries the
+// vault handler's "enc:v1:" and a notification config is raw AES-GCM bytes with no
+// marker at all. Both failed the prefix check and were skipped.
+//
+// So a database whose ONLY ciphertext was an invite code or a channel config
+// reported "no ciphertext", the gate sealed a sentinel under whatever key was
+// configured, and the correct key was refused from then on. The gate was inert for
+// two thirds of its own surface area, on exactly the boot where it matters.
+//
+// Driven per-family so a future fourth surface cannot be added to the query and
+// silently skipped in the switch.
+func TestProbe3SeesEveryCryptoFamily(t *testing.T) {
+	const correctKey = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+	const wrongKey = "wrong-key-that-opens-nothing-here"
+
+	families := []struct {
+		name string
+		// seed writes ONLY this family's ciphertext, nothing else.
+		seed func(t *testing.T, h *VaultHandler, queries *db.Queries)
+		// openable is false for raw AES-GCM: its nonce lives in another column so
+		// the probe can establish presence but not decrypt from here.
+		openable bool
+	}{
+		{
+			name:     "columncrypto (settings.smtp_password)",
+			openable: true,
+			seed: func(t *testing.T, h *VaultHandler, queries *db.Queries) {
+				enc, err := columncrypto.EncryptString("smtp-secret", correctKey)
+				if err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				if err := queries.UpsertSetting(context.Background(), db.UpsertSettingParams{
+					Key: "smtp_password", Value: enc,
+				}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+		},
+		{
+			name:     "vaultcolumn (invitations.code)",
+			openable: true,
+			seed: func(t *testing.T, h *VaultHandler, queries *db.Queries) {
+				enc, err := h.encryptColumn("INVITE-CODE-ABC123")
+				if err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				// Real columns, not guessed ones. An earlier version of this test
+				// invented `role` and `invited_by`, so both families SKIPPED and the
+				// two this fix exists for were never exercised: a green run that
+				// asserted nothing about the interesting half.
+				if _, err := h.db.Exec(
+					`INSERT INTO invitations (id, email, target_role, code, code_hash, status, expires_at, created_at)
+					 VALUES ('inv-1','x@example.com','user',?,'deadbeef','pending',datetime('now','+7 days'),CURRENT_TIMESTAMP)`,
+					enc); err != nil {
+					t.Fatalf("seed invitations: %v", err)
+				}
+			},
+		},
+		{
+			name:     "rawgcm (notification_channels.config)",
+			openable: false,
+			seed: func(t *testing.T, h *VaultHandler, queries *db.Queries) {
+				ct, nonce, err := h.EncryptValue([]byte(`{"webhook":"https://x.test"}`))
+				if err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				if _, err := h.db.Exec(
+					`INSERT INTO notification_channels (id, name, type, config, config_nonce, encryption_version, enabled, events, created_at)
+					 VALUES ('ch-1','n','webhook',?,?,2,1,'[]',CURRENT_TIMESTAMP)`,
+					string(ct), string(nonce)); err != nil {
+					t.Fatalf("seed notification_channels: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, f := range families {
+		t.Run(f.name, func(t *testing.T) {
+			h, queries := newCollectionAuthzEnv(t)
+			ctx := context.Background()
+			f.seed(t, h, queries)
+
+			has, opens, err := vaultKeyOpensExistingData(ctx, queries, correctKey)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+
+			// PRESENCE is the half that prevents the data loss.
+			if !has {
+				t.Fatalf("the probe did not see this family's ciphertext at all, so the gate would " +
+					"report an empty database and seal a sentinel over live data; the correct key " +
+					"would then be refused forever")
+			}
+			if f.openable && !opens {
+				t.Errorf("the probe saw the ciphertext but could not open it under the CORRECT key, " +
+					"so a legitimate deployment would be refused startup")
+			}
+
+			// And the wrong key must be refused rather than sealing over it.
+			if err := VerifyVaultKey(ctx, queries, wrongKey); f.openable && !errors.Is(err, ErrVaultKeyMismatch) {
+				t.Errorf("a WRONG key bootstrapped over this family's ciphertext (err=%v)", err)
+			}
+		})
 	}
 }

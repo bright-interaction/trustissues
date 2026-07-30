@@ -11,12 +11,17 @@ import (
 )
 
 const anyEncryptedColumnSample = `-- name: AnyEncryptedColumnSample :many
-SELECT blob FROM (SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
+SELECT family, blob FROM (SELECT 'columncrypto' AS family, value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL
-SELECT blob FROM (SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1)
+SELECT family, blob FROM (SELECT 'vaultcolumn' AS family, code AS blob FROM invitations WHERE code != '' LIMIT 1)
 UNION ALL
-SELECT blob FROM (SELECT config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1)
+SELECT family, blob FROM (SELECT 'rawgcm' AS family, config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1)
 `
+
+type AnyEncryptedColumnSampleRow struct {
+	Family string `json:"family"`
+	Blob   string `json:"blob"`
+}
 
 // Boot key-gate probe 3: every OTHER columncrypto surface.
 //
@@ -30,19 +35,30 @@ SELECT blob FROM (SELECT config AS blob FROM notification_channels WHERE config 
 // settings row and never probed an invitation code at all: a database whose only
 // ciphertext was an invite code still fell through the gate, which is the exact
 // hole this probe exists to close.
-func (q *Queries) AnyEncryptedColumnSample(ctx context.Context) ([]string, error) {
+// Each row carries its crypto FAMILY, because the three surfaces do not share one.
+// settings.smtp_password is columncrypto ("tienc:v1:"), invitations.code is the
+// vault handler's own column crypto ("enc:v1:"), and a notification config is raw
+// AES-GCM bytes with its nonce in a separate column and NO marker at all.
+//
+// Probe 3 used to run columncrypto.IsEncrypted over all three, so it recognised
+// exactly one and silently skipped the other two: a database whose only ciphertext
+// was an invite code or a channel config still reported "no ciphertext", the gate
+// sealed a sentinel under whatever key was configured, and the CORRECT key was
+// refused from then on. That is the data loss this probe exists to prevent, and it
+// was inert for two thirds of its own surface area.
+func (q *Queries) AnyEncryptedColumnSample(ctx context.Context) ([]AnyEncryptedColumnSampleRow, error) {
 	rows, err := q.db.QueryContext(ctx, anyEncryptedColumnSample)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []string{}
+	items := []AnyEncryptedColumnSampleRow{}
 	for rows.Next() {
-		var blob string
-		if err := rows.Scan(&blob); err != nil {
+		var i AnyEncryptedColumnSampleRow
+		if err := rows.Scan(&i.Family, &i.Blob); err != nil {
 			return nil, err
 		}
-		items = append(items, blob)
+		items = append(items, i)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
