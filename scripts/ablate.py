@@ -130,7 +130,12 @@ def main():
     print(f"\ncaught {counts['CAUGHT']}  missed {counts['MISSED']}  invalid {counts['INVALID']}  hung {counts['TIMEOUT']}")
     if counts["CAUGHT"] == 0 and results:
         print("ABORT-LIKE: nothing was caught at all; suspect the harness before trusting this.")
-    json.dump(results, open(sys.argv[2], "w"), indent=1)
+    # The results file is optional. It used to be read as sys.argv[2]
+    # unconditionally, so the documented one-argument form raised IndexError HERE,
+    # after the run but BEFORE the restore verification below, which is the one
+    # part of this harness that must never be skipped.
+    if len(sys.argv) > 2:
+        json.dump(results, open(sys.argv[2], "w"), indent=1)
 
     # Leave the tree exactly as found.
     rc, out = run("go build ./... 2>&1")
