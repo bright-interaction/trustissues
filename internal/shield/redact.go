@@ -68,20 +68,24 @@ var redactPatterns = []redactPattern{
 				`|-----BEGIN [A-Z ]*PRIVATE KEY-----`),
 	},
 
-	{
-		kind: KindPersonnummer,
-		// Swedish personnummer: YYYYMMDD-XXXX or YYMMDD-XXXX, optional
-		// dash. 10 or 12 digits with optional dash separator.
-		re:   regexp.MustCompile(`\b(?:19|20)?\d{6}[-\s]?\d{4}\b`),
-		hint: []string{"century"},
-	},
-	{
-		kind: KindIBAN,
-		// IBAN: 2 letters + 2 digits + 11..30 alnum. Loosely matched;
-		// detail validation happens at the application layer.
-		re:   regexp.MustCompile(`\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b`),
-		hint: []string{"country"},
-	},
+	// ORDER IS PRIORITY, and email must come before anything that can match
+	// INSIDE an address.
+	//
+	// Email used to sit after personnummer and IBAN, so a local part containing
+	// either was claimed by the narrower pattern first and the address was split,
+	// leaving whatever the narrower pattern did not cover in cleartext:
+	//
+	//	anna.svensson.19850101-1234@example.se
+	//	  -> anna.svensson.[shield:personnummer:...]@[shield:hostname:...]
+	//
+	// A full personal name egressed to the model beside two markers. Same failure
+	// class as the four earlier partial leaks and the FIFTH distinct route into it:
+	// not the local part's character class, not its shape, but which pattern gets
+	// to claim it first.
+	//
+	// Moving email first is safe in the other direction: a bare personnummer or
+	// IBAN has no "@", so the email pattern cannot match it and the narrower
+	// patterns still win where they should.
 	{
 		kind: KindEmail,
 		// The local part accepts any non-ASCII letter, and the leading \b is
@@ -132,8 +136,27 @@ var redactPatterns = []redactPattern{
 		// Generalised as an invariant in corpus_normalization_test.go: no marker may
 		// ever be preceded by "@", because that always means an address was matched
 		// from the domain inwards and its local part survived.
-		re:   regexp.MustCompile(`(?:"[^"\r\n]{1,64}"|[\p{L}\p{M}0-9._%+\-]+)@[\p{L}\p{M}0-9.\-]+\.[\p{L}\p{M}]{2,}`),
+		re: regexp.MustCompile(`(?:"[^"\r\n]{1,64}"|[\p{L}\p{M}0-9._%+\-]+)@` +
+			// The domain half: a normal FQDN, an IPv4 literal, or a bracketed
+			// IPv6 literal. The FQDN form demands a letter TLD, so it could not
+			// match user@192.168.1.1 at all: the IP pattern then claimed the
+			// numeric half and left "user@" bare in the output.
+			`(?:\[[0-9A-Fa-f:.]{2,45}\]|(?:\d{1,3}\.){3}\d{1,3}|[\p{L}\p{M}0-9.\-]+\.[\p{L}\p{M}]{2,})`),
 		hint: []string{"domain", "len"},
+	},
+	{
+		kind: KindPersonnummer,
+		// Swedish personnummer: YYYYMMDD-XXXX or YYMMDD-XXXX, optional
+		// dash. 10 or 12 digits with optional dash separator.
+		re:   regexp.MustCompile(`\b(?:19|20)?\d{6}[-\s]?\d{4}\b`),
+		hint: []string{"century"},
+	},
+	{
+		kind: KindIBAN,
+		// IBAN: 2 letters + 2 digits + 11..30 alnum. Loosely matched;
+		// detail validation happens at the application layer.
+		re:   regexp.MustCompile(`\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b`),
+		hint: []string{"country"},
 	},
 	{
 		kind: KindPhone,
