@@ -1,0 +1,15 @@
+[
+ {"id":"empty-allowlist-skips-recheck","mech":"capability","test":"TestClearingTheAllowListRevokesOutstandingTokens","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
+  "why":"the original bug: the ONLY revocation control was the one case the re-check skipped",
+  "old":"\tif len(patterns) == 0 || !destMatches(patterns, host, upstreamPath) {",
+  "new":"\tif len(patterns) > 0 && !destMatches(patterns, host, upstreamPath) {"},
+
+ {"id":"allowlist-read-error-fails-open","mech":"capability","test":"TestClearingTheAllowListRevokesOutstandingTokens","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
+  "why":"a transient DB error returned nil and skipped the check, opening the gate",
+  "old":"\t\treturn nil, err\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
+  "new":"\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil"},
+
+ {"id":"matcher-honours-wildcard-host","mech":"capability","test":"TestMatcherAndValidatorAgreeOnWildcardHosts","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
+  "why":"a stored row the validator would reject was still enforced as a valid ceiling",
+  "old":"\t\tif hostIsWildcarded(pat) {","new":"\t\tif false && hostIsWildcarded(pat) {"}
+]
