@@ -220,9 +220,17 @@ func summarizeDelivery(results []DeliveryResult) (status, summary string) {
 }
 
 // dispatchRotationAlert fires a notification to configured channels when a
-// rotation's value was stored but one or more targets failed to apply.
-// Best-effort: a no-op if no channel subscribes, and never panics the caller.
-func dispatchRotationAlert(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+// rotation's value was stored but one or more targets failed to apply, or the
+// old key could not be revoked.
+//
+// A var, not a plain func, so the rotation matrix can record whether an alert was
+// actually dispatched. That matters here specifically: the manual path recorded a
+// failed revoke and then overwrote it with success AND never alarmed, so a test
+// that only checks the database would have passed on two of the three symptoms.
+// Same idiom and same justification as providerHTTP.
+var dispatchRotationAlert = dispatchRotationAlertReal
+
+func dispatchRotationAlertReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("vault rotation: alert dispatch panicked", "recover", r)

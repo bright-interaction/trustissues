@@ -2189,12 +2189,17 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if pendingRevokeWarn != "" {
-		logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", pendingRevokeWarn)
-		_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-			LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
-			ID:                id,
-		})
+	// One fact, collected from both places a revoke can fail, folded into the
+	// final status exactly once at the end.
+	//
+	// It used to be written to last_rotation_error here, and again below, and both
+	// writes were then unconditionally overwritten by the outcome block: "" and
+	// status "success" without targets, a delivery-only summary with them. So the
+	// only durable record said the rotation was clean while the predecessor key
+	// was still live. See foldRevokeOutcome.
+	revokeWarn := pendingRevokeWarn
+	if revokeWarn != "" {
+		logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
 	}
 
 	// The new value is durably stored, so it is finally safe to destroy the old
@@ -2208,10 +2213,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		if warn := providerMeta["last_revoke_error"]; warn != "" {
 			delete(providerMeta, "last_revoke_error")
 			logError(r, "vault.rotate: old key revoke failed after persist (predecessor still live)", "entry", id, "detail", warn)
-			_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-				LastRotationError: toNullString("old key not revoked (still live at provider); see server logs"),
-				ID:                id,
-			})
+			revokeWarn = warn
 		}
 		// Re-persist meta so the pending-revoke markers never linger.
 		if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
@@ -2245,15 +2247,22 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	targets := ParseRotationTargets(rawTargets)
 
 	if len(targets) == 0 {
+		// No delivery to wait on, so the rotation is final now. It is only a
+		// success if the predecessor key actually died upstream.
+		status, errSummary, alert := foldRevokeOutcome("success", "", revokeWarn)
+		if alert {
+			dispatchRotationAlert(ctx, h.queries, h, entry.Name, revokeStillLiveMsg)
+		}
 		_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-			LastRotationError: toNullString(""),
+			LastRotationError: toNullString(errSummary),
 			ID:                id,
 		})
 		rotationRow, _ := h.queries.GetVaultEntryForRotation(ctx, id)
 		updatedLog := AppendRotationLog(rotationRow.RotationLog.String, RotationLogEntry{
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Status:    "success",
+			Status:    status,
 			Provider:  providerName,
+			Error:     errSummary,
 			Method:    rotationMethod,
 		})
 		_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
@@ -2266,7 +2275,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// rotation_log with the REAL delivery+verify outcome (success or
 		// partial) and alarms on failure.
 		h.delivery.Add(1)
-		go func(eid, name, oldV, newV, uid, provider, method string, ts []RotationTarget) {
+		go func(eid, name, oldV, newV, uid, provider, method, revoke string, ts []RotationTarget) {
 			defer h.delivery.Done()
 			deliveryCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
@@ -2276,6 +2285,13 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			if status != "success" {
 				slog.Error("vault.rotate: delivery had failures", "entry", name, "detail", errSummary)
 				dispatchRotationAlert(deliveryCtx, h.queries, h, name, errSummary)
+			}
+			// Same fold as the no-targets branch. Without it, a clean delivery
+			// wrote errSummary "" over the revoke failure and logged "success".
+			var revokeAlert bool
+			status, errSummary, revokeAlert = foldRevokeOutcome(status, errSummary, revoke)
+			if revokeAlert {
+				dispatchRotationAlert(deliveryCtx, h.queries, h, name, revokeStillLiveMsg)
 			}
 			_ = h.queries.UpdateVaultEntryRotationError(deliveryCtx, db.UpdateVaultEntryRotationErrorParams{
 				LastRotationError: toNullString(errSummary),
@@ -2293,7 +2309,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 				RotationLog: toNullString(updatedLog),
 				ID:          eid,
 			})
-		}(id, entry.Name, oldValue, newValue, userID, providerName, rotationMethod, targets)
+		}(id, entry.Name, oldValue, newValue, userID, providerName, rotationMethod, revokeWarn, targets)
 	}
 
 	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, entry.Name, userID, len(targets)))
