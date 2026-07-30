@@ -1959,6 +1959,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	var pendingRevokeWarn string
 	rotationMethod := "manual"
 	providerName := meta.Provider.String
+	// Resolved once. Every branch below asks providerRole rather than re-deriving
+	// the state from (name, found, CanAutoRotate), which is the shape that let an
+	// unregistered provider reach the local generator.
+	providerRoleFor, resolvedProvider := classifyProvider(providerName)
 
 	// Decrypt the current value once. provider.Rotate() needs it to
 	// authenticate against the provider API when minting the successor key.
@@ -1998,9 +2002,9 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// Declared out here so the deferred revoke after the value is persisted can
 	// still reach it; the revoke must not run until the new value is stored.
 	var providerMeta map[string]string
-	if providerName != "" {
-		provider, ok := ProviderRegistry[providerName]
-		if ok && provider.CanAutoRotate() {
+	{
+		if providerRoleFor == providerAuto {
+			provider := resolvedProvider
 			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
 			rotatedValue, rotErr := provider.Rotate(ctx, oldValue, providerMeta)
 			if rotErr != nil {
@@ -2067,8 +2071,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// already uses: tell the operator to rotate upstream, then paste the new
 	// value in via Edit. Only an entry with NO provider is a local secret this
 	// server is entitled to generate.
-	if newValue == "" && providerName != "" {
-		if provider, ok := ProviderRegistry[providerName]; ok && !provider.CanAutoRotate() {
+	// This guard used to read `if p, ok := Registry[name]; ok && !p.CanAutoRotate()`,
+	// so it caught providerReminder and let providerUnknown walk straight past it
+	// into the generator below. The sweep refused the same entry. Ask the role.
+	if newValue == "" {
+		switch providerRoleFor {
+		case providerReminder:
 			updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 				Status:    "reminder",
@@ -2084,6 +2092,23 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusConflict, "manual_rotation_required",
 				"this provider cannot be rotated automatically; rotate the credential in the provider's own dashboard, then edit this entry and paste the new value. Nothing was changed.")
 			return
+
+		case providerUnknown:
+			// The stored secret is a real credential for a system this build has
+			// no code to talk to, so there is nothing this server can do EXCEPT
+			// leave it alone. Generating locally would discard a live credential
+			// for a value that authenticates nowhere.
+			//
+			// Recorded as a failure, matching the sweep, so the entry shows up as
+			// broken rather than silently never rotating.
+			logError(r, "vault.rotate: provider is not in this build's registry, refusing to rotate",
+				"entry", id, "provider", providerName)
+			recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+				entryRow.RotationLog.String, rotFailUnknownProvider, rotationMethod, &userID)
+			writeError(w, r, http.StatusConflict, "unknown_provider",
+				"this entry is configured for a provider this server does not support, so it was not rotated; "+
+					"rotate the credential at the provider, then edit this entry and paste the new value. Nothing was changed.")
+			return
 		}
 	}
 
@@ -2093,6 +2118,19 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// provider never reaches here, it returned 502 above, and a reminder-only
 	// provider was refused just above.
 	if newValue == "" {
+		// Belt, to the switch above's braces. Every role except providerNone has
+		// already returned by now, so arriving here as anything else means a new
+		// role was added and this chain was not updated. Refuse rather than
+		// generate: guessing wrong here destroys a live credential, so doing
+		// nothing is the only safe default.
+		if !providerRoleFor.mayGenerateLocally() {
+			logError(r, "vault.rotate: refusing to generate a local value for a provider-backed entry",
+				"entry", id, "provider", providerName, "role", int(providerRoleFor))
+			writeError(w, r, http.StatusConflict, "manual_rotation_required",
+				"this secret cannot be rotated automatically; rotate it at the provider, then edit this entry "+
+					"and paste the new value. Nothing was changed.")
+			return
+		}
 		newValue, err = generateToken(32)
 		if err != nil {
 			logError(r, "vault.rotate: failed to generate token", "error", err)

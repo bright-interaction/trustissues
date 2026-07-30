@@ -125,8 +125,10 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 	}()
 	{
 		providerName := entry.Provider.String
-		provider, ok := ProviderRegistry[providerName]
-		if !ok {
+		// Same classifier the manual handler uses, so the four provider states are
+		// enumerated once and a fifth cannot be handled here and forgotten there.
+		role, provider := classifyProvider(providerName)
+		if role == providerUnknown {
 			// An entry configured for a provider this build does not know will
 			// never rotate. Silently skipping it meant the secret quietly went
 			// stale forever.
@@ -136,7 +138,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 
-		if !provider.CanAutoRotate() {
+		if role == providerReminder {
 			// For reminder-only providers, just log that rotation is due
 			slog.Info("vault rotation: rotation due (reminder-only provider)", "provider", providerName, "entry", entry.Name)
 			logEntry := RotationLogEntry{

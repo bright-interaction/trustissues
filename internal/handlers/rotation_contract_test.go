@@ -84,6 +84,35 @@ func rotationCases() []rotationCase {
 			wantManualStatus: http.StatusOK,
 			want:             rotationOutcome{valueChanged: true, errorRecorded: false, logStatus: "success"},
 		},
+		{
+			// A provider name this build does not know.
+			//
+			// "internal:postgres" is not hypothetical: trustissues is a fork of
+			// dockyard and the fork DELETED the five internal:* providers (see
+			// cred_rotation.go). Nothing validates provider against the registry
+			// when an entry is written, so a database carried over from dockyard
+			// holds entries in exactly this state.
+			//
+			// The secret is a REAL credential that only the upstream system can
+			// rotate. Generating 32 bytes locally does not rotate it: it discards
+			// the real credential, stores something that authenticates nowhere,
+			// and leaves the live one in place. Both paths must refuse.
+			name:             "provider not in this build's registry",
+			provider:         "internal:postgres",
+			sweepApplicable:  true,
+			wantManualStatus: http.StatusConflict,
+			want:             rotationOutcome{valueChanged: false, errorRecorded: true, logStatus: "error"},
+		},
+		{
+			// Reminder-only: the provider exists but cannot rotate itself. Same
+			// hazard as above, reached by a different branch, which is why it gets
+			// its own row rather than being folded in.
+			name:             "reminder-only provider",
+			provider:         "github",
+			sweepApplicable:  true,
+			wantManualStatus: http.StatusConflict,
+			want:             rotationOutcome{valueChanged: false, errorRecorded: false, logStatus: "reminder"},
+		},
 	}
 }
 
