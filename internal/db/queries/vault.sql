@@ -353,8 +353,19 @@ UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 -- settings row and never probed an invitation code at all: a database whose only
 -- ciphertext was an invite code still fell through the gate, which is the exact
 -- hole this probe exists to close.
-SELECT blob FROM (SELECT value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
+-- Each row carries its crypto FAMILY, because the three surfaces do not share one.
+-- settings.smtp_password is columncrypto ("tienc:v1:"), invitations.code is the
+-- vault handler's own column crypto ("enc:v1:"), and a notification config is raw
+-- AES-GCM bytes with its nonce in a separate column and NO marker at all.
+--
+-- Probe 3 used to run columncrypto.IsEncrypted over all three, so it recognised
+-- exactly one and silently skipped the other two: a database whose only ciphertext
+-- was an invite code or a channel config still reported "no ciphertext", the gate
+-- sealed a sentinel under whatever key was configured, and the CORRECT key was
+-- refused from then on. That is the data loss this probe exists to prevent, and it
+-- was inert for two thirds of its own surface area.
+SELECT family, blob FROM (SELECT 'columncrypto' AS family, value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL
-SELECT blob FROM (SELECT code AS blob FROM invitations WHERE code != '' LIMIT 1)
+SELECT family, blob FROM (SELECT 'vaultcolumn' AS family, code AS blob FROM invitations WHERE code != '' LIMIT 1)
 UNION ALL
-SELECT blob FROM (SELECT config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1);
+SELECT family, blob FROM (SELECT 'rawgcm' AS family, config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1);

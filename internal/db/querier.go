@@ -36,7 +36,18 @@ type Querier interface {
 	// settings row and never probed an invitation code at all: a database whose only
 	// ciphertext was an invite code still fell through the gate, which is the exact
 	// hole this probe exists to close.
-	AnyEncryptedColumnSample(ctx context.Context) ([]string, error)
+	// Each row carries its crypto FAMILY, because the three surfaces do not share one.
+	// settings.smtp_password is columncrypto ("tienc:v1:"), invitations.code is the
+	// vault handler's own column crypto ("enc:v1:"), and a notification config is raw
+	// AES-GCM bytes with its nonce in a separate column and NO marker at all.
+	//
+	// Probe 3 used to run columncrypto.IsEncrypted over all three, so it recognised
+	// exactly one and silently skipped the other two: a database whose only ciphertext
+	// was an invite code or a channel config still reported "no ciphertext", the gate
+	// sealed a sentinel under whatever key was configured, and the CORRECT key was
+	// refused from then on. That is the data loss this probe exists to prevent, and it
+	// was inert for two thirds of its own surface area.
+	AnyEncryptedColumnSample(ctx context.Context) ([]AnyEncryptedColumnSampleRow, error)
 	// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
 	// test whether the configured key actually opens this database BEFORE writing
 	// the sentinel. Version 1 rows are excluded: they are sealed under the legacy

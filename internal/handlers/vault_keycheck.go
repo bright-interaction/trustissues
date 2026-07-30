@@ -6,10 +6,12 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"golang.org/x/crypto/pbkdf2"
 
@@ -158,7 +160,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 		}
 	}
 
-	// Probe 3: every OTHER columncrypto surface.
+	// Probe 3: every OTHER encrypted surface, across all three crypto families.
 	//
 	// Probes 1 and 2 look only at v2 vault secrets and marked TOTP seeds. A
 	// database whose only ciphertext is an SMTP password, an invitation code or a
@@ -168,18 +170,56 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 	// exists to prevent exactly that, so it has to see every surface, not the two
 	// that happened to exist when it was written.
 	//
-	// If a new encrypted column is added anywhere, add it here in the same commit.
+	// If a new encrypted column is added anywhere, add it to the query AND give it a
+	// family label below, in the same commit.
+	// Each surface is checked by ITS OWN family's rules.
+	//
+	// This loop used to run columncrypto.IsEncrypted over all three, which is a
+	// prefix check for "tienc:v1:". Only settings.smtp_password is written by
+	// columncrypto. invitations.code is written by the vault handler's own column
+	// crypto ("enc:v1:") and a notification config is raw AES-GCM bytes with its
+	// nonce in a separate column and no marker at all, so both failed the prefix
+	// check and were skipped by `continue`.
+	//
+	// The probe therefore reported "no ciphertext" for a database whose only
+	// ciphertext was an invite code or a channel config, the gate sealed a sentinel
+	// under whatever key was configured, and the CORRECT key was refused from then
+	// on. The comment above says the gate has to see every surface; it saw one of
+	// three.
+	//
+	// PRESENCE is the half that prevents the data loss. Being able to decrypt only
+	// tells us the configured key is right; failing to RECOGNISE ciphertext is what
+	// lets the gate seal over live data. So every family sets hasCiphertext, and
+	// only the families we can open here attempt a decrypt.
 	blobs, bErr := queries.AnyEncryptedColumnSample(ctx)
 	if bErr != nil {
 		return hasCiphertext, false, fmt.Errorf("read columncrypto surfaces: %w", bErr)
 	}
 	for _, b := range blobs {
-		if !columncrypto.IsEncrypted(b) {
-			continue
-		}
-		hasCiphertext = true
-		if _, decErr := columncrypto.DecryptString(b, vaultKey); decErr == nil {
-			return true, true, nil
+		switch b.Family {
+		case "columncrypto":
+			if !columncrypto.IsEncrypted(b.Blob) {
+				continue
+			}
+			hasCiphertext = true
+			if _, decErr := columncrypto.DecryptString(b.Blob, vaultKey); decErr == nil {
+				return true, true, nil
+			}
+		case "vaultcolumn":
+			if !strings.HasPrefix(b.Blob, vaultColumnEncPrefix) {
+				continue
+			}
+			hasCiphertext = true
+			if vaultColumnOpens(b.Blob, vaultKey) {
+				return true, true, nil
+			}
+		case "rawgcm":
+			// No marker to check: the query already filtered on
+			// encryption_version > 0 and a non-empty column, which IS the
+			// statement that this value is ciphertext. The nonce lives in another
+			// column, so it cannot be decrypted from here; presence is what
+			// matters and presence is established.
+			hasCiphertext = true
 		}
 	}
 
@@ -265,4 +305,37 @@ What to do:
 
 `, allowKeyMismatchEnv)
 	os.Exit(1)
+}
+
+// vaultColumnOpens reports whether an "enc:v1:" column value decrypts under
+// vaultKey, without needing a constructed VaultHandler (the key check runs before
+// one exists). It mirrors VaultHandler.decryptColumn, and the v2 derivation is the
+// same one vaultSecretOpens uses.
+func vaultColumnOpens(stored, vaultKey string) bool {
+	if !strings.HasPrefix(stored, vaultColumnEncPrefix) {
+		return false
+	}
+	packed, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, vaultColumnEncPrefix))
+	if err != nil {
+		return false
+	}
+	derived := pbkdf2.Key([]byte(vaultKey), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New)
+	defer func() {
+		for i := range derived {
+			derived[i] = 0
+		}
+	}()
+	block, err := aes.NewCipher(derived)
+	if err != nil {
+		return false
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return false
+	}
+	if len(packed) < gcm.NonceSize() {
+		return false
+	}
+	_, err = gcm.Open(nil, packed[:gcm.NonceSize()], packed[gcm.NonceSize():], nil)
+	return err == nil
 }
