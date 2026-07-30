@@ -1,0 +1,21 @@
+[
+ {"id":"targets-degrade-to-none-manual","mech":"rotation","test":"TestRotationContract","file":"internal/handlers/vault.go","pkg":"./internal/handlers/",
+  "why":"an undecryptable target list read as 'nothing configured' and produced a clean success with no delivery",
+  "old":"\t\tif plain, tErr := h.decryptColumn(stored); tErr != nil {\n\t\t\ttargetsUndecryptable = true",
+  "new":"\t\tif plain, tErr := h.decryptColumn(stored); tErr != nil {\n\t\t\ttargetsUndecryptable = false\n\t\t\t_ = plain"},
+
+ {"id":"targets-degrade-to-none-sweep","mech":"rotation","test":"TestRotationContract","file":"internal/handlers/vault_rotation.go","pkg":"./internal/handlers/",
+  "why":"same on the sweep; the row must bite on BOTH drivers",
+  "old":"\t\t\tif plain, tErr := vaultHandler.decryptColumn(stored); tErr != nil {\n\t\t\t\ttargetsUnreadable = true",
+  "new":"\t\t\tif plain, tErr := vaultHandler.decryptColumn(stored); tErr != nil {\n\t\t\t\ttargetsUnreadable = false\n\t\t\t\t_ = plain"},
+
+ {"id":"method-reassigned-to-auto","mech":"rotation","test":"TestRotationContract","file":"internal/handlers/vault.go","pkg":"./internal/handlers/",
+  "why":"a user-clicked rotation recorded as the scheduler's work",
+  "old":"\t\t\tnewValue = rotatedValue\n\t\t\t// rotationMethod stays \"manual\".",
+  "new":"\t\t\tnewValue = rotatedValue\n\t\t\trotationMethod = \"auto\"\n\t\t\t// rotationMethod stays \"manual\"."},
+
+ {"id":"provider-failure-handrolled","mech":"rotation","test":"TestRotationContract","file":"internal/handlers/vault.go","pkg":"./internal/handlers/",
+  "why":"the most common manual failure alerted nobody and wrote no activity row",
+  "old":"\t\t\t\trecordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,\n\t\t\t\t\tentryRow.RotationLog.String, rotFailProvider, rotationMethod, &userID)",
+  "new":"\t\t\t\t_ = rotFailProvider"}
+]

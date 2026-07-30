@@ -238,7 +238,31 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
 		revokeWarn := revokeOldKeyAndPersistMeta(ctx, deps, entry.ID, entry.Name, meta, newValue)
 
-		targets := ParseRotationTargets(vaultHandler.decryptColumnOrLog(entry.RotationTargets.String, "[]", "rotation_targets"))
+		// Same distinction the manual path makes: an undecryptable target list is
+		// not "no targets". Degrading to "[]" recorded a clean success while every
+		// configured consumer kept a credential that had just been revoked.
+		targetsRaw := "[]"
+		targetsUnreadable := false
+		if stored := entry.RotationTargets.String; stored != "" {
+			if plain, tErr := vaultHandler.decryptColumn(stored); tErr != nil {
+				targetsUnreadable = true
+				slog.Error("vault rotation: rotation_targets did not decrypt; the new key cannot be delivered",
+					"entry", entry.Name, "error", tErr)
+			} else {
+				targetsRaw = plain
+			}
+		}
+		targets := ParseRotationTargets(targetsRaw)
+		if targetsUnreadable {
+			recordRotationOutcomeUndeliverable(ctx, deps, rotationRecord{
+				EntryID: entry.ID, EntryName: entry.Name, Provider: providerName,
+				Method: "auto", UserID: entry.UserID, RotationLog: entry.RotationLog.String,
+			})
+			LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf(
+				"Auto-rotated vault secret but NOT delivered: %s (provider: %s, rotation_targets unreadable)",
+				entry.Name, providerName))
+			return
+		}
 		status, _ := recordRotationOutcome(ctx, deps, rotationRecord{
 			EntryID:     entry.ID,
 			EntryName:   entry.Name,

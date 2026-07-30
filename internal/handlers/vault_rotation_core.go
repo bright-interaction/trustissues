@@ -204,3 +204,47 @@ func foldRevokeOutcome(status, errSummary, revokeWarn string) (outStatus, outSum
 // ablationTakesPool exists only so the tx-scope ablation can pass the pool to a
 // helper the way seedCapabilityDefaults did. Not called in production.
 func ablationTakesPool(_ context.Context, _ *db.Queries) error { return nil }
+
+// undeliverableMsg is what a rotation records when its delivery configuration
+// could not be read. Static, like revokeStillLiveMsg, so nothing derived from a
+// decrypt error reaches an API-visible column.
+const undeliverableMsg = "rotated but NOT delivered: rotation_targets could not be read; see server logs"
+
+// recordRotationOutcomeUndeliverable finalises a rotation whose target list was
+// unreadable.
+//
+// The value is committed and the predecessor key is already destroyed upstream, so
+// this is a PARTIAL rotation rather than a failure to rotate, and it must be loud:
+// every configured consumer still holds a credential that no longer works, and the
+// previous behaviour recorded it as a clean success with no alert because an
+// undecryptable column degraded to "no targets configured".
+//
+// Deliberately not folded into recordRotationOutcome: that function's contract is
+// "deliver, then record what delivery did", and here delivery cannot be attempted
+// at all. Sharing it would mean passing a flag that means "skip the first half",
+// which is how the two rotation paths drifted in the first place.
+func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, rec rotationRecord) {
+	slog.Error("vault rotation: target list unreadable, the new key was delivered to nobody",
+		"entry", rec.EntryName)
+	dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, undeliverableMsg)
+
+	if err := deps.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+		LastRotationError: toNullString(undeliverableMsg),
+		ID:                rec.EntryID,
+	}); err != nil {
+		slog.Error("vault rotation: persist last_rotation_error failed", "entry", rec.EntryName, "error", err)
+	}
+	updatedLog := AppendRotationLog(rec.RotationLog, RotationLogEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Status:    "partial",
+		Provider:  rec.Provider,
+		Error:     undeliverableMsg,
+		Method:    rec.Method,
+	})
+	if err := deps.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
+		RotationLog: toNullString(updatedLog),
+		ID:          rec.EntryID,
+	}); err != nil {
+		slog.Error("vault rotation: persist rotation_log failed", "entry", rec.EntryName, "error", err)
+	}
+}

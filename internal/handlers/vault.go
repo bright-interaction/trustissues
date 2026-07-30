@@ -2028,29 +2028,41 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 				// can embed the raw upstream response body (tokens, internal
 				// topology) and last_rotation_error is API-visible; the detail is
 				// in the log line.
+				// Routed through the SHARED recorder, not hand-rolled.
+				//
+				// This branch wrote last_rotation_error and rotation_log itself and
+				// stopped there, so the most common manual rotation failure notified
+				// nobody: no EventRotationFailed alert and no vault.rotation_failed
+				// activity row, which is exactly what recordRotationFailure exists to
+				// emit. The failure lived only in a column and the container log, and
+				// for an on-demand entry (auto_rotate = 0) the sweep never re-attempts
+				// it, so NO path ever alerted. An operator rotating a key they believe
+				// is compromised was told only in a browser tab they may have closed.
+				//
+				// The sweep has always called recordRotationFailure for the identical
+				// condition (rotFailProvider), so this also removes the duplicated
+				// message and the drift between the two.
 				logError(r, "vault.rotate: provider rotation failed", "provider", providerName, "entry", id, "error", rotErr)
-				const rotateFailed = "provider rotation failed (details in server logs)"
-				_ = h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-					LastRotationError: toNullString(rotateFailed),
-					ID:                id,
-				})
-				updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
-					Timestamp: time.Now().UTC().Format(time.RFC3339),
-					Status:    "error",
-					Provider:  providerName,
-					Error:     rotateFailed,
-					Method:    rotationMethod,
-				})
-				_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-					RotationLog: toNullString(updatedLog),
-					ID:          id,
-				})
+				recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+					entryRow.RotationLog.String, rotFailProvider, rotationMethod, &userID)
 				writeError(w, r, http.StatusBadGateway, "upstream_error",
 					"the provider rejected the rotation; the stored secret was left unchanged")
 				return
 			}
 			newValue = rotatedValue
-			rotationMethod = "auto"
+			// rotationMethod stays "manual".
+			//
+			// It used to be reassigned to "auto" here, so every user-clicked rotation
+			// of a provider-backed entry was recorded as the scheduler's work: the
+			// history row said "auto", and on the persist-failure path
+			// recordRotationFailure's kind selector produced "Auto-rotation failed for
+			// vault secret: X" while simultaneously attributing it to the acting user,
+			// an internally contradictory audit row.
+			//
+			// "auto" versus "manual" answers WHO TRIGGERED THIS, which is the only
+			// question an audit trail is asked about a secret. Whether a provider or
+			// the local generator produced the value is a different question and is
+			// already recorded in the Provider field.
 			// Rotate mutated providerMeta with the NEW provider-side key id;
 			// persist it (encrypted) so the NEXT rotation revokes THIS key
 			// instead of a stale predecessor id. Strip the transient revoke
@@ -2242,7 +2254,29 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// configured target applied + verified the new key, so with targets we
 	// finalise the rotation_log in the delivery goroutine below (the HTTP
 	// response stays immediate). Without targets the rotation is complete now.
-	rawTargets := h.decryptColumnOrLog(entryRow.RotationTargets.String, "[]", "rotation_targets")
+	// An undecryptable rotation_targets column is NOT "no targets".
+	//
+	// decryptColumnOrLog degrades to the fallback, so a column that failed to
+	// decrypt produced "[]", which reads as "nothing configured": the rotation then
+	// stored the new value, revoked the predecessor upstream, recorded status
+	// "success" with last_rotation_error NULL and dispatched no alert, while the
+	// configured webhooks and Actions secrets were never contacted and kept the key
+	// that had just been destroyed. A live outage recorded as a clean rotation.
+	//
+	// "The column is empty" and "the column would not open" are opposite facts, so
+	// they are distinguished here rather than at the read helper (which is correct
+	// to degrade for the metadata fields it was written for).
+	targetsUndecryptable := false
+	rawTargets := "[]"
+	if stored := entryRow.RotationTargets.String; stored != "" {
+		if plain, tErr := h.decryptColumn(stored); tErr != nil {
+			targetsUndecryptable = true
+			logError(r, "vault.rotate: rotation_targets did not decrypt; the new key cannot be delivered",
+				"entry", id, "error", tErr)
+		} else {
+			rawTargets = plain
+		}
+	}
 	targets := ParseRotationTargets(rawTargets)
 
 	rec := rotationRecord{
@@ -2256,6 +2290,20 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		OldValue:    oldValue,
 		NewValue:    newValue,
 		RevokeWarn:  revokeWarn,
+	}
+	if targetsUndecryptable {
+		// The value IS rotated and the predecessor IS revoked, so this is a partial
+		// rotation, not a failure to rotate. Say so, and alarm it: nobody received
+		// the new key and the old one is already dead.
+		rec.RevokeWarn = ""
+		recordRotationOutcomeUndeliverable(ctx, deps, rec)
+		LogActivityFromRequest(h.queries, r, "vault.rotated",
+			fmt.Sprintf("Vault secret rotated but NOT delivered (%s/%s): %s (user: %s, rotation_targets unreadable)",
+				rotationMethod, providerName, meta.Name, userID))
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		writeJSON(w, http.StatusOK, vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: newValue})
+		return
 	}
 
 	if len(targets) == 0 {
