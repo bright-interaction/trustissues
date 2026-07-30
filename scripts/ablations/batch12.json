@@ -1,0 +1,29 @@
+[
+ {
+  "id": "keys-not-redacted",
+  "mech": "shield-json",
+  "test": "TestShieldJSONRedactsKeysAndNonURLLeaves",
+  "file": "internal/shield/session.go",
+  "why": "PII used as an object key egressed verbatim",
+  "old": "\t\t\toutKey, kErr := s.RedactString(ctx, k)",
+  "new": "\t\t\toutKey, kErr := k, error(nil)"
+ },
+ {
+  "id": "url-exemption-by-name-only",
+  "mech": "shield-json",
+  "test": "TestShieldJSONRedactsKeysAndNonURLLeaves",
+  "file": "internal/shield/session.go",
+  "why": "exempting on the key NAME alone leaked every leaf beneath it, arrays included",
+  "old": "\t\tif dereferencedURLKeys[key] && looksLikeDereferenceableURL(t) {",
+  "new": "\t\tif dereferencedURLKeys[key] {"
+ },
+ {
+  "id": "unshield-skips-keys",
+  "mech": "shield-json",
+  "test": "TestShieldJSONRoundTripsAPIIKey",
+  "file": "internal/shield/session.go",
+  "why": "redacting keys without restoring them hands back a document whose keys are markers",
+  "old": "\t\t\toutKey, kErr := s.UnshieldString(ctx, k)",
+  "new": "\t\t\toutKey, kErr := k, error(nil)"
+ }
+]
