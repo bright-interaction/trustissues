@@ -1955,7 +1955,6 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	var oldValue string // current plaintext, needed by provider.Rotate()
 	// Deferred until after the CAS: writing either of these before it would move
 	// updated_at and make the compare-and-swap reject the handler's own write.
-	var pendingProviderMeta map[string]string
 	var pendingRevokeWarn string
 	rotationMethod := "manual"
 	providerName := meta.Provider.String
@@ -2056,7 +2055,6 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			// snapshot and the CAS.
 			pendingRevokeWarn = providerMeta["last_revoke_error"]
 			delete(providerMeta, "last_revoke_error")
-			pendingProviderMeta = providerMeta
 		}
 	}
 
@@ -2157,7 +2155,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Same hazard as the CAS-miss branch just below, and it recorded nothing.
 		// A provider-backed rotation has ALREADY minted the successor upstream by
-		// this point, and pendingProviderMeta (which holds its key id) is discarded
+		// this point, and providerMeta (which holds its key id) is discarded
 		// on return, so nobody holds the new key and nothing in the product says so.
 		// The sweep records rotFailPersist here; this path returned 500 and left the
 		// entry looking untouched.
@@ -2185,18 +2183,6 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Now that the value is committed, persist the provider metadata that was
-	// held back so it could not disturb the CAS.
-	if pendingProviderMeta != nil {
-		if metaJSON, mErr := json.Marshal(pendingProviderMeta); mErr == nil {
-			if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
-				_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-					ProviderMeta: toNullString(encMeta),
-					ID:           id,
-				})
-			}
-		}
-	}
 	// One fact, collected from both places a revoke can fail, folded into the
 	// final status exactly once at the end.
 	//
@@ -2210,12 +2196,21 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		logError(r, "vault.rotate: old key revoke failed (predecessor still live)", "entry", id, "detail", revokeWarn)
 	}
 
-	// The new value is durably stored, so it is finally safe to destroy the old
-	// key upstream. Rotate deferred it for exactly this reason: revoking first
-	// meant a failure in the encrypt/persist window above left the old
-	// credential dead at the provider and the new one discarded, with no copy of
-	// either anywhere. A failure here leaves BOTH keys live, which is
-	// recoverable and is recorded as last_rotation_error below.
+	// Revoke FIRST, then write provider_meta exactly once.
+	//
+	// This used to be two writes with the revoke between them, and
+	// the meta variable held back for the CAS was the SAME Go map as providerMeta
+	// (a map assignment, not a copy), so the FIRST write marshalled it while it
+	// still held
+	// pending_revoke_method and pending_revoke_url. Those are transient markers
+	// that vault_providers.go documents as never reaching the database, and they
+	// reached it on every provider-backed manual rotation. The second write then
+	// cleaned them, so the end state looked correct and only a crash, a timeout or
+	// a cancelled context in between left them behind, pointing a future revoke at
+	// a key id that is already gone. It also bumped updated_at twice for one
+	// logical change.
+	//
+	// The sweep has always done revoke-then-meta. This is that order.
 	if providerMeta != nil {
 		performPendingRevoke(ctx, providerMeta, newValue)
 		if warn := providerMeta["last_revoke_error"]; warn != "" {
@@ -2223,14 +2218,20 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			logError(r, "vault.rotate: old key revoke failed after persist (predecessor still live)", "entry", id, "detail", warn)
 			revokeWarn = warn
 		}
-		// Re-persist meta so the pending-revoke markers never linger.
-		if metaJSON, mErr := json.Marshal(providerMeta); mErr == nil {
-			if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr == nil {
-				_ = h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
-					ProviderMeta: toNullString(encMeta),
-					ID:           id,
-				})
-			}
+		// The single meta write. performPendingRevoke has stripped the pending
+		// markers by now, so what lands is the successor's key id and nothing
+		// transient. Errors are logged rather than discarded: the next rotation
+		// revokes whatever id is in here, so losing this write silently means the
+		// next revoke targets a dead predecessor and the real one leaks.
+		if metaJSON, mErr := json.Marshal(providerMeta); mErr != nil {
+			logError(r, "vault.rotate: marshal provider_meta failed", "entry", id, "error", mErr)
+		} else if encMeta, eErr := h.encryptColumn(string(metaJSON)); eErr != nil {
+			logError(r, "vault.rotate: encrypt provider_meta failed", "entry", id, "error", eErr)
+		} else if pErr := h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+			ProviderMeta: toNullString(encMeta),
+			ID:           id,
+		}); pErr != nil {
+			logError(r, "vault.rotate: persist provider_meta failed", "entry", id, "error", pErr)
 		}
 	}
 
