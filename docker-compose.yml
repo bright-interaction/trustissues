@@ -35,6 +35,18 @@ services:
       # turn it on is not shipped. Empty means off, which is the prior default.
       - TRUSTISSUES_SHIELD_KEY=${TRUSTISSUES_SHIELD_KEY:-}
       - TRUSTISSUES_SHIELD_HINT_LEVEL=${TRUSTISSUES_SHIELD_HINT_LEVEL:-full}
+      # The documented escape hatch, which was UNREACHABLE here for the same
+      # reason Shield was: SECURITY.md and the server's own refusal message tell
+      # the operator to set it, but it was absent from this list, so setting it
+      # in .env did nothing. Combined with `restart: unless-stopped` above, a
+      # vault-key mismatch became a crash loop with no documented way out, at
+      # the worst possible moment (the first boot after a restore).
+      #
+      # Empty means off, which is the safe default. Setting it to 1 lets the
+      # server start on a key that does not open existing data, and that data
+      # then reads as blank and is overwritten by the first edit. It is a
+      # last-resort tool, so it stays opt-in and loud.
+      - TRUSTISSUES_ALLOW_KEY_MISMATCH=${TRUSTISSUES_ALLOW_KEY_MISMATCH:-}
 
 volumes:
   trustissues_data:

@@ -298,15 +298,29 @@ SELECT rotation_targets FROM vault_entries WHERE id = ?;
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
 FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC;
 
--- name: AnyEncryptedVaultEntry :one
--- Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
--- test whether the configured key actually opens this database BEFORE writing
--- the sentinel. Version 1 rows are excluded: they are sealed under the legacy
--- SHA-256 key and would not decrypt under the current derivation even when the
--- configured key is correct.
-SELECT encrypted_value, nonce FROM vault_entries
-WHERE encryption_version = 2 AND length(encrypted_value) > 0
-LIMIT 1;
+-- name: AnyEncryptedVaultEntry :many
+-- Boot-time vault-key probe. Returns EVERY sealed secret, with its version, so
+-- VerifyVaultKey can test whether the configured key actually opens this
+-- database BEFORE writing the sentinel.
+--
+-- Two things here were wrong and both ended in the same unrecoverable state.
+--
+-- It filtered `encryption_version = 2`, which is defensible for deciding
+-- "opens" (a v1 row is sealed under the legacy SHA-256 derivation) but not for
+-- deciding "hasCiphertext". A database whose vault rows are ALL v1, which
+-- vault_rotation_cas.go documents as a supported carried-over input and which
+-- MigrateEncryption exists to handle, answered "no ciphertext at all". The gate
+-- then sealed the sentinel under whatever key was configured, and afterwards
+-- refused the CORRECT key permanently. The caller now tests v1 rows under the
+-- legacy derivation instead of pretending they are not there.
+--
+-- It was also `:one` with LIMIT 1, sampling ONE arbitrary row while probes 2
+-- and 3 both iterate. One row sealed under an older key, or one bit flip, made
+-- the gate refuse a key that opens every other row in the table. Returning the
+-- set lets the caller answer "does this key open ANY of them", which is the
+-- question the gate is actually asking.
+SELECT encrypted_value, nonce, encryption_version FROM vault_entries
+WHERE length(encrypted_value) > 0;
 
 -- name: ListVaultEntryTargetsInCollection :many
 -- Offboarding sweep: every entry in a collection that has rotation targets, so
