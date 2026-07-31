@@ -40,9 +40,10 @@
   "mech": "boot-gate",
   "test": "TestProbe1SeesEveryVaultRow",
   "file": "internal/db/vault.sql.go",
-  "why": "a v1-only vault reported empty, so a wrong key was cemented and the correct one refused forever. Ablating the GENERATED constant, because the harness has no sqlc regen step and the .sql file alone does not affect the built binary",
+  "why": "a v1-only vault reported empty, so a wrong key was cemented and the correct one refused forever. Ablating the GENERATED constant, because the harness has no sqlc regen step and the .sql file alone does not affect the built binary. pkg is set because the ablated file lives in internal/db while the guard lives in internal/handlers, and the harness otherwise infers the package from the file's own directory and reports a false MISS",
   "old": "SELECT encrypted_value, nonce, encryption_version FROM vault_entries\nWHERE length(encrypted_value) > 0\n",
-  "new": "SELECT encrypted_value, nonce, encryption_version FROM vault_entries\nWHERE encryption_version = 2 AND length(encrypted_value) > 0\n"
+  "new": "SELECT encrypted_value, nonce, encryption_version FROM vault_entries\nWHERE encryption_version = 2 AND length(encrypted_value) > 0\n",
+  "pkg": "./internal/handlers/"
  },
  {
   "id": "boot-probe-samples-one-row",
