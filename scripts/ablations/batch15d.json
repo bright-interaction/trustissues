@@ -1,0 +1,22 @@
+[
+ {"id":"minted-key-outlives-minter","mech":"apikey","test":"TestAMintedKeyCannotOutliveItsMinter","file":"internal/handlers/apikeys.go",
+  "why":"a 90-day vault_only extension key could mint itself a permanent successor",
+  "old":"\tif parentExp, viaAPIKey := middleware.APIKeyExpiry(r.Context()); viaAPIKey {",
+  "new":"\tif parentExp, viaAPIKey := middleware.APIKeyExpiry(r.Context()); false && viaAPIKey {\n\t\t_ = parentExp"},
+
+ {"id":"revoke-all-phantom-success","mech":"apikey","test":"TestRevokeAllRefusesAnUnknownUser","file":"internal/handlers/apikeys.go",
+  "why":"204 plus an audit entry for a user id that matched nothing, during an incident",
+  "old":"\tif _, err := h.queries.GetUserByID(r.Context(), targetID); err != nil {",
+  "new":"\tif _, err := h.queries.GetUserByID(r.Context(), targetID); false && err != nil {"},
+
+ {"id":"last-admin-check-then-act","mech":"last-admin","test":"TestTheLastAdminSurvivesConcurrentDemotion","file":"internal/db/users.sql.go",
+  "why":"the original shape: count in one statement, write in another, so two concurrent demotions both pass",
+  "old":"    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1\n  )\n`\n\ntype UpdateUserRoleIfNotLastAdminParams",
+  "new":"    OR 1 = 1\n  )\n`\n\ntype UpdateUserRoleIfNotLastAdminParams",
+  "pkg":"./internal/handlers/"},
+
+ {"id":"access-log-writes-query-string","mech":"egress","test":"TestAccessLogNeverWritesAQueryString","file":"cmd/server/main.go",
+  "why":"the vault-match URL that migration 00011 exists to keep out of storage went to stdout on every request",
+  "old":"\t\t\t\"path\", r.URL.Path,",
+  "new":"\t\t\t\"path\", r.URL.RequestURI(),"}
+]
