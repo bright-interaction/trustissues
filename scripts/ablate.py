@@ -106,6 +106,21 @@ def ablate(spec):
             msg = next((l.strip() for l in out.splitlines()
                         if ".go:" in l and ("Error" in l or ":" in l) and "--- FAIL" not in l), "")
             return {**spec, "result": "CAUGHT", "detail": msg[:200]}
+        # A MISS does not distinguish "the guard broke" from "a later fix made this
+        # bug unreachable". Three of the four misses in the first full 111-spec
+        # sweep were the second kind: the caller had gained a len(patterns)==0
+        # deny, leadingWildcardMatch had been deleted, the email pattern had been
+        # reordered ahead of personnummer. Each took a manual reproduction to
+        # classify, and nothing recorded the answer, so the next sweep would have
+        # redone all of it.
+        #
+        # `expect_miss` records a verdict that was reached by hand, WITH the note
+        # explaining why. It is reported as SUPERSEDED rather than silently
+        # passing, so a spec that starts catching again (the fix was reverted, the
+        # second layer removed) still shows up as a surprise worth reading.
+        if spec.get("expect_miss"):
+            return {**spec, "result": "SUPERSEDED",
+                    "detail": "expected miss: " + spec.get("note", "")[:160]}
         return {**spec, "result": "MISSED", "detail": "guard passed clean with the bug present"}
     finally:
         with open(path, "wb") as fh:
@@ -130,13 +145,16 @@ def main():
     for i, s in enumerate(specs, 1):
         r = ablate(s)
         results.append(r)
-        mark = {"CAUGHT": "ok  ", "MISSED": "MISS", "INVALID": "BAD ", "TIMEOUT": "HANG"}[r["result"]]
+        mark = {"CAUGHT": "ok  ", "MISSED": "MISS", "INVALID": "BAD ",
+                "TIMEOUT": "HANG", "SUPERSEDED": "sup "}[r["result"]]
         print(f"{mark} [{i:2}/{len(specs)}] {s['mech']:<14} {s['id']:<38} {r['detail'][:80]}", flush=True)
 
     # Guard the harness itself: a run where nothing was CAUGHT means the harness is
     # probably not invoking the tests correctly, not that every guard is perfect.
-    counts = {k: sum(1 for r in results if r["result"] == k) for k in ("CAUGHT", "MISSED", "INVALID", "TIMEOUT")}
-    print(f"\ncaught {counts['CAUGHT']}  missed {counts['MISSED']}  invalid {counts['INVALID']}  hung {counts['TIMEOUT']}")
+    counts = {k: sum(1 for r in results if r["result"] == k)
+              for k in ("CAUGHT", "MISSED", "INVALID", "TIMEOUT", "SUPERSEDED")}
+    print(f"\ncaught {counts['CAUGHT']}  missed {counts['MISSED']}  invalid {counts['INVALID']}"
+          f"  hung {counts['TIMEOUT']}  superseded {counts['SUPERSEDED']}")
     if counts["CAUGHT"] == 0 and results:
         print("ABORT-LIKE: nothing was caught at all; suspect the harness before trusting this.")
     # The results file is optional. It used to be read as sys.argv[2]

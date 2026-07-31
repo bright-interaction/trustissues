@@ -1,21 +1,40 @@
 [
- {"id":"use-shim-answers-read","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault.go",
-  "why":"the read-vs-use distinction IS the eighth door; if the use shim answers .read, every spend path re-opens for a removed creator",
-  "old":"\treturn h.grantFor(ctx, userID, false, entryID).use",
-  "new":"\treturn h.grantFor(ctx, userID, false, entryID).read"},
-
- {"id":"use-shim-admin-bypass","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault.go",
-  "why":"isAdmin false is deliberate here; flipping it makes every background spend privileged",
-  "old":"\treturn h.grantFor(ctx, userID, false, entryID).use",
-  "new":"\treturn h.grantFor(ctx, userID, true, entryID).use"},
-
- {"id":"access-shim-returns-use-as-write","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/vault.go",
-  "why":"canWrite must be manage, not use; conflating them hands editing to viewers",
-  "old":"\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.manage",
-  "new":"\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.use"},
-
- {"id":"must-grant-before-half-disabled","mech":"grant","test":"TestRemovalEndsEverySpendPath","file":"internal/handlers/access_revocation_test.go",
-  "why":"the load-bearing half: if an ACTIVE editor is silently denied, the whole matrix passes vacuously",
-  "old":"\t\t\t\tif !p.run(t, env, member) {",
-  "new":"\t\t\t\tif false && !p.run(t, env, member) {"}
+ {
+  "id": "use-shim-answers-read",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/vault.go",
+  "why": "the read-vs-use distinction IS the eighth door; if the use shim answers .read, every spend path re-opens for a removed creator",
+  "old": "\treturn h.grantFor(ctx, userID, false, entryID).use",
+  "new": "\treturn h.grantFor(ctx, userID, false, entryID).read"
+ },
+ {
+  "id": "use-shim-admin-bypass",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/vault.go",
+  "why": "isAdmin false is deliberate here; flipping it makes every background spend privileged",
+  "old": "\treturn h.grantFor(ctx, userID, false, entryID).use",
+  "new": "\treturn h.grantFor(ctx, userID, true, entryID).use"
+ },
+ {
+  "id": "access-shim-returns-use-as-write",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/vault.go",
+  "why": "canWrite must be manage, not use; conflating them hands editing to viewers",
+  "old": "\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.manage",
+  "new": "\tg := h.grantFor(ctx, userID, isAdmin, entryID)\n\treturn g.read, g.use"
+ },
+ {
+  "id": "must-grant-before-half-disabled",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/access_revocation_test.go",
+  "why": "the load-bearing half: if an ACTIVE editor is silently denied, the whole matrix passes vacuously",
+  "old": "\t\t\t\tif !p.run(t, env, member) {",
+  "new": "\t\t\t\tif false && !p.run(t, env, member) {",
+  "note": "MIS-SPECIFIED, not decay (verified 2026-07-31). This ablates an ASSERTION inside access_revocation_test.go and then runs that same test. Disabling an assertion can only make a test pass, never fail, so no run of TestRemovalEndsEverySpendPath can catch it. Verifying that a positive control still exists needs a structural meta-check, not an ablation.",
+  "expect_miss": true
+ }
 ]

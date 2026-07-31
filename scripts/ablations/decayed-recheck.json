@@ -7,7 +7,9 @@
   "pkg": "./internal/handlers/",
   "why": "a transient DB error returned nil and skipped the check, opening the gate",
   "old": "\t\treturn nil, err\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
-  "new": "\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil"
+  "new": "\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). The caller now denies on `len(patterns) == 0 || !destMatches(...)` (capability.go:356), so returning (nil, nil) still produces a 403. The distinct error path is still worth keeping for the deny REASON in the audit log (allowlist_unreadable vs destination_not_in_current_allowlist), which is what the test should assert. Not decay.",
+  "expect_miss": true
  },
  {
   "id": "matcher-honours-wildcard-host",
@@ -17,7 +19,9 @@
   "pkg": "./internal/handlers/",
   "why": "a stored row the validator would reject was still enforced as a valid ceiling",
   "old": "\t\tif hostIsWildcarded(pat) {",
-  "new": "\t\tif false && hostIsWildcarded(pat) {"
+  "new": "\t\tif false && hostIsWildcarded(pat) {",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). leadingWildcardMatch was deleted in round 14, so a host-wildcarded pattern does not match even with the hostIsWildcarded filter disabled: honouredOnMatch stays false and the agreement invariant holds. Not decay.",
+  "expect_miss": true
  },
  {
   "id": "must-grant-before-half-disabled",
@@ -26,7 +30,9 @@
   "file": "internal/handlers/access_revocation_test.go",
   "why": "the load-bearing half: if an ACTIVE editor is silently denied, the whole matrix passes vacuously",
   "old": "\t\t\t\tif !p.run(t, env, member) {",
-  "new": "\t\t\t\tif false && !p.run(t, env, member) {"
+  "new": "\t\t\t\tif false && !p.run(t, env, member) {",
+  "note": "MIS-SPECIFIED, not decay (verified 2026-07-31). This ablates an ASSERTION inside access_revocation_test.go and then runs that same test. Disabling an assertion can only make a test pass, never fail, so no run of TestRemovalEndsEverySpendPath can catch it. Verifying that a positive control still exists needs a structural meta-check, not an ablation.",
+  "expect_miss": true
  },
  {
   "id": "email-back-after-personnummer",
@@ -35,6 +41,8 @@
   "file": "internal/shield/redact.go",
   "why": "the 5th leak route: a narrower pattern claims part of the local part and the rest is left bare",
   "old": "\t\tre:   regexp.MustCompile(`\\b(?:19|20)?\\d{6}[-\\s]?\\d{4}\\b`),",
-  "new": "\t\tre:   regexp.MustCompile(`(?:19|20)?\\d{6}[-\\s]?\\d{4}`),"
+  "new": "\t\tre:   regexp.MustCompile(`(?:19|20)?\\d{6}[-\\s]?\\d{4}`),",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). The email block is ordered BEFORE personnummer, so it consumes the whole address first and a greedy personnummer cannot claim part of a local part. Confirmed: anna.svensson19850101@example.se still tokenizes whole. Not decay.",
+  "expect_miss": true
  }
 ]

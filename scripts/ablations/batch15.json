@@ -1,15 +1,36 @@
 [
- {"id":"empty-allowlist-skips-recheck","mech":"capability","test":"TestClearingTheAllowListRevokesOutstandingTokens","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
-  "why":"the original bug: the ONLY revocation control was the one case the re-check skipped",
-  "old":"\tif len(patterns) == 0 || !destMatches(patterns, host, upstreamPath) {",
-  "new":"\tif len(patterns) > 0 && !destMatches(patterns, host, upstreamPath) {"},
-
- {"id":"allowlist-read-error-fails-open","mech":"capability","test":"TestClearingTheAllowListRevokesOutstandingTokens","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
-  "why":"a transient DB error returned nil and skipped the check, opening the gate",
-  "old":"\t\treturn nil, err\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
-  "new":"\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil"},
-
- {"id":"matcher-honours-wildcard-host","mech":"capability","test":"TestMatcherAndValidatorAgreeOnWildcardHosts","file":"internal/handlers/capability.go","pkg":"./internal/handlers/",
-  "why":"a stored row the validator would reject was still enforced as a valid ceiling",
-  "old":"\t\tif hostIsWildcarded(pat) {","new":"\t\tif false && hostIsWildcarded(pat) {"}
+ {
+  "id": "empty-allowlist-skips-recheck",
+  "mech": "capability",
+  "test": "TestClearingTheAllowListRevokesOutstandingTokens",
+  "file": "internal/handlers/capability.go",
+  "pkg": "./internal/handlers/",
+  "why": "the original bug: the ONLY revocation control was the one case the re-check skipped",
+  "old": "\tif len(patterns) == 0 || !destMatches(patterns, host, upstreamPath) {",
+  "new": "\tif len(patterns) > 0 && !destMatches(patterns, host, upstreamPath) {"
+ },
+ {
+  "id": "allowlist-read-error-fails-open",
+  "mech": "capability",
+  "test": "TestClearingTheAllowListRevokesOutstandingTokens",
+  "file": "internal/handlers/capability.go",
+  "pkg": "./internal/handlers/",
+  "why": "a transient DB error returned nil and skipped the check, opening the gate",
+  "old": "\t\treturn nil, err\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
+  "new": "\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). The caller now denies on `len(patterns) == 0 || !destMatches(...)` (capability.go:356), so returning (nil, nil) still produces a 403. The distinct error path is still worth keeping for the deny REASON in the audit log (allowlist_unreadable vs destination_not_in_current_allowlist), which is what the test should assert. Not decay.",
+  "expect_miss": true
+ },
+ {
+  "id": "matcher-honours-wildcard-host",
+  "mech": "capability",
+  "test": "TestMatcherAndValidatorAgreeOnWildcardHosts",
+  "file": "internal/handlers/capability.go",
+  "pkg": "./internal/handlers/",
+  "why": "a stored row the validator would reject was still enforced as a valid ceiling",
+  "old": "\t\tif hostIsWildcarded(pat) {",
+  "new": "\t\tif false && hostIsWildcarded(pat) {",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). leadingWildcardMatch was deleted in round 14, so a host-wildcarded pattern does not match even with the hostIsWildcarded filter disabled: honouredOnMatch stays false and the agreement invariant holds. Not decay.",
+  "expect_miss": true
+ }
 ]
