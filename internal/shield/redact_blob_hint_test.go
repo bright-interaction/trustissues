@@ -85,8 +85,14 @@ func TestHintLevelIsHonouredByRedactString(t *testing.T) {
 			t.Fatalf("redact full: %v", err)
 		}
 		// Guard the setup: without a hint at HintFull there is nothing to compare.
-		if !strings.Contains(outFull, "domain=") {
-			t.Fatalf("ABORT: HintFull produced no domain hint (%q); the comparison below would be vacuous", outFull)
+		// The key is "industry" rather than "domain" because the domain hint is
+		// coarsened at every level now; publishing the literal domain was itself
+		// a leak, since Shield tokenizes that same string when it stands alone.
+		if !strings.Contains(outFull, "industry=") {
+			t.Fatalf("ABORT: HintFull produced no industry hint (%q); the comparison below would be vacuous", outFull)
+		}
+		if strings.Contains(outFull, "example.com") {
+			t.Fatalf("HintFull republished the literal domain inside the marker: %q", outFull)
 		}
 
 		none, _ := NewSession(ctx, store, "none", testKey(), time.Minute, HintNone)

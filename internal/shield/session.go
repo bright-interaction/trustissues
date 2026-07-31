@@ -1,6 +1,7 @@
 package shield
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -357,9 +358,9 @@ func (s *Session) UnshieldString(ctx context.Context, in string) (string, error)
 // Convenient for MCP tool-call argument blobs that arrive as
 // json.RawMessage.
 func (s *Session) UnshieldJSON(ctx context.Context, raw []byte) ([]byte, error) {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return nil, fmt.Errorf("shield: unmarshal: %w", err)
+	v, err := decodeJSONExact(raw)
+	if err != nil {
+		return nil, err
 	}
 	// Keep the partial result: a marker this session cannot resolve must not cost
 	// the caller every marker it CAN resolve. The error is returned alongside so
@@ -379,15 +380,43 @@ func (s *Session) UnshieldJSON(ctx context.Context, raw []byte) ([]byte, error) 
 // without typed structs still get redacted output. Strings that already
 // contain markers are not touched (the redact pass is idempotent).
 func (s *Session) ShieldJSON(ctx context.Context, raw []byte) ([]byte, error) {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return nil, fmt.Errorf("shield: unmarshal: %w", err)
+	v, err := decodeJSONExact(raw)
+	if err != nil {
+		return nil, err
 	}
 	redacted, err := s.shieldAny(ctx, v)
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(redacted)
+}
+
+// decodeJSONExact decodes into any WITHOUT turning numbers into float64.
+//
+// Both JSON entry points used plain json.Unmarshal, which decodes every number
+// as a float64 and then re-marshals it. That is lossy above 2^53 and it changes
+// the literal below it, so merely enabling Shield silently rewrote payloads it
+// was only supposed to redact, in BOTH directions (request and response):
+//
+//	{"seed":9007199254740993}       ->  {"seed":9007199254740992}
+//	{"external_id":12345678901234567890} -> {"external_id":12345678901234567000}
+//	{"temperature":1.0}             ->  {"temperature":1}
+//
+// with err == nil every time. Snowflake ids, ledger amounts and idempotency
+// keys are exactly the large integers that travel through an API gateway, and a
+// privacy control must not corrupt the data it passes through.
+//
+// json.Number keeps the original literal as a string, and json.Marshal writes
+// it back verbatim. It is a distinct type from string, so the redaction walk
+// skips it the same way it skipped float64.
+func decodeJSONExact(raw []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("shield: unmarshal: %w", err)
+	}
+	return v, nil
 }
 
 // dereferencedURLKeys are JSON keys whose string value is a URL the PROVIDER
@@ -611,10 +640,57 @@ func buildHintAtLevel(kind Kind, raw string, keys []string, level HintLevel) str
 				continue
 			}
 			k = bucketHintKey(k)
+		} else if k == "domain" {
+			// The domain hint is coarsened at EVERY level, not just bucketed.
+			//
+			// It published raw[at+1:] verbatim, which is the one thing a hint
+			// must never do: emit a value Shield's own rules classify as
+			// sensitive. The same string standalone is tokenized:
+			//
+			//	connect to host.internal   ->  [shield:hostname:tok_...]
+			//	mail admin@host.internal   ->  [shield:email:...,domain=host.internal]
+			//
+			// so redacting an address republished the infrastructure hostname
+			// inside the marker that was supposed to conceal it, on EVERY email,
+			// with an IP literal (user@192.168.1.1) as the sharpest case rather
+			// than a special one. looksLikeHostname claims essentially every real
+			// domain, so there is no subset that is safe to print verbatim.
+			//
+			// The industry bucket keeps what the agent actually reasons over
+			// (personal webmail vs business vs government) and drops the
+			// identifier. Emitted under the "industry" key so the marker does not
+			// claim to carry a domain it no longer carries.
+			v = domainIndustry(v)
+			if v == "" {
+				continue
+			}
+			k = "industry"
 		}
-		pairs = append(pairs, k+"="+v)
+		pairs = append(pairs, k+"="+sanitizeHintValue(v))
 	}
 	return strings.Join(pairs, ",")
+}
+
+// sanitizeHintValue strips characters that would break the marker grammar.
+//
+// Hint values were interpolated straight into [shield:kind:token:k=v,...], so a
+// value containing "]" ended the marker early and the remainder of the hint was
+// emitted as ordinary text. That corrupts the round trip: UnshieldJSON then
+// restores against a marker whose closing bracket is in the wrong place and
+// returns mangled output with err == nil, which is the silent-corruption shape
+// this codebase keeps producing. Separators are stripped too, since "," and "="
+// delimit the pairs and ":" delimits the marker fields.
+func sanitizeHintValue(v string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '[', ']', ':', ',', '=':
+			return -1
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, v)
 }
 
 // lengthBucket coarsens a raw value's length into small/medium/large
@@ -748,7 +824,36 @@ func extractHint(kind Kind, raw, key string) string {
 // must dereference, and nothing else under those keys has that justification.
 func looksLikeDereferenceableURL(v string) bool {
 	t := strings.TrimSpace(v)
-	return strings.HasPrefix(t, "http://") ||
-		strings.HasPrefix(t, "https://") ||
-		strings.HasPrefix(t, "data:")
+	if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") {
+		return true
+	}
+	// A bare "data:" prefix was a general redaction off-switch.
+	//
+	// The exemption exists for BINARY payloads the provider decodes rather than
+	// reads as prose (an inline image on a vision request). "data:" alone also
+	// covers data:text/plain, so anything under a url-ish key prefixed with it
+	// egressed verbatim:
+	//
+	//	{"image_url":"data:text/plain,anna@example.se +46 70 123 45 67"}
+	//
+	// Restricted to non-text media with base64 content, which is what the
+	// exemption was actually for. A text/* payload is prose and gets redacted
+	// like any other string.
+	if !strings.HasPrefix(t, "data:") {
+		return false
+	}
+	meta, _, found := strings.Cut(strings.TrimPrefix(t, "data:"), ",")
+	if !found {
+		return false
+	}
+	meta = strings.ToLower(meta)
+	if !strings.HasSuffix(meta, ";base64") {
+		return false
+	}
+	mediaType := strings.TrimSuffix(meta, ";base64")
+	// An omitted media type defaults to text/plain per RFC 2397.
+	if mediaType == "" || strings.HasPrefix(mediaType, "text/") {
+		return false
+	}
+	return true
 }

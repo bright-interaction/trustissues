@@ -136,7 +136,20 @@ var redactPatterns = []redactPattern{
 		// Generalised as an invariant in corpus_normalization_test.go: no marker may
 		// ever be preceded by "@", because that always means an address was matched
 		// from the domain inwards and its local part survived.
-		re: regexp.MustCompile(`(?:"[^"\r\n]{1,64}"|[\p{L}\p{M}0-9._%+\-]+)@` +
+		// The unquoted local part accepts the FULL RFC 5322 atext set, not a
+		// convenience subset.
+		//
+		// It used to be [\p{L}\p{M}0-9._%+\-], which omits ! # $ & ' * / = ? ^ `
+		// { | } ~ . Those are legal in an address and appear in real ones (plus
+		// addressing aside, "!" and "'" show up in Nordic and Irish names in
+		// export files). A missing character does not fail to match, it makes the
+		// match start AFTER the offending character, so anna!svensson@example.se
+		// tokenized as anna![shield:email:...] and published the name in
+		// cleartext while looking redacted. That is the fourth distinct route
+		// into this one failure class, after ASCII-only, \p{L} vs \p{M}, and
+		// quoted local parts, and it is the same lesson each time: the alphabet
+		// is the bug, not the invariant.
+		re: regexp.MustCompile(`(?:"[^"\r\n]{1,64}"|[\p{L}\p{M}0-9!#$%&'*+/=?^_\x60{|}~.\-]+)@` +
 			// The domain half: a normal FQDN, an IPv4 literal, or a bracketed
 			// IPv6 literal. The FQDN form demands a letter TLD, so it could not
 			// match user@192.168.1.1 at all: the IP pattern then claimed the
@@ -155,7 +168,18 @@ var redactPatterns = []redactPattern{
 		kind: KindIBAN,
 		// IBAN: 2 letters + 2 digits + 11..30 alnum. Loosely matched;
 		// detail validation happens at the application layer.
-		re:   regexp.MustCompile(`\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b`),
+		//
+		// The space is not cosmetic. This required a CONTIGUOUS run, but the
+		// printed presentation of an IBAN is grouped in fours, and that is the
+		// form banks put on invoices and people paste into chat:
+		//
+		//	SE45 5000 0000 0583 9825 7466   egressed completely untouched
+		//	SE4550000000058398257466        tokenized
+		//
+		// so the tokenizer covered the form nobody writes and missed the form
+		// everybody writes. Nothing caught it because the corpus has no IBAN
+		// line at all and the only IBAN assertion pins the contiguous form.
+		re:   regexp.MustCompile(`\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){10,30}\b`),
 		hint: []string{"country"},
 	},
 	{
