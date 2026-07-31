@@ -244,9 +244,46 @@ func LogActivityFromRequest(q *db.Queries, r *http.Request, action, detail strin
 	logActivityInternal(q, userPtr, action, detail, middleware.ClientIP(r), r.Header.Get("User-Agent"))
 }
 
+// Bounds on the attacker-influenced audit columns.
+//
+// user_agent came straight from the request header with nothing truncating it
+// anywhere in the tree, the column has no length bound, the server sets no
+// MaxHeaderBytes (so Go's 1 MB default applies to one header value), and
+// migration 00003 installs an append-only trigger that makes DELETE impossible.
+// So any authenticated user, including the lowest vault_only role, could commit
+// ~1 MB of chosen bytes per request into the same SQLite file that holds the
+// encrypted vault, at 500 requests/minute, with no way to remove it afterwards.
+//
+// That breaks two things at once, both on the surface an operator needs DURING
+// such an incident: the activity list and the CSV/JSON exports become too large
+// to read, and the disk backing the vault fills.
+//
+// 512 is well past any real User-Agent (the longest in the wild are ~250) and
+// ip_address is bounded too because it can come from a forwarded header.
+const (
+	maxAuditUserAgentLen = 512
+	maxAuditIPLen        = 64
+	maxAuditDetailLen    = 4096
+)
+
+// truncateAudit clips an attacker-influenced audit field and marks that it was
+// clipped, so a reader can tell a truncated value from a genuinely short one.
+func truncateAudit(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...[truncated]"
+}
+
 func logActivityInternal(q *db.Queries, userID *string, action, detail, ipAddress, userAgent string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Clipped HERE, at the single chokepoint every audit row passes through,
+	// rather than at each call site. There are 30+ call sites and the one that
+	// forgets is the one that gets exploited.
+	detail = truncateAudit(detail, maxAuditDetailLen)
+	ipAddress = truncateAudit(ipAddress, maxAuditIPLen)
+	userAgent = truncateAudit(userAgent, maxAuditUserAgentLen)
 	err := q.InsertActivity(ctx, db.InsertActivityParams{
 		UserID:    sql.NullString{String: ptrToStr(userID), Valid: userID != nil},
 		Action:    action,
@@ -276,4 +313,27 @@ func exportExactAction(filter string) string {
 		return ""
 	}
 	return filter
+}
+
+// logAuthEvent records an authentication event WITH its source.
+//
+// The four authentication events (setup_completed, login, login_failed, logout)
+// all went through LogActivity, which passes "" for both ip_address and
+// user_agent, so the audit trail was blind on precisely the surface it exists
+// for. Verified against production: every vault operation carries an IP, while
+// every auth.login row has an empty ip_address column and the address only
+// appears inside the free-text detail ("Login from 84.55.97.134"), where it
+// cannot be filtered, grouped, or read out of the ip_address column that the
+// activity UI and both exports display.
+//
+// auth.login_failed is the sharpest case: a brute-force or credential-stuffing
+// attempt is exactly what an operator greps this table for, and the source was
+// the one field never recorded.
+//
+// Separate from LogActivityFromRequest because these fire BEFORE the auth
+// middleware has populated a user id in the context: the caller already knows
+// which user row it is acting on and passes it explicitly.
+func logAuthEvent(q *db.Queries, r *http.Request, userID *string, action, detail string) {
+	logActivityInternal(q, userID, action, detail,
+		middleware.ClientIP(r), r.Header.Get("User-Agent"))
 }

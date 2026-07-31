@@ -245,7 +245,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	LogActivity(h.queries, &row.ID, "auth.setup_completed", "First-run admin account created")
+	logAuthEvent(h.queries, r, &row.ID, "auth.setup_completed", "First-run admin account created")
 
 	h.setSessionCookie(w, token)
 	writeJSON(w, http.StatusCreated, authResponse{Token: token, User: user})
@@ -356,7 +356,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		// Surface failures in the audit trail alongside successful logins.
 		// Attributed to the resolved account with the attempted email + source
 		// IP in the detail so admins can spot targeted or brute-force attempts.
-		LogActivity(h.queries, &row.ID, "auth.login_failed",
+		logAuthEvent(h.queries, r, &row.ID, "auth.login_failed",
 			fmt.Sprintf("Failed login for %s from %s", req.Email, ip))
 	}
 
@@ -441,7 +441,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	LogActivity(h.queries, &row.ID, "auth.login", fmt.Sprintf("Login from %s", ip))
+	logAuthEvent(h.queries, r, &row.ID, "auth.login", fmt.Sprintf("Login from %s", ip))
 
 	user := userInfo{
 		ID:          row.ID,
@@ -468,7 +468,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if userID := middleware.GetUserID(r.Context()); userID != "" {
-		LogActivity(h.queries, &userID, "auth.logout", "")
+		logAuthEvent(h.queries, r, &userID, "auth.logout", "")
 	}
 	h.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})

@@ -323,12 +323,17 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Offboard BEFORE the row goes away: the cleanup resolves the user by id,
+	// Revocations BEFORE the row goes away: the cleanup resolves the user by id,
 	// and once the users row is deleted there is nothing left to look up. Hard
 	// delete previously did none of this, so it was strictly weaker than the
 	// Disable toggle next to it.
+	//
+	// Only the REVERSIBLE half runs here. offboardUser revokes service
+	// identities and purges rotation targets, which is the right outcome for a
+	// user being removed and is recoverable (re-mint, re-add) if the delete is
+	// then refused. The IRREVERSIBLE half, deleting the personal vault, is
+	// deliberately deferred until after the authoritative guard has run.
 	h.offboardUser(r, targetID, target.Email)
-	h.disposeVaultEntriesOnDelete(r, targetID, target.Email, middleware.GetUserID(r.Context()))
 
 	// The guard is ON the delete, so a concurrent second delete cannot slip
 	// between a count and a write and take the last admin with it. The
@@ -352,6 +357,17 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "user not found")
 		return
 	}
+
+	// The vault goes ONLY after the delete is authorized and committed.
+	//
+	// This used to run three statements earlier, before DeleteUserIfNotLastAdmin,
+	// with no transaction spanning the two. So a delete the guard then REFUSED
+	// (the racing last-admin case) or that errored had already hard-deleted every
+	// personal entry the user owned and re-owned their shared entries, and the
+	// API returned failure over a vault that was already gone. There is no undo
+	// for that inside the product: the rows are DELETEd, not soft-deleted, and
+	// the only copy is whatever backup.sh last wrote.
+	h.disposeVaultEntriesOnDelete(r, targetID, target.Email, middleware.GetUserID(r.Context()))
 
 	LogActivityFromRequest(h.queries, r, "admin.user_deleted",
 		fmt.Sprintf("User %s deleted", target.Email))

@@ -677,8 +677,15 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Go's default is 1 MB for a SINGLE header value, and User-Agent is
+		// stored verbatim in the append-only activity_log, so that default was
+		// the size of one audit row an authenticated caller could choose. The
+		// column is bounded now too (truncateAudit), but bounding it here as
+		// well means the bytes never reach a handler and never sit in memory
+		// 500 times a minute. 16 KB is generous for real headers.
+		MaxHeaderBytes: 16 << 10,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    60 * time.Second,
 	}
 
 	// Graceful shutdown.
