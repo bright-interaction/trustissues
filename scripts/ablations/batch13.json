@@ -1,31 +1,56 @@
 [
- {"id":"email-localpart-drops-atext","mech":"shield-egress","test":"TestRFCLegalLocalPartsAreNotSplit","file":"internal/shield/redact.go",
-  "why":"the original class: a missing atext character makes the match start mid-address and the name egresses",
-  "old":"`(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@` +",
-  "new":"`(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@` +"},
-
- {"id":"iban-contiguous-only","mech":"shield-egress","test":"TestIBANIsDetectedInPrintedGrouping","file":"internal/shield/redact.go",
-  "why":"the printed grouping is the form people actually paste, and it egressed verbatim",
-  "old":"regexp.MustCompile(`\\b[A-Z]{2}\\d{2}(?:[ ]?[A-Z0-9]){10,30}\\b`)",
-  "new":"regexp.MustCompile(`\\b[A-Z]{2}\\d{2}[A-Z0-9]{10,30}\\b`)"},
-
- {"id":"domain-hint-republishes-literal","mech":"shield-egress","test":"TestAMarkerNeverRepublishesATokenizableValue","file":"internal/shield/session.go",
-  "why":"the hint printed the domain Shield tokenizes on its own, on every email",
-  "old":"\t\t\tv = domainIndustry(v)\n\t\t\tif v == \"\" {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tk = \"industry\"",
-  "new":"\t\t\tk = \"domain\""},
-
- {"id":"json-numbers-through-float64","mech":"shield-egress","test":"TestShieldJSONPreservesNumbersExactly","file":"internal/shield/session.go",
-  "why":"decoding into any via Unmarshal makes every number a float64 and silently rewrites it",
-  "old":"\tdec := json.NewDecoder(bytes.NewReader(raw))\n\tdec.UseNumber()\n\tvar v any\n\tif err := dec.Decode(&v); err != nil {",
-  "new":"\tvar v any\n\tif err := json.Unmarshal(raw, &v); err != nil {"},
-
- {"id":"data-url-is-an-off-switch","mech":"shield-egress","test":"TestDataURLExemptionIsNotARedactionOffSwitch","file":"internal/shield/session.go",
-  "why":"a bare data: prefix let any value under a url-ish key opt out of redaction",
-  "old":"\tif !strings.HasPrefix(t, \"data:\") {\n\t\treturn false\n\t}",
-  "new":"\tif strings.HasPrefix(t, \"data:\") {\n\t\treturn true\n\t}\n\tif !strings.HasPrefix(t, \"data:\") {\n\t\treturn false\n\t}"},
-
- {"id":"hint-values-unsanitized","mech":"shield-egress","test":"TestHintValuesCannotBreakTheMarkerGrammar","file":"internal/shield/session.go",
-  "why":"an unsanitized hint value containing ] closes the marker early and corrupts the round trip",
-  "old":"\t\tpairs = append(pairs, k+\"=\"+sanitizeHintValue(v))",
-  "new":"\t\tpairs = append(pairs, k+\"=\"+v)"}
+ {
+  "id": "email-localpart-drops-atext",
+  "mech": "shield-egress",
+  "test": "TestRFCLegalLocalPartsAreNotSplit",
+  "file": "internal/shield/redact.go",
+  "why": "the original class: a missing atext character makes the match start mid-address and the name egresses",
+  "old": "`(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@` +",
+  "new": "`(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@` +"
+ },
+ {
+  "id": "iban-contiguous-only",
+  "mech": "shield-egress",
+  "test": "TestIBANIsDetectedInPrintedGrouping",
+  "file": "internal/shield/redact.go",
+  "why": "the printed grouping is the form people actually paste, and it egressed verbatim",
+  "old": "regexp.MustCompile(`\\b[A-Z]{2}\\d{2}(?:[ ]?[A-Z0-9]){10,30}\\b`)",
+  "new": "regexp.MustCompile(`\\b[A-Z]{2}\\d{2}[A-Z0-9]{10,30}\\b`)"
+ },
+ {
+  "id": "domain-hint-republishes-literal",
+  "mech": "shield-egress",
+  "test": "TestAMarkerNeverRepublishesATokenizableValue",
+  "file": "internal/shield/session.go",
+  "why": "the hint printed the domain Shield tokenizes on its own, on every email",
+  "old": "\t\t\tv = domainIndustry(v)\n\t\t\tif v == \"\" {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tk = \"industry\"",
+  "new": "\t\t\tk = \"domain\""
+ },
+ {
+  "id": "json-numbers-through-float64",
+  "mech": "shield-egress",
+  "test": "TestShieldJSONPreservesNumbersExactly",
+  "file": "internal/shield/session.go",
+  "why": "dropping UseNumber sends every number through float64 and silently rewrites it",
+  "old": "\tdec.UseNumber()\n",
+  "new": ""
+ },
+ {
+  "id": "data-url-is-an-off-switch",
+  "mech": "shield-egress",
+  "test": "TestDataURLExemptionIsNotARedactionOffSwitch",
+  "file": "internal/shield/session.go",
+  "why": "a bare data: prefix let any value under a url-ish key opt out of redaction",
+  "old": "\tif !strings.HasPrefix(t, \"data:\") {\n\t\treturn false\n\t}",
+  "new": "\tif strings.HasPrefix(t, \"data:\") {\n\t\treturn true\n\t}\n\tif !strings.HasPrefix(t, \"data:\") {\n\t\treturn false\n\t}"
+ },
+ {
+  "id": "hint-values-unsanitized",
+  "mech": "shield-egress",
+  "test": "TestHintValuesCannotBreakTheMarkerGrammar",
+  "file": "internal/shield/session.go",
+  "why": "an unsanitized hint value containing ] closes the marker early and corrupts the round trip",
+  "old": "\t\tpairs = append(pairs, k+\"=\"+sanitizeHintValue(v))",
+  "new": "\t\tpairs = append(pairs, k+\"=\"+v)"
+ }
 ]
