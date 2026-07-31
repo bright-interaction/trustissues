@@ -189,9 +189,24 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIBody))
+	// Read ONE byte past the ceiling so truncation is detectable.
+	//
+	// io.LimitReader stops silently at the limit, so a provider response over
+	// maxAIBody was cut mid-JSON and then handed to the caller as a completed
+	// request: status 200, delivered, with a body that will not parse or, worse,
+	// that parses into a partial answer. The caller has no way to tell that from
+	// a genuine short response. A gateway may refuse to carry an oversized
+	// payload, but it must not report success for something it truncated.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIBody+1))
 	if err != nil {
 		writeError(w, r, http.StatusBadGateway, "upstream_error", "could not read the provider response")
+		return
+	}
+	if int64(len(respBody)) > maxAIBody {
+		logError(r, "ai_gateway: provider response exceeded the ceiling", "provider", providerName,
+			"limit_bytes", maxAIBody)
+		writeError(w, r, http.StatusBadGateway, "upstream_response_too_large",
+			fmt.Sprintf("the AI provider returned more than %d bytes; the response was not delivered", maxAIBody))
 		return
 	}
 

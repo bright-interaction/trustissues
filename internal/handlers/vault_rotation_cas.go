@@ -86,10 +86,14 @@ var errNoCASToken = errors.New("rotation: no compare-and-swap token; the row sna
 type rotationSnapshot struct {
 	EntryID       string
 	UpdatedAtText string
+	// PrevCiphertext is the value read at the start of the pass. The CAS
+	// compares it because updated_at alone has whole-second resolution, so two
+	// writes inside one second are invisible to a timestamp token.
+	PrevCiphertext []byte
 }
 
-func snapshotFromRotationRow(id, updatedAtText string) rotationSnapshot {
-	return rotationSnapshot{EntryID: id, UpdatedAtText: updatedAtText}
+func snapshotFromRotationRow(id, updatedAtText string, prevCiphertext []byte) rotationSnapshot {
+	return rotationSnapshot{EntryID: id, UpdatedAtText: updatedAtText, PrevCiphertext: prevCiphertext}
 }
 
 // persistRotatedValue is the ONLY way to write a rotated secret.
@@ -111,14 +115,18 @@ func snapshotFromRotationRow(id, updatedAtText string) rotationSnapshot {
 // invalidates its own swap. That is not a hypothetical; it is how manual rotate
 // stayed dead for a third round.
 func persistRotatedValue(ctx context.Context, q *db.Queries, snap rotationSnapshot, ciphertext, nonce []byte) (applied bool, err error) {
-	if snap.EntryID == "" || snap.UpdatedAtText == "" {
+	if snap.EntryID == "" || snap.UpdatedAtText == "" || len(snap.PrevCiphertext) == 0 {
+		// An empty PrevCiphertext would make the ciphertext half of the predicate
+		// match only rows whose value is empty, i.e. nothing, so a missing token
+		// has to be an error rather than a silently-never-applying update.
 		return false, fmt.Errorf("%w (entry %q)", errNoCASToken, snap.EntryID)
 	}
 	res, err := q.RotateVaultEntryValueUnchecked(ctx, db.RotateVaultEntryValueUncheckedParams{
-		EncryptedValue: ciphertext,
-		Nonce:          nonce,
-		ID:             snap.EntryID,
-		UpdatedAtText:  snap.UpdatedAtText,
+		EncryptedValue:     ciphertext,
+		Nonce:              nonce,
+		ID:                 snap.EntryID,
+		UpdatedAtText:      snap.UpdatedAtText,
+		PrevEncryptedValue: snap.PrevCiphertext,
 	})
 	if err != nil {
 		return false, err

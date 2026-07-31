@@ -1281,14 +1281,17 @@ func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]Res
 const rotateVaultEntryValueUnchecked = `-- name: RotateVaultEntryValueUnchecked :execresult
 
 UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND CAST(updated_at AS TEXT) = CAST(? AS TEXT)
+WHERE id = ?
+  AND CAST(updated_at AS TEXT) = CAST(? AS TEXT)
+  AND encrypted_value = ?
 `
 
 type RotateVaultEntryValueUncheckedParams struct {
-	EncryptedValue []byte `json:"encrypted_value"`
-	Nonce          []byte `json:"nonce"`
-	ID             string `json:"id"`
-	UpdatedAtText  string `json:"updated_at_text"`
+	EncryptedValue     []byte `json:"encrypted_value"`
+	Nonce              []byte `json:"nonce"`
+	ID                 string `json:"id"`
+	UpdatedAtText      string `json:"updated_at_text"`
+	PrevEncryptedValue []byte `json:"prev_encrypted_value"`
 }
 
 // ============================================================================
@@ -1313,12 +1316,26 @@ type RotateVaultEntryValueUncheckedParams struct {
 // matched: the first version of this CAS made every scheduled rotation report a
 // conflict and persist nothing, turning a rare lost-update into a total silent
 // outage of auto-rotation. Compare the raw text both ways.
+// The token also carries the PRIOR CIPHERTEXT, because a timestamp cannot see a
+// same-second write. updated_at is CURRENT_TIMESTAMP, which SQLite renders at
+// whole-second resolution, so two writes committed inside one second leave the
+// column byte-identical and a snapshot taken between them still matches: the CAS
+// reports applied=true for exactly the lost update it exists to refuse.
+// Demonstrated against the real schema (token 17:06:04, competing write at
+// 17:06:04, replayed stale CAS -> rows changed = 1).
+//
+// encrypted_value is AES-GCM under a fresh random nonce, so two different writes
+// essentially never produce the same bytes, and it is precisely the column whose
+// loss matters here: a concurrent name or schedule edit touches other columns and
+// is not lost by this statement. Comparing it makes the guard independent of clock
+// granularity.
 func (q *Queries) RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, rotateVaultEntryValueUnchecked,
 		arg.EncryptedValue,
 		arg.Nonce,
 		arg.ID,
 		arg.UpdatedAtText,
+		arg.PrevEncryptedValue,
 	)
 }
 
