@@ -1,0 +1,40 @@
+[
+ {
+  "id": "allowlist-read-error-fails-open",
+  "mech": "capability",
+  "test": "TestClearingTheAllowListRevokesOutstandingTokens",
+  "file": "internal/handlers/capability.go",
+  "pkg": "./internal/handlers/",
+  "why": "a transient DB error returned nil and skipped the check, opening the gate",
+  "old": "\t\treturn nil, err\n\t}\n\treturn parseDestinationPatterns(raw.String), nil",
+  "new": "\t\treturn nil, nil\n\t}\n\treturn parseDestinationPatterns(raw.String), nil"
+ },
+ {
+  "id": "matcher-honours-wildcard-host",
+  "mech": "capability",
+  "test": "TestMatcherAndValidatorAgreeOnWildcardHosts",
+  "file": "internal/handlers/capability.go",
+  "pkg": "./internal/handlers/",
+  "why": "a stored row the validator would reject was still enforced as a valid ceiling",
+  "old": "\t\tif hostIsWildcarded(pat) {",
+  "new": "\t\tif false && hostIsWildcarded(pat) {"
+ },
+ {
+  "id": "must-grant-before-half-disabled",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/access_revocation_test.go",
+  "why": "the load-bearing half: if an ACTIVE editor is silently denied, the whole matrix passes vacuously",
+  "old": "\t\t\t\tif !p.run(t, env, member) {",
+  "new": "\t\t\t\tif false && !p.run(t, env, member) {"
+ },
+ {
+  "id": "email-back-after-personnummer",
+  "mech": "shield-order",
+  "test": "TestAnAddressIsNeverSplit",
+  "file": "internal/shield/redact.go",
+  "why": "the 5th leak route: a narrower pattern claims part of the local part and the rest is left bare",
+  "old": "\t\tre:   regexp.MustCompile(`\\b(?:19|20)?\\d{6}[-\\s]?\\d{4}\\b`),",
+  "new": "\t\tre:   regexp.MustCompile(`(?:19|20)?\\d{6}[-\\s]?\\d{4}`),"
+ }
+]
