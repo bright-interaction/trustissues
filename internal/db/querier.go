@@ -231,6 +231,11 @@ type Querier interface {
 	// ============================================================================
 	GetServiceIdentityByKeyHash(ctx context.Context, keyHash string) (GetServiceIdentityByKeyHashRow, error)
 	GetSessionDurationSetting(ctx context.Context) (string, error)
+	// The HTTP session idle window, in minutes. Distinct from
+	// vault_auto_lock_max_minutes, which governs how long a DECRYPTED vault stays
+	// open in the browser: those are different security properties and sharing one
+	// knob meant widening the vault auto-lock silently widened every session.
+	GetSessionIdleSetting(ctx context.Context) (string, error)
 	GetSetting(ctx context.Context, key string) (string, error)
 	GetTOTPSecret(ctx context.Context, id string) (sql.NullString, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)

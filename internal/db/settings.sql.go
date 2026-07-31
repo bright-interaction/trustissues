@@ -20,6 +20,21 @@ func (q *Queries) GetSessionDurationSetting(ctx context.Context) (string, error)
 	return value, err
 }
 
+const getSessionIdleSetting = `-- name: GetSessionIdleSetting :one
+SELECT value FROM settings WHERE key = 'session_idle_minutes'
+`
+
+// The HTTP session idle window, in minutes. Distinct from
+// vault_auto_lock_max_minutes, which governs how long a DECRYPTED vault stays
+// open in the browser: those are different security properties and sharing one
+// knob meant widening the vault auto-lock silently widened every session.
+func (q *Queries) GetSessionIdleSetting(ctx context.Context) (string, error) {
+	row := q.db.QueryRowContext(ctx, getSessionIdleSetting)
+	var value string
+	err := row.Scan(&value)
+	return value, err
+}
+
 const getSetting = `-- name: GetSetting :one
 SELECT value FROM settings WHERE key = ?
 `

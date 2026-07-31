@@ -274,7 +274,7 @@ export const api = {
       request<{ message: string }>('/settings/smtp/test', { method: 'POST' }),
     getSessionDuration: () =>
       request<SessionDurationConfig>('/settings/session-duration'),
-    updateSessionDuration: (data: { duration_hours: number }) =>
+    updateSessionDuration: (data: { duration_hours: number; idle_minutes?: number }) =>
       request<SessionDurationConfig>('/settings/session-duration', {
         method: 'PUT',
         body: JSON.stringify(data),

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -149,12 +150,22 @@ func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := fmt.Sprintf("trustissues-activity-%s.csv", time.Now().Format("20060102-150405"))
-	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	w.Header().Set("Cache-Control", "no-cache")
-
-	cw := csv.NewWriter(w)
+	// Build the whole document BEFORE sending any of it.
+	//
+	// This wrote straight to the ResponseWriter with every cw.Write discarded as
+	// `_ =` and no cw.Error() check after Flush, so a failure partway through
+	// (a client disconnect, a broken pipe, a full disk on a proxy) produced a
+	// TRUNCATED file delivered under a 200 and an attachment filename. An admin
+	// exporting the audit trail for an incident or a compliance request got a
+	// prefix of it and no indication anything was missing, which is the one
+	// property an audit export has to get right.
+	//
+	// The rows are already fully materialised in memory above, so buffering the
+	// CSV text is a proportional cost, not a new class of problem, and it buys
+	// the ability to fail with a real 500 while the status line is still ours to
+	// write.
+	var buf bytes.Buffer
+	cw := csv.NewWriter(&buf)
 	_ = cw.Write([]string{"id", "user_id", "user_email", "action", "detail", "ip_address", "user_agent", "created_at"})
 	for _, row := range rows {
 		_ = cw.Write([]string{
@@ -169,6 +180,22 @@ func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	cw.Flush()
+	if err := cw.Error(); err != nil {
+		logError(r, "activity.export_csv: encoding failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	filename := fmt.Sprintf("trustissues-activity-%s.csv", time.Now().Format("20060102-150405"))
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Cache-Control", "no-cache")
+	// Content-Length makes a truncated transfer detectable by the CLIENT too: a
+	// download cut short no longer looks like a complete file.
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		logError(r, "activity.export_csv: write failed", "error", err)
+	}
 }
 
 // csvSafe neutralises spreadsheet formula injection in an exported CSV field.

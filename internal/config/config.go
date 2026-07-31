@@ -238,10 +238,24 @@ func envStr(key, defaultVal string) string {
 
 // envInt returns the value of an environment variable as int or a default.
 func envInt(key string, defaultVal int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
 	}
-	return defaultVal
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		// A malformed value is not the same as an unset one.
+		//
+		// This silently returned the default, so TRUSTISSUES_TRUSTED_PROXY_HOPS=
+		// "1 " or PORT="8080\n" behaved exactly like not setting them at all,
+		// and the operator had no way to tell. For the proxy-hop setting in
+		// particular that silently changes which address every rate limit,
+		// lockout and audit row is attributed to. Log it loudly and keep the
+		// default, which is the safe value, rather than refusing to boot over a
+		// stray space.
+		slog.Error("config: ignoring malformed integer env var, using the default",
+			"key", key, "value", v, "default", defaultVal)
+		return defaultVal
+	}
+	return n
 }
