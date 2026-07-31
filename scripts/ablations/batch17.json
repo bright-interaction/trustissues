@@ -1,6 +1,41 @@
 [
- {"id":"register-nonatomic-first-admin","mech":"auth","test":"TestRegisterRaceWithATrickledBody","file":"internal/handlers/auth.go","pkg":"./internal/handlers/",
-  "why":"unauthenticated admin creation surviving setup completion",
-  "old":"\trow, err := h.queries.CreateFirstAdmin(r.Context(), db.CreateFirstAdminParams{\n\t\tEmail:        req.Email,\n\t\tPasswordHash: hash,\n\t\tName:         toNullString(req.Name),\n\t})",
-  "new":"\trow, err := h.queries.CreateUser(r.Context(), db.CreateUserParams{\n\t\tEmail:        req.Email,\n\t\tPasswordHash: hash,\n\t\tName:         toNullString(req.Name),\n\t\tRole:         \"admin\",\n\t})"}
+ {
+  "id": "csv-export-streams-unchecked",
+  "mech": "audit-export",
+  "test": "TestActivityCSVExportIsCompleteOrFails",
+  "file": "internal/handlers/activity.go",
+  "why": "the original bug: writes discarded, no cw.Error() check, so a truncated export ships under a 200",
+  "old": "\tw.Header().Set(\"Content-Length\", strconv.Itoa(buf.Len()))",
+  "new": "\t_ = buf.Len()"
+ },
+ {
+  "id": "session-idle-reads-vault-knob",
+  "mech": "session",
+  "test": "TestSessionIdleIsSeparateFromVaultAutoLock",
+  "file": "internal/db/settings.sql.go",
+  "why": "the original coupling: the session idle window read the VAULT auto-lock knob, so widening one silently widened the other",
+  "old": "SELECT value FROM settings WHERE key = 'session_idle_minutes'",
+  "new": "SELECT value FROM settings WHERE key = 'vault_auto_lock_max_minutes'",
+  "pkg": "./internal/handlers/"
+ },
+ {
+  "id": "retry-after-go-duration",
+  "mech": "ratelimit",
+  "test": "TestRetryAfterIsDeltaSeconds",
+  "file": "internal/middleware/rate_limit.go",
+  "why": "a Go duration string is not a valid Retry-After value, so every client ignores it",
+  "old": "\t\t\t\tw.Header().Set(\"Retry-After\",\n\t\t\t\t\tstrconv.Itoa(int(limiter.window.Seconds())))",
+  "new": "\t\t\t\t_ = strconv.Itoa\n\t\t\t\tw.Header().Set(\"Retry-After\", limiter.window.String())",
+  "pkg": "./internal/middleware/"
+ },
+ {
+  "id": "disabled-account-is-403",
+  "mech": "session",
+  "test": "TestDisabledAccountIsADeadSession",
+  "file": "internal/middleware/auth.go",
+  "why": "403 leaves the SPA rendering cached data; a removed identity is a dead session",
+  "old": "\tcase \"account is disabled\", \"user not found\":\n\t\treturn http.StatusUnauthorized",
+  "new": "\tcase \"never-matches\":\n\t\treturn http.StatusUnauthorized",
+  "pkg": "./internal/middleware/"
+ }
 ]

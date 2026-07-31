@@ -98,6 +98,11 @@ export interface SMTPConfig {
 
 export interface SessionDurationConfig {
   duration_hours: number;
+  /** How long a session survives WITHOUT USE, as opposed to duration_hours
+   *  which is its absolute lifetime. Shown alongside it because the two used to
+   *  be governed by one control (the vault auto-lock knob), so an operator
+   *  widening that silently widened every session and could not see it. */
+  idle_minutes: number;
 }
 
 // AI + MCP settings. Provider keys point at vault entries by id; Shield is

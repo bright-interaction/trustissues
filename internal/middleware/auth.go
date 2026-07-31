@@ -214,7 +214,7 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				// API-key auth: no JWT session, so session revocation does not apply.
 				ctx, _, reject := enrichUserContext(ctx, db, userID)
 				if reject != "" {
-					writeAuthReject(w, http.StatusForbidden, reject)
+					writeAuthReject(w, authRejectStatus(reject), reject)
 					return
 				}
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -238,7 +238,7 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 			ctx := context.WithValue(r.Context(), UserIDKey, userID)
 			ctx, sva, reject := enrichUserContext(ctx, db, userID)
 			if reject != "" {
-				writeAuthReject(w, http.StatusForbidden, reject)
+				writeAuthReject(w, authRejectStatus(reject), reject)
 				return
 			}
 			if sessionRevoked(iat, sva) {
@@ -364,16 +364,33 @@ func validateSession(ctx context.Context, db *sql.DB, userID, jti string) (int, 
 // minutes when the setting is missing or invalid so a corrupt row cannot
 // disable the timeout.
 func sessionIdleModifier(ctx context.Context, db *sql.DB) string {
-	mins := 15
+	mins := DefaultSessionIdleMinutes
 	var v string
+	// session_idle_minutes, NOT vault_auto_lock_max_minutes.
+	//
+	// This read the VAULT auto-lock knob, so two unrelated security properties
+	// shared one control. The vault auto-lock decides how long a DECRYPTED vault
+	// stays open in the browser; the session idle timeout decides how long an
+	// authenticated HTTP session survives without use. An admin who widened the
+	// vault auto-lock to 240 minutes because re-unlocking was tiresome silently
+	// extended every HTTP session to a 4 hour idle window, and nothing in the UI
+	// said so: the setting is labelled and documented purely as vault auto-lock.
+	//
+	// They now have their own keys and their own defaults, and the idle window
+	// is editable in the same Session settings card as the session duration, so
+	// an operator changing one can see the other.
 	if err := db.QueryRowContext(ctx,
-		"SELECT value FROM settings WHERE key = ?", "vault_auto_lock_max_minutes").Scan(&v); err == nil {
+		"SELECT value FROM settings WHERE key = ?", "session_idle_minutes").Scan(&v); err == nil {
 		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
 			mins = n
 		}
 	}
 	return fmt.Sprintf("-%d minutes", mins)
 }
+
+// DefaultSessionIdleMinutes is the idle window applied when the operator has
+// not set one. Matches the value this code used before the setting existed.
+const DefaultSessionIdleMinutes = 15
 
 // extractSessionToken pulls the JWT from the Authorization header
 // ("Bearer <token>") or, failing that, from the session cookie.
@@ -392,6 +409,28 @@ func extractSessionToken(r *http.Request) string {
 }
 
 // writeAuthReject writes a JSON error body with the given status.
+// authRejectStatus maps an enrichUserContext rejection to the right status.
+//
+// Every rejection was a flat 403, which conflates two different things. A
+// disabled or deleted account is not "you are authenticated but not allowed to
+// do this", it is "the identity behind this session no longer exists", and the
+// client must treat it as a dead session and log out. The SPA only drops its
+// session on a 401, so a user disabled by an admin mid-visit kept a rendered
+// app full of cached data and a red toast on every request, and had no way to
+// tell that their access had actually been removed.
+//
+// A read failure stays a server error: it says nothing about the caller.
+func authRejectStatus(reject string) int {
+	switch reject {
+	case "account is disabled", "user not found":
+		return http.StatusUnauthorized
+	case "internal error":
+		return http.StatusInternalServerError
+	default:
+		return http.StatusForbidden
+	}
+}
+
 func writeAuthReject(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

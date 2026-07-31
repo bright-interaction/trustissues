@@ -172,6 +172,11 @@ func validatePasswordWithPolicy(ctx context.Context, q *db.Queries, password str
 // --- Session duration --------------------------------------------------------
 
 type sessionDurationResponse struct {
+	// IdleMinutes is how long a session survives WITHOUT USE, as opposed to
+	// DurationHours which is its absolute lifetime. It lives in the same
+	// payload so the Session settings card shows both, because they used to be
+	// governed by one control and an operator could not see the second.
+	IdleMinutes   int `json:"idle_minutes"`
 	DurationHours int `json:"duration_hours"`
 }
 
@@ -185,7 +190,15 @@ func (h *SettingsHandler) GetSessionDuration(w http.ResponseWriter, r *http.Requ
 	} else if err != nil && err != sql.ErrNoRows {
 		logError(r, "settings.session_duration: read failed", "error", err)
 	}
-	writeJSON(w, http.StatusOK, sessionDurationResponse{DurationHours: hours})
+	idle := middleware.DefaultSessionIdleMinutes
+	if v, err := h.queries.GetSessionIdleSetting(r.Context()); err == nil && v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			idle = n
+		}
+	} else if err != nil && err != sql.ErrNoRows {
+		logError(r, "settings.session_idle: read failed", "error", err)
+	}
+	writeJSON(w, http.StatusOK, sessionDurationResponse{DurationHours: hours, IdleMinutes: idle})
 }
 
 // UpdateSessionDuration handles PUT /api/settings/session-duration (admin
@@ -200,6 +213,12 @@ func (h *SettingsHandler) UpdateSessionDuration(w http.ResponseWriter, r *http.R
 		writeValidationError(w, r, "duration_hours must be between 1 and 720")
 		return
 	}
+	// 0 means "not supplied": keep whatever is stored rather than silently
+	// resetting the idle window to a default an older client never sent.
+	if req.IdleMinutes != 0 && (req.IdleMinutes < 1 || req.IdleMinutes > 1440) {
+		writeValidationError(w, r, "idle_minutes must be between 1 and 1440")
+		return
+	}
 
 	if err := h.queries.UpsertSetting(r.Context(), db.UpsertSettingParams{
 		Key:   "session_duration_hours",
@@ -210,8 +229,20 @@ func (h *SettingsHandler) UpdateSessionDuration(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	if req.IdleMinutes != 0 {
+		if err := h.queries.UpsertSetting(r.Context(), db.UpsertSettingParams{
+			Key:   "session_idle_minutes",
+			Value: strconv.Itoa(req.IdleMinutes),
+		}); err != nil {
+			logError(r, "settings.session_idle: update failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+	}
+
 	LogActivityFromRequest(h.queries, r, "settings.session_duration_updated",
-		fmt.Sprintf("Session duration set to %d hours", req.DurationHours))
+		fmt.Sprintf("Session duration set to %d hours, idle window %d minutes",
+			req.DurationHours, req.IdleMinutes))
 
 	writeJSON(w, http.StatusOK, req)
 }

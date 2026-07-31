@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,7 +124,13 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 
 			if !limiter.allow(ip) {
 				slog.Debug("rate limit exceeded", "ip", ip)
-				w.Header().Set("Retry-After", limiter.window.String())
+				// Retry-After is delta-seconds or an HTTP-date (RFC 9110), never
+				// a Go duration string: window.String() emits "1m0s", which no
+				// client can parse, so every well-behaved client and every SDK
+				// with retry support ignored the hint and hammered the endpoint
+				// at whatever interval it chose.
+				w.Header().Set("Retry-After",
+					strconv.Itoa(int(limiter.window.Seconds())))
 				http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
 				return
 			}

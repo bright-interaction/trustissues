@@ -564,14 +564,16 @@ function SessionTab() {
   });
 
   const [hours, setHours] = useState<number | null>(null);
+  const [idle, setIdle] = useState<number | null>(null);
 
   useEffect(() => {
     if (data && hours === null) setHours(data.duration_hours);
-  }, [data, hours]);
+    if (data && idle === null) setIdle(data.idle_minutes);
+  }, [data, hours, idle]);
 
   const saveMutation = useMutation({
-    mutationFn: (duration_hours: number) =>
-      api.settings.updateSessionDuration({ duration_hours }),
+    mutationFn: (payload: { duration_hours: number; idle_minutes: number }) =>
+      api.settings.updateSessionDuration(payload),
     onSuccess: (saved) => {
       toast.success('Session duration saved');
       queryClient.setQueryData(queryKeys.settings.sessionDuration(), saved);
@@ -579,7 +581,7 @@ function SessionTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  if (isLoading || hours === null) {
+  if (isLoading || hours === null || idle === null) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
@@ -596,7 +598,7 @@ function SessionTab() {
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          saveMutation.mutate(hours);
+          saveMutation.mutate({ duration_hours: hours, idle_minutes: idle });
         }}
         className="max-w-sm space-y-4"
       >
@@ -610,6 +612,26 @@ function SessionTab() {
             onChange={(e) => setHours(Number(e.target.value))}
             className={inputClass}
           />
+          <p className="mt-1 text-xs text-slate-500">
+            Absolute lifetime. A session is dropped this long after sign-in even
+            if it is in constant use.
+          </p>
+        </div>
+        <div>
+          <label className={labelClass}>Idle timeout (minutes)</label>
+          <input
+            type="number"
+            min={1}
+            max={1440}
+            value={idle}
+            onChange={(e) => setIdle(Number(e.target.value))}
+            className={inputClass}
+          />
+          <p className="mt-1 text-xs text-slate-500">
+            How long an unused session survives. Separate from the vault
+            auto-lock, which only decides how long a decrypted vault stays open
+            in the browser.
+          </p>
         </div>
         <button
           type="submit"
