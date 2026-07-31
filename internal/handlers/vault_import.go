@@ -91,12 +91,30 @@ func importedCustomFields(extra, totp string) []CustomField {
 	return out
 }
 
+// maxImportEntries caps one import batch.
+//
+// ImportConfirm holds SQLite's single write lock for the whole batch, so this
+// is really a cap on how long every other writer in the instance is blocked.
+// 5,000 entries is far above any real password-manager export and far below the
+// ~200k a 10 MB body of minimal CSV rows can carry.
+const maxImportEntries = 5000
+
 // VaultImportPreview represents the preview of what will be imported
 type VaultImportPreview struct {
 	Format    string        `json:"format"`
 	Entries   []ImportEntry `json:"entries"`
 	Conflicts []string      `json:"conflicts"`
 	Total     int           `json:"total"`
+	// Skipped names the rows the parser could not turn into entries, and
+	// SourceRows is the count BEFORE those drops.
+	//
+	// Total is len(entries), which is the post-drop number, so on its own it can
+	// never reveal that anything went missing: an export of 500 items with 120
+	// secure notes previewed as "500 rows -> 380 entries" indistinguishably from
+	// a clean export of 380. Reporting both numbers is what makes the loss
+	// visible at the only moment the operator can still act on it.
+	Skipped    []skippedEntry `json:"skipped"`
+	SourceRows int            `json:"source_rows"`
 }
 
 // detectFormat attempts to detect the password manager format from CSV headers
@@ -133,14 +151,15 @@ func containsAll(s string, required []string) bool {
 }
 
 // parseCSV parses a CSV file and returns import entries
-func (h *VaultImportHandler) parseCSV(reader io.Reader, format PasswordManagerFormat) ([]ImportEntry, error) {
+func (h *VaultImportHandler) parseCSV(reader io.Reader, format PasswordManagerFormat) ([]ImportEntry, []skippedEntry, error) {
 	csvReader := csv.NewReader(reader)
 	headers, err := csvReader.Read()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CSV headers: %w", err)
+		return nil, nil, fmt.Errorf("failed to read CSV headers: %w", err)
 	}
 
 	var entries []ImportEntry
+	skipped := []skippedEntry{}
 	lineNum := 1
 
 	for {
@@ -149,25 +168,77 @@ func (h *VaultImportHandler) parseCSV(reader io.Reader, format PasswordManagerFo
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("error reading CSV line %d: %w", lineNum, err)
+			return nil, nil, fmt.Errorf("error reading CSV line %d: %w", lineNum, err)
 		}
 
 		if len(record) != len(headers) {
-			return nil, fmt.Errorf("mismatched column count at line %d", lineNum)
+			return nil, nil, fmt.Errorf("mismatched column count at line %d", lineNum)
 		}
 
-		entry := parseRecordByFormat(headers, record, format)
-		if entry != nil {
+		entry, reason := parseRecordByFormat(headers, record, format)
+		switch {
+		case entry != nil:
 			entries = append(entries, *entry)
+		case reason != "":
+			// A dropped row is reported, never swallowed.
+			//
+			// This discarded every nil silently, and Total is len(entries), the
+			// POST-drop count, so a Bitwarden export of 500 items where 120 are
+			// secure notes, cards or identities previewed as 380 with nothing
+			// naming the missing 120, imported 380, and showed a plain success
+			// toast. A secure note carries its content in the notes field, so
+			// those are secrets the operator believed they had migrated.
+			name := rowLabel(headers, record)
+			skipped = append(skipped, skippedEntry{Name: name, Reason: reason})
 		}
 		lineNum++
 	}
 
-	return entries, nil
+	return entries, skipped, nil
 }
 
-// parseRecordByFormat parses a CSV record based on the detected format
-func parseRecordByFormat(headers []string, record []string, format PasswordManagerFormat) *ImportEntry {
+// importSkipReason explains why a row with no name or no value was dropped.
+//
+// The reason has to match the branch actually taken. One message covered both
+// causes ("no password value in the export row (secure notes, cards and
+// identities have none)"), so a row that HAD a good password and merely lacked
+// a name was explained to the operator as a secure note. That sends them
+// looking in the wrong place in their export for the one problem they could
+// have fixed in a minute.
+func importSkipReason(entry ImportEntry) string {
+	switch {
+	case entry.Name == "" && entry.Value == "":
+		return "the export row has neither a name nor a password value"
+	case entry.Name == "":
+		return "no name in the export row, so there is nothing to file it under"
+	default:
+		return "no password value in the export row (secure notes, cards and identities have none)"
+	}
+}
+
+// rowLabel picks the most name-like column available so a reported skip points
+// at something the operator can find in their export.
+func rowLabel(headers, record []string) string {
+	for _, want := range []string{"name", "title", "account"} {
+		for i, h := range headers {
+			if strings.ToLower(strings.TrimSpace(h)) == want && i < len(record) {
+				if v := strings.TrimSpace(record[i]); v != "" {
+					return v
+				}
+			}
+		}
+	}
+	return "(unnamed row)"
+}
+
+// parseRecordByFormat parses a CSV record based on the detected format.
+//
+// Returns (entry, "") when the row becomes an entry, and (nil, reason) when it
+// is dropped. The reason is not decoration: a dropped row used to vanish here
+// with nothing recording it, and every count downstream is computed AFTER the
+// drop, so nothing anywhere could tell the operator that part of their export
+// did not arrive.
+func parseRecordByFormat(headers []string, record []string, format PasswordManagerFormat) (*ImportEntry, string) {
 	// Create a map for easier field access
 	fields := make(map[string]string)
 	for i, header := range headers {
@@ -185,11 +256,19 @@ func parseRecordByFormat(headers []string, record []string, format PasswordManag
 			Notes:    fields["notes"],
 			CustomFields: importedCustomFields("",
 				getFirstField(fields, []string{"otpauth", "one-time password", "one_time_password", "totp"})),
-		}
+		}, ""
 
 	case FormatBitwarden:
 		if fields["type"] != "login" {
-			return nil // Skip non-login items
+			// Secure notes, cards and identities have no password, so they
+			// cannot become vault entries. Reporting them is the point: a
+			// secure note keeps its content in the notes field, so these are
+			// secrets the operator believes they are migrating.
+			kind := fields["type"]
+			if kind == "" {
+				kind = "unknown"
+			}
+			return nil, "Bitwarden item of type \"" + kind + "\" has no password, so it cannot become a vault entry"
 		}
 		return &ImportEntry{
 			Name:         fields["name"],
@@ -198,7 +277,7 @@ func parseRecordByFormat(headers []string, record []string, format PasswordManag
 			Value:        fields["login_password"],
 			Notes:        fields["notes"],
 			CustomFields: importedCustomFields(fields["fields"], fields["login_totp"]),
-		}
+		}, ""
 
 	case FormatLastPass:
 		return &ImportEntry{
@@ -208,10 +287,10 @@ func parseRecordByFormat(headers []string, record []string, format PasswordManag
 			Value:        fields["password"],
 			Notes:        fields["extra"],
 			CustomFields: importedCustomFields("", fields["totp"]),
-		}
+		}, ""
 	}
 
-	return nil
+	return nil, "the export format could not be recognised for this row"
 }
 
 // getFirstField returns the first non-empty field from the list
@@ -321,10 +400,27 @@ func (h *VaultImportHandler) ImportPreview(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Parse full CSV
-	entries, err := h.parseCSV(file, format)
+	entries, skipped, err := h.parseCSV(file, format)
 	if err != nil {
 		logError(r, "failed to parse CSV", "error", err)
 		writeBadRequest(w, r, "failed to parse CSV")
+		return
+	}
+
+	// Refuse a batch too large to import in one transaction.
+	//
+	// ImportConfirm runs the WHOLE batch inside one BEGIN IMMEDIATE, which takes
+	// the single write lock for the duration. There was no cap on entry count,
+	// only a 10 MB body limit, and 10 MB of minimal CSV rows is on the order of
+	// 200k entries, each doing an encrypt plus an insert. Every other writer in
+	// the instance (a login touching sessions, the rotation sweep, any edit)
+	// blocks on that lock and gives up at the 5s busy timeout, so one import
+	// stalls the product. Refusing at preview is the honest place: the operator
+	// finds out before committing, not halfway through.
+	if len(entries) > maxImportEntries {
+		writeBadRequest(w, r, fmt.Sprintf(
+			"this export has %d entries, which is over the %d limit for a single import. "+
+				"Split the file and import it in parts.", len(entries), maxImportEntries))
 		return
 	}
 
@@ -333,10 +429,12 @@ func (h *VaultImportHandler) ImportPreview(w http.ResponseWriter, r *http.Reques
 
 	// Return preview
 	preview := VaultImportPreview{
-		Format:    string(format),
-		Entries:   entries,
-		Conflicts: conflicts,
-		Total:     len(entries),
+		Format:     string(format),
+		Entries:    entries,
+		Conflicts:  conflicts,
+		Total:      len(entries),
+		Skipped:    skipped,
+		SourceRows: len(entries) + len(skipped),
 	}
 
 	writeJSON(w, http.StatusOK, preview)
@@ -363,6 +461,17 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 
 	if len(req.Entries) == 0 {
 		writeBadRequest(w, r, "no entries to import")
+		return
+	}
+	// The cap is enforced HERE too, not only at preview.
+	//
+	// Confirm takes its entries from the request body, not from the preview, so
+	// a caller can post any batch it likes without ever calling preview. A limit
+	// checked only on the advisory path is not a limit.
+	if len(req.Entries) > maxImportEntries {
+		writeBadRequest(w, r, fmt.Sprintf(
+			"%d entries is over the %d limit for a single import; split the file and import it in parts",
+			len(req.Entries), maxImportEntries))
 		return
 	}
 
@@ -401,12 +510,27 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			if name == "" {
 				name = "(unnamed row)"
 			}
-			skipped = append(skipped, skippedEntry{
-				Name:   name,
-				Reason: "no password value in the export row (secure notes, cards and identities have none)",
-			})
+			skipped = append(skipped, skippedEntry{Name: name, Reason: importSkipReason(entry)})
 			continue
 		}
+
+		// Same field rules as Create and Update.
+		//
+		// Import applied none of them, so a legitimate CSV could write a row the
+		// edit form could never save again (Update re-validates on every save and
+		// the form resubmits every field), and an untrimmed name defeated both
+		// checkConflicts and UNIQUE(user_id, name). Reported as a skip rather
+		// than failing the batch: one bad row out of 400 should not cost the
+		// other 399, and the operator now gets told which one and why.
+		fields := vaultEntryFields{
+			Name: entry.Name, Value: entry.Value, URL: entry.URL,
+			Username: entry.Username, Notes: entry.Notes,
+		}
+		if msg := normalizeAndValidateEntryFields(&fields); msg != "" {
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: msg})
+			continue
+		}
+		entry.Name, entry.URL, entry.Username = fields.Name, fields.URL, fields.Username
 
 		// Encrypt the value
 		encrypted, nonce, err := h.handler.encrypt([]byte(entry.Value))

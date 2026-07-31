@@ -133,7 +133,7 @@ func TestImportCarriesTOTPAndCustomFields(t *testing.T) {
 	headers := []string{"type", "name", "login_uri", "login_username", "login_password", "login_totp", "fields"}
 	record := []string{"login", "AWS Console", "https://aws.amazon.com", "ops@example.com", "hunter2",
 		"otpauth://totp/AWS?secret=JBSWY3DPEHPK3PXP", "recovery_pin: 998877\nregion: eu-north-1"}
-	entry := parseRecordByFormat(headers, record, FormatBitwarden)
+	entry, _ := parseRecordByFormat(headers, record, FormatBitwarden)
 	if entry == nil {
 		t.Fatal("ABORT: the Bitwarden row did not parse at all")
 	}
@@ -161,7 +161,7 @@ func TestImportCarriesTOTPAndCustomFields(t *testing.T) {
 	}
 
 	// LastPass carries its seed in a different column.
-	lp := parseRecordByFormat(
+	lp, _ := parseRecordByFormat(
 		[]string{"name", "url", "username", "password", "totp"},
 		[]string{"Bank", "https://bank.example", "u", "p", "JBSWY3DPEHPK3PXP"},
 		FormatLastPass)

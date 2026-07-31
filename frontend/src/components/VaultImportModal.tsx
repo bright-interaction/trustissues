@@ -202,6 +202,43 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
                 </p>
               </div>
 
+              {/* Rows the parser dropped.
+                  Shown BEFORE conflicts because a conflict is a choice the
+                  operator gets to make, while a dropped row is data that will
+                  not arrive at all. The count on its own could never reveal
+                  this: `total` is computed after the drops, so an export of
+                  500 with 120 secure notes looked exactly like a clean export
+                  of 380. */}
+              {(preview.skipped?.length ?? 0) > 0 && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <div className="flex items-start">
+                    <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
+                    <div className="ml-3 min-w-0">
+                      <p className="text-sm font-medium text-red-800">
+                        {preview.skipped.length} of {preview.source_rows} rows in this file cannot be
+                        imported
+                      </p>
+                      <p className="text-sm text-red-600 mt-1">
+                        These will NOT be added. A Bitwarden secure note keeps its content in
+                        the notes field, so check them in your export before deleting it.
+                      </p>
+                      <ul className="mt-2 space-y-1 text-sm text-red-700 max-h-32 overflow-y-auto">
+                        {preview.skipped.slice(0, 20).map((s, i) => (
+                          <li key={i} className="truncate">
+                            <span className="font-medium">{s.name}</span>: {s.reason}
+                          </li>
+                        ))}
+                      </ul>
+                      {preview.skipped.length > 20 && (
+                        <p className="text-sm text-red-600 mt-1">
+                          and {preview.skipped.length - 20} more
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Warnings */}
               {preview.conflicts.length > 0 && (
                 <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
