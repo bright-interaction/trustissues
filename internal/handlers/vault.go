@@ -973,39 +973,19 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		collectionID = sql.NullString{String: *req.CollectionID, Valid: true}
 	}
 
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		writeBadRequest(w, r, "name is required")
+	// One validator for every write path (see vault_field_limits.go). These used
+	// to be literals here, partly duplicated in Update, and entirely absent from
+	// import, which is how import could write a row the edit form then refused
+	// to save.
+	fields := vaultEntryFields{
+		Name: req.Name, Value: req.Value, URL: req.URL,
+		AliasURL: req.AliasURL, Username: req.Username, Notes: req.Notes,
+	}
+	if msg := normalizeAndValidateEntryFields(&fields); msg != "" {
+		writeBadRequest(w, r, msg)
 		return
 	}
-	if len(req.Name) > 255 {
-		writeBadRequest(w, r, "name must be 255 characters or less")
-		return
-	}
-	if req.Value == "" {
-		writeBadRequest(w, r, "value is required")
-		return
-	}
-	if len(req.Value) > 65536 {
-		writeBadRequest(w, r, "value must be 64KB or less")
-		return
-	}
-	if len(req.URL) > 2048 {
-		writeBadRequest(w, r, "url must be 2048 characters or less")
-		return
-	}
-	if len(req.AliasURL) > 2048 {
-		writeBadRequest(w, r, "alias url must be 2048 characters or less")
-		return
-	}
-	if len(req.Username) > 255 {
-		writeBadRequest(w, r, "username must be 255 characters or less")
-		return
-	}
-	if len(req.Notes) > 10000 {
-		writeBadRequest(w, r, "notes must be 10000 characters or less")
-		return
-	}
+	req.Name, req.URL, req.AliasURL, req.Username = fields.Name, fields.URL, fields.AliasURL, fields.Username
 	validCategories := map[string]bool{
 		"": true, "login": true, "password": true, "api_key": true, "database": true,
 		"certificate": true, "credit_card": true, "ssh_key": true, "server": true,

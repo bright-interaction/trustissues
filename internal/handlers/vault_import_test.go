@@ -33,7 +33,7 @@ func TestParseCSVFormats(t *testing.T) {
 	t.Run("1password", func(t *testing.T) {
 		csvData := "Title,Website,Username,Password,Notes\n" +
 			"GitHub,https://github.com,octocat,hunter2,\"my, note\"\n"
-		entries, err := h.parseCSV(strings.NewReader(csvData), Format1Password)
+		entries, _, err := h.parseCSV(strings.NewReader(csvData), Format1Password)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
@@ -50,22 +50,40 @@ func TestParseCSVFormats(t *testing.T) {
 		csvData := "folder,favorite,type,name,notes,fields,login_uri,login_username,login_password\n" +
 			",,login,Site A,,,https://a.example,user-a,pass-a\n" +
 			",,note,Secure Note,,,,,\n"
-		entries, err := h.parseCSV(strings.NewReader(csvData), FormatBitwarden)
+		entries, skipped, err := h.parseCSV(strings.NewReader(csvData), FormatBitwarden)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
 		if len(entries) != 1 {
-			t.Fatalf("got %d entries, want 1 (non-login skipped)", len(entries))
+			t.Fatalf("got %d entries, want 1", len(entries))
 		}
 		if entries[0].Name != "Site A" || entries[0].Value != "pass-a" {
 			t.Fatalf("bad entry: %+v", entries[0])
+		}
+		// The non-login row must be REPORTED, not silently dropped.
+		//
+		// This used to assert `want 1 (non-login skipped)` and nothing else,
+		// which pinned the silence as correct behaviour: the row vanished in the
+		// parser, `total` is computed after the drop, and a 500-item export with
+		// 120 secure notes was indistinguishable from a clean export of 380. A
+		// secure note carries its content in the notes field, so those are
+		// secrets the operator believed they had migrated.
+		if len(skipped) != 1 {
+			t.Fatalf("got %d reported skips, want 1; a dropped row that nothing reports is "+
+				"invisible at every layer above this one", len(skipped))
+		}
+		if skipped[0].Name != "Secure Note" {
+			t.Errorf("the skip does not name the row: %+v", skipped[0])
+		}
+		if !strings.Contains(skipped[0].Reason, "note") {
+			t.Errorf("the reason does not say what kind of item was dropped: %+v", skipped[0])
 		}
 	})
 
 	t.Run("lastpass", func(t *testing.T) {
 		csvData := "url,username,password,extra,name,grouping,fav\n" +
 			"https://b.example,user-b,pass-b,extra note,Site B,Work,0\n"
-		entries, err := h.parseCSV(strings.NewReader(csvData), FormatLastPass)
+		entries, _, err := h.parseCSV(strings.NewReader(csvData), FormatLastPass)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
@@ -81,7 +99,7 @@ func TestParseCSVFormats(t *testing.T) {
 	t.Run("mismatched column count errors", func(t *testing.T) {
 		csvData := "url,username,password,extra,name,grouping,fav\n" +
 			"only,two\n"
-		if _, err := h.parseCSV(strings.NewReader(csvData), FormatLastPass); err == nil {
+		if _, _, err := h.parseCSV(strings.NewReader(csvData), FormatLastPass); err == nil {
 			t.Fatal("expected error on mismatched columns")
 		}
 	})

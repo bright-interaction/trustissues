@@ -84,6 +84,11 @@ export interface VaultImportPreview {
   entries: ImportEntry[];
   conflicts: string[];
   total: number;
+  /** Rows the parser could not turn into entries, with the reason for each. */
+  skipped: Array<{ name: string; reason: string }>;
+  /** Row count BEFORE those drops. `total` is the post-drop number, so the two
+   *  together are what reveal that part of an export did not arrive. */
+  source_rows: number;
 }
 
 export interface ServiceIdentity {
