@@ -69,27 +69,58 @@ func (q *Queries) AnyEncryptedColumnSample(ctx context.Context) ([]AnyEncryptedC
 	return items, nil
 }
 
-const anyEncryptedVaultEntry = `-- name: AnyEncryptedVaultEntry :one
-SELECT encrypted_value, nonce FROM vault_entries
-WHERE encryption_version = 2 AND length(encrypted_value) > 0
-LIMIT 1
+const anyEncryptedVaultEntry = `-- name: AnyEncryptedVaultEntry :many
+SELECT encrypted_value, nonce, encryption_version FROM vault_entries
+WHERE length(encrypted_value) > 0
 `
 
 type AnyEncryptedVaultEntryRow struct {
-	EncryptedValue []byte `json:"encrypted_value"`
-	Nonce          []byte `json:"nonce"`
+	EncryptedValue    []byte        `json:"encrypted_value"`
+	Nonce             []byte        `json:"nonce"`
+	EncryptionVersion sql.NullInt64 `json:"encryption_version"`
 }
 
-// Boot-time vault-key probe. Returns one v2-sealed secret so VerifyVaultKey can
-// test whether the configured key actually opens this database BEFORE writing
-// the sentinel. Version 1 rows are excluded: they are sealed under the legacy
-// SHA-256 key and would not decrypt under the current derivation even when the
-// configured key is correct.
-func (q *Queries) AnyEncryptedVaultEntry(ctx context.Context) (AnyEncryptedVaultEntryRow, error) {
-	row := q.db.QueryRowContext(ctx, anyEncryptedVaultEntry)
-	var i AnyEncryptedVaultEntryRow
-	err := row.Scan(&i.EncryptedValue, &i.Nonce)
-	return i, err
+// Boot-time vault-key probe. Returns EVERY sealed secret, with its version, so
+// VerifyVaultKey can test whether the configured key actually opens this
+// database BEFORE writing the sentinel.
+//
+// Two things here were wrong and both ended in the same unrecoverable state.
+//
+// It filtered `encryption_version = 2`, which is defensible for deciding
+// "opens" (a v1 row is sealed under the legacy SHA-256 derivation) but not for
+// deciding "hasCiphertext". A database whose vault rows are ALL v1, which
+// vault_rotation_cas.go documents as a supported carried-over input and which
+// MigrateEncryption exists to handle, answered "no ciphertext at all". The gate
+// then sealed the sentinel under whatever key was configured, and afterwards
+// refused the CORRECT key permanently. The caller now tests v1 rows under the
+// legacy derivation instead of pretending they are not there.
+//
+// It was also `:one` with LIMIT 1, sampling ONE arbitrary row while probes 2
+// and 3 both iterate. One row sealed under an older key, or one bit flip, made
+// the gate refuse a key that opens every other row in the table. Returning the
+// set lets the caller answer "does this key open ANY of them", which is the
+// question the gate is actually asking.
+func (q *Queries) AnyEncryptedVaultEntry(ctx context.Context) ([]AnyEncryptedVaultEntryRow, error) {
+	rows, err := q.db.QueryContext(ctx, anyEncryptedVaultEntry)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AnyEncryptedVaultEntryRow{}
+	for rows.Next() {
+		var i AnyEncryptedVaultEntryRow
+		if err := rows.Scan(&i.EncryptedValue, &i.Nonce, &i.EncryptionVersion); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const cASVaultEntryRotationLog = `-- name: CASVaultEntryRotationLog :execresult

@@ -53,14 +53,36 @@ umask 077
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST_PATH="${DEST_DIR%/}/trustissues-${STAMP}.db"
 
+# Write to a .part name and rename only once the copy is complete AND verified.
+#
+# This used to write straight to the final name. The error branch cleans up
+# after a non-zero exit, but a SIGKILL, a full disk or a yanked power cord skips
+# that branch entirely and leaves a truncated file sitting under the real
+# backup name, byte-indistinguishable from a good one until the day it is
+# restored. A rename is atomic within a filesystem, so a file at the final name
+# now means "sqlite finished and the result verified".
+PART_PATH="${DEST_PATH}.part"
+trap 'rm -f "${PART_PATH}"' EXIT
+
 # .backup uses the online backup API: a consistent, WAL-safe copy of the live DB.
-if ! sqlite3 "${DB_PATH}" ".backup '${DEST_PATH}'"; then
+if ! sqlite3 "${DB_PATH}" ".backup '${PART_PATH}'"; then
   echo "error: sqlite backup failed" >&2
-  rm -f "${DEST_PATH}"
   exit 2
 fi
 
-chmod 600 "${DEST_PATH}"
+# Verify what was just written rather than trusting the exit status. A backup
+# nobody can restore is worse than a failed backup, because it is silent, and
+# this is the last moment the live database is still available to redo it.
+INTEGRITY="$(sqlite3 "${PART_PATH}" 'PRAGMA integrity_check;' 2>&1 || true)"
+if [ "${INTEGRITY}" != "ok" ]; then
+  echo "error: the snapshot just written fails integrity_check; not keeping it" >&2
+  echo "       sqlite3 said: ${INTEGRITY}" >&2
+  exit 2
+fi
+
+chmod 600 "${PART_PATH}"
+mv "${PART_PATH}" "${DEST_PATH}"
+trap - EXIT
 
 echo "backup written: ${DEST_PATH}"
 echo

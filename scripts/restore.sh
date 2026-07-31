@@ -50,6 +50,37 @@ if ! head -c 16 "${SNAPSHOT}" | grep -q "SQLite format 3"; then
   exit 1
 fi
 
+# ...but those 16 bytes are the FIRST 16 of the file, so a snapshot truncated at
+# any point after the header passes them. backup.sh writes with the online
+# backup API, which is safe, yet the file can still be cut short by a full disk,
+# a killed process or a partial copy off the box, and this script then destroys
+# the live database in place. Header bytes are a filetype check, not an
+# integrity check.
+#
+# integrity_check walks the whole b-tree, so it reads the parts a truncated file
+# does not have. Skipped only when sqlite3 is genuinely absent, and then it says
+# so rather than implying the snapshot was verified.
+if command -v sqlite3 >/dev/null 2>&1; then
+  echo "verifying snapshot integrity (this reads the whole file)..."
+  INTEGRITY="$(sqlite3 "${SNAPSHOT}" 'PRAGMA integrity_check;' 2>&1 || true)"
+  if [ "${INTEGRITY}" != "ok" ]; then
+    echo "error: ${SNAPSHOT} fails integrity_check; refusing to restore it" >&2
+    echo "       sqlite3 said: ${INTEGRITY}" >&2
+    echo "       Keep this file, and try an older snapshot." >&2
+    exit 1
+  fi
+  # A structurally valid database from a DIFFERENT product would also pass, and
+  # restoring one is the same lost-vault outcome.
+  if ! sqlite3 "${SNAPSHOT}" \
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vault_entries';" | grep -q 1; then
+    echo "error: ${SNAPSHOT} has no vault_entries table; this is not a Trustissues database" >&2
+    exit 1
+  fi
+else
+  echo "warning: sqlite3 not found, so the snapshot was NOT integrity-checked." >&2
+  echo "         Only its first 16 bytes were verified. A truncated file will restore." >&2
+fi
+
 SERVICE="${TRUSTISSUES_COMPOSE_SERVICE:-trustissues}"
 
 if [ "${MODE}" = "compose" ]; then
@@ -64,6 +95,25 @@ if [ "${MODE}" = "compose" ]; then
     echo "error: ${SERVICE} is still running. Run 'docker compose stop ${SERVICE}' first," >&2
     echo "       otherwise the live writer will overwrite the restored file." >&2
     exit 1
+  fi
+
+  # `docker compose cp` needs a container to exist. On a FRESH host, which is
+  # the total-host-loss case this whole procedure is written for, none does:
+  # the operator has a compose file and a snapshot and nothing else, and the cp
+  # below failed with "no container found". Starting the service to create one
+  # is the damaging act this script exists to avoid, because the server would
+  # boot on an empty volume, run migrations and write a key sentinel before the
+  # snapshot was ever in place.
+  #
+  # `create` makes the container and its volume WITHOUT starting it, which is
+  # exactly the state the rest of this branch already assumes. It is a no-op
+  # when the container is already there.
+  if [ -z "$(docker compose ps -aq "${SERVICE}" 2>/dev/null)" ]; then
+    echo "no ${SERVICE} container yet (fresh host); creating it stopped so the volume exists..."
+    if ! docker compose create "${SERVICE}" >/dev/null 2>&1; then
+      echo "error: could not create the ${SERVICE} container; check docker-compose.yml and .env" >&2
+      exit 2
+    fi
   fi
 
   echo "restoring into the ${SERVICE} volume (container stopped)..."
@@ -97,10 +147,67 @@ else
     echo "error: data dir not found: ${DATA_DIR}" >&2
     exit 1
   fi
-  # Refuse while something still holds the database open, when we can tell.
-  if command -v fuser >/dev/null 2>&1 && fuser "${DB_PATH}" >/dev/null 2>&1; then
-    echo "error: ${DB_PATH} is open by another process; stop Trustissues first" >&2
+  # Refuse while something still holds the database open.
+  #
+  # This was `command -v fuser && fuser ...`, so on any host without fuser the
+  # whole guard silently evaporated and the restore proceeded under a live
+  # writer, which is the case that silently undoes the restore. README states
+  # flatly that it "refuses while the service is running", so a missing tool
+  # must not quietly downgrade that promise. fuser is not in coreutils and is
+  # absent from slim images, which is exactly where a panicked 3am restore runs.
+  #
+  # Judge these on their OUTPUT, never on their exit status.
+  #
+  # macOS fuser exits 0 with an EMPTY holder list when nothing has the file
+  # open, so `fuser file >/dev/null` is true on every macOS host and the old
+  # guard refused every native restore there. It never showed up because these
+  # scripts had no tests: the estate rule "capture the output and test the
+  # content, never the pipeline exit status" applies to process probes too.
+  # Both tools print one PID per holder and nothing when there are none.
+  HOLDERS=""
+  if command -v lsof >/dev/null 2>&1; then
+    HOLDERS="$(lsof -t -- "${DB_PATH}" 2>/dev/null || true)"
+  elif command -v fuser >/dev/null 2>&1; then
+    HOLDERS="$(fuser "${DB_PATH}" 2>/dev/null || true)"
+  fi
+  if [ -n "$(printf '%s' "${HOLDERS}" | tr -d '[:space:]')" ]; then
+    echo "error: ${DB_PATH} is open by another process (${HOLDERS}); stop Trustissues first" >&2
     exit 1
+  fi
+  if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then
+    echo "warning: neither fuser nor lsof is available, so it cannot be verified that" >&2
+    echo "         Trustissues is stopped. A running writer will checkpoint its old WAL" >&2
+    echo "         over the restored file and silently undo this restore." >&2
+    echo "         Stop the service, then re-run with TRUSTISSUES_RESTORE_FORCE=1." >&2
+    if [ "${TRUSTISSUES_RESTORE_FORCE:-}" != "1" ]; then
+      exit 1
+    fi
+  fi
+
+  # Keep the database being replaced.
+  #
+  # The restore is the one operation with no second copy: it used to `cp` over
+  # the live file and `rm` its WAL, so a snapshot that turned out to be the
+  # wrong one, or taken under a different vault key, had already destroyed the
+  # only thing that could still be read. Moving it aside costs one rename and
+  # makes the whole operation reversible.
+  if [ -f "${DB_PATH}" ]; then
+    ASIDE="${DB_PATH}.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "${DB_PATH}" "${ASIDE}"
+    # The sidecars belong to the database just moved aside, never to the
+    # incoming one. Keep them together so the pre-restore state stays openable.
+    #
+    # Full if blocks, not `[ -f x ] && mv x y`: under `set -e` that one-liner
+    # returns non-zero when the sidecar is absent, which is the NORMAL case
+    # (a cleanly stopped service has no WAL), and kills the restore right after
+    # the live database has been moved aside. Caught by test-backup-restore.sh.
+    if [ -f "${DB_PATH}-wal" ]; then
+      mv "${DB_PATH}-wal" "${ASIDE}-wal"
+    fi
+    if [ -f "${DB_PATH}-shm" ]; then
+      mv "${DB_PATH}-shm" "${ASIDE}-shm"
+    fi
+    echo "previous database kept at: ${ASIDE}"
   fi
 
   echo "restoring ${DB_PATH}..."

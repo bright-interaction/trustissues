@@ -119,10 +119,8 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 // It is the guard for the bootstrap boot. Two independent probes are used so a
 // deployment that happens to have one but not the other is still covered:
 //
-//   - a v2-sealed vault secret, opened with the same PBKDF2 derivation
-//     NewVaultHandler uses (salt "trustissues:vault:v2"). v1 rows are skipped
-//     because they are sealed under the legacy SHA-256 key and would fail to
-//     open even under the correct configured key.
+//   - a sealed vault secret, opened with the derivation matching ITS version:
+//     PBKDF2 salt "trustissues:vault:v2" for v2, the legacy SHA-256 key for v1.
 //   - a columncrypto-marked TOTP seed, opened with the columncrypto derivation.
 //
 // hasCiphertext false means there is genuinely nothing to protect yet, so
@@ -130,18 +128,38 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 // as "no data": failing to read must never be mistaken for an empty vault, or
 // the guard silently degrades back into the fail-open it exists to prevent.
 func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKey string) (hasCiphertext, opens bool, err error) {
-	// Probe 1: a v2 vault secret.
-	row, vErr := queries.AnyEncryptedVaultEntry(ctx)
-	switch {
-	case vErr == nil:
+	// Probe 1: every sealed vault secret, at whatever version it carries.
+	//
+	// This used to ask for ONE row (LIMIT 1) filtered to encryption_version = 2,
+	// and both halves of that were wrong in the same direction.
+	//
+	// The version filter meant a database whose vault rows are ALL v1 answered
+	// "no ciphertext", so the gate sealed the sentinel under whatever key was
+	// configured and then refused the CORRECT key forever. v1 rows are a
+	// supported carried-over input (see vault_rotation_cas.go and the
+	// MigrateEncryption boot step), and they are ciphertext whether or not the
+	// v2 derivation opens them. They are now tested under the LEGACY derivation
+	// instead of being treated as absent.
+	//
+	// Sampling one row meant a single row sealed under an older key, or one bit
+	// flip, made the gate refuse a key that opens everything else. Probes 2 and
+	// 3 both iterate; this one now does too, so the question asked is "does this
+	// key open ANY existing ciphertext", which is what the gate is deciding.
+	rows, vErr := queries.AnyEncryptedVaultEntry(ctx)
+	if vErr != nil {
+		return false, false, fmt.Errorf("read vault ciphertext: %w", vErr)
+	}
+	for _, row := range rows {
 		hasCiphertext = true
+		if row.EncryptionVersion.Valid && row.EncryptionVersion.Int64 == 1 {
+			if vaultSecretOpensLegacy(row.EncryptedValue, row.Nonce, vaultKey) {
+				return true, true, nil
+			}
+			continue
+		}
 		if vaultSecretOpens(row.EncryptedValue, row.Nonce, vaultKey) {
 			return true, true, nil
 		}
-	case errors.Is(vErr, sql.ErrNoRows):
-		// No v2 secrets; fall through to the TOTP probe.
-	default:
-		return false, false, fmt.Errorf("read vault ciphertext: %w", vErr)
 	}
 
 	// Probe 2: a columncrypto-sealed TOTP seed.
@@ -239,6 +257,29 @@ func vaultSecretOpens(ciphertext, nonce []byte, vaultKey string) bool {
 		}
 	}()
 	block, err := aes.NewCipher(derived)
+	if err != nil {
+		return false
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(nonce) != gcm.NonceSize() {
+		return false
+	}
+	_, err = gcm.Open(nil, nonce, ciphertext, nil)
+	return err == nil
+}
+
+// vaultSecretOpensLegacy is the v1 counterpart of vaultSecretOpens.
+//
+// v1 rows are sealed under sha256(key + ":secrets-vault"), the derivation
+// NewVaultHandler still builds as legacyKey for MigrateEncryption. The probe
+// needs it so a v1-only database can answer "yes, this key opens my data"
+// rather than "I contain nothing", which is what cemented a wrong key.
+func vaultSecretOpensLegacy(ciphertext, nonce []byte, vaultKey string) bool {
+	if len(ciphertext) == 0 || len(nonce) == 0 {
+		return false
+	}
+	derived := sha256.Sum256([]byte(vaultKey + ":secrets-vault"))
+	block, err := aes.NewCipher(derived[:])
 	if err != nil {
 		return false
 	}
