@@ -8,8 +8,9 @@ import {
   type ReactNode,
 } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
-import { api } from '@/lib/api';
+import { api, setUnauthorizedHandler } from '@/lib/api';
 import type { User, AuthResponse } from '@/lib/types';
 
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
@@ -27,7 +28,7 @@ interface AuthContextValue {
     password: string,
     totpCode?: string
   ) => Promise<AuthResponse>;
-  logout: () => void;
+  logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 }
 
@@ -38,6 +39,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [setupRequired, setSetupRequired] = useState(false);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+
+  // A 401 from ANY request drops the session locally.
+  //
+  // Without this the only auth check was the single /auth/me at mount, so a
+  // session revoked or expired mid-visit left the SPA rendering cached data
+  // with a red toast, and /login bounced the stale client back into the app.
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      queryClient.clear();
+      setUser(null);
+      navigate('/login');
+    });
+    return () => setUnauthorizedHandler(undefined);
+  }, [navigate, queryClient]);
 
   useEffect(() => {
     async function init() {
@@ -79,6 +95,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return res;
       }
       if (res.user) {
+        // Clear on the way IN as well as on the way out. A tab that was never
+        // logged out (crash, force-quit, a session that simply expired) still
+        // holds the previous account's cached data, and login is the point
+        // where a different identity takes over the tab.
+        queryClient.clear();
         setUser(res.user);
         navigate(res.user.role === 'vault_only' ? '/vault' : '/');
       }
@@ -87,12 +108,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [navigate]
   );
 
-  const logout = useCallback(() => {
-    // Fire-and-forget: even if the server call fails, drop local state.
-    api.auth.logout().catch(() => undefined);
+  const logout = useCallback(async () => {
+    // AWAIT the server call, and clear the query cache.
+    //
+    // This was fire-and-forget: it dropped local state and navigated
+    // immediately, so the UI said "signed out" while the request was still in
+    // flight and, if it failed, forever. Server-side revocation happens ONLY
+    // inside that request (RevokeSession + clearSessionCookie), and the cookie
+    // is HttpOnly with no Max-Age, so the SPA cannot clear it itself. On a
+    // shared machine that means the next person presses Back and is logged in.
+    //
+    // The cache matters just as much: React Query held the previous account's
+    // vault list, user list and settings with a 5 minute default gcTime, and
+    // nothing anywhere called clear/removeQueries/resetQueries. Logging in as a
+    // second account in the same tab rendered the FIRST account's data until
+    // each query refetched.
+    try {
+      await api.auth.logout();
+    } catch {
+      // Still drop local state: a network failure must not strand the user in
+      // a session they asked to end. The cookie may survive, which is why the
+      // await above exists to make the common case correct.
+    }
+    queryClient.clear();
     setUser(null);
     navigate('/login');
-  }, [navigate]);
+  }, [navigate, queryClient]);
 
   const refreshUser = useCallback(async () => {
     try {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import {
   Plus,
   Trash2,
@@ -1255,6 +1255,31 @@ export default function Vault() {
   const [newCustomFields, setNewCustomFields] = useState<CustomField[]>([]);
   const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
   const [rotatedValue, setRotatedValue] = useState<{ id: string; value: string } | null>(null);
+
+  // lockVault is the ONLY way to re-lock, because there are six places that do
+  // it and every one of them cleared a different subset of the secret-bearing
+  // state.
+  //
+  // Only the auto-lock timer cleared all four. The create, delete, update and
+  // import handlers cleared vaultUnlocked and vaultEntries but left BOTH
+  // revealedSecrets and rotatedValue, and the explicit Lock button cleared
+  // rotatedValue but not revealedSecrets. The visible consequences:
+  //
+  //   the blue "New Secret Value" banner renders rotatedValue in cleartext and
+  //   is a sibling of the lock bar, OUTSIDE the vaultUnlocked ternary, so a
+  //   rotated secret stayed on screen on a page that says "Vault is locked"
+  //
+  //   revealedSecrets is a set of entry ids whose plaintext renders, so a
+  //   secret revealed before locking auto-rendered in cleartext on the NEXT
+  //   unlock without anyone asking for it
+  //
+  // Any future re-lock site gets all four by construction.
+  const lockVault = useCallback(() => {
+    setVaultUnlocked(false);
+    setVaultEntries([]);
+    setRevealedSecrets(new Set());
+    setRotatedValue(null);
+  }, []);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [rotatingEntryId, setRotatingEntryId] = useState<string | null>(null);
   const [rotationPanelId, setRotationPanelId] = useState<string | null>(null);
@@ -1287,10 +1312,7 @@ export default function Vault() {
     if (!vaultUnlocked) return;
     const minutes = vaultPolicy?.auto_lock_max_minutes ?? 15;
     const timer = setTimeout(() => {
-      setVaultUnlocked(false);
-      setVaultEntries([]);
-      setRevealedSecrets(new Set());
-      setRotatedValue(null);
+      lockVault();
       toast('Vault locked automatically', { icon: '🔒' });
     }, minutes * 60_000);
     return () => clearTimeout(timer);
@@ -1321,8 +1343,7 @@ export default function Vault() {
       setNewCustomFields([]);
       setShowAddSecret(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
-      setVaultUnlocked(false);
-      setVaultEntries([]);
+      lockVault();
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -1332,8 +1353,7 @@ export default function Vault() {
     onSuccess: () => {
       toast.success('Secret deleted');
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
-      setVaultUnlocked(false);
-      setVaultEntries([]);
+      lockVault();
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -1391,8 +1411,7 @@ export default function Vault() {
       toast.success('Secret updated');
       setEditingEntryId(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
-      setVaultUnlocked(false);
-      setVaultEntries([]);
+      lockVault();
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -1726,9 +1745,7 @@ export default function Vault() {
             </div>
             <button
               onClick={() => {
-                setVaultUnlocked(false);
-                setVaultEntries([]);
-                setRotatedValue(null);
+                lockVault();
               }}
               className="flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-white px-3 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
             >
@@ -2538,8 +2555,7 @@ export default function Vault() {
         isOpen={showImportModal}
         onClose={() => setShowImportModal(false)}
         onImportComplete={() => {
-          setVaultUnlocked(false);
-          setVaultEntries([]);
+          lockVault();
           queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
         }}
       />
