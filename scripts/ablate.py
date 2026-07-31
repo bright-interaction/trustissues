@@ -17,7 +17,16 @@ Restore is always from an in-memory copy of the original bytes, never
 """
 import subprocess, sys, json, os, atexit, signal
 
-ROOT = "~/Desktop/Automation HQ/automations-ti-audit-fixes/trustissues"
+# Derived from THIS file's location, never hardcoded.
+#
+# It used to be an absolute path to one particular checkout. Running it from a
+# second git worktree (the documented way to work while another session holds
+# the main one) therefore ablated the OTHER worktree: it injected bugs into a
+# tree the caller was not looking at, ran the tests there, and reported results
+# that had nothing to do with the code under review. Here it only refused to
+# start, because that tree happened to be mid-sweep and dirty, which is the
+# lucky version of this failure.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run(cmd, timeout=900):
