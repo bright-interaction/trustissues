@@ -1,22 +1,56 @@
 [
  {
-  "id": "log-write-from-snapshot",
-  "mech": "rotation-log",
-  "test": "TestConcurrentRotationLogAppendsDoNotLoseEachOther",
-  "file": "internal/handlers/vault_rotation_core.go",
-  "pkg": "./internal/handlers/",
-  "why": "the original bug: append from a caller-supplied snapshot with a plain UPDATE = lost update",
-  "old": "\t\t\tRotationLog:   toNullString(AppendRotationLog(current, entry)),",
-  "new": "\t\t\tRotationLog:   toNullString(AppendRotationLog(\"\", entry)),"
+  "id": "parser-drops-rows-silently",
+  "mech": "import",
+  "test": "TestImportReportsRowsDroppedByTheParser",
+  "file": "internal/handlers/vault_import.go",
+  "why": "the original bug: a non-login row vanished in the parser and every count downstream is post-drop",
+  "old": "\t\t\tname := rowLabel(headers, record)\n\t\t\tskipped = append(skipped, skippedEntry{Name: name, Reason: reason})",
+  "new": "\t\t\t_ = reason"
  },
  {
-  "id": "trim-dropped",
-  "mech": "rotation-log",
-  "test": "TestRotationLogAppendKeepsTheTrim",
-  "file": "internal/handlers/vault_providers.go",
-  "pkg": "./internal/handlers/",
-  "why": "an audit column that grows without bound is its own problem",
-  "old": "\tif len(log) > 50 {\n\t\tlog = log[len(log)-50:]\n\t}",
-  "new": ""
+  "id": "skip-reason-blames-wrong-cause",
+  "mech": "import",
+  "test": "TestSkipReasonNamesTheRealCause",
+  "file": "internal/handlers/vault_import.go",
+  "why": "one message for both causes sends the operator to the wrong place in their export",
+  "old": "\tcase entry.Name == \"\":\n\t\treturn \"no name in the export row, so there is nothing to file it under\"",
+  "new": "\tcase entry.Name == \"\" && false:\n\t\treturn \"unreachable\""
+ },
+ {
+  "id": "import-skips-field-validation",
+  "mech": "import",
+  "test": "TestImportEnforcesTheSameFieldRulesAsCreate",
+  "file": "internal/handlers/vault_field_limits.go",
+  "why": "import could write a row the edit form can never save",
+  "old": "\tcase len(f.Name) > maxEntryNameLen:\n\t\treturn fmt.Sprintf(\"name must be %d characters or less\", maxEntryNameLen)",
+  "new": "\tcase false:\n\t\treturn \"\""
+ },
+ {
+  "id": "fields-not-trimmed",
+  "mech": "import",
+  "test": "TestImportEnforcesTheSameFieldRulesAsCreate",
+  "file": "internal/handlers/vault_field_limits.go",
+  "why": "an untrimmed name defeats checkConflicts and UNIQUE(user_id, name)",
+  "old": "\tf.Name = strings.TrimSpace(f.Name)",
+  "new": "\t_ = strings.TrimSpace"
+ },
+ {
+  "id": "boot-probe-blind-to-v1",
+  "mech": "boot-gate",
+  "test": "TestProbe1SeesEveryVaultRow",
+  "file": "internal/db/vault.sql.go",
+  "why": "a v1-only vault reported empty, so a wrong key was cemented and the correct one refused forever. Ablating the GENERATED constant, because the harness has no sqlc regen step and the .sql file alone does not affect the built binary",
+  "old": "SELECT encrypted_value, nonce, encryption_version FROM vault_entries\nWHERE length(encrypted_value) > 0\n",
+  "new": "SELECT encrypted_value, nonce, encryption_version FROM vault_entries\nWHERE encryption_version = 2 AND length(encrypted_value) > 0\n"
+ },
+ {
+  "id": "boot-probe-samples-one-row",
+  "mech": "boot-gate",
+  "test": "TestProbe1SeesEveryVaultRow",
+  "file": "internal/handlers/vault_keycheck.go",
+  "why": "sampling one row refused a key that opens every other row in the table",
+  "old": "\tfor _, row := range rows {\n\t\thasCiphertext = true",
+  "new": "\tfor _, row := range rows[:min(1, len(rows))] {\n\t\thasCiphertext = true"
  }
 ]
