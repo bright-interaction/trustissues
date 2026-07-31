@@ -251,8 +251,16 @@ func TestShieldStructWalk(t *testing.T) {
 		if !strings.HasPrefix(c.Email, "[shield:email:tok_") {
 			t.Fatalf("Email not shielded: %q", c.Email)
 		}
-		if !strings.Contains(c.Email, "domain=andersson-law.se") {
-			t.Fatalf("email domain hint missing: %q", c.Email)
+		// The hint carries the CLASS of the domain, never the domain.
+		//
+		// This used to assert domain=andersson-law.se, pinning the leak: a
+		// hostname Shield tokenizes when it stands alone was being republished
+		// verbatim inside the marker meant to conceal the address it belongs to.
+		if !strings.Contains(c.Email, "industry=business") {
+			t.Fatalf("email industry hint missing: %q", c.Email)
+		}
+		if strings.Contains(c.Email, "andersson-law.se") {
+			t.Fatalf("the marker republished the literal domain: %q", c.Email)
 		}
 		if !strings.HasPrefix(c.Name, "[shield:name:tok_") {
 			t.Fatalf("Name not shielded: %q", c.Name)
