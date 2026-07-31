@@ -23,6 +23,7 @@ import (
 	"github.com/brightinteraction/trustissues/internal/config"
 	"github.com/brightinteraction/trustissues/internal/database"
 	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/brightinteraction/trustissues/internal/flarereport"
 	"github.com/brightinteraction/trustissues/internal/handlers"
 	timw "github.com/brightinteraction/trustissues/internal/middleware"
 	"github.com/brightinteraction/trustissues/internal/shield"
@@ -245,6 +246,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Error reporting + liveness beacon to Flare. No-op unless FLARE_DSN is set
+	// (injected by the Hephaestus flare-provision deploy step), so dev runs and
+	// self-hosts are unaffected. Before 2026-07-31 trustissues had no reporting
+	// at all: a live product with a provisioned Flare project that had never sent
+	// a single event, and which Flare's silence rule could never flag because
+	// that rule needs a prior activity baseline to notice the absence of one.
+	flarereport.InitFlare("trustissues", Version)
+
 	// Structured logging only.
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.SlogLevel(),
@@ -437,6 +446,9 @@ func main() {
 	r.Use(randomRequestID)
 	r.Use(accessLog)
 	r.Use(chimiddleware.Recoverer)
+	// AFTER Recoverer so the panic is captured before Recoverer renders the 500.
+	// Re-panics, so Recoverer still owns the response. No-op when InitFlare was.
+	r.Use(flarereport.FlareRecoverer)
 	r.Use(chimiddleware.Compress(5))
 	r.Use(timw.SecurityHeaders)
 	r.Use(bodyLimits)
