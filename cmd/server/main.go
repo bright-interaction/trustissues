@@ -159,6 +159,39 @@ func rejectCrossSite(w http.ResponseWriter, r *http.Request, source string) {
 // middleware.GetReqID). Unlike chimiddleware.RequestID it derives no part of
 // the id from os.Hostname(), and it ignores any inbound X-Request-Id so a
 // client cannot reflect chosen content back through the logs.
+// accessLog replaces chi's DefaultLogger, which wrote the query string.
+//
+// chi's formatter emits r.RequestURI verbatim, which is the raw request-target
+// INCLUDING the query. The autofill route GET /match takes the page URL there
+// (vault.go: rawURL := r.URL.Query().Get("url")), and migration
+// 00011_metadata_at_rest.sql exists precisely so that value is not stored in the
+// clear: it replaced LIKE matching with a keyed blind index because those
+// columns "previously sat in cleartext next to the encrypted secret, so a raw
+// DB-file leak exposed which sites a user has logins for". THREAT-MODEL.md
+// repeats the promise. Writing the same URL to stdout on every request rebuilds
+// the browsing history the blind index was built to avoid, in a place with
+// looser access than the database file, and container logs are shipped off-box.
+//
+// So: PATH only, never RawQuery. Also on slog rather than chi's own
+// log.New(os.Stdout, ...), which ignored the configured log level entirely.
+func accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := chimiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		reqID, _ := r.Context().Value(chimiddleware.RequestIDKey).(string)
+		slog.Info("http",
+			"method", r.Method,
+			// r.URL.Path, never r.RequestURI or r.URL.String().
+			"path", r.URL.Path,
+			"status", ww.Status(),
+			"bytes", ww.BytesWritten(),
+			"duration_ms", time.Since(start).Milliseconds(),
+			"request_id", reqID,
+		)
+	})
+}
+
 func randomRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqID string
@@ -402,7 +435,7 @@ func main() {
 	// whose default id prefix embeds os.Hostname() and would leak the host
 	// name into logs and any echoed request id.
 	r.Use(randomRequestID)
-	r.Use(chimiddleware.Logger)
+	r.Use(accessLog)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Compress(5))
 	r.Use(timw.SecurityHeaders)

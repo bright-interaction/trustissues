@@ -183,6 +183,8 @@ type Querier interface {
 	DeletePersonalVaultEntriesForUser(ctx context.Context, userID string) (sql.Result, error)
 	DeleteServiceIdentity(ctx context.Context, id string) (sql.Result, error)
 	DeleteUser(ctx context.Context, id string) (sql.Result, error)
+	// Hard delete that refuses to remove the last active admin.
+	DeleteUserIfNotLastAdmin(ctx context.Context, id string) (sql.Result, error)
 	DeleteVaultEntry(ctx context.Context, id string) (sql.Result, error)
 	DisableTOTP(ctx context.Context, id string) error
 	EnableTOTP(ctx context.Context, arg EnableTOTPParams) error
@@ -470,6 +472,9 @@ type Querier interface {
 	// patterns are never overwritten.
 	SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error
 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (sql.Result, error)
+	// Disable that refuses to disable the last active admin. Same reasoning as
+	// UpdateUserRoleIfNotLastAdmin.
+	SetUserDisabledIfNotLastAdmin(ctx context.Context, arg SetUserDisabledIfNotLastAdminParams) (sql.Result, error)
 	SetVaultEntryCollection(ctx context.Context, arg SetVaultEntryCollectionParams) error
 	StoreTOTPSecret(ctx context.Context, arg StoreTOTPSecretParams) error
 	TouchServiceIdentityLastUsed(ctx context.Context, id string) error
@@ -479,6 +484,19 @@ type Querier interface {
 	UpdateRecoveryCodes(ctx context.Context, arg UpdateRecoveryCodesParams) error
 	UpdateUserName(ctx context.Context, arg UpdateUserNameParams) error
 	UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (sql.Result, error)
+	// Role change that REFUSES to remove the last active admin, atomically.
+	//
+	// ensureNotLastAdmin was a check-then-act: COUNT(*) in one statement, the write
+	// in another, with no transaction and no CAS between them. Two admins demoting
+	// each other concurrently (or one admin demoted twice by two tabs) both saw
+	// count = 2, both proceeded, and the instance was left with zero admins. Nothing
+	// in the product can create one back: CreateFirstAdmin is gated on the users
+	// table being empty, and every admin route needs an admin. The recovery is
+	// hand-editing the database.
+	//
+	// The guard travels WITH the write here, so the count and the update see the
+	// same snapshot. RowsAffected = 0 means it was refused.
+	UpdateUserRoleIfNotLastAdmin(ctx context.Context, arg UpdateUserRoleIfNotLastAdminParams) (sql.Result, error)
 	UpdateVaultEntryAliasURL(ctx context.Context, arg UpdateVaultEntryAliasURLParams) error
 	UpdateVaultEntryAutoLogin(ctx context.Context, arg UpdateVaultEntryAutoLoginParams) error
 	UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error

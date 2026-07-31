@@ -172,6 +172,21 @@ func (q *Queries) DeleteUser(ctx context.Context, id string) (sql.Result, error)
 	return q.db.ExecContext(ctx, deleteUser, id)
 }
 
+const deleteUserIfNotLastAdmin = `-- name: DeleteUserIfNotLastAdmin :execresult
+DELETE FROM users
+WHERE users.id = ?
+  AND (
+    users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  )
+`
+
+// Hard delete that refuses to remove the last active admin.
+func (q *Queries) DeleteUserIfNotLastAdmin(ctx context.Context, id string) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteUserIfNotLastAdmin, id)
+}
+
 const disableTOTP = `-- name: DisableTOTP :exec
 UPDATE users SET totp_enabled = 0, totp_secret = '', totp_recovery_codes = '' WHERE id = ?
 `
@@ -411,6 +426,29 @@ func (q *Queries) SetUserDisabled(ctx context.Context, arg SetUserDisabledParams
 	return q.db.ExecContext(ctx, setUserDisabled, arg.Disabled, arg.ID)
 }
 
+const setUserDisabledIfNotLastAdmin = `-- name: SetUserDisabledIfNotLastAdmin :execresult
+UPDATE users SET disabled = ?
+WHERE users.id = ?
+  AND (
+    ? = 0
+    OR users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  )
+`
+
+type SetUserDisabledIfNotLastAdminParams struct {
+	Disabled int64       `json:"disabled"`
+	ID       string      `json:"id"`
+	Column3  interface{} `json:"column_3"`
+}
+
+// Disable that refuses to disable the last active admin. Same reasoning as
+// UpdateUserRoleIfNotLastAdmin.
+func (q *Queries) SetUserDisabledIfNotLastAdmin(ctx context.Context, arg SetUserDisabledIfNotLastAdminParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, setUserDisabledIfNotLastAdmin, arg.Disabled, arg.ID, arg.Column3)
+}
+
 const storeTOTPSecret = `-- name: StoreTOTPSecret :exec
 UPDATE users SET totp_secret = ? WHERE id = ?
 `
@@ -478,4 +516,37 @@ type UpdateUserRoleParams struct {
 
 func (q *Queries) UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, updateUserRole, arg.Role, arg.ID)
+}
+
+const updateUserRoleIfNotLastAdmin = `-- name: UpdateUserRoleIfNotLastAdmin :execresult
+UPDATE users SET role = ?
+WHERE users.id = ?
+  AND (
+    ? = 'admin'
+    OR users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  )
+`
+
+type UpdateUserRoleIfNotLastAdminParams struct {
+	Role    string      `json:"role"`
+	ID      string      `json:"id"`
+	Column3 interface{} `json:"column_3"`
+}
+
+// Role change that REFUSES to remove the last active admin, atomically.
+//
+// ensureNotLastAdmin was a check-then-act: COUNT(*) in one statement, the write
+// in another, with no transaction and no CAS between them. Two admins demoting
+// each other concurrently (or one admin demoted twice by two tabs) both saw
+// count = 2, both proceeded, and the instance was left with zero admins. Nothing
+// in the product can create one back: CreateFirstAdmin is gated on the users
+// table being empty, and every admin route needs an admin. The recovery is
+// hand-editing the database.
+//
+// The guard travels WITH the write here, so the count and the update see the
+// same snapshot. RowsAffected = 0 means it was refused.
+func (q *Queries) UpdateUserRoleIfNotLastAdmin(ctx context.Context, arg UpdateUserRoleIfNotLastAdminParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, updateUserRoleIfNotLastAdmin, arg.Role, arg.ID, arg.Column3)
 }
