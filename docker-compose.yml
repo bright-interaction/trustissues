@@ -28,6 +28,12 @@ services:
       - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
       - TRUSTISSUES_TRUSTED_PROXY_HOPS=${TRUSTISSUES_TRUSTED_PROXY_HOPS:-1}
       - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}
+      # Error reporting + liveness beacon to the house Flare instance. Absent
+      # until 2026-07-31, so trustissues had a provisioned Flare project that
+      # could never receive anything: the app read FLARE_DSN, compose never
+      # passed it. Empty means off, which is the prior behaviour.
+      - FLARE_DSN=${FLARE_DSN:-}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       # Shield (LLM-boundary PII tokenization for the AI gateway). Optional, but
       # it was UNREACHABLE via the documented Compose path: these were absent
       # here, so setting them in .env did nothing and Shield stayed off with no
