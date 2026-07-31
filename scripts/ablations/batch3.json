@@ -5,8 +5,9 @@
   "test": "Corpus",
   "file": "internal/shield/redact.go",
   "why": "the fourth route into the partial-leak class: domain matched, local part left in the clear",
-  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
-  "new": "[\\p{L}\\p{M}0-9._%+\\-]+@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}"
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
  },
  {
   "id": "drop-p-M-again",
@@ -14,7 +15,8 @@
   "test": "Corpus",
   "file": "internal/shield/redact.go",
   "why": "the third route, re-verified after adding 19 new corpus classes",
-  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@[\\p{L}\\p{M}0-9.\\-]+\\.[\\p{L}\\p{M}]{2,}",
-  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9._%+\\-]+)@[\\p{L}0-9.\\-]+\\.[\\p{L}]{2,}"
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
  }
 ]

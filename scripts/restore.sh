@@ -218,6 +218,19 @@ else
 fi
 
 echo
-echo "Verify before you trust it: log in, unlock the vault, reveal one secret."
-echo "Cleartext means the key and the snapshot match. '[decryption error]' means"
-echo "you restored under the wrong key: stop, keep your good backup, find the key."
+echo "Verify before you trust it: start the service, then log in and reveal one secret."
+echo "Cleartext means the key and the snapshot match."
+echo
+echo "A WRONG key now shows up at STARTUP, not as '[decryption error]' in the UI:"
+echo "the boot key-gate compares the configured key against the data and REFUSES TO"
+echo "START on a mismatch. So if the container exits with 'vault key does not match',"
+echo "that is the gate doing its job. Stop, keep the snapshot, and find the right key."
+echo "Do NOT reach for TRUSTISSUES_ALLOW_KEY_MISMATCH to get past it: it lets the"
+echo "server start on a key that cannot read the data, which then reads as blank and"
+echo "is overwritten by the first edit."
+if [ -n "${ASIDE:-}" ]; then
+  echo
+  echo "The database this replaced is still at:"
+  echo "  ${ASIDE}"
+  echo "Delete it once you have confirmed the restore, not before."
+fi

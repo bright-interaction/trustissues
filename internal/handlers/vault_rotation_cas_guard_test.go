@@ -99,7 +99,7 @@ func TestPersistRotatedValueRefusesAMissingToken(t *testing.T) {
 		t.Fatalf("encrypt: %v", err)
 	}
 	applied, err := persistRotatedValue(ctx, queries,
-		snapshotFromRotationRow("cas-guard-1", row.UpdatedAtText), ct, nonce)
+		snapshotFromRotationRow("cas-guard-1", row.UpdatedAtText, row.EncryptedValue), ct, nonce)
 	if err != nil || !applied {
 		t.Fatalf("a valid snapshot did not apply: applied=%v err=%v", applied, err)
 	}

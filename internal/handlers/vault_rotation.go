@@ -208,7 +208,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// predicate a value the user saved in between is silently overwritten by
 		// the stale one.
 		applied, casErr := persistRotatedValue(ctx, queries,
-			snapshotFromRotationRow(entry.ID, entry.UpdatedAtText), encrypted, nonce)
+			snapshotFromRotationRow(entry.ID, entry.UpdatedAtText, entry.EncryptedValue), encrypted, nonce)
 		if casErr == nil {
 			if !applied {
 				// Someone changed or deleted the entry during the pass. The

@@ -2155,7 +2155,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// sweep passed it and this path did not, so the CAS made manual rotation
 	// 100% dead while the test suite stayed green.
 	applied, err := persistRotatedValue(ctx, h.queries,
-		snapshotFromRotationRow(id, entryRow.UpdatedAtText), encrypted, nonce)
+		snapshotFromRotationRow(id, entryRow.UpdatedAtText, entryRow.EncryptedValue), encrypted, nonce)
 	if err != nil {
 		// Same hazard as the CAS-miss branch just below, and it recorded nothing.
 		// A provider-backed rotation has ALREADY minted the successor upstream by

@@ -25,7 +25,8 @@
   "test": "TestAnAddressIsNeverSplit",
   "file": "internal/shield/redact.go",
   "why": "route 2 re-verified against the generated matrix rather than hand-written lines",
-  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9._%+\\-]+)@",
-  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9._%+\\-]+)@"
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
  }
 ]

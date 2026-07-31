@@ -1,6 +1,13 @@
 [
- {"id":"minted-markers-not-trusted","mech":"shield-marker","test":"TestOurOwnMarkersAreStillProtected","file":"internal/shield/redact.go",
-  "why":"the OTHER direction: stop trusting our OWN markers and a later broad pattern corrupts the round-trip. Without this the fix could pass by protecting nothing.",
-  "old":"\t\t\tif g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {\n\t\t\t\ttrusted[g[2]] = true\n\t\t\t}\n",
-  "new":""}
+ {
+  "id": "minted-markers-not-trusted",
+  "mech": "shield-marker",
+  "test": "TestOurOwnMarkersAreStillProtected",
+  "file": "internal/shield/redact.go",
+  "why": "the OTHER direction: stop trusting our OWN markers and a later broad pattern corrupts the round-trip. Without this the fix could pass by protecting nothing.",
+  "old": "\t\t\tif g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {\n\t\t\t\ttrusted[g[2]] = true\n\t\t\t}",
+  "new": "",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). Round 16 changed the email domain hint from the literal domain to an industry bucket, so no hint value can contain a tokenizable value any more: hints are now industry=business, len=NN, century=19, initials=AA. The `trusted` bookkeeping for freshly minted markers protected against a later broad pattern re-matching INSIDE a hint, which was only reachable while the hint carried a hostname. Keep the bookkeeping (a future hint key could reintroduce the shape) but it is no longer load-bearing. Not decay.",
+  "expect_miss": true
+ }
 ]

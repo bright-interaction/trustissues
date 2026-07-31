@@ -466,6 +466,19 @@ type Querier interface {
 	// matched: the first version of this CAS made every scheduled rotation report a
 	// conflict and persist nothing, turning a rare lost-update into a total silent
 	// outage of auto-rotation. Compare the raw text both ways.
+	// The token also carries the PRIOR CIPHERTEXT, because a timestamp cannot see a
+	// same-second write. updated_at is CURRENT_TIMESTAMP, which SQLite renders at
+	// whole-second resolution, so two writes committed inside one second leave the
+	// column byte-identical and a snapshot taken between them still matches: the CAS
+	// reports applied=true for exactly the lost update it exists to refuse.
+	// Demonstrated against the real schema (token 17:06:04, competing write at
+	// 17:06:04, replayed stale CAS -> rows changed = 1).
+	//
+	// encrypted_value is AES-GCM under a fresh random nonce, so two different writes
+	// essentially never produce the same bytes, and it is precisely the column whose
+	// loss matters here: a concurrent name or schedule edit touches other columns and
+	// is not lost by this statement. Comparing it makes the guard independent of clock
+	// granularity.
 	RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error)
 	// Seeds the capability-bridge columns from the provider defaults at
 	// enrollment time. Only fills untouched rows so explicit per-entry

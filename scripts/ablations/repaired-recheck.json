@@ -1,0 +1,73 @@
+[
+ {
+  "id": "empty-token-accepted",
+  "mech": "cas-chokepoint",
+  "file": "internal/handlers/vault_rotation_cas.go",
+  "test": "TestRotationContract|TestManualRotate",
+  "why": "the guard that turns a missing CAS token into a hard error instead of a silent zero-row write",
+  "old": "\tif snap.EntryID == \"\" || snap.UpdatedAtText == \"\" || len(snap.PrevCiphertext) == 0 {",
+  "new": "\tif snap.EntryID == \"\" {",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ },
+ {
+  "id": "log-never-appended",
+  "mech": "rotation-matrix",
+  "file": "internal/handlers/vault_rotation_core.go",
+  "test": "TestRotationContract",
+  "why": "can logStatus actually fail across both drivers?",
+  "old": "\t\t\tRotationLog:   toNullString(AppendRotationLog(current, entry)),",
+  "new": "\t\t\tRotationLog:   toNullString(current),",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ },
+ {
+  "id": "drop-quoted-local-support",
+  "mech": "shield",
+  "test": "Corpus",
+  "file": "internal/shield/redact.go",
+  "why": "the fourth route into the partial-leak class: domain matched, local part left in the clear",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ },
+ {
+  "id": "drop-p-M-again",
+  "mech": "shield",
+  "test": "Corpus",
+  "file": "internal/shield/redact.go",
+  "why": "the third route, re-verified after adding 19 new corpus classes",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ },
+ {
+  "id": "use-shim-returns-read",
+  "mech": "grant",
+  "test": "TestRemovalEndsEverySpendPath",
+  "file": "internal/handlers/vault_reference.go",
+  "why": "the read-vs-use distinction: if the use shim answers read, every spend path re-opens",
+  "old": "\t\tif h.entryCurrentlyUsableBy(ctx, userID, row.ID) {",
+  "new": "\t\tif true {",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ },
+ {
+  "id": "minted-markers-not-trusted",
+  "mech": "shield-marker",
+  "test": "TestOurOwnMarkersAreStillProtected",
+  "file": "internal/shield/redact.go",
+  "why": "the OTHER direction: if we stop trusting our own markers, a later broad pattern corrupts the round-trip",
+  "old": "\t\t\tif g := MarkerPattern.FindStringSubmatch(marker); len(g) >= 3 {\n\t\t\t\ttrusted[g[2]] = true\n\t\t\t}",
+  "new": "",
+  "note": "EXPECTED MISS (defense in depth, verified 2026-07-31). Round 16 changed the email domain hint from the literal domain to an industry bucket, so no hint value can contain a tokenizable value any more: hints are now industry=business, len=NN, century=19, initials=AA. The `trusted` bookkeeping for freshly minted markers protected against a later broad pattern re-matching INSIDE a hint, which was only reachable while the hint carried a hostname. Keep the bookkeeping (a future hint key could reintroduce the shape) but it is no longer load-bearing. Not decay.",
+  "expect_miss": true
+ },
+ {
+  "id": "drop-p-M-fifth-check",
+  "mech": "shield-order",
+  "test": "TestAnAddressIsNeverSplit",
+  "file": "internal/shield/redact.go",
+  "why": "route 2 re-verified against the generated matrix rather than hand-written lines",
+  "old": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}\\p{M}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "new": "(?:\"[^\"\\r\\n]{1,64}\"|[\\p{L}0-9!#$%&'*+/=?^_\\x60{|}~.\\-]+)@",
+  "note": "anchor repaired 2026-07-31: the quoted source had drifted, so this spec silently reported INVALID and the guard it names was not being verified by the sweep at all."
+ }
+]
