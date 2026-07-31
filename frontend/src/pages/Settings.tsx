@@ -652,9 +652,30 @@ function EmailTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  // "Send test email" tests the STORED config, never what is on screen.
+  //
+  // POST /api/settings/smtp/test reads nothing from the request body: the
+  // handler sends using the values already persisted in the settings table. The
+  // button sits inside the same form as the host/port/password inputs, right
+  // next to Save, so an operator who edits the host and presses Test is told
+  // "Test email sent" about the OLD host, and concludes the new one works. The
+  // reverse is worse: they fix a broken host, press Test, see it fail, and
+  // conclude the fix did not work.
+  const smtpDirty =
+    !!form && !!data &&
+    (form.host !== data.host ||
+      form.port !== data.port ||
+      form.from !== data.from ||
+      form.username !== data.username ||
+      form.use_tls !== data.use_tls ||
+      form.password !== '');
+
   const testMutation = useMutation({
     mutationFn: api.settings.testSMTP,
-    onSuccess: (res) => toast.success(res.message || 'Test email sent'),
+    onSuccess: (res) =>
+      toast.success(
+        (res.message || 'Test email sent') + ' (using the saved settings)'
+      ),
     onError: (err) => toast.error(errorMessage(err)),
   });
 
@@ -761,7 +782,12 @@ function EmailTab() {
           <button
             type="button"
             onClick={() => testMutation.mutate()}
-            disabled={testMutation.isPending}
+            disabled={testMutation.isPending || smtpDirty}
+            title={
+              smtpDirty
+                ? 'Save first: the test sends with the stored settings, not the edits on screen'
+                : undefined
+            }
             className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50"
           >
             {testMutation.isPending && (
@@ -769,6 +795,11 @@ function EmailTab() {
             )}
             Send test email
           </button>
+          {smtpDirty && (
+            <p className="self-center text-xs text-amber-600">
+              Save your changes first. The test uses the stored settings.
+            </p>
+          )}
         </div>
       </form>
     </div>

@@ -42,6 +42,16 @@ export function setApiKey(key: string | null) {
   apiKey = key;
 }
 
+// onUnauthorized is invoked once per 401 so the app can drop its session state.
+// AuthProvider sets it at mount. Kept as a plain callback so this module stays
+// free of React and router imports, and so a caller that legitimately expects a
+// 401 (the /auth/me probe at startup) can opt out with skipAuthRedirect.
+let onUnauthorized: (() => void) | undefined;
+
+export function setUnauthorizedHandler(fn: (() => void) | undefined): void {
+  onUnauthorized = fn;
+}
+
 // Core fetch helper. Auth is a server-set HttpOnly session cookie, so every
 // request carries credentials; there is no bearer token in the client.
 export async function request<T>(
@@ -49,7 +59,6 @@ export async function request<T>(
   opts?: RequestInit & { skipAuthRedirect?: boolean }
 ): Promise<T> {
   const { skipAuthRedirect, ...fetchOpts } = opts || {};
-  void skipAuthRedirect;
   const headers: Record<string, string> = {
     ...(fetchOpts?.headers as Record<string, string>),
   };
@@ -71,6 +80,21 @@ export async function request<T>(
   });
 
   if (res.status === 401) {
+    // A dead session must return the app to a logged-out state.
+    //
+    // skipAuthRedirect was destructured and then thrown away with
+    // `void skipAuthRedirect`, so the redirect it names did not exist, and no
+    // file anywhere tested `status === 401`: ApiError was only ever read for
+    // .message. So an expired or revoked session surfaced as a red toast on a
+    // still-rendered page showing cached data, and navigating to /login sent
+    // the stale client straight back in because AuthProvider only calls
+    // /auth/me once at mount.
+    //
+    // The callback is registered by AuthProvider rather than imported, so this
+    // module keeps no dependency on React or the router.
+    if (!skipAuthRedirect) {
+      onUnauthorized?.();
+    }
     throw new ApiError('Unauthorized', 401);
   }
 
