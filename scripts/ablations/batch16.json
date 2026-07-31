@@ -1,22 +1,16 @@
 [
- {
-  "id": "resend-mails-blank-code",
-  "mech": "invitations",
-  "test": "TestResendRefusesAnUnreadableInviteCode",
-  "file": "internal/handlers/users.go",
-  "pkg": "./internal/handlers/",
-  "why": "the original bug: a branded email with an EMPTY setup code plus a 200",
-  "old": "\tcode := h.openInviteCode(row.Code)\n\tif code == \"\" {",
-  "new": "\tcode := h.openInviteCode(row.Code)\n\tif false {"
- },
- {
-  "id": "sender-belt-removed",
-  "mech": "invitations",
-  "test": "TestSenderRefusesABlankCodeFirst",
-  "file": "internal/handlers/users.go",
-  "pkg": "./internal/handlers/",
-  "why": "the belt that covers every current and future caller",
-  "old": "\tif strings.TrimSpace(code) == \"\" {",
-  "new": "\tif false {"
- }
+ {"id":"auth-events-lose-their-source","mech":"audit","test":"TestAuthEventsRecordTheirSource","file":"internal/handlers/activity.go",
+  "why":"the original bug: the four auth events recorded no ip_address, so the trail was blind on the surface it exists for",
+  "old":"\tlogActivityInternal(q, userID, action, detail,\n\t\tmiddleware.ClientIP(r), r.Header.Get(\"User-Agent\"))",
+  "new":"\t_ = r\n\tlogActivityInternal(q, userID, action, detail, \"\", \"\")"},
+
+ {"id":"user-agent-unbounded","mech":"audit","test":"TestAuditFieldsAreBounded","file":"internal/handlers/activity.go",
+  "why":"1MB of chosen bytes per request into an append-only table sharing the vault's disk",
+  "old":"\tuserAgent = truncateAudit(userAgent, maxAuditUserAgentLen)",
+  "new":"\t_ = maxAuditUserAgentLen"},
+
+ {"id":"audit-detail-unbounded","mech":"audit","test":"TestAuditFieldsAreBounded","file":"internal/handlers/activity.go",
+  "why":"detail is attacker-influenced too (entry names come from an invited teammate)",
+  "old":"\tdetail = truncateAudit(detail, maxAuditDetailLen)",
+  "new":"\t_ = maxAuditDetailLen"}
 ]
