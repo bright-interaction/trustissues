@@ -33,6 +33,30 @@ func TestProbe1SeesEveryVaultRow(t *testing.T) {
 		ctx := context.Background()
 		seedLegacyVaultRow(t, vh, "legacy-1", correctKey, "the-legacy-secret")
 
+		// Assert on PROBE 1 directly first.
+		//
+		// The composite result below can be satisfied by probes 2 or 3 finding
+		// ciphertext on some other surface, and an ablation restoring the
+		// `encryption_version = 2` filter proved exactly that: the subtest passed
+		// clean while probe 1 was blind again. The finding is about probe 1, so
+		// the query it runs is what has to be pinned.
+		rows, qErr := queries.AnyEncryptedVaultEntry(ctx)
+		if qErr != nil {
+			t.Fatalf("probe 1 query: %v", qErr)
+		}
+		sawV1 := false
+		for _, row := range rows {
+			if row.EncryptionVersion.Valid && row.EncryptionVersion.Int64 == 1 {
+				sawV1 = true
+			}
+		}
+		if !sawV1 {
+			t.Fatal("probe 1 does not return version 1 rows at all.\n" +
+				"Excluding them makes a carried-over vault read as EMPTY, so VerifyVaultKey " +
+				"seals its sentinel under whatever key is configured and the correct key is " +
+				"refused from that boot on.")
+		}
+
 		has, opens, err := vaultKeyOpensExistingData(ctx, queries, correctKey)
 		if err != nil {
 			t.Fatalf("probe: %v", err)
