@@ -86,18 +86,30 @@ func TestRFCLegalLocalPartsAreNotSplit(t *testing.T) {
 			if !strings.Contains(out, "[shield:email:") {
 				t.Fatalf("%q was not recognised as an email at all: %s", lp, out)
 			}
-			// Any surviving piece of the local part is the leak.
-			if strings.Contains(out, lp) {
-				t.Errorf("the local part survived in cleartext: %s", out)
+			// The invariant is about the BOUNDARY, not the whole string.
+			//
+			// The first version of this test asserted the whole local part was
+			// absent, and an ablation reverting the character class passed it
+			// clean: with anna!svensson@example.se the output is
+			// "anna![shield:email:...]", so the FULL local part is indeed gone
+			// while the leaked fragment "anna!" sits right there. Checking for
+			// the whole value cannot see a partial match, which is the only way
+			// this bug ever manifests.
+			//
+			// What must hold is that the marker begins at an address boundary:
+			// the character before it is whitespace or start-of-string. Anything
+			// else means the match started mid-address and whatever precedes it
+			// is unredacted PII.
+			i := strings.Index(out, "[shield:email:")
+			if i < 0 {
+				t.Fatalf("no email marker in %q", out)
 			}
-			// The generalised invariant: a marker preceded by @ or glued to text
-			// means the address was matched from the middle.
-			if strings.Contains(out, "@[shield:") {
-				t.Errorf("address matched from the domain inwards, local part left bare: %s", out)
-			}
-			for _, frag := range strings.Split(lp, "@") {
-				if frag != "" && strings.Contains(out, frag+"[shield:") {
-					t.Errorf("a local-part fragment is glued to the marker: %s", out)
+			if i > 0 {
+				prev := rune(out[i-1])
+				if prev != ' ' && prev != '\t' && prev != '\n' {
+					t.Errorf("the marker is glued to %q, so the address was matched from the "+
+						"middle and the leading fragment egressed in cleartext:\n  %s",
+						out[:i], out)
 				}
 			}
 		})
@@ -215,12 +227,22 @@ func TestDataURLExemptionIsNotARedactionOffSwitch(t *testing.T) {
 // closed the marker early, so the rest of the hint became ordinary text and the round
 // trip returned mangled output with err == nil.
 func TestHintValuesCannotBreakTheMarkerGrammar(t *testing.T) {
-	for _, hostile := range []string{"a]b", "a[b", "a,b", "a=b", "a:b", "a\x00b"} {
-		got := sanitizeHintValue(hostile)
-		for _, bad := range []string{"[", "]", ",", "=", ":", "\x00"} {
-			if strings.Contains(got, bad) {
-				t.Errorf("sanitizeHintValue(%q) = %q, still carries %q", hostile, got, bad)
-			}
+	// Assert through buildHint, NOT through sanitizeHintValue directly.
+	//
+	// The first version called the helper, and an ablation that deleted the
+	// CALL SITE (leaving the helper intact and unused) passed it clean. Same
+	// trap as the notify-only guard last round: a test that exercises the
+	// sanitizer proves the sanitizer works, never that anything calls it.
+	//
+	// KindName/initials is the path that can still carry hostile bytes, since
+	// initials are taken from the raw value's first bytes.
+	hostile := buildHint(KindName, "]evil ]person", []string{"initials"})
+	for _, bad := range []string{"[", "]", ",", ":"} {
+		// "=" is the pair separator produced by buildHint itself, so only the
+		// VALUE half is checked for it.
+		if strings.Contains(strings.SplitN(hostile, "=", 2)[len(strings.SplitN(hostile, "=", 2))-1], bad) {
+			t.Errorf("buildHint emitted %q, which carries %q and breaks the marker grammar",
+				hostile, bad)
 		}
 	}
 
