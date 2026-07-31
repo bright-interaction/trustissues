@@ -109,3 +109,47 @@ SELECT id, totp_secret FROM users WHERE totp_secret != '';
 -- replayed), which is how a captured code stops being reusable inside its own window.
 UPDATE users SET totp_last_step = ?
 WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?);
+
+-- name: UpdateUserRoleIfNotLastAdmin :execresult
+-- Role change that REFUSES to remove the last active admin, atomically.
+--
+-- ensureNotLastAdmin was a check-then-act: COUNT(*) in one statement, the write
+-- in another, with no transaction and no CAS between them. Two admins demoting
+-- each other concurrently (or one admin demoted twice by two tabs) both saw
+-- count = 2, both proceeded, and the instance was left with zero admins. Nothing
+-- in the product can create one back: CreateFirstAdmin is gated on the users
+-- table being empty, and every admin route needs an admin. The recovery is
+-- hand-editing the database.
+--
+-- The guard travels WITH the write here, so the count and the update see the
+-- same snapshot. RowsAffected = 0 means it was refused.
+UPDATE users SET role = ?
+WHERE users.id = ?
+  AND (
+    ? = 'admin'
+    OR users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  );
+
+-- name: SetUserDisabledIfNotLastAdmin :execresult
+-- Disable that refuses to disable the last active admin. Same reasoning as
+-- UpdateUserRoleIfNotLastAdmin.
+UPDATE users SET disabled = ?
+WHERE users.id = ?
+  AND (
+    ? = 0
+    OR users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  );
+
+-- name: DeleteUserIfNotLastAdmin :execresult
+-- Hard delete that refuses to remove the last active admin.
+DELETE FROM users
+WHERE users.id = ?
+  AND (
+    users.role != 'admin'
+    OR users.disabled = 1
+    OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  );

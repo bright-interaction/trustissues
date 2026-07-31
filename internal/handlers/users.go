@@ -195,17 +195,24 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeBadRequest(w, r, "you cannot demote your own account")
 			return
 		}
-		if target.Role == "admin" && *req.Role != "admin" {
-			if err := h.ensureNotLastAdmin(r.Context()); err != nil {
-				writeBadRequest(w, r, err.Error())
-				return
-			}
-		}
-		if _, err := h.queries.UpdateUserRole(r.Context(), db.UpdateUserRoleParams{
-			Role: *req.Role, ID: targetID,
-		}); err != nil {
+		// The last-admin guard travels WITH the write.
+		//
+		// It used to be a COUNT in one statement and the UPDATE in another, with
+		// no transaction between them: two admins demoting each other at the same
+		// time both saw count = 2, both proceeded, and the instance was left with
+		// ZERO admins. Nothing in the product recovers from that (CreateFirstAdmin
+		// needs an empty users table, every admin route needs an admin), so the
+		// fix has to be atomic rather than merely re-checked.
+		res, err := h.queries.UpdateUserRoleIfNotLastAdmin(r.Context(), db.UpdateUserRoleIfNotLastAdminParams{
+			Role: *req.Role, ID: targetID, Column3: *req.Role,
+		})
+		if err != nil {
 			logError(r, "users.update: role update failed", "error", err)
 			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeBadRequest(w, r, "cannot remove the last active admin")
 			return
 		}
 		LogActivityFromRequest(h.queries, r, "admin.user_role_changed",
@@ -217,21 +224,21 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeBadRequest(w, r, "you cannot disable your own account")
 			return
 		}
-		if target.Role == "admin" && *req.Disabled {
-			if err := h.ensureNotLastAdmin(r.Context()); err != nil {
-				writeBadRequest(w, r, err.Error())
-				return
-			}
-		}
 		disabled := int64(0)
 		if *req.Disabled {
 			disabled = 1
 		}
-		if _, err := h.queries.SetUserDisabled(r.Context(), db.SetUserDisabledParams{
-			Disabled: disabled, ID: targetID,
-		}); err != nil {
+		// Atomic last-admin guard, same reasoning as the role change above.
+		dres, err := h.queries.SetUserDisabledIfNotLastAdmin(r.Context(), db.SetUserDisabledIfNotLastAdminParams{
+			Disabled: disabled, ID: targetID, Column3: disabled,
+		})
+		if err != nil {
 			logError(r, "users.update: disabled update failed", "error", err)
 			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if n, _ := dres.RowsAffected(); n == 0 {
+			writeBadRequest(w, r, "cannot remove the last active admin")
 			return
 		}
 		action := "admin.user_enabled"
@@ -303,6 +310,12 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The DELETE below carries its own last-admin guard (see
+	// DeleteUserIfNotLastAdmin), so this pre-check is only a fast, friendly
+	// rejection. The authoritative refusal is the RowsAffected == 0 branch at
+	// the write itself, because a count taken here and a delete run afterwards
+	// are two separate statements and two concurrent deletes both pass a
+	// pre-check.
 	if target.Role == "admin" && target.Disabled == 0 {
 		if err := h.ensureNotLastAdmin(r.Context()); err != nil {
 			writeBadRequest(w, r, err.Error())
@@ -317,13 +330,25 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	h.offboardUser(r, targetID, target.Email)
 	h.disposeVaultEntriesOnDelete(r, targetID, target.Email, middleware.GetUserID(r.Context()))
 
-	result, err := h.queries.DeleteUser(r.Context(), targetID)
+	// The guard is ON the delete, so a concurrent second delete cannot slip
+	// between a count and a write and take the last admin with it. The
+	// pre-check above still runs first, because it rejects the ordinary case
+	// BEFORE offboarding side effects; this is the authoritative refusal for
+	// the racing case.
+	result, err := h.queries.DeleteUserIfNotLastAdmin(r.Context(), targetID)
 	if err != nil {
 		logError(r, "users.delete: delete failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 	if rows, _ := result.RowsAffected(); rows == 0 {
+		// Zero rows now means EITHER no such user OR the guard refused, and
+		// answering "user not found" for a refusal would be a lie that reads as
+		// "already gone". Ask which one it was.
+		if _, lookupErr := h.queries.GetUserByID(r.Context(), targetID); lookupErr == nil {
+			writeBadRequest(w, r, "cannot remove the last active admin")
+			return
+		}
 		writeNotFound(w, r, "user not found")
 		return
 	}

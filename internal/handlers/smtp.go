@@ -12,11 +12,17 @@ import (
 // sendInvitationEmail sends a branded invitation email via SMTP.
 func sendInvitationEmail(host, port, from, username, password string, useTLS bool, toEmail, name, code, serverURL string) error {
 	if port == "" {
-		if useTLS {
-			port = "465"
-		} else {
-			port = "587"
-		}
+		// 587 either way.
+		//
+		// A blank port used to select 465 (implicit TLS) whenever useTLS was on,
+		// while the schema default and the UI placeholder both say 587. Nothing
+		// in the product tells the operator that ticking a TLS box also silently
+		// changes the port, and 465 is blocked outbound in this estate, so the
+		// send hangs until the dial timeout rather than failing fast. 587 with
+		// STARTTLS is the path that works and the one the rest of the product
+		// advertises; an operator who genuinely wants implicit TLS still sets
+		// 465 explicitly.
+		port = "587"
 	}
 
 	addr := net.JoinHostPort(host, port)
@@ -47,11 +53,17 @@ func sendInvitationEmail(host, port, from, username, password string, useTLS boo
 // settings from the Settings page.
 func sendTestEmail(host, port, from, username, password string, useTLS bool, toEmail string) error {
 	if port == "" {
-		if useTLS {
-			port = "465"
-		} else {
-			port = "587"
-		}
+		// 587 either way.
+		//
+		// A blank port used to select 465 (implicit TLS) whenever useTLS was on,
+		// while the schema default and the UI placeholder both say 587. Nothing
+		// in the product tells the operator that ticking a TLS box also silently
+		// changes the port, and 465 is blocked outbound in this estate, so the
+		// send hangs until the dial timeout rather than failing fast. 587 with
+		// STARTTLS is the path that works and the one the rest of the product
+		// advertises; an operator who genuinely wants implicit TLS still sets
+		// 465 explicitly.
+		port = "587"
 	}
 
 	addr := net.JoinHostPort(host, port)

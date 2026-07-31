@@ -35,7 +35,19 @@ const (
 	// SessionIDKey is the context key for the validated server-side session id
 	// (the JWT jti). Empty on the API-key path, which has no session.
 	SessionIDKey contextKey = "session_id"
+	// APIKeyExpiryKey carries the expiry of the API key that authenticated this
+	// request, so a handler minting a NEW credential can refuse to let it
+	// outlive the one presented. Absent on the JWT path (an interactive login is
+	// not itself time-boxed this way) and absent for a key with no expiry.
+	APIKeyExpiryKey contextKey = "api_key_expires_at"
 )
+
+// APIKeyExpiry returns the authenticating API key's expiry, and ok=false when
+// the request was not authenticated by a time-boxed API key.
+func APIKeyExpiry(ctx context.Context) (time.Time, bool) {
+	v, ok := ctx.Value(APIKeyExpiryKey).(time.Time)
+	return v, ok
+}
 
 // GetUserID extracts the authenticated user ID from the request context.
 // Returns an empty string if no user ID is present.
@@ -156,14 +168,16 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				// UTC, so this compares correctly whatever wrote the row.
 				var userID string
 				var expired, revoked bool
+				var keyExpiresAt sql.NullTime
 				err := db.QueryRowContext(
 					r.Context(),
 					`SELECT user_id,
 					        expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now'),
-					        revoked_at IS NOT NULL
+					        revoked_at IS NOT NULL,
+					        expires_at
 					 FROM api_keys WHERE key_hash = ?`,
 					keyHash,
-				).Scan(&userID, &expired, &revoked)
+				).Scan(&userID, &expired, &revoked, &keyExpiresAt)
 
 				if err != nil {
 					if err == sql.ErrNoRows {
@@ -192,6 +206,11 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 					time.Now().UTC().Format(time.RFC3339), keyHash)
 
 				ctx := context.WithValue(r.Context(), UserIDKey, userID)
+				// Carry this key's own expiry so a handler minting another
+				// credential cannot hand out one that outlives it.
+				if keyExpiresAt.Valid {
+					ctx = context.WithValue(ctx, APIKeyExpiryKey, keyExpiresAt.Time.UTC())
+				}
 				// API-key auth: no JWT session, so session revocation does not apply.
 				ctx, _, reject := enrichUserContext(ctx, db, userID)
 				if reject != "" {
@@ -296,11 +315,25 @@ func validateSession(ctx context.Context, db *sql.DB, userID, jti string) (int, 
 
 	var sessUserID string
 	var revokedAt sql.NullString
-	var idle int
+	var idle, pastDeadline int
+	// expires_at is the session's ABSOLUTE deadline, and until now nothing read
+	// it. Migration 00022 creates the column, LoginUser writes it on every login,
+	// and this query, the only place session validity is decided, selected
+	// revoked_at and the idle window and nothing else. So the ceiling the schema
+	// declares was never a ceiling: a session refreshed inside the idle window
+	// stayed valid indefinitely, which is precisely what an absolute deadline
+	// exists to stop. The JWT's own exp bounds the token, but the server-side
+	// deadline is the one an admin can shorten centrally.
+	//
+	// NULL means no deadline recorded (rows written before the column existed),
+	// which must not expire them, so the comparison is guarded on NOT NULL.
 	err := db.QueryRowContext(ctx,
-		"SELECT user_id, revoked_at, (last_used_at <= datetime('now', ?)) FROM sessions WHERE id = ?",
+		`SELECT user_id, revoked_at,
+		        (last_used_at <= datetime('now', ?)),
+		        (expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now'))
+		 FROM sessions WHERE id = ?`,
 		sessionIdleModifier(ctx, db), jti,
-	).Scan(&sessUserID, &revokedAt, &idle)
+	).Scan(&sessUserID, &revokedAt, &idle, &pastDeadline)
 	if err == sql.ErrNoRows {
 		return http.StatusUnauthorized, "session expired, please log in again"
 	}
@@ -313,6 +346,9 @@ func validateSession(ctx context.Context, db *sql.DB, userID, jti string) (int, 
 	}
 	if idle == 1 {
 		return http.StatusUnauthorized, "session expired due to inactivity, please log in again"
+	}
+	if pastDeadline == 1 {
+		return http.StatusUnauthorized, "session expired, please log in again"
 	}
 
 	// Best effort: record activity so the idle timeout measures inactivity.

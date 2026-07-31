@@ -155,7 +155,9 @@ def main():
               for k in ("CAUGHT", "MISSED", "INVALID", "TIMEOUT", "SUPERSEDED")}
     print(f"\ncaught {counts['CAUGHT']}  missed {counts['MISSED']}  invalid {counts['INVALID']}"
           f"  hung {counts['TIMEOUT']}  superseded {counts['SUPERSEDED']}")
-    if counts["CAUGHT"] == 0 and results:
+    # Superseded specs are not expected to catch, so a run made only of them is
+    # not evidence the harness is broken.
+    if counts["CAUGHT"] == 0 and (len(results) - counts["SUPERSEDED"]) > 0:
         print("ABORT-LIKE: nothing was caught at all; suspect the harness before trusting this.")
     # The results file is optional. It used to be read as sys.argv[2]
     # unconditionally, so the documented one-argument form raised IndexError HERE,

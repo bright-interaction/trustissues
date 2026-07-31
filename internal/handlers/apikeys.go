@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -155,6 +157,32 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		expiresAtDB = sql.NullTime{Time: exp, Valid: true}
 	}
 
+	// A minted key may never outlive the API key that minted it.
+	//
+	// This route accepts X-API-Key as authentication, so an API key was
+	// sufficient to mint another API key, and omitting expires_in_days produced
+	// expires_at NULL, which the auth path's
+	// `expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`
+	// can never make true. So the vault_only extension key that RedeemInvitation
+	// hands out over a PUBLIC endpoint, documented as "deliberately time-boxed
+	// (invitationAPIKeyTTL) rather than permanent" at 90 days, could mint itself
+	// a permanent successor and keep vault access forever. Revoking the original
+	// does nothing to the child, and nothing in the UI shows it came from a
+	// time-boxed parent.
+	//
+	// Capping rather than refusing keeps the documented flow working: a
+	// vault_only teammate connecting the browser extension still gets a key,
+	// it just cannot reach past the credential that authorised it.
+	if parentExp, viaAPIKey := middleware.APIKeyExpiry(r.Context()); viaAPIKey {
+		if !expiresAtDB.Valid || expiresAtDB.Time.After(parentExp) {
+			expStr := parentExp.Format(time.RFC3339)
+			expiresAt = &expStr
+			expiresAtDB = sql.NullTime{Time: parentExp, Valid: true}
+			slog.Info("api key: capped the new key's expiry to the minting key's",
+				"user_id", userID, "expires_at", expStr)
+		}
+	}
+
 	if err := h.queries.CreateAPIKeyForUser(r.Context(), db.CreateAPIKeyForUserParams{
 		ID:        id,
 		UserID:    userID,
@@ -277,6 +305,27 @@ func (h *APIKeyHandler) AdminRevokeAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetID := chi.URLParam(r, "id")
+
+	// Confirm the target exists before reporting success.
+	//
+	// RevokeAPIKeysByUser is an UPDATE with a WHERE, so an id matching nothing is
+	// not an error: this answered 204 and wrote "All API keys revoked for user X"
+	// into the activity log for a user id that does not exist. During an incident
+	// that is the worst possible answer, because the admin reads it as "that
+	// person's keys are dead" when nothing was touched, and the audit trail
+	// afterwards agrees with them. A typo, a stale id from an old page, or a
+	// deleted user all produce it.
+	if _, err := h.queries.GetUserByID(r.Context(), targetID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, r, http.StatusNotFound, "user_not_found",
+				"no such user, so no API keys were revoked")
+			return
+		}
+		logError(r, "apikeys.admin_revoke_all: user lookup failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
 	if err := h.queries.RevokeAPIKeysByUser(r.Context(), targetID); err != nil {
 		logError(r, "apikeys.admin_revoke_all: revoke failed", "error", err)
 		writeInternalError(w, r, "internal server error")

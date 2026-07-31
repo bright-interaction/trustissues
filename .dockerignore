@@ -8,3 +8,13 @@ data
 bin
 server
 notes
+
+# The operator's .env holds TRUSTISSUES_VAULT_KEY and TRUSTISSUES_JWT_SECRET.
+# Without these lines it was copied into the builder layer by `COPY . .`, so the
+# live vault key sat in an image layer: readable by anyone who can pull or
+# inspect the image, and present in any registry it is pushed to, even though
+# the final stage never references it.
+.env
+.env.*
+*.env
+!.env.example
