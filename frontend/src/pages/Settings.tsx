@@ -1649,6 +1649,11 @@ function EncryptionTab() {
 
   const view = blocked ?? data;
   const state = view.status;
+  // The sweep needs the old key to convert ciphertext, but not to recompute a
+  // stale lookup index (that is derived from cleartext). Gating the button on
+  // previous_key_configured alone left the stale case with a warning banner and
+  // no way to act on it.
+  const canSweep = view.previous_key_configured || view.values_stale > 0;
 
   return (
     <div className="space-y-4">
@@ -1684,7 +1689,7 @@ function EncryptionTab() {
           </div>
         )}
 
-        {state === 'needs_rekey' && (
+        {state === 'needs_rekey' && view.values_on_previous > 0 && (
           <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4">
             <div className="flex items-start gap-2">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
@@ -1700,6 +1705,33 @@ function EncryptionTab() {
                     TRUSTISSUES_VAULT_KEY_PREVIOUS
                   </code>{' '}
                   from the environment and restart.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/*
+          A stale lookup index gets its own banner because its remedy is
+          different, and saying "encrypted with the previous key" here was a
+          diagnosis the keyring contradicted: this state is reachable with no
+          rotation configured at all (a metadata backfill that ran out of budget),
+          and the previous message sent the operator looking for a key they never
+          lost while the button that fixes it sat disabled.
+        */}
+        {state === 'needs_rekey' && view.values_stale > 0 && (
+          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div className="text-sm text-amber-800">
+                <p className="font-medium">
+                  {view.values_stale} autofill lookup index(es) are out of date.
+                </p>
+                <p className="mt-1">
+                  Those entries still decrypt fine, but the browser extension
+                  will not offer them for their site: a lookup index is a keyed
+                  hash, so a stale one matches nothing and reports no error. The
+                  sweep recomputes them. No previous key is needed for this.
                 </p>
               </div>
             </div>
@@ -1750,7 +1782,7 @@ function EncryptionTab() {
         <div className="flex flex-wrap items-center gap-3">
           <button
             onClick={() => rekeyMutation.mutate()}
-            disabled={rekeyMutation.isPending || !view.previous_key_configured}
+            disabled={rekeyMutation.isPending || !canSweep}
             className={primaryButtonClass}
           >
             {rekeyMutation.isPending ? (
@@ -1819,6 +1851,7 @@ function EncryptionTab() {
                 <th className="py-2 pr-4">Holds</th>
                 <th className="py-2 pr-4 text-right">Current</th>
                 <th className="py-2 pr-4 text-right">Previous</th>
+                <th className="py-2 pr-4 text-right">Stale</th>
                 <th className="py-2 text-right">Unreadable</th>
               </tr>
             </thead>
@@ -1844,6 +1877,15 @@ function EncryptionTab() {
                     }`}
                   >
                     {s.on_previous}
+                  </td>
+                  <td
+                    className={`py-2 pr-4 text-right tabular-nums ${
+                      s.stale > 0
+                        ? 'font-medium text-amber-700'
+                        : 'text-slate-400'
+                    }`}
+                  >
+                    {s.stale}
                   </td>
                   <td
                     className={`py-2 text-right tabular-nums ${

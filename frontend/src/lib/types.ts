@@ -246,6 +246,9 @@ export interface RekeySurface {
   on_current: number;
   on_previous: number;
   plaintext: number;
+  // Blind indexes only: an HMAC that matches no key on the ring. Repairable by
+  // recomputing it, so unlike on_previous it needs no old key.
+  stale: number;
   unreadable: number;
   converted: number;
 }
@@ -274,6 +277,11 @@ export interface VaultKeyStatus {
   blockers_total: number;
   values_on_current: number;
   values_on_previous: number;
+  // Stale lookup indexes. Kept separate from values_on_previous because the
+  // remedy differs: the sweep recomputes these with no previous key, so a store
+  // whose only problem is stale indexes must not be told to go and find an old
+  // key it never lost.
+  values_stale: number;
   values_unreadable: number;
   rows_converted: number;
   started_at: string;

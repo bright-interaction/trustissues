@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -18,13 +20,13 @@ func withBaseEnv(t *testing.T) {
 	t.Setenv("TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT", "")
 }
 
-// TestPreviousVaultKeyIsHeldToTheSameBarAsTheCurrentOne.
+// TestAPreviousVaultKeyEqualToTheCurrentOneIsRefused.
 //
-// A malformed previous key is worse than an absent one. The operator believes
-// the dual-key read is working, every status surface says a rotation is
-// configured, and they find out otherwise when the sweep reports rows it cannot
-// open, which is the middle of an incident.
-func TestPreviousVaultKeyIsHeldToTheSameBarAsTheCurrentOne(t *testing.T) {
+// The one previous-key misconfiguration that must fail closed. It is not a weak
+// key, it is a NO-OP that reports as a configured rotation on every status
+// surface, and an operator who trusts that report deletes the old key from their
+// password manager.
+func TestAPreviousVaultKeyEqualToTheCurrentOneIsRefused(t *testing.T) {
 	withBaseEnv(t)
 
 	// Absent is fine: that is the steady state.
@@ -42,29 +44,57 @@ func TestPreviousVaultKeyIsHeldToTheSameBarAsTheCurrentOne(t *testing.T) {
 		t.Fatalf("VaultKeyPrevious = %q, want the configured value", cfg.VaultKeyPrevious)
 	}
 
-	for _, tc := range []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{
-			name: "identical to the current key", value: testCurrentKey,
-			// This is the dangerous one: it reports as a configured rotation
-			// while being a no-op, and an operator who trusts that report deletes
-			// the old key from their password manager.
-			want: "identical",
-		},
-		{name: "too short", value: "short", want: "at least 32 characters"},
-		{name: "obvious placeholder", value: "changeme_changeme_changeme_change", want: "placeholder"},
+	t.Setenv("TRUSTISSUES_VAULT_KEY_PREVIOUS", testCurrentKey)
+	_, err = Load()
+	if err == nil {
+		t.Fatal("a previous key identical to the current one was accepted; it reports as a configured " +
+			"rotation while converting nothing")
+	}
+	if !strings.Contains(err.Error(), "identical") {
+		t.Fatalf("error %q does not explain the problem", err)
+	}
+}
+
+// TestAWeakPreviousVaultKeyIsWarnedAboutAndACCEPTED.
+//
+// The previous key describes data that already exists, which makes it unlike
+// every other secret this file validates. Refusing a short or weak one protects
+// nothing (the data is sealed under it either way) and blocks the single
+// rotation that matters most: an instance whose key predates these checks, or
+// was forced through with TRUSTISSUES_ALLOW_KEY_MISMATCH, cannot name that key
+// as PREVIOUS and therefore cannot rotate away from it. That is the population
+// holding the weakest key in the estate.
+//
+// So: accepted, and said out loud.
+func TestAWeakPreviousVaultKeyIsWarnedAboutAndAccepted(t *testing.T) {
+	withBaseEnv(t)
+
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, tc := range []struct{ name, value string }{
+		{"a key shorter than today's minimum", "short-old-key"},
+		{"a key that looks like a placeholder", "changeme_changeme_changeme_change"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
 			t.Setenv("TRUSTISSUES_VAULT_KEY_PREVIOUS", tc.value)
-			_, err := Load()
-			if err == nil {
-				t.Fatalf("%q was accepted as a previous vault key", tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf(`%q was refused as a previous vault key: %v
+
+Refusing it does not make the data safer, it is already encrypted with that key.
+It only makes the rotation AWAY from that key impossible, for the instances that
+need it most.`, tc.value, err)
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error %q does not explain the problem (%q)", err, tc.want)
+			if cfg.VaultKeyPrevious != tc.value {
+				t.Fatalf("VaultKeyPrevious = %q, want %q", cfg.VaultKeyPrevious, tc.value)
+			}
+			if !strings.Contains(buf.String(), "TRUSTISSUES_VAULT_KEY_PREVIOUS") {
+				t.Fatalf("no warning was logged for %q; accepting a weak key silently is how it stays "+
+					"in the environment forever", tc.value)
 			}
 		})
 	}

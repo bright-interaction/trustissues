@@ -173,24 +173,35 @@ func (c *Config) Validate() error {
 		errs = append(errs, "TRUSTISSUES_VAULT_KEY looks like a placeholder or low-entropy value (generate a real one: openssl rand -hex 32)")
 	}
 
-	// The previous key is optional, but a malformed one is worse than an absent
-	// one: the operator believes they have a working dual-key read and would
-	// only find out otherwise when the sweep reports rows it cannot open, which
-	// is the middle of an incident. So hold it to the same bar as the real key.
+	// The previous key describes data that ALREADY EXISTS. That is what makes it
+	// different from every other secret validated here, and why strength is a
+	// warning rather than a refusal.
 	//
-	// Equal-to-current is rejected outright. It reads as "rotation configured"
-	// on every status surface while being a no-op, which is exactly the state
-	// where somebody deletes the old key from their password manager because the
-	// UI told them the rotation was set up.
+	// Refusing a short or weak previous key does not make anything safer: the
+	// data is already sealed under it either way. All it does is make the one
+	// rotation that matters most impossible. An instance whose key was set before
+	// these checks existed, or forced through with TRUSTISSUES_ALLOW_KEY_MISMATCH,
+	// cannot name that key as PREVIOUS, so it cannot rotate away from it, and
+	// that is exactly the population with the weakest key in the estate. The
+	// operator is told, loudly, and then allowed to proceed.
+	//
+	// Equal-to-current stays a hard error. It is not a weak key, it is a no-op
+	// that REPORTS as a configured rotation on every status surface, which is
+	// precisely the state in which somebody deletes the old key from their
+	// password manager believing the rotation is set up.
 	if c.VaultKeyPrevious != "" {
 		switch {
 		case c.VaultKeyPrevious == c.VaultKey:
 			errs = append(errs, "TRUSTISSUES_VAULT_KEY_PREVIOUS is identical to TRUSTISSUES_VAULT_KEY; "+
 				"that is a no-op that reports as a configured rotation. Set it to the OLD key, or unset it")
 		case len(c.VaultKeyPrevious) < 32:
-			errs = append(errs, "TRUSTISSUES_VAULT_KEY_PREVIOUS must be at least 32 characters (it is a real key this data was encrypted with)")
+			slog.Warn("config: TRUSTISSUES_VAULT_KEY_PREVIOUS is shorter than 32 characters. " +
+				"Accepted, because it is the key your existing data is already sealed under and refusing it " +
+				"would block the rotation away from it. Complete the re-encrypt sweep, then remove it.")
 		case isWeakSecret(c.VaultKeyPrevious):
-			errs = append(errs, "TRUSTISSUES_VAULT_KEY_PREVIOUS looks like a placeholder or low-entropy value")
+			slog.Warn("config: TRUSTISSUES_VAULT_KEY_PREVIOUS looks like a placeholder or low-entropy value. " +
+				"Accepted, because it is the key your existing data is already sealed under and refusing it " +
+				"would block the rotation away from it. Complete the re-encrypt sweep, then remove it.")
 		}
 	}
 
