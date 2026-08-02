@@ -1,0 +1,35 @@
+[Unit]
+Description=Email alert for a failed Trustissues backup or restore drill (%i)
+Documentation=file:///opt/trustissues/deploy/systemd/trustissues-backup-alert.sh
+
+# No After=/Wants=. This unit is started by OnFailure= on another unit, never by
+# boot or by the network target. Ordering directives here would only make it
+# possible for the alerter to be blocked by whatever also broke the backup.
+
+[Service]
+Type=oneshot
+# %i is the full name of the unit that failed, e.g. trustissues-backup.service,
+# so one templated alerter serves the backup and the drill and the mail says
+# which one broke.
+ExecStart=/opt/trustissues/deploy/systemd/trustissues-backup-alert.sh %i
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustissues-backup-alert
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log
+ReadOnlyPaths=/etc/trustissues
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# NO OnFailure= and NO Restart= here, deliberately. If the alerter itself fails,
+# an OnFailure on this unit would page about the pager and bury the real
+# failure. The script matches this by never exiting non-zero.
+Restart=no
