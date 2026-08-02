@@ -86,8 +86,17 @@ var vaultEntryEgressClass = map[string]struct {
 	"last_rotated_at":        {egressTriggersDelivery, "with the interval, decides due-ness"},
 
 	// ── neutral ─────────────────────────────────────────────────────────
-	"id":                  {egressNeutral, "primary key"},
-	"user_id":             {egressNeutral, "creator; an input to authorization, never to a URL"},
+	"id": {egressNeutral, "primary key"},
+	"user_id": {egressNeutral,
+		"never reaches a URL. It IS the input to mayDirectSecretEgress, so writing it transfers the " +
+			"right to choose a destination, and there is exactly one writer: AdoptAndRenameVaultEntry, " +
+			"reachable only by a collection MANAGER and only once the creator has left that collection " +
+			"(managerMayAdoptOrphanedEntry). That is a deliberate, documented ownership transfer for a " +
+			"stranded secret, not a redirect. Any second writer of this column has to be read as an " +
+			"egress-authority change, not as bookkeeping"},
+	"collection_id": {egressNeutral,
+		"sharing scope, so it decides who holds manage. It cannot name a host, and manage alone no " +
+			"longer carries the right to add one"},
 	"name":                {egressNeutral, "lookup key for MCP and service identities, not a destination"},
 	"encrypted_value":     {egressNeutral, "the secret itself, which is WHAT travels, not where to"},
 	"nonce":               {egressNeutral, "AEAD nonce"},
@@ -101,7 +110,6 @@ var vaultEntryEgressClass = map[string]struct {
 	"username":            {egressNeutral, "autofill metadata"},
 	"auto_login":          {egressNeutral, "extension behaviour, client side"},
 	"custom_fields":       {egressNeutral, "user key/value pairs; no code path builds a URL from them"},
-	"collection_id":       {egressNeutral, "sharing scope; an input to authorization"},
 	"rotation_log":        {egressNeutral, "audit history, written by the server"},
 	"last_rotation_error": {egressNeutral, "status text, written by the server"},
 	"injection_spec": {egressNeutral,
