@@ -38,9 +38,11 @@ export interface VaultEntry {
   last_rotation_error?: string;
   // Which shared collection the entry lives in, or null for a personal entry.
   collection_id: string | null;
-  // Arbitrary label/value pairs. Present on the create response and on unlocked
-  // entries; absent or empty on the plain locked list.
-  custom_fields?: CustomField[];
+  // Arbitrary label/value pairs. Every metadata response now carries the key,
+  // null when the entry has none: `omitempty` made "no custom fields" look
+  // identical to "this response does not report them", so a client merging a
+  // write response kept showing a field the user had just deleted.
+  custom_fields?: CustomField[] | null;
   // Capability ceiling, returned so the edit form can show what is set. An empty
   // or absent list means no agent token can be minted for this secret at all.
   destination_patterns?: string[];

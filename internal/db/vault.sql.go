@@ -316,12 +316,13 @@ func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetV
 }
 
 const getVaultEntryMeta = `-- name: GetVaultEntryMeta :one
-SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
+SELECT id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?
 `
 
 type GetVaultEntryMetaRow struct {
 	ID                   string         `json:"id"`
+	CollectionID         sql.NullString `json:"collection_id"`
 	Name                 string         `json:"name"`
 	Url                  sql.NullString `json:"url"`
 	AliasUrl             sql.NullString `json:"alias_url"`
@@ -342,11 +343,18 @@ type GetVaultEntryMetaRow struct {
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
+// collection_id is SELECTed here on purpose. It was missing, so every response
+// built from this row (PUT /vault/{id}, POST /{id}/rotate, PUT /{id}/schedule)
+// reported collection_id: null no matter which shared collection the entry was
+// actually in. Clients that merge a write response into a cached entry then
+// moved every shared entry back to "Personal" on save. Adding a column to this
+// projection is cheap; the clients working around its absence was not.
 func (q *Queries) GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error) {
 	row := q.db.QueryRowContext(ctx, getVaultEntryMeta, id)
 	var i GetVaultEntryMetaRow
 	err := row.Scan(
 		&i.ID,
+		&i.CollectionID,
 		&i.Name,
 		&i.Url,
 		&i.AliasUrl,
