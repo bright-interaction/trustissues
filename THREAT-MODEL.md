@@ -292,14 +292,37 @@ without seeing" into "see". Two rules now hold the boundary (`secret_egress.go`)
   of `provider_meta` into the host (`{tenant}.auth0.com`), which put the host in
   an editor's hands.
 
-**What the pin does not cover.** Rotation DELIVERY targets on entries that are
-not the gateway key still take only `manage`, so an accepted editor can point a
-shared secret's rotation webhook at a host they choose. That is bounded (it needs
-a rotation to fire, it is audited and alerted, and delivery re-checks the
-configurer's access) but it is a real path for an API-key-only caller, who can
-set `auto_rotate` without a password and let the scheduler deliver. Written up as
-DEFERRED (i) with the design, deliberately not changed here: four earlier guards
-encode "a member with manage configures delivery" as the intended behaviour.
+- **Delivery targets are destinations too.** Adding a rotation target whose type
+  transmits the value (`webhook`, `forgejo_secret`) is the same act as widening
+  the ceiling and takes the same right, at the write (`decideDeliveryEgress`) and
+  at delivery (`targetStillAuthorized`). Removing one, clearing the list,
+  relabelling it, rotating its HMAC secret and configuring a `notify` target stay
+  open to `manage`. This was DEFERRED (i) until 2026-08-02 and was the round-5
+  blocker: an accepted `vault_only` editor pointed a shared secret's rotation
+  webhook at a host they controlled and the scheduler delivered the freshly
+  minted plaintext.
+
+**Why this stopped being a per-handler check.** Rounds 2 through 5 each closed
+one named field and the next round found the next one. Round 4 answered that with
+a coverage table forcing every `vault_entries` column to be classified as
+host-choosing or not. It did not stop round 5, because `rotation_targets` was
+correctly classified and `UpdateTargets` wrote it without asking anybody: a
+classification is a claim about the code, and a table that labels a field next to
+an unenforced write path reads as coverage. So the enforcement point is now a
+value a handler cannot fabricate. `internal/egressgate` issues a `Ticket` only
+from `Decide`, which consults the authority oracle exactly when a write ADDS a
+destination; every generated query that writes `destination_patterns`,
+`provider`, `provider_meta` or `rotation_targets` is called from
+`vault_egress_writes.go` and nowhere else, through a wrapper that demands a
+Ticket for that entry and that field.
+`TestEveryHostChoosingWriteGoesThroughTheChokepoint` derives the guarded queries
+from the generated SQL and the columns from the classification table, so a new
+column or a new route is covered on the day it is written.
+
+**What this does not cover.** `auto_rotate` still takes only `manage` and is
+classified `egressTriggersDelivery`: it decides WHETHER the secret moves, never
+WHERE. An API-key-only caller can still set it without a password and make the
+scheduler act, but only toward destinations an authorised principal chose.
 
 **Timing on membership writes.** `POST /collections/{id}/members` and
 `DELETE /collections/{id}/invitations` answer identically whether or not an

@@ -126,8 +126,12 @@ func TestEditorCannotPointARotationWebhookAtAHostTheyChose(t *testing.T) {
 		t.Errorf("the refusal does not name the host that was refused, so an operator reading it cannot "+
 			"tell what happened: %s", rec.Body.String())
 	}
+	// Errorf, not Fatalf, deliberately. If the write gate is gone the interesting
+	// question is not "was it stored" but "did the plaintext reach the collector",
+	// and stopping here would report the weaker of the two. Carrying on means a
+	// regression prints the wire evidence rather than a status code.
 	if got := storedTargets(); len(got) != 0 {
-		t.Fatalf("the refused target was stored anyway: %+v", got)
+		t.Errorf("the refused target was stored anyway: %+v", got)
 	}
 
 	// ── STEP 2. Rotate for real and read the WIRE, not the status code. ─────
