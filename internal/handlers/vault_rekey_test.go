@@ -6,11 +6,16 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/columncrypto"
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/database"
@@ -74,7 +79,20 @@ const (
 	seedTOTP     = "JBSWY3DPEHPK3PXP"
 	seedSMTP     = "smtp-relay-password"
 	seedInvite   = "INVITE-CODE-ABCDEF"
-	seedChannel  = `{"webhook_url":"https://hooks.slack.example/T000/B000/xxxx"}`
+
+	// The channel config points at a PRIVATE address on purpose.
+	//
+	// It is the one surface whose real reader lives in another package
+	// (internal/alerts) behind an unexported decrypt, so the only way to read it
+	// back through production code is to make production try to send. The send
+	// path is SSRF-guarded at dial time, so a private literal turns "the config
+	// decrypted to exactly this URL" into a deterministic, network-free
+	// assertion: the guard's refusal quotes the address it refused, and that
+	// address can only have come out of the ciphertext. AES-GCM authenticates
+	// the whole blob, so an open that yields the right URL proves the secret
+	// alongside it is intact too.
+	seedChannelHost = "10.1.2.3"
+	seedChannel     = `{"url":"https://10.1.2.3/hook","secret":"webhook-hmac-secret"}`
 )
 
 // seedUnderKey writes one of every keyed surface using the handler's CURRENT
@@ -169,22 +187,7 @@ func seedUnderKey(t *testing.T, h *VaultHandler, queries *db.Queries) seededStor
 		t.Fatalf("store smtp password: %v", err)
 	}
 
-	chCT, chNonce, err := h.EncryptValue([]byte(seedChannel))
-	if err != nil {
-		t.Fatalf("encrypt channel config: %v", err)
-	}
-	chID, err := queries.CreateNotificationChannel(ctx, db.CreateNotificationChannelParams{
-		Name:              "ops-slack",
-		Type:              "webhook",
-		Enabled:           sql.NullInt64{Int64: 1, Valid: true},
-		Config:            string(chCT),
-		ConfigNonce:       chNonce,
-		EncryptionVersion: sql.NullInt64{Int64: 2, Valid: true},
-		Events:            `["vault.rotated"]`,
-	})
-	if err != nil {
-		t.Fatalf("create notification channel: %v", err)
-	}
+	chID := seedNotificationChannelThroughTheRealWriter(t, h, queries)
 
 	// The boot sentinel, written the way a real first boot writes it.
 	if err := VerifyVaultKey(ctx, queries, h.keySource); err != nil {
@@ -192,6 +195,82 @@ func seedUnderKey(t *testing.T, h *VaultHandler, queries *db.Queries) seededStor
 	}
 
 	return seededStore{userID: user.ID, entryID: entryID, inviteID: inv.ID, channelID: chID}
+}
+
+// seedNotificationChannelThroughTheRealWriter creates a channel the way the
+// product creates one: through POST /api/admin/notification-channels.
+//
+// Hand-rolling this row is what hid a data-corruption bug for a whole review
+// cycle. The old fixture wrote Config: string(ciphertext), which NO production
+// writer ever produces (notifications.go base64-encodes into a TEXT column), so
+// the fixture agreed with the sweep's mistaken assumption and both disagreed
+// with the product. Every rekey test inherited the blind spot, and on a real
+// store the sweep refused every instance that had ever created a channel.
+//
+// A fixture for an at-rest format must come from the writer that actually
+// produces it. That is the rule this function exists to enforce.
+func seedNotificationChannelThroughTheRealWriter(t *testing.T, h *VaultHandler, queries *db.Queries) string {
+	t.Helper()
+	nh := NewNotificationChannelsHandler(queries, h,
+		alerts.NewChannelDispatcher(context.Background(), queries, h))
+
+	body := `{"name":"ops-webhook","type":"webhook","config":` + seedChannel +
+		`,"events":["` + alerts.EventRotationFailed + `"]}`
+	rec := httptest.NewRecorder()
+	nh.Create(rec, httptest.NewRequest(http.MethodPost, "/api/admin/notification-channels", strings.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create notification channel: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.ID == "" {
+		t.Fatalf("create notification channel: could not read the id back: %v (%s)", err, rec.Body.String())
+	}
+	return out.ID
+}
+
+// assertChannelConfigThroughTheRealReader reads a channel config back through
+// internal/alerts, the code that actually serves it, rather than through the
+// sweep's own helpers.
+//
+// Reading it back with h.DecryptValue proves nothing: that is the same call the
+// sweep makes, so a sweep whose wire format disagrees with the product agrees
+// with itself perfectly. The real reader base64-decodes BEFORE decrypting, and
+// that one step is where the corruption lived.
+//
+// The send is expected to FAIL, at the SSRF dial guard, quoting the address from
+// the decrypted config. See seedChannelHost for why that is the assertion.
+func assertChannelConfigThroughTheRealReader(t *testing.T, h *VaultHandler, queries *db.Queries, channelID, stage string) {
+	t.Helper()
+	row, err := queries.GetNotificationChannel(context.Background(), channelID)
+	if err != nil {
+		t.Fatalf("%s: read notification channel: %v", stage, err)
+	}
+
+	// The stored form must be what the production READER expects to parse, which
+	// is base64 text. Checked separately from the decrypt so a failure says which
+	// half broke.
+	if _, decErr := base64.StdEncoding.DecodeString(row.Config); decErr != nil {
+		t.Fatalf("%s: notification_channels.config is not valid base64 (%v). "+
+			"internal/alerts.decryptConfig base64-decodes before decrypting, so whatever wrote this "+
+			"has made every webhook URL and bot token in the store unreadable by the product.",
+			stage, decErr)
+	}
+
+	sendErr := alerts.NewChannelDispatcher(context.Background(), queries, h).DispatchTest(row)
+	if sendErr == nil {
+		t.Fatalf("%s: the test send to %s succeeded; it must be refused by the SSRF dial guard, "+
+			"so this assertion is no longer proving anything about the config", stage, seedChannelHost)
+	}
+	msg := sendErr.Error()
+	if strings.Contains(msg, "decrypting config") || strings.Contains(msg, "decoding config") {
+		t.Fatalf("%s: the REAL reader (internal/alerts) could not open the channel config: %v", stage, sendErr)
+	}
+	if !strings.Contains(msg, seedChannelHost) {
+		t.Fatalf("%s: the send failed with %q, which does not name %s. The webhook URL that came out of "+
+			"the ciphertext is not the one that was stored.", stage, msg, seedChannelHost)
+	}
 }
 
 // assertEverythingReadable proves each keyed surface round-trips back to the
@@ -312,14 +391,7 @@ func assertEverythingReadable(t *testing.T, h *VaultHandler, queries *db.Queries
 	if len(channels) != 1 {
 		t.Fatalf("%s: expected 1 channel, got %d", stage, len(channels))
 	}
-	chVersion := 0
-	if channels[0].EncryptionVersion.Valid {
-		chVersion = int(channels[0].EncryptionVersion.Int64)
-	}
-	chPlain, err := h.DecryptValue([]byte(channels[0].Config), channels[0].ConfigNonce, chVersion)
-	if err != nil || string(chPlain) != seedChannel {
-		t.Fatalf("%s: channel config = %q (err %v), want %q", stage, chPlain, err, seedChannel)
-	}
+	assertChannelConfigThroughTheRealReader(t, h, queries, s.channelID, stage)
 
 	if err := VerifyVaultKey(ctx, queries, h.keySource, previousSourceOf(h)); err != nil {
 		t.Fatalf("%s: boot key gate refused: %v", stage, err)
@@ -595,6 +667,89 @@ func TestRekeyUpgradesLegacyV1SecretsSealedUnderTheOldKey(t *testing.T) {
 	plain, err := final.DecryptValue(rows[0].EncryptedValue, rows[0].Nonce, 2)
 	if err != nil || string(plain) != seedValue {
 		t.Fatalf("v1 secret after sweep = %q (err %v), want %q", plain, err, seedValue)
+	}
+}
+
+// TestSweepRepairsAStaleBlindIndexWithNoPreviousKeyConfigured.
+//
+// A stale blind index is NOT "encrypted with the previous key", and conflating
+// the two produced a dead end with a false diagnosis.
+//
+// The reachable state: no rotation configured, and an index that does not match
+// what the current key computes. BackfillMetadataAtRest runs on a two-minute
+// budget and `continue`s past any row whose url will not decrypt, so a boot that
+// times out or trips one bad row leaves exactly this. The old classification
+// reported it as keyAgePrevious, so the operator was told "N value(s) are still
+// encrypted with the previous key ... only because the old key is still loaded"
+// when no old key existed, the sweep button was disabled on
+// !previous_key_configured, and POST /rekey answered 400 "no previous key".
+//
+// The sweep can fix it with no old key at all, because an index is RECOMPUTED
+// from cleartext rather than decrypted. So it must.
+func TestSweepRepairsAStaleBlindIndexWithNoPreviousKeyConfigured(t *testing.T) {
+	ctx := context.Background()
+	dbConn, queries := newRekeyDB(t)
+	h := rekeyHandler(dbConn, queries, rekeyOldKey, "")
+	seeded := seedUnderKey(t, h, queries)
+
+	// A backfill that never finished: the index does not match the host.
+	if _, err := dbConn.ExecContext(ctx,
+		`UPDATE vault_entries SET url_bidx = ? WHERE id = ?`,
+		strings.Repeat("ab", 32), seeded.entryID); err != nil {
+		t.Fatalf("plant a stale index: %v", err)
+	}
+
+	// The damage is real and silent: autofill returns nothing, no error.
+	before := httptest.NewRecorder()
+	h.Match(before, withUser(httptest.NewRequest(http.MethodGet, "/api/vault/match?url="+seedURL, nil), seeded.userID))
+	var beforeEntries []vaultEntryMeta
+	if err := json.Unmarshal(before.Body.Bytes(), &beforeEntries); err != nil {
+		t.Fatalf("decode match: %v", err)
+	}
+	if len(beforeEntries) != 0 {
+		t.Fatalf("the planted index still matches (%d entries); this test is not reproducing the state "+
+			"it exists to cover", len(beforeEntries))
+	}
+
+	status, err := h.RekeyStatus(ctx)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Status != "needs_rekey" {
+		t.Fatalf("status = %q, want needs_rekey; a stale lookup index is work the sweep must do", status.Status)
+	}
+	if status.ValuesStale != 1 {
+		t.Fatalf("ValuesStale = %d, want 1", status.ValuesStale)
+	}
+	if status.ValuesOnPrevious != 0 {
+		t.Fatalf(`ValuesOnPrevious = %d with NO previous key configured.
+
+Classifying a stale index as "on the previous key" is a diagnosis the keyring
+contradicts. It tells the operator to go and find a key they never lost, and the
+UI then disables the only button that would have fixed it.`, status.ValuesOnPrevious)
+	}
+
+	// And the sweep must run, with no previous key, and repair it.
+	rep, err := h.RekeyVault(ctx)
+	if errors.Is(err, ErrRekeyNoPreviousKey) {
+		t.Fatal("the sweep refused for want of a previous key, but a blind index is recomputed from " +
+			"cleartext: there is nothing to convert FROM, so no old key is needed")
+	}
+	if err != nil {
+		t.Fatalf("rekey: %v", err)
+	}
+	if rep.RowsConverted != 1 {
+		t.Fatalf("RowsConverted = %d, want 1", rep.RowsConverted)
+	}
+
+	after := httptest.NewRecorder()
+	h.Match(after, withUser(httptest.NewRequest(http.MethodGet, "/api/vault/match?url="+seedURL, nil), seeded.userID))
+	var afterEntries []vaultEntryMeta
+	if err := json.Unmarshal(after.Body.Bytes(), &afterEntries); err != nil {
+		t.Fatalf("decode match: %v", err)
+	}
+	if len(afterEntries) != 1 {
+		t.Fatalf("autofill returned %d entries after the repair, want 1", len(afterEntries))
 	}
 }
 

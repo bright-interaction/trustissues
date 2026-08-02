@@ -99,9 +99,21 @@ Take a backup first (see `docs/BACKUP.md`). Then:
    defeats the point of rotating after a compromise.
 
 `GET /api/admin/vault-key` returns the same report as the UI: a per-column count
-of how many values are on the current key, on the previous key, or unreadable.
-It needs no configuration, so it is also the fastest way to check the state of an
-instance somebody else deployed.
+of how many values are on the current key, on the previous key, stale, or
+unreadable. It needs no configuration, so it is also the fastest way to check the
+state of an instance somebody else deployed.
+
+Two notes on the environment while a rotation is in flight:
+
+- The old key is accepted as `TRUSTISSUES_VAULT_KEY_PREVIOUS` even if it is short
+  or looks weak, with a warning. It describes data that already exists, so
+  refusing it would protect nothing and would block the one rotation that matters
+  most: away from a bad key. Setting it to the SAME value as
+  `TRUSTISSUES_VAULT_KEY` is still refused, because that reads as a configured
+  rotation while converting nothing.
+- Once the sweep is done, every boot warns that the retired key is still loaded,
+  until you remove it. Not once: every boot, because on a headless deploy that
+  log line is the only surface anyone sees.
 
 ### What the sweep covers
 
@@ -116,9 +128,19 @@ keyed HMACs, not ciphertext, so a stale one does not fail to decrypt, it just
 stops matching and browser autofill quietly returns nothing. The sweep recomputes
 them, and autofill looks up under both keys while a rotation is configured.
 
-The list is enforced by a test that walks the real database schema and fails when
+Because they are recomputed from cleartext rather than decrypted, a stale index
+is repaired with **no previous key at all**. That state is reachable without any
+rotation (a metadata backfill that ran out of budget leaves it), so the status
+page reports it as needing a sweep and the button stays available.
+
+Two tests enforce this list. One walks the real database schema and fails when
 any column is neither registered as a keyed surface nor explicitly classified as
 unkeyed, so a new encrypted column cannot ship without a decision about rotation.
+The other states each crypto family's on-disk format as a pair, and asserts in
+both directions that the sweep's reader accepts what the production writer
+produces AND that the production reader accepts what the sweep writes. The second
+half is the one that matters: a sweep that reads correctly and writes a shape the
+product cannot parse has already re-encrypted the original away.
 
 ### If the sweep refuses
 

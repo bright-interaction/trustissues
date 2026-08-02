@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -74,10 +75,14 @@ const (
 	// base64 with no marker, which is why "is this plaintext" is answered by
 	// trying to decrypt rather than by a prefix alone.
 	familyColumnCrypto rekeyFamily = "columncrypto"
-	// familyRawGCM: raw AES-256-GCM with the nonce in a sibling column and no
-	// marker anywhere. Only notification_channels.config. Identical bytes to
-	// familyVaultValue but a different table and a different nonce column, so it
-	// gets its own label rather than being folded in.
+	// familyRawGCM: AES-256-GCM with the nonce in a sibling column and no marker
+	// anywhere, stored BASE64-ENCODED in a TEXT column. Only
+	// notification_channels.config. The ciphertext is produced by the same
+	// EncryptValue as familyVaultValue, but the column is text rather than a
+	// BLOB, so the bytes are base64 on the way in and base64-decoded on the way
+	// out (see decodeRawGCMColumn / encodeRawGCMColumn). That encoding is the
+	// entire reason this is a separate family and not folded into
+	// familyVaultValue.
 	familyRawGCM rekeyFamily = "rawgcm"
 	// familyBlindIndex: NOT ciphertext. A deterministic HMAC-SHA256 of a
 	// normalized URL host under PBKDF2("trustissues:vault:bidx:v1"), used so
@@ -163,11 +168,15 @@ type RekeySurfaceReport struct {
 	Why        string `json:"why"`
 	// Scanned counts rows examined, including ones with nothing in the column.
 	Scanned int `json:"scanned"`
-	// OnCurrent / OnPrevious / Plaintext / Unreadable partition the values that
-	// actually hold something.
+	// OnCurrent / OnPrevious / Plaintext / Stale / Unreadable partition the
+	// values that actually hold something.
 	OnCurrent  int `json:"on_current"`
 	OnPrevious int `json:"on_previous"`
 	Plaintext  int `json:"plaintext"`
+	// Stale counts blind indexes that match no key on the ring. Only
+	// familyBlindIndex can be stale: it is an HMAC recomputed from cleartext, so
+	// unlike ciphertext it can be repaired with no previous key.
+	Stale      int `json:"stale"`
 	Unreadable int `json:"unreadable"`
 	// Converted is populated by a sweep, zero by a read-only scan.
 	Converted int `json:"converted"`
@@ -189,7 +198,8 @@ type RekeyBlocker struct {
 type RekeyReport struct {
 	// Status is one of:
 	//   already_current  every keyed value opens under the current key
-	//   needs_rekey      at least one value is still on the previous key
+	//   needs_rekey      at least one value is still on the previous key, or at
+	//                    least one blind index is stale
 	//   converted        a sweep ran and moved everything to the current key
 	//   blocked          at least one value opens under NEITHER key
 	Status string `json:"status"`
@@ -210,6 +220,12 @@ type RekeyReport struct {
 
 	ValuesOnCurrent  int `json:"values_on_current"`
 	ValuesOnPrevious int `json:"values_on_previous"`
+	// ValuesStale counts blind indexes that match no key on the ring. Kept
+	// separate from ValuesOnPrevious because the remedy is different: a stale
+	// index is repaired by recomputing it, which needs no previous key, so a
+	// store whose only problem is stale indexes must NOT be told to go and find
+	// an old key it never lost.
+	ValuesStale      int `json:"values_stale"`
 	ValuesUnreadable int `json:"values_unreadable"`
 	RowsConverted    int `json:"rows_converted"`
 
@@ -276,7 +292,11 @@ const (
 	keyAgePlaintext               // stored, but not ciphertext under any key
 	keyAgeCurrent                 // opens under the current master key
 	keyAgePrevious                // opens only under the previous master key
-	keyAgeUnknown                 // marked ciphertext that opens under neither
+	// keyAgeStale is a blind index matching NO key on the ring. Blind indexes
+	// only: an HMAC is recomputed from cleartext rather than decrypted, so this
+	// is repairable with no previous key, unlike keyAgeUnknown ciphertext.
+	keyAgeStale
+	keyAgeUnknown // marked ciphertext that opens under neither
 )
 
 // surfaceReports builds the report skeleton in registry order and an index into
@@ -344,7 +364,11 @@ func (h *VaultHandler) RekeyStatus(ctx context.Context) (*RekeyReport, error) {
 	switch {
 	case rep.ValuesUnreadable > 0:
 		rep.Status = "blocked"
-	case rep.ValuesOnPrevious > 0:
+	case rep.ValuesOnPrevious > 0 || rep.ValuesStale > 0:
+		// Stale counts here too. A stale lookup index is silent (autofill returns
+		// nothing, no error anywhere), so a status page that called that store
+		// "already current" would be the one surface that could have reported it
+		// saying nothing.
 		rep.Status = "needs_rekey"
 	default:
 		rep.Status = "already_current"
@@ -412,9 +436,13 @@ func (h *VaultHandler) RekeyVault(ctx context.Context) (*RekeyReport, error) {
 		return rep, ErrRekeyBlocked
 	}
 	if rep.ValuesOnPrevious > 0 && h.previous == nil {
-		// Unreachable in practice (a value cannot be classified "previous"
-		// without a previous key) but stated so the invariant is checked rather
-		// than assumed.
+		// Every classifier reaches keyAgePrevious only by opening (or matching)
+		// the value under h.previous, so this cannot happen. It is stated as an
+		// assertion rather than assumed, and it is deliberately NOT extended to
+		// ValuesStale: a stale blind index is recomputed from cleartext, so the
+		// sweep repairs it with no previous key at all. Refusing that case is
+		// what used to leave an operator with a "needs rekey" banner, a disabled
+		// button and a 400 from the endpoint, for a state the sweep could fix.
 		return nil, ErrRekeyNoPreviousKey
 	}
 
@@ -436,15 +464,15 @@ func (h *VaultHandler) RekeyVault(ctx context.Context) (*RekeyReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("verify after rekey: %w", err)
 	}
-	if verifyRep.ValuesOnPrevious > 0 || verifyRep.ValuesUnreadable > 0 {
+	if verifyRep.ValuesOnPrevious > 0 || verifyRep.ValuesUnreadable > 0 || verifyRep.ValuesStale > 0 {
 		// Roll back via the deferred Rollback. This is the guard that turns "the
 		// sweep says it covered everything" into "the sweep proved it": if a
 		// surface exists that the conversion code does not handle, the values stay
 		// on the previous key and this catches it here instead of after the
 		// operator has deleted the old key.
-		return nil, fmt.Errorf("rekey verification failed: %d value(s) still on the previous key, %d unreadable; "+
-			"the transaction was rolled back and nothing changed",
-			verifyRep.ValuesOnPrevious, verifyRep.ValuesUnreadable)
+		return nil, fmt.Errorf("rekey verification failed: %d value(s) still on the previous key, "+
+			"%d stale lookup index(es), %d unreadable; the transaction was rolled back and nothing changed",
+			verifyRep.ValuesOnPrevious, verifyRep.ValuesStale, verifyRep.ValuesUnreadable)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -512,16 +540,33 @@ func (s *scanCtx) record(sr *RekeySurfaceReport, age keyAge, table, column, sett
 		s.rep.ValuesOnPrevious++
 	case keyAgePlaintext:
 		sr.Plaintext++
+	case keyAgeStale:
+		sr.Stale++
+		s.rep.ValuesStale++
 	case keyAgeUnknown:
-		sr.Unreadable++
-		s.rep.ValuesUnreadable++
-		s.rep.BlockersTotal++
-		if len(s.rep.Blockers) < maxReportedBlockers {
-			s.rep.Blockers = append(s.rep.Blockers, RekeyBlocker{
-				Table: table, Column: column, SettingKey: settingKey, RowID: rowID,
-				Reason: "marked ciphertext that opens under neither the current nor the previous vault key",
-			})
-		}
+		s.blocked(sr, table, column, settingKey, rowID,
+			"marked ciphertext that opens under neither the current nor the previous vault key")
+	}
+}
+
+// recordUnreadable folds in a value that no key opens, with a reason of its own.
+// Same accounting as record(keyAgeUnknown), for callers that know something more
+// specific than "wrong key" (a corrupt encoding, say), because the operator's
+// next action differs.
+func (s *scanCtx) recordUnreadable(sr *RekeySurfaceReport, table, column, settingKey, rowID, reason string) {
+	sr.Scanned++
+	s.blocked(sr, table, column, settingKey, rowID, reason)
+}
+
+func (s *scanCtx) blocked(sr *RekeySurfaceReport, table, column, settingKey, rowID, reason string) {
+	sr.Unreadable++
+	s.rep.ValuesUnreadable++
+	s.rep.BlockersTotal++
+	if len(s.rep.Blockers) < maxReportedBlockers {
+		s.rep.Blockers = append(s.rep.Blockers, RekeyBlocker{
+			Table: table, Column: column, SettingKey: settingKey, RowID: rowID,
+			Reason: reason,
+		})
 	}
 }
 
@@ -678,6 +723,63 @@ func (h *VaultHandler) classifyVaultValue(ciphertext, nonce []byte, encVersion i
 	return nil, keyAgeUnknown
 }
 
+// decodeRawGCMColumn / encodeRawGCMColumn are the on-disk encoding of
+// notification_channels.config. It is NOT raw ciphertext: the column is TEXT and
+// the ciphertext is base64.
+//
+// The failure that motivates this pair. The sweep read row.Config as if it were
+// the AES-GCM ciphertext itself and handed the base64 TEXT to gcm.Open. Nothing
+// opens that, so every store that had ever created a notification channel
+// classified its config as "marked ciphertext that opens under neither key", the
+// sweep refused with ErrRekeyBlocked, and the status page permanently told the
+// operator to restore a key they never lost. The feature was inert on any real
+// instance.
+//
+// Patching only the READ half is worse than leaving it broken. The plan wrote
+// string(ciphertext) back with no base64, which the production reader
+// (internal/alerts.decryptConfig base64-decodes BEFORE decrypting) cannot parse,
+// and the sweep has by then re-encrypted under the new key. Every webhook URL
+// and bot token would be unrecoverable. So the two halves live as one pair, and
+// TestEveryRekeyFamilyMatchesItsProductionWireFormat asserts they agree with
+// the real writer (notifications.go) and the real reader (alerts/channels.go).
+func decodeRawGCMColumn(stored string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(stored)
+}
+
+func encodeRawGCMColumn(ciphertext []byte) string {
+	return base64.StdEncoding.EncodeToString(ciphertext)
+}
+
+// classifyBlindIndex answers which key an existing blind index was computed
+// under by CONSULTING THE KEYRING, rather than inferring "previous" from any
+// mismatch.
+//
+// The failure this fixes: a stale index was reported as keyAgePrevious even with
+// no previous key configured. A backfill that timed out (BackfillMetadataAtRest
+// has a two-minute budget) or that hit a decrypt error and `continue`d leaves
+// exactly that state, and the operator was then told "N values are still
+// encrypted with the previous key ... only because the old key is still loaded"
+// when no old key existed, handed a disabled button, and answered 400
+// "TRUSTISSUES_VAULT_KEY_PREVIOUS is not set" if they called the endpoint
+// directly. A dead end with a false diagnosis, for the one surface the sweep can
+// repair with no old key at all: an index is RECOMPUTED from cleartext, never
+// decrypted.
+//
+// keyAgeStale is therefore its own answer: work the sweep must do, that needs no
+// previous key.
+func (h *VaultHandler) classifyBlindIndex(stored, want, scope, plain string) keyAge {
+	if stored == "" && want == "" {
+		return keyAgeEmpty
+	}
+	if stored == want {
+		return keyAgeCurrent
+	}
+	if h.previous != nil && stored != "" && stored == blindIndexWith(h.previous.bidx, scope, plain) {
+		return keyAgePrevious
+	}
+	return keyAgeStale
+}
+
 // legacyKeyFor re-derives the v1 key from a master key string.
 //
 // It does NOT read h.legacyKey, on purpose: MigrateEncryption zeroes that field
@@ -781,20 +883,11 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		wantURLBidx := h.urlBlindIndex(scope, plains["url"])
 		wantAliasBidx := h.urlBlindIndex(scope, plains["alias_url"])
 
-		urlBidxAge, aliasBidxAge := keyAgeEmpty, keyAgeEmpty
-		if row.UrlBidx != "" || wantURLBidx != "" {
-			urlBidxAge = keyAgeCurrent
-			if row.UrlBidx != wantURLBidx {
-				urlBidxAge = keyAgePrevious
-				needsWrite = true
-			}
-		}
-		if row.AliasUrlBidx != "" || wantAliasBidx != "" {
-			aliasBidxAge = keyAgeCurrent
-			if row.AliasUrlBidx != wantAliasBidx {
-				aliasBidxAge = keyAgePrevious
-				needsWrite = true
-			}
+		urlBidxAge := h.classifyBlindIndex(row.UrlBidx, wantURLBidx, scope, plains["url"])
+		aliasBidxAge := h.classifyBlindIndex(row.AliasUrlBidx, wantAliasBidx, scope, plains["alias_url"])
+		if urlBidxAge == keyAgePrevious || urlBidxAge == keyAgeStale ||
+			aliasBidxAge == keyAgePrevious || aliasBidxAge == keyAgeStale {
+			needsWrite = true
 		}
 		sc.record(sc.surface("vault_entries", "url_bidx", ""), urlBidxAge, "vault_entries", "url_bidx", "", row.ID)
 		sc.record(sc.surface("vault_entries", "alias_url_bidx", ""), aliasBidxAge, "vault_entries", "alias_url_bidx", "", row.ID)
@@ -926,7 +1019,20 @@ func (h *VaultHandler) scanNotificationChannels(ctx context.Context, q *db.Queri
 			sc.record(sr, age, "notification_channels", "config", "", row.ID)
 			continue
 		}
-		plain, age := h.classifyVaultValue([]byte(row.Config), row.ConfigNonce, encVersion)
+		// The column is base64 TEXT, not raw ciphertext. See decodeRawGCMColumn.
+		raw, decErr := decodeRawGCMColumn(row.Config)
+		if decErr != nil {
+			// Marked as encrypted (encryption_version > 0) but not even valid
+			// base64, so no key can open it and guessing would destroy it. Report
+			// it as a blocker with its own reason rather than the generic
+			// wrong-key one, because the fix is different: the row is corrupt, not
+			// sealed under a key that is missing.
+			sc.recordUnreadable(sr, "notification_channels", "config", "", row.ID,
+				"encryption_version says this config is encrypted, but the stored value is not valid base64, "+
+					"so it is corrupt rather than sealed under a missing key")
+			continue
+		}
+		plain, age := h.classifyVaultValue(raw, row.ConfigNonce, encVersion)
 		sc.record(sr, age, "notification_channels", "config", "", row.ID)
 		if age != keyAgePrevious && !(age == keyAgeCurrent && encVersion == 1) {
 			zero(plain)
@@ -938,7 +1044,7 @@ func (h *VaultHandler) scanNotificationChannels(ctx context.Context, q *db.Queri
 			return fmt.Errorf("re-encrypt notification channel %s: %w", row.ID, encErr)
 		}
 		plan.channels = append(plan.channels, db.RekeyNotificationChannelConfigParams{
-			Config:            string(ct),
+			Config:            encodeRawGCMColumn(ct),
 			ConfigNonce:       nc,
 			EncryptionVersion: sql.NullInt64{Int64: 2, Valid: true},
 			ID:                row.ID,

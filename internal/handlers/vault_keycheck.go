@@ -405,6 +405,23 @@ func EnforceVaultKey(ctx context.Context, queries *db.Queries, vaultKeys ...stri
 				"Reads work only because TRUSTISSUES_VAULT_KEY_PREVIOUS is set. " +
 				"Run the re-encrypt sweep (Settings -> Encryption, or POST /api/admin/vault-key/rekey, " +
 				"or set TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT=1) and only then remove the previous key.")
+		} else if previousKey != "" {
+			// The sweep is DONE and the previous key is still in the environment.
+			//
+			// Said on every boot, not once. After the sweep re-seals the sentinel
+			// SentinelOnPreviousKey answers false forever, so the only thing that
+			// ever mentioned the retired key was the sweep's own one-shot log line
+			// in whichever process happened to run it. The admin UI covers this
+			// with a green banner, which is no help at all to a headless deploy
+			// driven by TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT: exactly the
+			// deployments where nobody opens Settings. A retired key that stays
+			// loaded still opens this data and still opens every pre-sweep backup,
+			// which is the whole thing a rotation after a compromise is meant to
+			// end.
+			slog.Warn("vault: rotation is complete but TRUSTISSUES_VAULT_KEY_PREVIOUS is STILL SET. " +
+				"Every value in this store is now sealed under the current key, so the retired key is no " +
+				"longer needed for anything: it is simply still loaded and still opens this data. " +
+				"Remove it from the environment and restart.")
 		}
 		return
 	}

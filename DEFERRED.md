@@ -66,12 +66,34 @@ The sweep still refuses to touch unmarked values it cannot open, and it tries
 BOTH keys on unmarked legacy ciphertext, because classifying old-key ciphertext
 as plaintext is exactly what produces the irreversible `Enc_new(Enc_old(v))`.
 
-**The guard.** `vault_rekey_coverage_test.go` walks the real migrated schema and
+**The guards.** `vault_rekey_coverage_test.go` walks the real migrated schema and
 fails when any column is neither a registered keyed surface nor an explicit
 entry in `notKeyedColumns` with a stated reason. Adding an encrypted column
 without deciding how it rotates does not compile past CI. A second test asserts
 every registered surface is actually reached by a scanner, so a surface cannot
 sit in the operator's status page reporting zero rows and reading as clean.
+
+Both of those are INVENTORY guards, and inventory was not enough. They both
+answered yes for `notification_channels.config` while the sweep was handing
+base64 text to AES-GCM (so it refused every store that had ever created a
+channel) and writing raw bytes into a base64 column (which would have destroyed
+every webhook URL and bot token, after the original had been re-encrypted away).
+The column was registered. It was scanned. It was also completely broken.
+
+So `vault_rekey_format_test.go` states each crypto family's on-disk format as a
+pair and asserts both directions: the sweep's reader must accept what the
+production writer produces, and the production reader must accept what the
+sweep's writer produces. The closures call the real functions on both sides,
+including the notification reader in `internal/alerts`, so the guard cannot drift
+into asserting a private theory of the format. A new family without a contract
+fails the test.
+
+`vault_rotation_callsites_test.go` closes the other half: the dual-key helpers
+each had a unit test and every one of their CALL SITES was untested, so all four
+could be reverted to single-key with the suite still green. It drives `Match`,
+`Login` with 2FA, the SMTP test button and the invitation mailer against a
+mid-rotation store, and adds source-level guards so a new call site cannot pass
+the current key alone or look an entry up under a single blind index.
 
 ## (b) Append-only / tamper-evident audit tables
 
