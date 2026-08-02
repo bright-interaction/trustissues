@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // The instance must never be left with zero active admins.

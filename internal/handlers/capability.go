@@ -18,9 +18,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/capability"
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/capability"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // CapabilityHandler exposes the trustissues secrets bridge:

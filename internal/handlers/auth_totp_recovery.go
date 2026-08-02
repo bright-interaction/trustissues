@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/brightinteraction/trustissues/internal/db"
-	"github.com/brightinteraction/trustissues/internal/totp"
+	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/totp"
 )
 
 // recoveryCASAttempts bounds the retry. Contention is two logins for ONE account

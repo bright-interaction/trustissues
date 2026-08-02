@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // TestManualRotateRefusesReminderOnlyProviders locks the fix for a destroy-on-

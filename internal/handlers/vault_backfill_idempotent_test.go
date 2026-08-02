@@ -6,7 +6,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/brightinteraction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/config"
 )
 
 // TestMetaColumnsBackfillIsIdempotent is the regression lock for a

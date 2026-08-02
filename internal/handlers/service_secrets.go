@@ -24,9 +24,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // ServiceSecretsHandler exposes these endpoints:

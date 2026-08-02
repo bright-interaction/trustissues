@@ -1,4 +1,4 @@
-module github.com/brightinteraction/trustissues
+module github.com/bright-interaction/trustissues
 
 go 1.26
 

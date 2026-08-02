@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/go-chi/chi/v5"
 )
 

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 )
 
 // TestMain lowers the argon2id cost for this package.

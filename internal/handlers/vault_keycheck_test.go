@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/columncrypto"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/columncrypto"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestVaultKeyCheckRefusesAWrongKey locks the boot gate.

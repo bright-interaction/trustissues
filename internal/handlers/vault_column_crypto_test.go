@@ -6,8 +6,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestColumnCryptoRoundTrip locks the core invariant: encryptColumn produces a

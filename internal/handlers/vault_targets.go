@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // RotationTarget defines where a rotated key should be delivered.

@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/middleware"
-	"github.com/brightinteraction/trustissues/internal/shield"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/shield"
 )
 
 // TestMCPToolResultSurvivesAnEnabledShield locks the fix for a shipped feature

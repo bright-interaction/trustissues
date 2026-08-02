@@ -3,7 +3,7 @@ package handlers
 import (
 	"context"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // entryGrant is what one user may do with one vault entry, right now.

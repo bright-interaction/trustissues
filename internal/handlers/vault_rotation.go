@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // rotationCheckInterval is how often the background worker looks for entries

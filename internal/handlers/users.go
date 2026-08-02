@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/db"
-	"github.com/brightinteraction/trustissues/internal/middleware"
-	"github.com/brightinteraction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/go-chi/chi/v5"
 )
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // There is exactly ONE client-IP derivation in the codebase.

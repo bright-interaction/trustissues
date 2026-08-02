@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestNeverRotatedEntryIsNotInstantlyDue locks the fix for the worst rotation

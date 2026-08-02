@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // providerRole is an entry's provider resolved ONCE, so no branch has to

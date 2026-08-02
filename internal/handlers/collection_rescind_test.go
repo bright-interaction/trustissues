@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestPendingInviteCanBeRescinded locks the fix for an invitation that could

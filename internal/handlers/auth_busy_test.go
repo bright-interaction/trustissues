@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 )
 
 // TestCapacityErrorIsNeverAFailedLoginAttempt pins a contract that was written

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
 	_ "github.com/mattn/go-sqlite3"
 )
 

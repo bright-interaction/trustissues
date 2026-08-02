@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestRecordRotationFailureLeavesEvidenceEverywhere locks the fix for the

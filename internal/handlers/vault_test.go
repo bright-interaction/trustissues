@@ -10,8 +10,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // newVaultTestDB opens an in-memory SQLite database with the vault schema

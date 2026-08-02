@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestRemovedMemberCannotResolveSharedSecretByName closes the EIGHTH door onto
