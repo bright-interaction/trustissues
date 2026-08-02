@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 )
 
 // purgeTargetsConfiguredBy removes every rotation target in a collection that
@@ -60,7 +61,20 @@ func (h *CollectionHandler) purgeTargetsConfiguredBy(ctx context.Context, collec
 			slog.Error("collections: could not encrypt purged targets", "entry", row.ID, "error", encErr)
 			continue
 		}
-		if uErr := h.queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+		// Narrowing only, and the ticket is derived from the two slices rather
+		// than asserted. See the twin in vault_target_purge.go.
+		tk, tkErr := egressgate.Decide(egressgate.Request{
+			EntryID: row.ID,
+			What:    egressFieldRotationTarget,
+			Before:  deliveryDestinations(targets),
+			After:   deliveryDestinations(kept),
+		})
+		if tkErr != nil {
+			slog.Error("collections: refusing to persist purged targets, the write is not a narrowing",
+				"entry", row.ID, "error", tkErr)
+			continue
+		}
+		if uErr := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
 			RotationTargets: toNullString(enc),
 			ID:              row.ID,
 		}); uErr != nil {

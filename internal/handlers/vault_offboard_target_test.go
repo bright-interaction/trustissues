@@ -37,7 +37,15 @@ func TestOffboardedMemberStopsReceivingTheRotatedSecret(t *testing.T) {
 		editor: collRoleEditor,
 	})
 	const entryID = "entry-stripe"
-	mustEntry(t, h, queries, entryID, owner, "Stripe live key", "sk_live_ORIGINAL")
+	// PREMISE CHANGE, round 5: the configurer is the entry's CREATOR. Naming a
+	// delivery destination is now held to the same right as widening
+	// destination_patterns, so a plain editor cannot configure one at all and
+	// targetStillAuthorized asks the same question at delivery. The property is
+	// unchanged and still the serious one: someone who could legitimately
+	// configure delivery, and is then offboarded, must stop receiving the secret,
+	// and the rotation performed to revoke them must not be what hands them the
+	// new value.
+	mustEntry(t, h, queries, entryID, editor, "Stripe live key", "sk_live_ORIGINAL")
 	placeInCollection(t, queries, entryID, "coll-pay")
 
 	// The editor's sink. Records anything delivered to it.

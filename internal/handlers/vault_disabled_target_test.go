@@ -39,12 +39,19 @@ func TestDisabledUserStopsReceivingTheRotatedSecret(t *testing.T) {
 		editor: collRoleEditor,
 	})
 	const entryID = "entry-disable"
-	mustEntry(t, h, queries, entryID, owner, "Stripe live key", "sk_live_ORIGINAL")
+	// PREMISE CHANGE, round 5: the configurer is the entry's CREATOR, because
+	// naming a delivery destination is now held to the same right as widening
+	// destination_patterns and a plain editor no longer has it. `owner` stays the
+	// collection manager. Nothing about the property under test moves: a disabled
+	// account must stop receiving the rotated secret, and grantFor refuses a
+	// disabled user before it looks at ownership at all, so the creator is exactly
+	// as good a subject as an editor was.
+	mustEntry(t, h, queries, entryID, editor, "Stripe live key", "sk_live_ORIGINAL")
 	placeInCollection(t, queries, entryID, "coll-disable")
 
 	target := RotationTarget{
 		Type:         "webhook",
-		Label:        "editor backup",
+		Label:        "creator backup",
 		WebhookURL:   "https://sink.example.com/hook",
 		ConfiguredBy: editor,
 	}

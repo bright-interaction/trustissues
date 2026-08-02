@@ -233,8 +233,25 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	}
 	// isAdmin false on purpose: this asks whether THIS user still has access,
 	// not whether the process is privileged.
-	if _, canWrite := vault.entryAccessFor(ctx, target.ConfiguredBy, false, entryID); !canWrite {
-		return fmt.Errorf("delivery target skipped: the user who configured it no longer has write access to this secret")
+	//
+	// mayDirectSecretEgress, not entryAccessFor. The doc comment above this
+	// function has always said this asks "whether they would still be allowed to
+	// set it up today", and from round 5 that answer is the widening right rather
+	// than plain write access. Asking the weaker question would leave the fix
+	// half-applied in exactly the cases that matter most on a shared instance:
+	// UpdateTargets now refuses an editor at the write, but every row already
+	// stored by an editor on a running deployment, and every row that arrives
+	// through a restored backup, an import, or an older binary, would keep
+	// delivering. Refused at the write AND at delivery is the same discipline the
+	// provider pin already follows, and for the same reason: the write gate can
+	// only guard writes it sees.
+	//
+	// mayDirectSecretEgress subsumes the old check. It calls grantFor and requires
+	// manage before it looks at anything else, so every case the write check
+	// caught is still caught, with the account-status rows ahead of it.
+	if !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {
+		return fmt.Errorf("delivery target skipped: the user who configured it may no longer choose " +
+			"where this secret is delivered (that takes the secret's owner or an instance admin)")
 	}
 	return nil
 }
@@ -420,4 +437,25 @@ func rotationTargetIdentity(t RotationTarget) string {
 	default:
 		return t.Type + "|" + t.Label
 	}
+}
+
+// rotationTargetAttribution keys a target by everything that decides WHOSE
+// authority the delivery runs under, so an unchanged row keeps its original
+// ConfiguredBy and a changed one is stamped to whoever changed it.
+//
+// It is the destination PLUS auth_token, and the auth_token half is the reason
+// this is a second function rather than a reuse of rotationTargetIdentity.
+// deliverToForgejoSecret resolves auth_token against ConfiguredBy, so preserving
+// the attribution across an auth_token edit let an editor point somebody else's
+// identity at a different one of their secrets and have it spent as the bearer
+// token for the delivery. Changing which credential is spent is a new decision
+// and belongs to whoever made it.
+//
+// It deliberately still excludes the label and the webhook HMAC secret: renaming
+// a target or rotating its signing key changes neither the destination nor the
+// identity that authorizes it, and re-attributing on those would let an
+// unrelated save launder a departed member's target back to life, which is the
+// bug the preservation rule exists to prevent.
+func rotationTargetAttribution(t RotationTarget) string {
+	return rotationTargetIdentity(t) + "|auth=" + t.AuthToken
 }

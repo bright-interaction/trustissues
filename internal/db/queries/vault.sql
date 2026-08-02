@@ -218,7 +218,11 @@ UPDATE vault_entries SET provider = ?, provider_meta = ?, auto_rotate = ?, updat
 UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: ListVaultEntriesForMetaBackfill :many
-SELECT id, provider_meta, rotation_targets FROM vault_entries;
+-- provider is selected alongside the two columns being re-encrypted because the
+-- egress write gate derives the entry's reachable host set from the
+-- (provider, provider_meta) pair. A backfill must be able to show that its write
+-- moves that set nowhere, and it cannot show that without the provider name.
+SELECT id, provider, provider_meta, rotation_targets FROM vault_entries;
 
 -- ============================================================================
 -- Metadata-at-rest backfill (encrypt url/alias_url/username/category/notes,

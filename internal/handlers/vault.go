@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/go-chi/chi/v5"
@@ -1048,7 +1050,26 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, r, expErr.Error())
 		return
 	}
-	err = h.queries.CreateVaultEntry(ctx, db.CreateVaultEntryParams{
+	// The INSERT carries provider and provider_meta, so it is a host-choosing
+	// write and it goes through the same door as every other one.
+	//
+	// The oracle is a constant true and says why in code rather than by being
+	// absent: the row being created carries this caller's user_id, so they are
+	// exactly the principal mayDirectSecretEgress would name. Asking the real
+	// oracle here would query a row that does not exist yet and get false.
+	createTicket, createTkErr := egressgate.Decide(egressgate.Request{
+		EntryID:     entryID,
+		What:        egressFieldProvider,
+		After:       providerDestinations(req.Provider, ParseProviderMeta(req.ProviderMeta)),
+		Covers:      providerDestinationCovers,
+		MayRedirect: func() bool { return true }, // the creator, by construction
+	})
+	if createTkErr != nil {
+		logError(r, "vault.create: egress decision failed", "entry", entryID, "error", createTkErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	err = createEntryRow(ctx, h.queries, createTicket, db.CreateVaultEntryParams{
 		ID:                   entryID,
 		UserID:               userID,
 		Name:                 req.Name,
@@ -1122,7 +1143,10 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// Seed the capability-bridge columns from the provider's defaults so the
 	// secret is immediately usable through /secrets/issue + /proxy (dockyard
 	// did this in its vault-enroll path). Only untouched rows are filled.
-	h.seedCapabilityDefaults(ctx, h.queries, r, entryID, req.Provider)
+	// The oracle is a constant true for the same reason as the INSERT above: this
+	// caller is the row's user_id, which is the principal the widening right
+	// belongs to.
+	h.seedCapabilityDefaults(ctx, h.queries, r, entryID, req.Provider, func() bool { return true })
 
 	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", req.Name, userID))
 
@@ -1247,7 +1271,16 @@ func collectionLabel(collectionID string) string {
 // Same shape as the activity-log write that used to sit inside this handler's
 // transaction. Any helper called between BeginTx and Commit has to take the
 // transaction, not reach for h.queries.
-func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries, r *http.Request, entryID, provider string) {
+//
+// mayWiden is the authority oracle for the ceiling this seeds. It is a
+// parameter rather than a recomputation because the two callers know different
+// things: Create is the principal who just deposited the plaintext, while Update
+// has already resolved mayDirectSecretEgress for the request. Passing it keeps
+// the seed on the SAME decision as an explicit ceiling write, which matters
+// because this IS a ceiling write: it turns "no agent access" into "one host",
+// and three presets (supabase, auth0, grafana) expand a tenant value out of the
+// entry's own provider_meta, which an editor can set.
+func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries, r *http.Request, entryID, provider string, mayWiden func() bool) {
 	if provider == "" {
 		return
 	}
@@ -1271,7 +1304,24 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries
 	if inj == "" {
 		inj = "{}"
 	}
-	if err := q.SeedVaultEntryCapabilityDefaults(ctx, db.SeedVaultEntryCapabilityDefaultsParams{
+	// The seed only lands on an UNTOUCHED row (the SQL carries
+	// destination_patterns = '[]' AND injection_spec = '{}' in its WHERE), so the
+	// set it moves from is empty and every seeded host is an addition.
+	tk, tkErr := egressgate.Decide(egressgate.Request{
+		EntryID:     entryID,
+		What:        egressFieldDestinations,
+		After:       ceilingDestinations(parseDestinationPatterns(dests)),
+		Covers:      destinationCovers,
+		MayRedirect: mayWiden,
+	})
+	if tkErr != nil {
+		// Not seeding is fail-closed: the bridge refuses to mint until somebody
+		// with the right sets a ceiling explicitly.
+		logError(r, "vault: capability preset not seeded; the caller may not widen this secret's egress",
+			"entry_id", entryID, "provider", provider, "reason", tkErr)
+		return
+	}
+	if err := seedEntryCapabilityDefaults(ctx, q, tk, db.SeedVaultEntryCapabilityDefaultsParams{
 		DestinationPatterns: dests,
 		InjectionSpec:       inj,
 		ID:                  entryID,
@@ -1492,11 +1542,31 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 		// Narrowing is open to anyone with manage (clearing the list is the only
 		// per-secret agent revocation the product has). Widening is not.
-		if widened := widenedDestinations(parseDestinationPatterns(stored.DestinationPatterns), patterns); len(widened) > 0 && !mayWidenEgress {
-			logError(r, "vault.update: refused an egress widening", "entry", id, "user", userID, "added", widened)
-			writeError(w, r, http.StatusForbidden, "egress_widening_denied",
-				fmt.Sprintf("you can narrow where this secret may be sent, but adding %v takes the secret's owner or an instance admin. "+
-					"Editing an entry does not carry the right to choose where its value is delivered", widened))
+		//
+		// Covers is destinationCovers, the ceiling grammar, so replacing
+		// "api.openai.com/*" with "api.openai.com/v1/chat" reads as a narrowing
+		// rather than as an addition. That is the one thing a plain set
+		// difference would get wrong here, and getting it wrong would put
+		// tightening a ceiling behind the widening right.
+		ceilingTicket, ceilErr := egressgate.Decide(egressgate.Request{
+			EntryID:     id,
+			What:        egressFieldDestinations,
+			Before:      ceilingDestinations(parseDestinationPatterns(stored.DestinationPatterns)),
+			After:       ceilingDestinations(patterns),
+			Covers:      destinationCovers,
+			MayRedirect: func() bool { return mayWidenEgress },
+		})
+		if ceilErr != nil {
+			var denied *egressgate.DeniedError
+			if errors.As(ceilErr, &denied) {
+				logError(r, "vault.update: refused an egress widening", "entry", id, "user", userID, "added", denied.Added)
+				writeError(w, r, http.StatusForbidden, "egress_widening_denied",
+					fmt.Sprintf("you can narrow where this secret may be sent, but adding %v takes the secret's owner or an instance admin. "+
+						"Editing an entry does not carry the right to choose where its value is delivered", denied.Added))
+				return
+			}
+			logError(r, "vault.update: egress decision failed", "entry", id, "error", ceilErr)
+			writeInternalError(w, r, "internal server error")
 			return
 		}
 
@@ -1506,7 +1576,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		if err := qtx.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+		if err := setEntryDestinationPatterns(ctx, qtx, ceilingTicket, db.UpdateVaultEntryDestinationPatternsParams{
 			DestinationPatterns: string(encoded),
 			ID:                  id,
 		}); err != nil {
@@ -1849,17 +1919,37 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			if change := authorityForEgressChange(current.Provider.String, beforeMeta, provider, afterMeta); change.widensEgress() {
-				if !mayWidenEgress {
+			// One decision, one ticket, and the ticket is what the write demands.
+			// authorityForEgressChange still computes the resulting host set for
+			// the pin loop below; the AUTHORITY half now goes through the same
+			// egressgate.Decide every other host-choosing column uses, so the
+			// three of them cannot drift into three different answers again.
+			change := authorityForEgressChange(current.Provider.String, beforeMeta, provider, afterMeta)
+			providerTicket, provErr := egressgate.Decide(egressgate.Request{
+				EntryID:     id,
+				What:        egressFieldProvider,
+				Before:      providerDestinations(current.Provider.String, beforeMeta),
+				After:       providerDestinations(provider, afterMeta),
+				Covers:      providerDestinationCovers,
+				MayRedirect: func() bool { return mayWidenEgress },
+			})
+			if provErr != nil {
+				var denied *egressgate.DeniedError
+				if errors.As(provErr, &denied) {
 					logError(r, "vault.update: refused an egress widening through provider/provider_meta",
-						"entry", id, "user", userID, "added", change.added)
+						"entry", id, "user", userID, "added", denied.Added)
 					writeError(w, r, http.StatusForbidden, "egress_widening_denied",
 						fmt.Sprintf("changing the provider configuration would let this secret be sent to %v, "+
 							"which takes the secret's owner or an instance admin. Editing an entry does not carry "+
 							"the right to choose where its value is delivered (the fields that decide this are the "+
-							"provider and the provider_meta keys %v)", change.added, egressInfluencingMetaKeys()))
+							"provider and the provider_meta keys %v)", denied.Added, egressInfluencingMetaKeys()))
 					return
 				}
+				logError(r, "vault.update: provider egress decision failed", "entry", id, "error", provErr)
+				writeInternalError(w, r, "internal server error")
+				return
+			}
+			if change.widensEgress() {
 				// The pin outranks the widening right, exactly as it does for
 				// destination_patterns: while an admin has the instance pointed at
 				// this entry, its key goes to that provider and nowhere else, and
@@ -1900,7 +1990,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				}
 				encMeta = enc
 			}
-			if err := qtx.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+			if err := setEntryProvider(ctx, qtx, providerTicket, db.UpdateVaultEntryProviderParams{
 				Provider:     toNullString(provider),
 				ProviderMeta: toNullString(encMeta),
 				AutoRotate:   sql.NullInt64{Int64: autoRotate, Valid: true},
@@ -1922,12 +2012,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			// ceiling empty, which is fail-closed: the bridge refuses to mint at
 			// all until the owner sets one.
 			if req.Provider != nil {
-				if mayWidenEgress {
-					h.seedCapabilityDefaults(ctx, qtx, r, id, provider)
-				} else {
-					logError(r, "vault.update: provider preset not seeded; the caller may not widen this secret's egress",
-						"entry", id, "user", userID, "provider", provider)
-				}
+				h.seedCapabilityDefaults(ctx, qtx, r, id, provider, func() bool { return mayWidenEgress })
 			}
 		}
 	}
@@ -2491,7 +2576,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// other outbound call and it gets the same answer.
 	deps := rotationDeps{queries: h.queries, vault: h}
 	if warn := revokeOldKeyAndPersistMeta(withProviderEgress(ctx, providerName, providerMeta),
-		deps, id, meta.Name, providerMeta, newValue); warn != "" {
+		deps, id, meta.Name, providerName, providerMeta, newValue); warn != "" {
 		revokeWarn = warn
 	}
 
@@ -2891,11 +2976,11 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	priorBy := make(map[string]string, len(stored))
 	for _, t := range stored {
 		if t.ConfiguredBy != "" {
-			priorBy[rotationTargetIdentity(t)] = t.ConfiguredBy
+			priorBy[rotationTargetAttribution(t)] = t.ConfiguredBy
 		}
 	}
 	for i := range targets {
-		if who, ok := priorBy[rotationTargetIdentity(targets[i])]; ok {
+		if who, ok := priorBy[rotationTargetAttribution(targets[i])]; ok {
 			targets[i].ConfiguredBy = who
 			continue
 		}
@@ -2923,29 +3008,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// NOTE, deliberately not a check. Adding a delivery target is the same ACT as
-	// widening destination_patterns (deliverToWebhook POSTs {"new_value": <the
-	// secret>} to a URL somebody named), but it is not held to the same right,
-	// and that is a decision rather than an oversight.
-	//
-	// Any member with manage may configure delivery here. Four earlier rounds
-	// looked straight at that and hardened it instead of forbidding it:
-	// ConfiguredBy is stamped server-side and an auth_token resolves as the
-	// CONFIGURER, delivery re-checks that they still have write access
-	// (targetStillAuthorized), leaving purges their targets, and a stale panel
-	// cannot resurrect one. Reversing it is a product change to how teams run
-	// shared rotation, not a fix, and it would rewrite the premise of those four
-	// guards.
-	//
-	// What is closed here is the case this audit is about: an entry wired into
-	// the AI gateway carries no delivery target at all (the pin below, and its
-	// twin in DeliverRotatedKey). The residual, and the exact escalation path
-	// that keeps it interesting (an API-key caller who cannot unlock or rotate
-	// sets auto_rotate and waits for the scheduler to hand their webhook a fresh
-	// provider credential), is written up in DEFERRED (i) and THREAT-MODEL rather
-	// than left for the next reviewer to rediscover.
-	//
-	// The provider pin covers this door too. A rotation target is a DELIVERY
+	// The provider pin. A rotation target is a DELIVERY
 	// destination: deliverToWebhook POSTs {"new_value": <the secret>} to a URL
 	// the caller names. So an entry wired as the instance's AI provider key must
 	// not carry one, or "the operator's key only ever goes to the provider"
@@ -2974,6 +3037,55 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// MAY THIS CALLER REDIRECT THIS SECRET? The round-5 blocker, in one call.
+	//
+	// A delivery target is a destination. deliverToWebhook POSTs
+	// {"new_value": <the freshly minted plaintext>} to a URL the caller named,
+	// which is the same act as pointing the capability proxy at a host the caller
+	// named, and until now the two were held to different rights on the same
+	// entry: PUT /api/vault/{id} refused an accepted editor with 403
+	// egress_widening_denied, while PUT /api/vault/{id}/targets took whatever
+	// they sent. A vault_only account (the role the PUBLIC invite-redeem endpoint
+	// hands out) holding an EDITOR seat on somebody else's shared entry used the
+	// second door and the scheduler delivered the credential.
+	//
+	// Same question, same answer, one implementation: egressgate.Decide asks
+	// mayDirectSecretEgress exactly when the write ADDS a destination, and hands
+	// back the ticket setEntryRotationTargets demands.
+	//
+	// NARROWING IS STILL OPEN TO ANYONE WITH MANAGE. Removing a target, clearing
+	// the list, renaming a label, rotating a webhook's HMAC secret and re-saving
+	// the panel unchanged all add nothing and never reach the oracle. So the
+	// revocation lever an operator needs in a hurry is not behind the stricter
+	// right, and neither is configuring a "notify" target, which transmits no
+	// value at all.
+	//
+	// THIS CHANGES A PREMISE FOUR OTHER GUARDS WERE WRITTEN AGAINST, deliberately.
+	// leave-purge, the stale-panel version check, ConfiguredBy stamping and the
+	// target read gate were all built on "a member with manage may configure
+	// delivery, safely, by attribution". The safety-by-attribution machinery is
+	// unchanged and still load-bearing (an admin or the creator can also be
+	// offboarded, and notify targets are still configured by editors); what
+	// changed is that attribution is no longer the ONLY thing standing between an
+	// editor and the plaintext. See DEFERRED (i).
+	tk, egErr := h.decideDeliveryEgress(r.Context(), userID, middleware.IsAdmin(r.Context()), id, stored, targets)
+	if egErr != nil {
+		var denied *egressgate.DeniedError
+		if errors.As(egErr, &denied) {
+			hosts := deliveryDestinationHosts(denied.Added)
+			logError(r, "vault.targets: refused an egress widening",
+				"entry", id, "user", userID, "added", hosts)
+			writeError(w, r, http.StatusForbidden, "egress_widening_denied",
+				fmt.Sprintf("you can remove or narrow this secret's delivery targets, but adding one that "+
+					"sends it to %v takes the secret's owner or an instance admin. Editing an entry does "+
+					"not carry the right to choose where its value is delivered", hosts))
+			return
+		}
+		logError(r, "vault.targets: egress decision failed", "entry", id, "error", egErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
 	data, _ := json.Marshal(targets)
 	// Encrypt at rest: rotation_targets embeds webhook HMAC secrets that
 	// should not sit in cleartext in a DB dump.
@@ -2983,10 +3095,11 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to update targets")
 		return
 	}
-	if err := h.queries.UpdateVaultEntryRotationTargets(r.Context(), db.UpdateVaultEntryRotationTargetsParams{
+	if err := setEntryRotationTargets(r.Context(), h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
 		RotationTargets: toNullString(encTargets),
 		ID:              id,
 	}); err != nil {
+		logError(r, "vault.updateTargets: persist failed", "entry", id, "error", err)
 		writeInternalError(w, r, "failed to update targets")
 		return
 	}
@@ -3037,7 +3150,30 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	// This route carries the STORED provider and provider_meta forward verbatim
+	// and changes only auto_rotate, so it moves the reachable host set nowhere.
+	// Deriving both sides from the SAME loaded row rather than passing a
+	// "trust me, nothing changed" flag is the point: if a future edit ever puts
+	// a caller-supplied provider into this request body, the two sides stop
+	// matching and the ticket is refused instead of silently reopening round 4
+	// through a door nobody is watching.
+	scheduleMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", "provider_meta"))
+	scheduleTicket, schedTkErr := egressgate.Decide(egressgate.Request{
+		EntryID: id,
+		What:    egressFieldProvider,
+		Before:  providerDestinations(current.Provider.String, scheduleMeta),
+		After:   providerDestinations(current.Provider.String, scheduleMeta),
+		Covers:  providerDestinationCovers,
+		MayRedirect: func() bool {
+			return h.mayDirectSecretEgress(ctx, middleware.GetUserID(ctx), middleware.IsAdmin(ctx), id)
+		},
+	})
+	if schedTkErr != nil {
+		logError(r, "vault.schedule: egress decision failed", "entry", id, "error", schedTkErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if err := setEntryProvider(ctx, h.queries, scheduleTicket, db.UpdateVaultEntryProviderParams{
 		Provider:     current.Provider,
 		ProviderMeta: current.ProviderMeta,
 		AutoRotate:   sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},

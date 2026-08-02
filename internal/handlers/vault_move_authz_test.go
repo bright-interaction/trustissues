@@ -314,9 +314,24 @@ func TestOwnerRetainsAccessInsideCollection(t *testing.T) {
 
 // TestUpdateTargetsStampsConfiguringUser proves the rotation-target
 // exfiltration fix: the configuring identity is recorded server-side (a
-// client-supplied configured_by is ignored) and the forgejo auth_token resolves
-// against that identity, so an editor cannot reach the entry owner's unrelated
-// personal secrets.
+// client-supplied configured_by is ignored), the forgejo auth_token resolves
+// against that identity, and changing WHICH credential is spent re-attributes
+// the target to whoever changed it.
+//
+// PREMISE CHANGE, round 5. The editor used to be the one who created the target,
+// because manage was enough to name a delivery destination. It is not any more:
+// adding one is held to the same right as widening destination_patterns. So the
+// owner configures it and the editor works on it afterwards, which is a sharper
+// version of the same question, and it exposed a sibling of the round-5 defect
+// that the old shape could not reach:
+//
+//	the target's DESTINATION is unchanged, so ConfiguredBy was preserved, so the
+//	auth_token resolved as the OWNER, so an editor could swap auth_token for one
+//	of the owner's unrelated personal secrets and have it spent as the bearer
+//	token for the delivery.
+//
+// rotationTargetAttribution closes that: auth_token is part of what decides
+// whose authority the delivery runs under, so editing it stamps the editor.
 func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 	ctx := context.Background()
@@ -335,81 +350,103 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	// The owner's unrelated personal secret, the exfiltration objective.
 	mustEntry(t, h, queries, "entry-personal", owner, "OWNER_PERSONAL", "owner-only-value")
 
-	body := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
-		`"secret_name":"CI_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, owner)
-	rec := putTargets(t, h, editor, "user", entryID, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("editor could not set targets: HTTP %d: %s", rec.Code, rec.Body.String())
+	readStored := func() []RotationTarget {
+		t.Helper()
+		raw, err := queries.GetVaultEntryTargets(ctx, entryID)
+		if err != nil {
+			t.Fatalf("read back targets: %v", err)
+		}
+		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
 	}
 
-	raw, err := queries.GetVaultEntryTargets(ctx, entryID)
-	if err != nil {
-		t.Fatalf("read back targets: %v", err)
+	// The owner configures delivery, and lies about who configured it. The
+	// server-side stamp must overwrite the client value.
+	body := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
+		`"secret_name":"CI_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, editor)
+	rec := putTargets(t, h, owner, "user", entryID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner could not set targets: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
-	stored := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+	stored := readStored()
 	if len(stored) != 1 {
 		t.Fatalf("expected 1 stored target, got %d", len(stored))
 	}
-	if stored[0].ConfiguredBy != editor {
-		t.Fatalf("configured_by = %q, want the writing editor %q (client value must be overwritten)", stored[0].ConfiguredBy, editor)
+	if stored[0].ConfiguredBy != owner {
+		t.Fatalf("configured_by = %q, want the writing owner %q (client value must be overwritten)",
+			stored[0].ConfiguredBy, owner)
 	}
-
-	// Delivery resolves as the editor, who owns no OWNER_PERSONAL entry, so the
-	// owner's secret is never decrypted. userID here is the entry owner, which
-	// is exactly the identity the old code resolved against.
-	err = deliverToForgejoSecret(ctx, queries, h, stored[0], "new-value", owner)
-	if err == nil {
-		t.Fatal("editor-configured target resolved the owner's personal secret")
-	}
-	if !strings.Contains(err.Error(), "OWNER_PERSONAL") {
-		t.Fatalf("unexpected error: %v", err)
+	// The positive half: the owner's own target resolves the owner's own secret.
+	if _, err := h.resolveVaultReferenceFor(ctx, "OWNER_PERSONAL", stored[0].ConfiguredBy); err != nil {
+		t.Fatalf("owner-configured target should resolve its own secret: %v", err)
 	}
 
 	// A legacy target with no recorded configurer fails closed instead of
 	// falling back to the entry owner.
 	legacy := stored[0]
 	legacy.ConfiguredBy = ""
-	err = deliverToForgejoSecret(ctx, queries, h, legacy, "new-value", owner)
-	if err == nil || !strings.Contains(err.Error(), "re-save") {
+	if err := deliverToForgejoSecret(ctx, queries, h, legacy, "new-value", owner); err == nil ||
+		!strings.Contains(err.Error(), "re-save") {
 		t.Fatalf("legacy target should fail closed with a re-save hint, got %v", err)
 	}
 
-	// Re-saving an UNCHANGED target must NOT re-attribute it. This assertion
-	// used to demand the opposite (owner re-saves the same body, attribution
-	// moves to the owner), which was the laundering bug: the rotation panel PUTs
-	// every row it loaded, so an owner adding one target of their own silently
-	// re-authorized a departed member's webhook and the next rotation POSTed
-	// them the fresh plaintext. "Who set this up" must not change because
-	// somebody else pressed Save.
-	rec = putTargets(t, h, owner, "user", entryID, body)
+	// Re-saving an UNCHANGED target must NOT re-attribute it. This assertion used
+	// to demand the opposite (attribution moves to whoever saved), which was the
+	// laundering bug: the rotation panel PUTs every row it loaded, so an unrelated
+	// save silently re-authorized a departed member's webhook and the next
+	// rotation POSTed them the fresh plaintext. "Who set this up" must not change
+	// because somebody else pressed Save.
+	rec = putTargets(t, h, editor, "user", entryID, body)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("owner could not save targets: HTTP %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("editor could not re-save an unchanged target: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
-	raw, err = queries.GetVaultEntryTargets(ctx, entryID)
-	if err != nil {
-		t.Fatalf("read back targets: %v", err)
-	}
-	stored = ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
-	if stored[0].ConfiguredBy != editor {
+	stored = readStored()
+	if stored[0].ConfiguredBy != owner {
 		t.Fatalf("re-saving an unchanged target re-attributed it: configured_by = %q, want the original configurer %q",
-			stored[0].ConfiguredBy, editor)
+			stored[0].ConfiguredBy, owner)
 	}
 
-	// The legitimate case the old assertion was reaching for: a genuinely NEW
-	// target (different destination) is stamped to whoever created it.
+	// THE SIBLING. Same destination, different auth_token. The destination did not
+	// move, so the egress gate has nothing to refuse, and that is exactly why the
+	// ATTRIBUTION has to move: the editor chose which credential gets spent, so
+	// the lookup must run as the editor and find nothing.
+	swapped := `[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",` +
+		`"secret_name":"CI_KEY","auth_token":"OWNER_PERSONAL_2"}]`
+	mustEntry(t, h, queries, "entry-personal-2", owner, "OWNER_PERSONAL_2", "owner-only-value-2")
+	rec = putTargets(t, h, editor, "user", entryID, swapped)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("editor could not change the auth_token: HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	stored = readStored()
+	if stored[0].ConfiguredBy != editor {
+		t.Fatalf("changing auth_token kept the previous attribution (configured_by = %q). The editor "+
+			"picked which of the owner's credentials is spent as the delivery bearer token and the "+
+			"lookup would run as the owner", stored[0].ConfiguredBy)
+	}
+	err := deliverToForgejoSecret(ctx, queries, h, stored[0], "new-value", owner)
+	if err == nil {
+		t.Fatal("an editor-chosen auth_token resolved the owner's personal secret")
+	}
+	if !strings.Contains(err.Error(), "OWNER_PERSONAL_2") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// A genuinely NEW destination is stamped to whoever created it, and only
+	// someone with the widening right may create one.
 	newBody := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
 		`"secret_name":"OTHER_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, editor)
+	rec = putTargets(t, h, editor, "user", entryID, newBody)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("an editor added a NEW delivery destination on somebody else's secret: HTTP %d (%s)",
+			rec.Code, rec.Body.String())
+	}
 	rec = putTargets(t, h, owner, "user", entryID, newBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner could not set a new target: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
-	raw, err = queries.GetVaultEntryTargets(ctx, entryID)
-	if err != nil {
-		t.Fatalf("read back targets: %v", err)
-	}
-	stored = ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+	stored = readStored()
 	if stored[0].ConfiguredBy != owner {
-		t.Fatalf("a new target was not stamped to its creator: configured_by = %q, want %q", stored[0].ConfiguredBy, owner)
+		t.Fatalf("a new target was not stamped to its creator: configured_by = %q, want %q",
+			stored[0].ConfiguredBy, owner)
 	}
 	// Resolve through the handler helper, not the raw query: the query is now
 	// name-only and access is decided by entryCurrentlyUsableBy, so calling the

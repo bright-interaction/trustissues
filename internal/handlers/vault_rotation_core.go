@@ -8,6 +8,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 )
 
 // Shared rotation outcome logic: everything that happens AFTER the rotated value
@@ -57,7 +58,7 @@ type rotationDeps struct {
 // Call only after the value is durably stored: revoking earlier means a failure in
 // the encrypt/persist window leaves the old credential dead upstream and the new
 // one discarded, with no copy of either anywhere.
-func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName string, providerMeta map[string]string, newValue string) string {
+func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string, newValue string) string {
 	if providerMeta == nil {
 		return ""
 	}
@@ -73,11 +74,48 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 	// just created instead of a stale predecessor. Errors are logged, never
 	// discarded: losing this write means the next revoke targets a dead id and the
 	// real predecessor leaks.
+	// THE WRITE-BACK IS ALSO A HOST-CHOOSING WRITE, and nobody authorizes it.
+	//
+	// This map came back out of a provider adapter. Twilio writes key_sid,
+	// backblaze writes key_id, and the whole map is then persisted with no
+	// authorization check anywhere, because it is the server recording its own
+	// work. An adapter that wrote a HOST-influencing key (grafana's instance,
+	// datadog's site) would therefore move the entry's destination from inside
+	// the rotation it was asked to perform, with nobody's permission.
+	// TestProviderRequestsStayInsideTheirDeclaredHosts detects that in the suite;
+	// this refuses it in production.
+	//
+	// The oracle is deliberately absent, which egressgate reads as deny: there is
+	// no principal on this path. A rotation is triggered by the scheduler or by a
+	// caller who has already been authorized to rotate, and neither of those is
+	// "and may also repoint this secret". So the only write allowed here is one
+	// that adds nothing.
+	beforeMeta := map[string]string{}
+	if row, rErr := deps.queries.GetVaultEntryMeta(ctx, entryID); rErr != nil {
+		slog.Error("vault rotation: could not read the stored provider_meta to check the write-back",
+			"entry", entryName, "error", rErr)
+		return revokeWarn
+	} else {
+		beforeMeta = ParseProviderMeta(deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"))
+	}
+	tk, tkErr := egressgate.Decide(egressgate.Request{
+		EntryID: entryID,
+		What:    egressFieldProviderMeta,
+		Before:  providerDestinations(provider, beforeMeta),
+		After:   providerDestinations(provider, providerMeta),
+		Covers:  providerDestinationCovers,
+	})
+	if tkErr != nil {
+		slog.Error("vault rotation: refusing to persist a provider_meta write-back that moves the "+
+			"entry's reachable hosts", "entry", entryName, "provider", provider, "error", tkErr)
+		return revokeWarn
+	}
+
 	if metaJSON, mErr := json.Marshal(providerMeta); mErr != nil {
 		slog.Error("vault rotation: marshal provider_meta failed", "entry", entryName, "error", mErr)
 	} else if encMeta, encErr := deps.vault.encryptColumn(string(metaJSON)); encErr != nil {
 		slog.Error("vault rotation: encrypt provider_meta failed", "entry", entryName, "error", encErr)
-	} else if pErr := deps.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+	} else if pErr := setEntryProviderMeta(ctx, deps.queries, tk, db.UpdateVaultEntryProviderMetaParams{
 		ProviderMeta: toNullString(encMeta),
 		ID:           entryID,
 	}); pErr != nil {

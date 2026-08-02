@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 )
 
 // vaultColumnEncPrefix marks a vault metadata column (provider_meta,
@@ -160,7 +161,23 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 			if encErr != nil {
 				return updated, fmt.Errorf("encrypt provider_meta for %s: %w", row.ID, encErr)
 			}
-			if err := h.queries.UpdateVaultEntryProviderMeta(ctx, db.UpdateVaultEntryProviderMetaParams{
+			// This backfill changes the ENCODING of a stored value, never the
+			// value, so both sides of the decision are derived from the one
+			// string it is about to encrypt. Nothing is added and the authority
+			// oracle is never consulted, which is what a re-encryption pass
+			// should look like from the gate's point of view.
+			meta := ParseProviderMeta(row.ProviderMeta.String)
+			tk, tkErr := egressgate.Decide(egressgate.Request{
+				EntryID: row.ID,
+				What:    egressFieldProviderMeta,
+				Before:  providerDestinations(row.Provider.String, meta),
+				After:   providerDestinations(row.Provider.String, meta),
+				Covers:  providerDestinationCovers,
+			})
+			if tkErr != nil {
+				return updated, fmt.Errorf("egress decision for provider_meta on %s: %w", row.ID, tkErr)
+			}
+			if err := setEntryProviderMeta(ctx, h.queries, tk, db.UpdateVaultEntryProviderMetaParams{
 				ProviderMeta: toNullString(enc),
 				ID:           row.ID,
 			}); err != nil {
@@ -173,7 +190,17 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 			if encErr != nil {
 				return updated, fmt.Errorf("encrypt rotation_targets for %s: %w", row.ID, encErr)
 			}
-			if err := h.queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+			same := deliveryDestinations(ParseRotationTargets(row.RotationTargets.String))
+			tk, tkErr := egressgate.Decide(egressgate.Request{
+				EntryID: row.ID,
+				What:    egressFieldRotationTarget,
+				Before:  same,
+				After:   same,
+			})
+			if tkErr != nil {
+				return updated, fmt.Errorf("egress decision for rotation_targets on %s: %w", row.ID, tkErr)
+			}
+			if err := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
 				RotationTargets: toNullString(enc),
 				ID:              row.ID,
 			}); err != nil {
