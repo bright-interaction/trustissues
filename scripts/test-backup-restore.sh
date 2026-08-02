@@ -334,12 +334,19 @@ fi
 # the env var (set by the systemd unit), the env var through a symlink (logical
 # pwd compares one directory unequal to itself), and no env var at all, which is
 # every hand-run invocation.
+#
+# The fixtures are deliberately NOT identical. Only the marker route plants a
+# trustissues.db; the other two are a data directory before its first boot, which
+# is a real state. If all three planted one, the marker check alone would satisfy
+# all three cases, deleting the env-var checks would leave the suite green, and
+# these would be three tests that measure one thing. Caught by ablation on the
+# first draft of this very case.
+#
 # Every case asserts the SNAPSHOTS SURVIVED, not merely that the exit code was
 # non-zero: a refusal that deletes first is not a refusal.
 PLIVE_SNAPS="20260802T100000Z 20260701T100000Z 20260601T100000Z 20260501T100000Z"
 for route in envvar symlink marker; do
   PL="${WORK}/prune-live-${route}"; mkdir -p "${PL}"
-  make_db "${PL}/trustissues.db"
   for s in ${PLIVE_SNAPS}; do make_snapshot "${PL}" "${s}"; done
   BEFORE13B="$(snapshot_names "${PL}")"
   case "${route}" in
@@ -351,10 +358,11 @@ for route in envvar symlink marker; do
     # env -u, not just "do not set it": if the operator running this suite happens
     # to have TRUSTISSUES_DATA_DIR exported, this case would silently be testing
     # the env-var route again and the marker check would never be exercised.
-    marker)  RAN="$(env -u TRUSTISSUES_DATA_DIR TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
+    marker)  make_db "${PL}/trustissues.db"
+             RAN="$(env -u TRUSTISSUES_DATA_DIR TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
                       "${HERE}/prune-backups.sh" "${PL}" 2>&1 || true)" ;;
   esac
-  if [ "$(snapshot_names "${PL}")" = "${BEFORE13B}" ] && [ -f "${PL}/trustissues.db" ]; then
+  if [ "$(snapshot_names "${PL}")" = "${BEFORE13B}" ]; then
     ok "retention refuses to delete inside the live data dir (${route}) and deletes nothing"
   else
     bad "retention DELETED inside the live data dir (${route}): ${RAN}"
