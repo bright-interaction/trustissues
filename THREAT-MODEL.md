@@ -147,6 +147,20 @@ If you need the property that even the operator cannot read secrets
   membership role. Access is enforced server-side on every read and write path
   (`entryAccess` in `internal/handlers/vault.go`), not just hidden in the UI.
   Sharing is an authorization layer only; the encryption model is unchanged.
+- One user cannot use the collection surface to learn who else has an account.
+  Any authenticated role, including `vault_only`, can create a collection and is
+  its first manager, so every answer that surface gives has to be independent of
+  the rest of the directory. Inviting an address answers identically whether or
+  not it matches an account, a pending seat is recorded by the invited EMAIL
+  either way and carries no user id or display name until the invitee accepts,
+  and withdrawing an invitation always answers 204. Renaming an entry somebody
+  else created is refused outright rather than checked against their private
+  namespace, because `UNIQUE(user_id, name)` is scoped to the creator and a
+  conflict answer would read out of a vault the caller cannot see.
+- The AI gateway proxies inference calls only. It runs with the operator's
+  provider account rights, so the reachable methods and paths are an explicit
+  per-provider allowlist (see `aiProviders` in `internal/handlers/ai_gateway.go`)
+  rather than whatever the caller names.
 
 ## The vault "lock" is a client-side convenience, not a server control
 

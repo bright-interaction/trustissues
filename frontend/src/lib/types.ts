@@ -171,6 +171,13 @@ export interface Collection {
 // A member of a collection, as returned by GET /collections/{id}/members.
 // Membership is consent based: a row with `pending: true` has been invited but
 // has not accepted yet and holds no access to the collection's entries.
+//
+// A PENDING row carries no `user_id` and no `name`, and carries `email` only for
+// a manager (who typed the address). The server withholds them because a pending
+// seat used to appear only when the address matched an account, which turned
+// this endpoint into a directory of every user on the instance for anyone who
+// created a collection. Render pending rows from `email` alone, and fall back to
+// a placeholder when it is blank.
 export interface CollectionMember {
   user_id: string;
   email: string;

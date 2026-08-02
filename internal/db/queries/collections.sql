@@ -92,6 +92,31 @@ JOIN users u ON u.id = cm.user_id
 WHERE cm.collection_id = ?
 ORDER BY u.email ASC;
 
+-- ============================================================================
+-- Pending invitations, keyed by the invited EMAIL
+-- ============================================================================
+--
+-- These exist so a pending seat is recorded whether or not the address matches
+-- an account. collection_members can only hold a row for an address that HAS an
+-- account (user_id is a foreign key), so listing pending memberships told any
+-- collection manager, including a vault_only user who just created a throwaway
+-- collection, exactly which addresses are registered. See migration 00033.
+
+-- name: UpsertCollectionInvitation :exec
+-- Re-inviting the same address updates the seat's role rather than adding a
+-- second one, which is also how the members UI sends a role change.
+INSERT INTO collection_invitations (collection_id, email, role, invited_by) VALUES (?, ?, ?, ?)
+ON CONFLICT(collection_id, email) DO UPDATE SET
+  role = excluded.role,
+  invited_by = excluded.invited_by;
+
+-- name: ListCollectionInvitations :many
+SELECT collection_id, email, role, invited_by, created_at FROM collection_invitations
+WHERE collection_id = ? ORDER BY email ASC;
+
+-- name: DeleteCollectionInvitation :execresult
+DELETE FROM collection_invitations WHERE collection_id = ? AND email = ?;
+
 -- name: CountCollectionManagers :one
 -- Accepted managers only: a pending invitee cannot be the manager that keeps a
 -- collection from being orphaned.

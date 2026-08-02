@@ -339,6 +339,15 @@ export const api = {
       request<void>(`/collections/${id}/members/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
       }),
+    // Withdraws a PENDING invitation. It is addressed by email because a pending
+    // seat has no user id to remove: the members list withholds it (publishing
+    // it told the caller whether the address had an account) and an address with
+    // no account never had one. Always 204, so it says nothing either.
+    rescindInvite: (id: string, email: string) =>
+      request<void>(`/collections/${id}/invitations`, {
+        method: 'DELETE',
+        body: JSON.stringify({ email }),
+      }),
     // Invitations waiting on the current user. Empty array when there are none.
     listPendingInvites: () =>
       request<PendingInvite[]>('/collections/invitations'),
