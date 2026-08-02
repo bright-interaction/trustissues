@@ -1,0 +1,112 @@
+[
+ {
+  "id": "max-age-not-validated",
+  "mech": "drill-freshness",
+  "file": "scripts/restore-drill.sh",
+  "test": "21d",
+  "why": "BLOCKER 1: a typo in backup.env silently disabled the freshness check AND the drill still reported PASSED. [ 5000 -gt 48h ] returns 2 with 'integer expected', and set -e does not apply inside an if ... && ... condition, so the branch is just false",
+  "build": "bash -n scripts/restore-drill.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "printf '%s' \"${MAX_AGE_HOURS}\" | grep -Eq '^[0-9]+$' \\\n  || setup \"TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check.\"\n",
+  "new": ""
+ },
+ {
+  "id": "future-stamp-blinds-freshness",
+  "mech": "drill-freshness",
+  "file": "scripts/restore-drill.sh",
+  "test": "21e",
+  "why": "one clock-skewed run writes trustissues-20300101T000000Z.db, which sorts newest forever, gives a negative age, passes -gt 48, and is protected from retention as the newest file",
+  "build": "bash -n scripts/restore-drill.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "if [ \"${AGE_HOURS}\" -lt 0 ]; then\n  fail \"the newest snapshot ${SNAP_BASE} is stamped ${AGE_HOURS#-}h in the FUTURE. A run with a skewed clock wrote it, and while it is there it hides every real snapshot from the freshness check. Delete it and check the host clock.\"\nfi\n",
+  "new": ""
+ },
+ {
+  "id": "condition-path-exists-on-backup-unit",
+  "mech": "systemd-alerting",
+  "file": "deploy/systemd/trustissues-backup.service",
+  "test": "25b",
+  "why": "BLOCKER 2: a condition that does not hold marks the job SUCCESSFUL, so OnFailure= is never reached. EnvironmentFile= without a - already fails the unit on a missing backup.env, which is what pages; the Condition line strictly removed alerting from the case it looked like it was handling",
+  "build": "grep -q '^ConditionPathExists=' deploy/systemd/trustissues-backup.service",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "Documentation=file:///opt/trustissues/docs/BACKUP.md\n",
+  "new": "Documentation=file:///opt/trustissues/docs/BACKUP.md\nConditionPathExists=/etc/trustissues/backup.env\n"
+ },
+ {
+  "id": "condition-path-exists-on-drill-unit",
+  "mech": "systemd-alerting",
+  "file": "deploy/systemd/trustissues-restore-drill.service",
+  "test": "25b",
+  "why": "BLOCKER 2, the half that matters most: this is the unit whose whole job is to notice silence, and it carried the same line, so losing backup.env silenced the backup AND the thing that watches the backup",
+  "build": "grep -q '^ConditionPathExists=' deploy/systemd/trustissues-restore-drill.service",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "Documentation=file:///opt/trustissues/docs/BACKUP.md\n",
+  "new": "Documentation=file:///opt/trustissues/docs/BACKUP.md\nConditionPathExists=/etc/trustissues/backup.env\n"
+ },
+ {
+  "id": "unresolvable-data-dir-not-refused",
+  "mech": "drill-false-page",
+  "file": "scripts/restore-drill.sh",
+  "test": "21f",
+  "why": "BLOCKER 3: with the up-front refusal gone, a TRUSTISSUES_DATA_DIR that does not resolve is silently ignored instead of reported, which is how the empty-LIVE_ABS collapse got in",
+  "build": "bash -n scripts/restore-drill.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  [ -n \"${LIVE_ABS}\" ] \\\n    || setup \"TRUSTISSUES_DATA_DIR is set to ${TRUSTISSUES_DATA_DIR}, which does not resolve to a directory\"\n",
+  "new": ""
+ },
+ {
+  "id": "drill-containment-back-to-logical-pwd",
+  "mech": "drill-false-page",
+  "file": "scripts/restore-drill.sh",
+  "test": "21g",
+  "why": "BLOCKER 3 + 4: the exact original block. Resolving LIVE_ABS inline with a fallback to empty made the pattern collapse to /* and match every absolute path (the weekly false page), and the logical pwd made one directory compare unequal to itself (the symlink bypass)",
+  "build": "bash -n scripts/restore-drill.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "if [ -n \"${LIVE_ABS}\" ]; then\n  DRILL_ABS=\"$(cd \"${DRILL_DIR}\" && pwd -P)\"\n",
+  "new": "if [ -n \"${TRUSTISSUES_DATA_DIR:-}\" ]; then\n  LIVE_ABS=\"$(cd \"${TRUSTISSUES_DATA_DIR}\" 2>/dev/null && pwd || echo \"\")\"\n  DRILL_ABS=\"$(cd \"${DRILL_DIR}\" && pwd)\"\n"
+ },
+ {
+  "id": "backup-dest-guard-logical-pwd",
+  "mech": "same-dir-refusal",
+  "file": "scripts/backup.sh",
+  "test": "8b",
+  "why": "BLOCKER 4a: bash's cd sym && pwd prints the symlink, so TRUSTISSUES_BACKUP_DIR symlinked at the data dir compared unequal and backup.sh wrote snapshots beside the live database. The shipped unit sets TRUSTISSUES_BACKUP_PRUNE=1, so the next run is an automated rm in there",
+  "build": "bash -n scripts/backup.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "DEST_ABS=\"$(cd \"${DEST_DIR}\" && pwd -P)\"\nDATA_ABS=\"$(cd \"${DATA_DIR}\" && pwd -P)\"\n",
+  "new": "DEST_ABS=\"$(cd \"${DEST_DIR}\" && pwd)\"\nDATA_ABS=\"$(cd \"${DATA_DIR}\" && pwd)\"\n"
+ },
+ {
+  "id": "prune-no-data-dir-refusal-envvar",
+  "mech": "same-dir-refusal",
+  "file": "scripts/prune-backups.sh",
+  "test": "13b",
+  "why": "BLOCKER 4b: the invariant was enforced in the script that WRITES and absent from the script that DELETES. prune-backups.sh <live data dir> deleted snapshots in place",
+  "build": "bash -n scripts/prune-backups.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "if [ -n \"${TRUSTISSUES_DATA_DIR:-}\" ]; then\n  # pwd -P on both sides: `cd sym && pwd` prints the symlink, so the logical\n  # spelling of one directory compares unequal to itself.\n  DATA_ABS=\"$(cd \"${TRUSTISSUES_DATA_DIR}\" 2>/dev/null && pwd -P || echo \"\")\"\n  if [ -n \"${DATA_ABS}\" ] && [ \"${DEST_ABS}\" = \"${DATA_ABS}\" ]; then\n    echo \"error: refusing to prune ${DEST_ABS}: it is the LIVE data directory (TRUSTISSUES_DATA_DIR)\" >&2\n    echo \"       Retention must never run an automated rm inside the directory that holds\" >&2\n    echo \"       the live vault. Point TRUSTISSUES_BACKUP_DIR at separate storage.\" >&2\n    exit 1\n  fi\nfi\n",
+  "new": ""
+ },
+ {
+  "id": "prune-data-dir-refusal-logical-pwd",
+  "mech": "same-dir-refusal",
+  "file": "scripts/prune-backups.sh",
+  "test": "13b symlink route",
+  "why": "the same symlink bypass one level down: with the logical pwd the deletion site compares one directory unequal to itself and prunes the live data dir",
+  "build": "bash -n scripts/prune-backups.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  DATA_ABS=\"$(cd \"${TRUSTISSUES_DATA_DIR}\" 2>/dev/null && pwd -P || echo \"\")\"\n",
+  "new": "  DATA_ABS=\"$(cd \"${TRUSTISSUES_DATA_DIR}\" 2>/dev/null && pwd || echo \"\")\"\n"
+ },
+ {
+  "id": "prune-no-marker-refusal",
+  "mech": "same-dir-refusal",
+  "file": "scripts/prune-backups.sh",
+  "test": "13b marker route",
+  "why": "TRUSTISSUES_DATA_DIR is set on the scheduled path and not on a hand-run one, which is the invocation the review actually proved deleted snapshots in a live data dir. The marker is what covers it",
+  "build": "bash -n scripts/prune-backups.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "if [ -f \"${DEST_ABS}/trustissues.db\" ]; then\n  echo \"error: refusing to prune ${DEST_ABS}: it holds trustissues.db, so it is a LIVE data directory\" >&2\n",
+  "new": "if false; then\n  echo \"error: refusing to prune ${DEST_ABS}: it holds trustissues.db, so it is a LIVE data directory\" >&2\n"
+ }
+]

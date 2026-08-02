@@ -135,23 +135,68 @@ teammates need to audit agent secret usage without shell access.
 
 ## (d) Automated / scheduled backups
 
-**Today.** Backups are manual: `scripts/backup.sh` plus the procedure in
-`docs/BACKUP.md`. There is no built-in `trustissues backup` subcommand and no
-scheduler.
+**Mostly SHIPPED.** Scheduling, retention and a restore drill are in the tree.
+What remains deferred is narrower than this entry used to describe, so the two
+halves are separated below.
 
-**Design when built.** (1) A `trustissues backup <path>` subcommand that calls
-the SQLite online backup API in-process (no external `sqlite3` dependency),
-writes 0600, and optionally prunes by age / count. (2) An optional internal
-scheduler (or documented cron / systemd timer, which works today) that runs it on
-an interval and reports success to a notification channel. Keep the
-key-separation rule front and centre so an automated job never co-locates the
-backup with the vault key.
+**What ships now.**
 
-**Why safe to defer.** Durability is achievable now with the shipped script run
-from cron or a systemd timer, which is the standard way a self-hoster schedules
-any job. The missing piece is convenience, not capability. The correctness-
-critical part (WAL-safe snapshot + key separation) is already documented and
-scripted.
+- `deploy/systemd/`: a backup service + daily timer, a restore-drill service +
+  weekly timer, a templated failure alerter, one `backup.env` for all of them,
+  and an `install.sh` that installs, verifies the `OnFailure=` chain resolves to
+  a real unit, and can fire a test alert. `install.sh --root DIR` rehearses the
+  whole install into a throwaway tree, which is how the suite executes it: the
+  version that demanded `OnFailure=` on the `.timer` units aborted every real
+  install and no test noticed, because nothing ever ran the installer.
+- `deploy/cron/trustissues-backup.cron`: the same two jobs for hosts without
+  systemd, each with explicit failure alerting because cron's own reporting
+  needs an MTA nobody has.
+- `scripts/prune-backups.sh`: keep N daily / M weekly (defaults 7 and 4), refuse
+  a keep-nothing or non-numeric policy, refuse to run inside the live data
+  directory at all, clean stale `.part` files.
+- `scripts/restore-drill.sh`: restore the newest snapshot through the real
+  `restore.sh` into a throwaway directory, fail on a stale (or future-stamped)
+  snapshot, refuse a non-numeric freshness limit rather than ignoring it, and
+  check a named row survived the round trip.
+- `scripts/backup.sh`: destination configurable via `TRUSTISSUES_BACKUP_DIR`,
+  refuses to write into the live data directory (physical paths, so a symlink is
+  not a way around it), warns when the backups share a filesystem with the
+  database.
+- `scripts/restore.sh --compose`: driven end to end by the suite against a real
+  docker daemon (a throwaway compose project, a real named volume, a real
+  unprivileged image user), covering the fresh-host `docker compose create`, the
+  chown that keeps the app from crash-looping on its first write, and the refusal
+  when the service user cannot write what was restored. Those cases SKIP loudly
+  on a machine without docker and the summary line says how many skipped.
+- Every one of those behaviours has a case in `scripts/test-backup-restore.sh`
+  that has been watched to fail without it, with one deliberate exception:
+  `prune-backups.sh`'s "the newest snapshot is never a deletion candidate" guard
+  is belt-and-braces on top of the bucket arithmetic, so it only fires when that
+  arithmetic is already wrong. Deleting the guard keeps the suite green, which is
+  the honest state of it. The ablation specs are in
+  `scripts/ablations/backups.json`, runnable with `scripts/ablate.py`.
+
+**Still deferred: the in-process `trustissues backup` subcommand.** The scripts
+shell out to the `sqlite3` CLI, so a host without it cannot take a backup and
+the failure surfaces at 03:20 rather than at install time. A `trustissues backup
+<path>` subcommand calling the online backup API in-process would remove that
+dependency and let the server report success to a notification channel directly,
+which the shell path cannot do.
+
+**Still deferred: off-host replication.** The timer, the retention policy and
+the drill all operate on one directory on one host. Copying snapshots off the
+box is left to the operator's own `restic` / `rclone` / object-storage job.
+`docs/BACKUP.md` says so explicitly rather than implying the schedule covers it.
+
+**Also not covered: backing up from inside the container.** The units run
+`sqlite3` on the host against the Compose volume's `_data` path. The documented
+`docker compose exec` route still works but nothing schedules it.
+
+**Why the remainder is safe to defer.** All three are convenience or reach, not
+correctness. The correctness-critical parts (a WAL-safe snapshot, verified
+before it is kept, key separation, a retention policy that cannot delete the
+newest copy, and a drill that proves the newest snapshot actually restores) are
+scripted, scheduled, alerted on, and tested.
 
 ## (e) Per-secret reveal granularity in the audit
 
