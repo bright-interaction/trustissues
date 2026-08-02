@@ -71,10 +71,12 @@ var vaultEntryEgressClass = map[string]struct {
 			"enumeration is providerEgress[...].metaKeys"},
 	"rotation_targets": {egressChoosesHost,
 		"webhook_url and forgejo instance are literal delivery destinations for the rotated " +
-			"plaintext. Written only through PUT /api/vault/{id}/targets, which stamps ConfiguredBy " +
-			"server-side, re-checks that configurer at delivery (targetStillAuthorized) and applies " +
-			"the provider pin. Deliberately manage-gated rather than owner-gated; see the NOTE in " +
-			"UpdateTargets and DEFERRED (i)"},
+			"plaintext. THE round-5 blocker: this row already said 'chooses a host' while " +
+			"VaultHandler.UpdateTargets wrote the column without asking anybody, which is why the " +
+			"guard below now checks ENFORCEMENT rather than classification. Gated by " +
+			"decideDeliveryEgress at the write and by targetStillAuthorized at delivery, both of " +
+			"which resolve to mayDirectSecretEgress; the write goes through " +
+			"setEntryRotationTargets in vault_egress_writes.go"},
 
 	// ── triggers delivery without choosing where ────────────────────────
 	"auto_rotate": {egressTriggersDelivery,
@@ -216,6 +218,15 @@ func TestEveryVaultEntryColumnIsClassified(t *testing.T) {
 
 // TestHostChoosingColumnsAreGatedAtTheirWriteSite is the other half of the
 // column guard, and the one that would have caught round 4 at review time.
+//
+// It is NOT the one that would have caught round 5. This checks one named
+// handler's one named condition, so it can only see the doors it was told
+// about, and rotation_targets has its own route. The guard that answers the
+// general question, for every host-choosing column and every write path
+// including ones nobody has written yet, is
+// TestEveryHostChoosingWriteGoesThroughTheChokepoint in
+// egress_write_chokepoint_test.go. This one stays because it pins the SHAPE of
+// the condition inside Update, which the chokepoint cannot see.
 //
 // A classification is a claim. This checks the claim against the handler: every
 // column classified egressChoosesHost and writable through PUT /api/vault/{id}

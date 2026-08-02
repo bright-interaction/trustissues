@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
@@ -171,7 +172,12 @@ func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
 		leaver:  collRoleEditor,
 	})
 	const entryID = "entry-stale"
-	mustEntry(t, h, queries, entryID, manager, "Stripe", "sk_live_x")
+	// PREMISE CHANGE, round 5: the leaver is the entry's CREATOR, because naming a
+	// delivery destination is now held to the same right as widening
+	// destination_patterns and a plain editor no longer has it. The resurrection
+	// property is unchanged: a purged target must not come back through a stale
+	// panel save, whoever writes next.
+	mustEntry(t, h, queries, entryID, leaver, "Stripe", "sk_live_x")
 	placeInCollection(t, queries, entryID, "coll-stale")
 
 	// The leaver configures a delivery target.
@@ -229,18 +235,42 @@ func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
 	}
 
 	// A save with the CURRENT version still works, or the panel is unusable.
-	rec = httptest.NewRecorder()
-	h.GetTargets(rec, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", manager, "user", entryID, ""))
-	var fresh struct {
-		Version string `json:"version"`
+	//
+	// The manager saves a "notify" target rather than a webhook, and that choice
+	// is the round-5 premise change stated as a test: notify fires the channel
+	// dispatcher and never carries the value, so it is not a destination and stays
+	// open to anyone with manage. A webhook IS a destination, and a manager who
+	// did not create the entry may no longer add one. Both halves are asserted, so
+	// a future edit that quietly relaxes either one fails here.
+	freshVersion := func() string {
+		g := httptest.NewRecorder()
+		h.GetTargets(g, vaultAuthzRequest("GET", "/api/vault/"+entryID+"/targets", manager, "user", entryID, ""))
+		var fresh struct {
+			Version string `json:"version"`
+		}
+		_ = json.Unmarshal(g.Body.Bytes(), &fresh)
+		return fresh.Version
 	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &fresh)
 	rec = httptest.NewRecorder()
 	h.UpdateTargets(rec, vaultAuthzRequest("PUT",
-		"/api/vault/"+entryID+"/targets?version="+fresh.Version, manager, "user", entryID,
-		`[{"type":"webhook","label":"mine","webhook_url":"https://mine.example.com/hook"}]`))
+		"/api/vault/"+entryID+"/targets?version="+freshVersion(), manager, "user", entryID,
+		`[{"type":"notify","label":"tell-me"}]`))
 	if rec.Code != http.StatusOK {
-		t.Errorf("a save with the current version returned %d: the panel would be unusable", rec.Code)
+		t.Errorf("a save with the current version returned %d (%s): the panel would be unusable",
+			rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	h.UpdateTargets(rec, vaultAuthzRequest("PUT",
+		"/api/vault/"+entryID+"/targets?version="+freshVersion(), manager, "user", entryID,
+		`[{"type":"notify","label":"tell-me"},{"type":"webhook","label":"mine","webhook_url":"https://mine.example.com/hook"}]`))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("a manager who did not create this entry added a webhook delivery target: HTTP %d (%s). "+
+			"Naming where the plaintext goes is the entry owner's right, the same one "+
+			"destination_patterns requires", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mine.example.com") {
+		t.Errorf("the refusal does not name the host that was refused: %s", rec.Body.String())
 	}
 }
 

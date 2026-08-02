@@ -823,15 +823,20 @@ func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]
 }
 
 const listVaultEntriesForMetaBackfill = `-- name: ListVaultEntriesForMetaBackfill :many
-SELECT id, provider_meta, rotation_targets FROM vault_entries
+SELECT id, provider, provider_meta, rotation_targets FROM vault_entries
 `
 
 type ListVaultEntriesForMetaBackfillRow struct {
 	ID              string         `json:"id"`
+	Provider        sql.NullString `json:"provider"`
 	ProviderMeta    sql.NullString `json:"provider_meta"`
 	RotationTargets sql.NullString `json:"rotation_targets"`
 }
 
+// provider is selected alongside the two columns being re-encrypted because the
+// egress write gate derives the entry's reachable host set from the
+// (provider, provider_meta) pair. A backfill must be able to show that its write
+// moves that set nowhere, and it cannot show that without the provider name.
 func (q *Queries) ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVaultEntriesForMetaBackfillRow, error) {
 	rows, err := q.db.QueryContext(ctx, listVaultEntriesForMetaBackfill)
 	if err != nil {
@@ -841,7 +846,12 @@ func (q *Queries) ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVa
 	items := []ListVaultEntriesForMetaBackfillRow{}
 	for rows.Next() {
 		var i ListVaultEntriesForMetaBackfillRow
-		if err := rows.Scan(&i.ID, &i.ProviderMeta, &i.RotationTargets); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.Provider,
+			&i.ProviderMeta,
+			&i.RotationTargets,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

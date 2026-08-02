@@ -42,14 +42,24 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 		leaver: collRoleEditor,
 	})
 	const entryID = "entry-leave"
-	mustEntry(t, h, queries, entryID, owner, "Stripe live key", "sk_live_ORIGINAL")
+	// PREMISE CHANGE, round 5. The leaver used to be a plain editor on somebody
+	// else's entry, because manage was enough to name a delivery destination.
+	// Adding one is now held to the same right as widening destination_patterns,
+	// so the leaver is the entry's CREATOR here and `owner` is the collection
+	// manager who later saves the panel.
+	//
+	// The property under test is untouched and is still the serious one: someone
+	// who could legitimately configure delivery, and then leaves, must stop
+	// receiving the secret, and an unrelated save by a colleague must not
+	// re-authorize them. A creator who moves teams is exactly that person.
+	mustEntry(t, h, queries, entryID, leaver, "Stripe live key", "sk_live_ORIGINAL")
 	placeInCollection(t, queries, entryID, "coll-leave")
 
-	// The leaver configures a delivery target while they are a legitimate editor.
+	// The leaver configures a delivery target while they are a legitimate member.
 	body := `[{"type":"webhook","label":"editor-hook","webhook_url":"https://editor.example.com/h"}]`
 	rec := putTargets(t, h, leaver, "user", entryID, body)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("ABORT: the editor could not set a target while a member: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("ABORT: the creator could not set a target while a member: %d %s", rec.Code, rec.Body.String())
 	}
 
 	readTargets := func() []RotationTarget {

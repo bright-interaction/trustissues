@@ -255,7 +255,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// vault_rotation_core.go. This path used to hold its own copy of it, which is
 		// how the two drifted on five separate behaviours.
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
-		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, meta, newValue)
+		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, providerName, meta, newValue)
 
 		// Same distinction the manual path makes: an undecryptable target list is
 		// not "no targets". Degrading to "[]" recorded a clean success while every

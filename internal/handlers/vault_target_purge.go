@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 )
 
 // PurgeTargetsConfiguredByUser detaches every rotation delivery target that the
@@ -63,7 +64,24 @@ func (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID 
 			slog.Error("vault: could not encrypt purged targets", "entry", row.ID, "error", encErr)
 			continue
 		}
-		if uErr := h.queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+		// A purge only ever REMOVES, and it proves that rather than asserting it:
+		// the before and after sets are derived from the two slices this loop
+		// actually built, so egressgate.Decide computes an empty addition and
+		// never consults the authority oracle. If a future edit made this write
+		// keep something it did not load, the ticket would be refused rather
+		// than quietly turning an offboarding sweep into a redirect primitive.
+		tk, tkErr := egressgate.Decide(egressgate.Request{
+			EntryID: row.ID,
+			What:    egressFieldRotationTarget,
+			Before:  deliveryDestinations(targets),
+			After:   deliveryDestinations(kept),
+		})
+		if tkErr != nil {
+			slog.Error("vault: refusing to persist purged targets, the write is not a narrowing",
+				"entry", row.ID, "error", tkErr)
+			continue
+		}
+		if uErr := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
 			RotationTargets: toNullString(enc),
 			ID:              row.ID,
 		}); uErr != nil {
