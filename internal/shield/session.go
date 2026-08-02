@@ -647,8 +647,8 @@ func buildHintAtLevel(kind Kind, raw string, keys []string, level HintLevel) str
 			// must never do: emit a value Shield's own rules classify as
 			// sensitive. The same string standalone is tokenized:
 			//
-			//	connect to host.internal   ->  [shield:hostname:tok_...]
-			//	mail admin@host.internal   ->  [shield:email:...,domain=host.internal]
+			//	connect to edge-node.internal   ->  [shield:hostname:tok_...]
+			//	mail admin@edge-node.internal   ->  [shield:email:...,domain=edge-node.internal]
 			//
 			// so redacting an address republished the infrastructure hostname
 			// inside the marker that was supposed to conceal it, on EVERY email,

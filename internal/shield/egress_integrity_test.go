@@ -24,8 +24,8 @@ func egressSession(t *testing.T, level HintLevel) (*Session, context.Context) {
 // address's own domain in cleartext inside the marker meant to conceal it. The same
 // string standalone IS tokenized, which is the contradiction:
 //
-//	connect to host.internal   ->  [shield:hostname:tok_...]
-//	mail admin@host.internal   ->  [shield:email:...,domain=host.internal]
+//	connect to edge-node.internal   ->  [shield:hostname:tok_...]
+//	mail admin@edge-node.internal   ->  [shield:email:...,domain=edge-node.internal]
 //
 // It was filed as an IP-literal edge case (user@192.168.1.1 republishing the IP), but
 // the IP is just the sharpest instance of a channel open on EVERY email. Fixing only
@@ -37,7 +37,7 @@ func TestAMarkerNeverRepublishesATokenizableValue(t *testing.T) {
 		// the substring that must NOT survive anywhere in the output
 		leaked string
 	}{
-		{"internal hostname", "mail admin@host.internal today", "host.internal"},
+		{"internal hostname", "mail admin@edge-node.internal today", "edge-node.internal"},
 		{"ipv4 literal", "mail ops@192.168.1.1 today", "192.168.1.1"},
 		{"ipv6 literal", "mail ops@[2001:db8::1] today", "2001:db8"},
 		{"business domain", "mail anna@andersson-law.se today", "andersson-law.se"},
