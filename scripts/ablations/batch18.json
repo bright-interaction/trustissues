@@ -1,23 +1,12 @@
 [
- {"id":"twilio-discards-sid","mech":"providers","test":"TestTwilioRotatePairsTheNewSecretWithItsOwnSid","file":"internal/handlers/vault_providers.go","pkg":"./internal/handlers/",
-  "why":"the stored secret's sid was thrown away, so the value authenticated nowhere",
-  "old":"\toldSid := meta[\"key_sid\"]\n\tmeta[\"key_sid\"] = result.Sid",
-  "new":"\toldSid := meta[\"key_sid\"]\n\t_ = oldSid"},
+ {"id":"second-client-ip-derivation","mech":"client-ip","test":"TestForwardedHeaderCannotForgeTheAuditIP","file":"internal/handlers/service_secrets.go",
+  "why":"the original bug: a second XFF reader with no trusted-peer gate let a direct caller choose its own audit IP",
+  "old":"\treturn middleware.ClientIP(r)",
+  "new":"\tif v := r.Header.Get(\"X-Forwarded-For\"); v != \"\" {\n\t\tparts := strings.Split(v, \",\")\n\t\tif last := strings.TrimSpace(parts[len(parts)-1]); last != \"\" {\n\t\t\treturn last\n\t\t}\n\t}\n\treturn r.RemoteAddr"},
 
- {"id":"twilio-pairs-with-account-sid","mech":"providers","test":"TestTwilioValidateUsesTheSameIdentityAsRotate","file":"internal/handlers/vault_providers.go","pkg":"./internal/handlers/",
-  "why":"Validate paired an API Key secret with the ACCOUNT sid, a hard 401",
-  "old":"\treq.SetBasicAuth(twilioAuthUser(meta, accountSid), key)",
-  "new":"\treq.SetBasicAuth(accountSid, key)"},
-
- {"id":"twilio-accepts-sidless-key","mech":"providers","test":"TestTwilioRefusesAKeyItCannotPair","file":"internal/handlers/vault_providers.go","pkg":"./internal/handlers/",
-  "why":"storing a secret that can never be paired recreates the unusable state",
-  "old":"\tif result.Sid == \"\" {","new":"\tif false {"},
-
- {"id":"undeclared-provider-fate","mech":"providers","test":"TestEveryAutoRotatingProviderDeclaresPredecessorFate","file":"internal/handlers/vault_providers.go","pkg":"./internal/handlers/",
-  "why":"a provider that silently leaves the predecessor live",
-  "old":"\t\"vercel\":     {false, \"TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded\"},","new":""},
-
- {"id":"fate-table-lies","mech":"providers","test":"TestPredecessorFateMatchesTheCode","file":"internal/handlers/vault_providers.go","pkg":"./internal/handlers/",
-  "why":"a table that drifts from the code would tell an operator a live key is dead",
-  "old":"\t\"cloudflare\": {false,","new":"\t\"cloudflare\": {true,"}
+ {"id":"vault-only-reaches-ai-gateway","mech":"authz","test":"TestVaultOnlyIsBlockedFromNonVaultSurfaces","file":"internal/middleware/auth.go",
+  "why":"vault_only comes from the PUBLIC invite endpoint and could spend the team's provider key",
+  "old":"\t\t\tif IsVaultOnly(r.Context()) {",
+  "new":"\t\t\tif false && IsVaultOnly(r.Context()) {",
+  "pkg":"./internal/middleware/"}
 ]
