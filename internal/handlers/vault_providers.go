@@ -193,6 +193,14 @@ func ListProviders() []ProviderInfo {
 // (some are user-controlled instance/tenant URLs) must never be an internal
 // one. Uses the platform's guarded client; tests swap this var for a plain
 // client to reach httptest loopback servers.
+//
+// NOTHING IN THIS PACKAGE CALLS providerHTTP.Do DIRECTLY. Every outbound
+// request goes through providerDo (egress_authority.go), which checks the host
+// against the egress authority the caller installed when it decrypted the
+// secret. The private-IP block answers "is this destination internal"; the
+// authority answers the question that kept coming back, "who chose this
+// destination, and were they allowed to". TestNoProviderCallBypassesTheEgressGate
+// fails if a call site goes around it.
 var providerHTTP = alerts.GuardedWebhookClient(15 * time.Second)
 
 // Transient meta keys describing a revoke that has been DEFERRED until the new
@@ -296,7 +304,7 @@ func revokeOldProviderKey(ctx context.Context, meta map[string]string, method, u
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		meta["last_revoke_error"] = "revoke old key: " + err.Error()
 		return
@@ -361,7 +369,7 @@ func providerGet(ctx context.Context, url, authHeader string) (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Authorization", authHeader)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return 0, err
 	}
@@ -436,7 +444,7 @@ func (p *CloudflareTokenProvider) Validate(ctx context.Context, key string, _ ma
 		return false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -454,7 +462,7 @@ func (p *CloudflareTokenProvider) getTokenID(ctx context.Context, token string) 
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -482,7 +490,7 @@ func (p *CloudflareTokenProvider) rollToken(ctx context.Context, currentToken, t
 	}
 	req.Header.Set("Authorization", "Bearer "+currentToken)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -528,7 +536,7 @@ func (p *VercelTokenProvider) Rotate(ctx context.Context, currentKey string, met
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -576,7 +584,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -639,7 +647,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -706,7 +714,7 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// its key sid or every subsequent call 401s.
 	req.SetBasicAuth(twilioAuthUser(meta, accountSid), currentKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -781,7 +789,7 @@ func (p *TwilioProvider) Validate(ctx context.Context, key string, meta map[stri
 	// Same pairing rule as Rotate: an entry that has rotated holds an API Key secret
 	// and must authenticate with that key's sid, not the account sid.
 	req.SetBasicAuth(twilioAuthUser(meta, accountSid), key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -811,7 +819,7 @@ func (p *LinodeProvider) Rotate(ctx context.Context, currentKey string, meta map
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -859,7 +867,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -925,7 +933,7 @@ func (p *DatadogProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	req.Header.Set("DD-API-KEY", currentKey)
 	req.Header.Set("DD-APPLICATION-KEY", appKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -960,7 +968,7 @@ func (p *DatadogProvider) Validate(ctx context.Context, key string, meta map[str
 		return false, err
 	}
 	req.Header.Set("DD-API-KEY", key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -998,7 +1006,7 @@ func (p *GrafanaProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1048,7 +1056,7 @@ func (p *FastlyProvider) Rotate(ctx context.Context, currentKey string, meta map
 	}
 	req.Header.Set("Fastly-Key", currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1075,7 +1083,7 @@ func (p *FastlyProvider) Validate(ctx context.Context, key string, _ map[string]
 		return false, err
 	}
 	req.Header.Set("Fastly-Key", key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1110,7 +1118,7 @@ func (p *Auth0Provider) Rotate(ctx context.Context, currentKey string, meta map[
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1143,7 +1151,7 @@ func (p *Auth0Provider) Validate(ctx context.Context, key string, meta map[strin
 		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1182,7 +1190,7 @@ func (p *ZitadelProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	}
 	req.Header.Set("Authorization", "Bearer "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1248,7 +1256,7 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 	}
 	req.Header.Set("Authorization", "Basic "+auth)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1293,7 +1301,7 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 		return
 	}
 	req.Header.Set("Authorization", "Basic "+auth)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		meta["last_revoke_error"] = "b2 authorize: " + err.Error()
 		return
@@ -1325,7 +1333,7 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 	}
 	delReq.Header.Set("Authorization", authResp.AuthorizationToken)
 	delReq.Header.Set("Content-Type", "application/json")
-	dr, err := providerHTTP.Do(delReq)
+	dr, err := providerDo(delReq)
 	if err != nil {
 		meta["last_revoke_error"] = "b2 delete key: " + err.Error()
 		return
@@ -1350,7 +1358,7 @@ func (p *BackblazeProvider) Validate(ctx context.Context, key string, meta map[s
 		return false, err
 	}
 	req.Header.Set("Authorization", "Basic "+auth)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1385,7 +1393,7 @@ func (p *ForgejoProvider) Rotate(ctx context.Context, currentKey string, meta ma
 	}
 	req.Header.Set("Authorization", "token "+currentKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return "", err
 	}
@@ -1416,7 +1424,7 @@ func (p *ForgejoProvider) Validate(ctx context.Context, key string, meta map[str
 		return false, err
 	}
 	req.Header.Set("Authorization", "token "+key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1445,7 +1453,7 @@ func (p *GitHubTokenProvider) Validate(ctx context.Context, key string, _ map[st
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1501,7 +1509,7 @@ func (p *AnthropicProvider) Validate(ctx context.Context, key string, _ map[stri
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1525,7 +1533,7 @@ func (p *StripeProvider) Validate(ctx context.Context, key string, _ map[string]
 		return false, err
 	}
 	req.SetBasicAuth(key, "")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1654,7 +1662,7 @@ func (p *PostmarkProvider) Validate(ctx context.Context, key string, _ map[strin
 		return false, err
 	}
 	req.Header.Set("X-Postmark-Server-Token", key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1701,7 +1709,7 @@ func (p *SupabaseProvider) Validate(ctx context.Context, key string, meta map[st
 		return false, err
 	}
 	req.Header.Set("apikey", key)
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}
@@ -1727,7 +1735,7 @@ func (p *RailwayProvider) Validate(ctx context.Context, key string, _ map[string
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return false, err
 	}

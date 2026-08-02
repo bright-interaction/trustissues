@@ -164,8 +164,27 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		}
 
 		meta := ParseProviderMeta(vaultHandler.decryptColumnOrLog(entry.ProviderMeta.String, "{}", "provider_meta"))
+		// The egress authority for this entry's rotation. This is the path the
+		// round-4 report walked: an editor sets provider + provider_meta +
+		// auto_rotate through PUT /api/vault/{id} with no password, and the
+		// SCHEDULER, running with nobody watching, carries the operator's
+		// decrypted key to the host they named. The write is refused now (see
+		// VaultHandler.Update), and this refuses to deliver a row that got
+		// written some other way. See egress_authority.go.
+		rotateCtx, egressErr := providerEgressContextFor(ctx, queries, entry.ID, providerName, meta)
+		if egressErr != nil {
+			for i := range plaintext {
+				plaintext[i] = 0
+			}
+			slog.Error("vault rotation: refusing to rotate through this provider configuration; "+
+				"the secret was not sent anywhere",
+				"entry", entry.Name, "provider", providerName, "error", egressErr)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailProvider, "auto", nil)
+			return
+		}
 		oldValueCopy := string(plaintext) // captured for delivery, zeroed in plaintext below
-		newValue, err := provider.Rotate(ctx, string(plaintext), meta)
+		newValue, err := provider.Rotate(rotateCtx, string(plaintext), meta)
 
 		// Zero plaintext immediately
 		for i := range plaintext {
@@ -236,7 +255,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// vault_rotation_core.go. This path used to hold its own copy of it, which is
 		// how the two drifted on five separate behaviours.
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
-		revokeWarn := revokeOldKeyAndPersistMeta(ctx, deps, entry.ID, entry.Name, meta, newValue)
+		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, meta, newValue)
 
 		// Same distinction the manual path makes: an undecryptable target list is
 		// not "no targets". Degrading to "[]" recorded a clean success while every

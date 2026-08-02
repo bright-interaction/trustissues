@@ -108,6 +108,23 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		writeUnauthorized(w, r, "authentication required")
 		return
 	}
+	// The role check the review asked for, in the HANDLER and not only on the
+	// route.
+	//
+	// /api/secrets and /api/mcp are mounted behind VaultOnlyBlock in
+	// cmd/server/main.go and TestServerRoutesKeepTheirGuards pins that. This is
+	// the second lock on the same door, and it is worth its four lines because
+	// of how the first one failed: /api/ai was blocked while its sibling mint
+	// route was not, so a vault_only account defeated the gateway's block by
+	// minting a capability for the team key and driving /proxy with it. That was
+	// a property of the ROUTER, invisible from every handler test in this
+	// package. A handler that refuses on its own cannot be un-refused by moving
+	// a line in main.go.
+	if middleware.IsVaultOnly(ctx) {
+		writeForbidden(w, r, "vault-only accounts cannot mint capability tokens; "+
+			"minting spends a secret this account may use but may not redirect")
+		return
+	}
 
 	var req issueRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {

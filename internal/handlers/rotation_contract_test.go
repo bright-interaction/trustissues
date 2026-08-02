@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -400,9 +401,26 @@ func installRotationFakes(t *testing.T) *alertRecorder {
 
 	ProviderRegistry[revokeFailProvider] = &revokeFailingProvider{}
 	providerLabels[revokeFailProvider] = "Revoke-failing test provider"
+	// A registered provider declares where its secret may go, and a test provider
+	// is not exempt: providerDo refuses an undeclared host, which is exactly the
+	// fail-closed posture that makes a real provider added without a declaration
+	// unable to reach the network. Resolved through the live revokeTargetURL so a
+	// case that points the revoke at an httptest sink is covered without this
+	// hardcoding a port.
+	providerEgress[revokeFailProvider] = providerEgressDecl{
+		hosts: func(map[string]string) []string {
+			u, err := url.Parse(revokeTargetURL)
+			if err != nil || u.Hostname() == "" {
+				return nil
+			}
+			return []string{u.Hostname()}
+		},
+		why: "test provider: its deferred revoke targets whatever revokeTargetURL names",
+	}
 	t.Cleanup(func() {
 		delete(ProviderRegistry, revokeFailProvider)
 		delete(providerLabels, revokeFailProvider)
+		delete(providerEgress, revokeFailProvider)
 	})
 
 	// BOTH dispatchers. dispatchRotationAlert fires EventRotationPartial (a

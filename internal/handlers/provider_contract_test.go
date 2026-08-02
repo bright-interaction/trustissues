@@ -37,6 +37,20 @@ func withFakeUpstream(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	return srv
 }
 
+// providerCtx is the context production hands a provider adapter: it carries the
+// egress authority DECLARED for that provider in egress_authority.go, resolved
+// against the same meta the adapter is about to read.
+//
+// Every direct provider call in this package goes through it, and that is the
+// point rather than plumbing. providerDo refuses a host outside the declaration,
+// so these contract tests now also assert that the declaration and the adapter
+// agree. A provider that grows a new provider_meta key which lands in the HOST
+// (datadog's "site", grafana's "instance": the round-4 shape) fails HERE, in the
+// test that drives it, instead of shipping and being found by a reviewer.
+func providerCtx(p KeyProvider, meta map[string]string) context.Context {
+	return withProviderEgress(context.Background(), p.Name(), meta)
+}
+
 // rewriteTo sends every request to base, preserving path and query, so a provider's
 // hard-coded https://api.vendor.com/... reaches the fake upstream unchanged.
 type rewriteTransport struct{ base string }
@@ -91,7 +105,7 @@ func TestTwilioRotatePairsTheNewSecretWithItsOwnSid(t *testing.T) {
 
 	// FIRST rotation: the stored value is the account Auth Token, so the mint
 	// authenticates as the account.
-	got, err := p.Rotate(context.Background(), "the-auth-token", meta)
+	got, err := p.Rotate(providerCtx(p, meta), "the-auth-token", meta)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -111,7 +125,7 @@ func TestTwilioRotatePairsTheNewSecretWithItsOwnSid(t *testing.T) {
 	}
 
 	// SECOND rotation: now it must authenticate with the KEY sid, not the account.
-	if _, err := p.Rotate(context.Background(), "newsecret456", meta); err != nil {
+	if _, err := p.Rotate(providerCtx(p, meta), "newsecret456", meta); err != nil {
 		t.Fatalf("second rotate: %v", err)
 	}
 	if gotUser != "SKnew123" {
@@ -147,7 +161,8 @@ func TestTwilioValidateUsesTheSameIdentityAsRotate(t *testing.T) {
 	p := &TwilioProvider{}
 
 	// Pre-rotation: the value is the Auth Token, paired with the account sid.
-	if _, err := p.Validate(context.Background(), "auth-token", map[string]string{"account_sid": "ACaccount"}); err != nil {
+	preMeta := map[string]string{"account_sid": "ACaccount"}
+	if _, err := p.Validate(providerCtx(p, preMeta), "auth-token", preMeta); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if gotUser != "ACaccount" {
@@ -155,8 +170,8 @@ func TestTwilioValidateUsesTheSameIdentityAsRotate(t *testing.T) {
 	}
 
 	// Post-rotation: the value is an API Key secret, paired with its own sid.
-	if _, err := p.Validate(context.Background(), "keysecret",
-		map[string]string{"account_sid": "ACaccount", "key_sid": "SKnew123"}); err != nil {
+	postMeta := map[string]string{"account_sid": "ACaccount", "key_sid": "SKnew123"}
+	if _, err := p.Validate(providerCtx(p, postMeta), "keysecret", postMeta); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if gotUser != "SKnew123" {
@@ -178,7 +193,7 @@ func TestTwilioRefusesAKeyItCannotPair(t *testing.T) {
 	})
 	p := &TwilioProvider{}
 	meta := map[string]string{"account_sid": "ACaccount"}
-	got, err := p.Rotate(context.Background(), "tok", meta)
+	got, err := p.Rotate(providerCtx(p, meta), "tok", meta)
 	if err == nil {
 		t.Errorf("a sid-less key was accepted and %q would be stored; it can never be paired "+
 			"and every later call 401s", got)
@@ -228,7 +243,7 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 		})
 		p := &SendGridProvider{}
 		meta := map[string]string{}
-		if _, err := p.Rotate(context.Background(), "SG.old", meta); err != nil {
+		if _, err := p.Rotate(providerCtx(p, meta), "SG.old", meta); err != nil {
 			t.Fatalf("rotate: %v", err)
 		}
 		for _, want := range []string{"api_keys.create", "api_keys.read", "api_keys.delete"} {
@@ -245,7 +260,7 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 		// The operator's own scope list must be honoured AND still carry the
 		// management scopes, or widening the key re-breaks the chain.
 		meta2 := map[string]string{"scopes": "mail.send, stats.read"}
-		if _, err := p.Rotate(context.Background(), "SG.old", meta2); err != nil {
+		if _, err := p.Rotate(providerCtx(p, meta2), "SG.old", meta2); err != nil {
 			t.Fatalf("rotate with declared scopes: %v", err)
 		}
 		if !hasScope(scopes, "stats.read") {
@@ -274,7 +289,7 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 		})
 		p := &BackblazeProvider{}
 		meta := map[string]string{"key_id": "0021old", "account_id": "acct"}
-		if _, err := p.Rotate(context.Background(), "K0old", meta); err != nil {
+		if _, err := p.Rotate(providerCtx(p, meta), "K0old", meta); err != nil {
 			t.Fatalf("rotate: %v", err)
 		}
 		for _, want := range []string{"writeKeys", "deleteKeys"} {

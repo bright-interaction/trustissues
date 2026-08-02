@@ -416,20 +416,42 @@ func TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret(t *testing.T) {
 	}
 
 	t.Run("an editor cannot smuggle a host in through a provider preset", func(t *testing.T) {
-		// seedCapabilityDefaults is the column's other writer. Three presets
-		// expand a tenant value out of provider_meta, which an editor can set,
-		// so enrolling a provider was a ceiling write with the host in the
+		// seedCapabilityDefaults is the ceiling column's other writer. Three
+		// presets expand a tenant value out of provider_meta, which an editor can
+		// set, so enrolling a provider was a ceiling write with the host in the
 		// caller's hands: {tenant}.auth0.com with tenant="attacker" seeds
 		// attacker.auth0.com/*, and anyone can register that.
+		//
+		// Round 3 answered this by storing the provider and SKIPPING the seed, so
+		// this case expected 200 with an empty ceiling. Round 4 showed why that
+		// was half an answer: the stored provider + provider_meta pair is a
+		// destination in its own right, independent of the ceiling column. The
+		// rotation scheduler and POST /api/vault/{id}/validate both read it and
+		// dial "https://attacker.auth0.com" carrying the decrypted secret,
+		// touching destination_patterns at no point. So the WRITE is refused now,
+		// not merely the seed.
 		env.forceDestinations(t, entryID, `[]`)
 		body, _ := json.Marshal(map[string]any{"provider": "auth0", "provider_meta": `{"tenant":"attacker"}`})
 		rec := httptest.NewRecorder()
 		env.vault.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+entryID, editor, "user", entryID, string(body)))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("ABORT: enrolling a provider should still succeed: %d %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("enrolling a provider on somebody else's secret: HTTP %d, want 403 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "egress_widening_denied") {
+			t.Errorf("the refusal should name the reason, got %s", rec.Body.String())
 		}
 		if got := env.storedDestinations(t, entryID); strings.Contains(got, "attacker") {
 			t.Fatalf("the preset seeded a host the editor chose: %s", got)
+		}
+		// And the provider pair itself must not be stored, or the scheduler still
+		// has the attacker's host to dial.
+		row, err := env.queries.GetVaultEntryMeta(context.Background(), entryID)
+		if err != nil {
+			t.Fatalf("reload entry: %v", err)
+		}
+		if row.Provider.String == "auth0" {
+			t.Fatalf("the provider was stored anyway; provider_meta then names the host the "+
+				"rotation scheduler dials: provider=%q", row.Provider.String)
 		}
 	})
 
