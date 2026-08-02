@@ -1,0 +1,37 @@
+# /etc/cron.d/trustissues-backup - the fallback for hosts without systemd.
+#
+# Install:
+#   install -m 0644 deploy/cron/trustissues-backup.cron /etc/cron.d/trustissues-backup
+#
+# Prefer the systemd units in deploy/systemd/ when the host has systemd. They
+# give you Persistent=true (a backup missed while the box was off runs at the
+# next boot instead of vanishing), a sandbox, and a real failure hook. This file
+# exists so a host without systemd is not left with "run backup.sh from cron"
+# as a doc line, which is what DEFERRED.md section (d) called out.
+#
+# Three cron traps are handled explicitly below, because each of them silently
+# produces a schedule that looks installed and never works:
+#
+#   1. cron's PATH is not your PATH. It is typically /usr/bin:/bin only, so
+#      sqlite3 is frequently not found and backup.sh exits 1 every night.
+#   2. cron mails output to the crontab owner ONLY if the box runs an MTA. Most
+#      do not, so cron's own error reporting goes to a mail spool nobody reads,
+#      or nowhere. That is why every line below ends in an explicit `|| alert`
+#      instead of relying on MAILTO.
+#   3. A percent sign in a cron command is a newline, not a percent. There are
+#      none here. If you add a `date +%F`, escape it as `\%F` or it will
+#      truncate the command at that point and you will not be told.
+#
+# Requires /etc/trustissues/backup.env, the same file the systemd units read.
+# Copy it from deploy/systemd/backup.env.example and chmod 0600.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHELL=/bin/bash
+
+# Daily backup + retention prune at 03:20, matching trustissues-backup.timer.
+20 3 * * * root set -a; . /etc/trustissues/backup.env; set +a; export TRUSTISSUES_BACKUP_PRUNE=1 TRUSTISSUES_ALERT_LOG=/var/log/trustissues-backup.log; /opt/trustissues/scripts/backup.sh >>/var/log/trustissues-backup.log 2>&1 || /opt/trustissues/deploy/systemd/trustissues-backup-alert.sh trustissues-backup.service >>/var/log/trustissues-backup.log 2>&1
+
+# Weekly restore drill on Mondays at 04:10, matching trustissues-restore-drill.timer.
+# This is the line people leave out. Do not leave it out: the backup job above
+# proves a file was written, and only this proves the file can be restored.
+10 4 * * 1 root set -a; . /etc/trustissues/backup.env; set +a; export TRUSTISSUES_ALERT_LOG=/var/log/trustissues-drill.log; /opt/trustissues/scripts/restore-drill.sh >>/var/log/trustissues-drill.log 2>&1 || /opt/trustissues/deploy/systemd/trustissues-backup-alert.sh trustissues-restore-drill.service >>/var/log/trustissues-drill.log 2>&1
