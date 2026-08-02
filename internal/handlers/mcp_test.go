@@ -40,6 +40,14 @@ func mcpTestDB(t *testing.T) *sql.DB {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+	-- settings carries ai_key_openai / ai_key_anthropic, which is how the
+	-- capability bridge learns that an entry is the instance's provider key and
+	-- may only ever be delivered to that provider (secret_egress.go). use_secret
+	-- mints through the real Issue handler, which reads it and DENIES on a read
+	-- error, so a fixture without this table refuses every mint.
+	CREATE TABLE settings (
+		key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	CREATE TABLE collection_members (
 		collection_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer',
 		-- accepted_at is REQUIRED by ListAccessibleVaultEntryNames, which filters

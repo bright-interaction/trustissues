@@ -105,6 +105,43 @@ func (h *VaultHandler) grantFor(ctx context.Context, userID string, isAdmin bool
 	return none
 }
 
+// mayDirectSecretEgress reports whether userID may ADD or WIDEN a destination
+// this entry's secret is delivered to.
+//
+// It is deliberately narrower than manage. grantFor row 5 hands manage to every
+// accepted editor of the collection an entry lives in, and that is right for
+// editing an entry: name, notes, rotation schedule, even the value. It is not
+// right for choosing where the plaintext GOES. An editor who can repoint the
+// ceiling turns "use without seeing" into "see": /proxy injects the decrypted
+// value into a request addressed at a host they named, and unlike
+// /api/vault/unlock (which re-verifies the caller's password) the proxy path is
+// reachable with an API key alone. That is the round-3 blocker in one sentence.
+//
+// The right belongs to the principal who deposited the plaintext (the entry's
+// creator) or to an instance admin. Both must ALSO still have manage right now,
+// so a departed creator's residual recovery read (row 7) does not carry a
+// licence to redirect the secret of a collection they were removed from.
+//
+// Narrowing is not gated here: anyone with manage may shrink or clear the list,
+// because clearing it is the only per-secret agent revocation the product has.
+func (h *VaultHandler) mayDirectSecretEgress(ctx context.Context, userID string, isAdmin bool, entryID string) bool {
+	if entryID == "" {
+		return false
+	}
+	g := h.grantFor(ctx, userID, isAdmin, entryID)
+	if !g.manage {
+		return false
+	}
+	if isAdmin {
+		return true
+	}
+	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
+	if err != nil {
+		return false
+	}
+	return userID != "" && info.UserID == userID
+}
+
 // managerMayAdoptOrphanedEntry reports whether callerID may rename an entry that
 // somebody else created, by taking ownership of it.
 //

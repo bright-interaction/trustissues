@@ -487,6 +487,17 @@ func newTestDB(t *testing.T) *sql.DB {
 			accepted_at TEXT,
 			PRIMARY KEY (collection_id, user_id)
 		)`,
+		// settings is where the AI gateway records which vault entry holds the
+		// instance's provider key (ai_key_openai / ai_key_anthropic). The
+		// capability bridge reads it on every mint and every proxied request to
+		// find the entry's egress PIN, and a read error DENIES, so a fixture
+		// without this table refuses every call for a reason production never
+		// has. See secret_egress.go.
+		`CREATE TABLE settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE TABLE capability_grants (
 			agent_id TEXT NOT NULL,
 			secret_id TEXT NOT NULL,

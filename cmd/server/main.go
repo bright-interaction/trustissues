@@ -431,6 +431,23 @@ func main() {
 	// one token is single-use, so an agent's real traffic is bounded by minting,
 	// and anything above this is flooding.
 	proxyLimiter := timw.NewRateLimiter(120, 1*time.Minute)
+	// The AI gateway spends the OPERATOR's provider budget on every allowed call
+	// and writes an attributed activity_log row on every REFUSED one, so the
+	// 500/min apiLimiter was the only thing bounding either: one client could
+	// burn the team's tokens or grow the audit table by 720k rows a day from a
+	// single address. 120/min is above any interactive or agent workload that
+	// waits for a non-streaming completion.
+	aiGatewayLimiter := timw.NewRateLimiter(120, 1*time.Minute)
+	// Membership writes answer, in their timing, a question their bodies
+	// deliberately refuse to answer: whether an address has an account here.
+	// AddMember does three extra reads and one extra insert on a hit, and
+	// RescindInvitation two extra reads, which no amount of response shaping
+	// removes while one branch writes a row the other cannot. What CAN be taken
+	// away is the sample count: averaging a sub-millisecond difference over the
+	// network needs thousands of probes, and the shared 500/min apiLimiter was
+	// the only bound. 30 per 15 minutes is far above real member management
+	// (adding a team, then a role change or two) and far below a timing attack.
+	membershipLimiter := timw.NewRateLimiter(30, 15*time.Minute)
 
 	// MCP shares the sensitive-op budget with POST /api/secrets/issue: its
 	// use_secret tool mints capability tokens by calling the Issue handler
@@ -608,14 +625,14 @@ func main() {
 					r.Put("/", collectionHandler.Update)
 					r.Delete("/", collectionHandler.Delete)
 					r.Get("/members", collectionHandler.ListMembers)
-					r.Post("/members", collectionHandler.AddMember)
+					r.With(timw.RateLimit(membershipLimiter)).Post("/members", collectionHandler.AddMember)
 					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
 					// Withdraw a PENDING invitation by email. The members list
 					// no longer hands out a user id for a pending seat (that
 					// was the account-enumeration oracle), and an address with
 					// no account never had one, so rescinding needs its own
 					// email-addressed route or an invite could never be undone.
-					r.Delete("/invitations", collectionHandler.RescindInvitation)
+					r.With(timw.RateLimit(membershipLimiter)).Delete("/invitations", collectionHandler.RescindInvitation)
 					r.Post("/accept", collectionHandler.AcceptInvite)
 					r.Post("/decline", collectionHandler.DeclineInvite)
 				})
@@ -634,6 +651,7 @@ func main() {
 			// /service-identities alone.
 			r.Group(func(r chi.Router) {
 				r.Use(timw.VaultOnlyBlock())
+				r.Use(timw.RateLimit(aiGatewayLimiter))
 				r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
 			})
 
@@ -642,14 +660,28 @@ func main() {
 			r.Get("/settings/ai", aiGatewayHandler.GetConfig)
 			r.With(timw.AdminOnly()).Put("/settings/ai", aiGatewayHandler.UpdateConfig)
 
-			// Remote HTTP MCP endpoint (JSON-RPC) for Claude/ChatGPT connectors:
-			// list_secrets + use_secret, with Shield tokenizing tool results.
-			r.Post("/mcp", mcpHandler.Handle)
-
-			// Capability bridge token minting (dockyard main.go:894-896).
-			// Sensitive op: rate limited hard.
-			r.Route("/secrets", func(r chi.Router) {
-				r.With(timw.RateLimit(capabilityLimiter)).Post("/issue", capabilityHandler.Issue)
+			// The capability bridge: MCP (list_secrets + use_secret, with Shield
+			// tokenizing tool results) and the HTTP mint route. Both hand out a
+			// token that /proxy spends by injecting a decrypted secret upstream,
+			// so they are ONE surface and get one rule.
+			//
+			// NOT open to vault_only, for the same reason /api/ai is not. That
+			// role is what RedeemInvitation hands out over the PUBLIC invite
+			// endpoint, and it exists to let a teammate use the browser extension
+			// against their own secrets, not to spend the team's Claude/OpenAI
+			// budget. Blocking the gateway while leaving the bridge open was the
+			// same door twice: an accepted vault_only member minted for the team
+			// key and drove POST /proxy/api.openai.com/v1/chat/completions, and
+			// the operator paid for it. Neither handler has a role check of its
+			// own; VaultOnlyBlock's doc says to mount it on every group that is
+			// not part of the vault surface, and this is not.
+			r.Group(func(r chi.Router) {
+				r.Use(timw.VaultOnlyBlock())
+				r.Post("/mcp", mcpHandler.Handle)
+				// Sensitive op: rate limited hard.
+				r.Route("/secrets", func(r chi.Router) {
+					r.With(timw.RateLimit(capabilityLimiter)).Post("/issue", capabilityHandler.Issue)
+				})
 			})
 
 			// Service identities: admin-only mint + list + revoke + delete +

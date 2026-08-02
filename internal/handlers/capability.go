@@ -20,6 +20,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/capability"
+	dbpkg "github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
@@ -34,8 +35,12 @@ import (
 // See internal/capability/token.go for the token format and
 // internal/database/migrations/00020_capability.sql for the schema.
 type CapabilityHandler struct {
-	db          *sql.DB
-	vault       alerts.ConfigDecrypter
+	db    *sql.DB
+	vault alerts.ConfigDecrypter
+	// settings reads the ai_key_* rows that PIN an entry to one provider host.
+	// See secret_egress.go: the pin is what stops an editor who can rewrite
+	// destination_patterns from choosing where the operator's key is delivered.
+	settings    settingReader
 	signingKey  capability.SigningKey
 	httpClient  *http.Client
 	defaultTTL  time.Duration
@@ -59,6 +64,7 @@ func NewCapabilityHandler(db *sql.DB, vault alerts.ConfigDecrypter, signingKeySo
 	return &CapabilityHandler{
 		db:         db,
 		vault:      vault,
+		settings:   dbpkg.New(db),
 		signingKey: key,
 		// SSRF-hardened: the proxy injects the real decrypted secret into the
 		// outbound request, so the destination must never be reachable at a
@@ -218,6 +224,28 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 				"Set one on the secret (Vault, edit the entry, Agent access) and try again")
 		return
 	}
+	// The pin again, at mint time. The proxy is the authority (it sees the real
+	// request and it is the door a stolen token would use), but a token that can
+	// never be spent should not be handed out: an agent gets one honest refusal
+	// naming the reason instead of a 403 per attempt. This also refuses a token
+	// whose CEILING has already been rewritten off-pin, which is the state the
+	// attack leaves the row in.
+	pin, pinErr := providerPinFor(ctx, h.settings, entry.ID)
+	if pinErr != nil {
+		slog.Error("capability.issue: could not read the entry's provider pin, denying",
+			"secret_id", entry.ID, "error", pinErr)
+		writeError(w, r, http.StatusForbidden, "destination_pinned", "the secret's provider binding could not be read")
+		return
+	}
+	if bad, outside := firstDestinationOutsidePin(pin, dests); outside {
+		h.logCapabilityEvent(ctx, req.AgentID, &entry.ID, entry.Name, bad, req.Method, "denied", 0, "destination_outside_provider_pin", "")
+		writeError(w, r, http.StatusForbidden, "destination_pinned",
+			fmt.Sprintf("%s is the instance's AI provider key; it is only ever delivered to %s, and %q is not that. "+
+				"If this key is meant to be a general-purpose secret, unwire it in Settings > AI gateway first",
+				entry.Name, pin.describe(), bad))
+		return
+	}
+
 	method := req.Method
 	if method == "" {
 		method = "*"
@@ -386,6 +414,42 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	if !capability.MethodMatches(tok, r.Method) {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "method_mismatch", tok.Nonce)
 		writeError(w, r, http.StatusForbidden, "method_mismatch", "token does not authorise this method")
+		return
+	}
+
+	// THE PIN. An entry an admin wired into the AI gateway may only be delivered
+	// to that provider's own API host, whatever destination_patterns says.
+	//
+	// Everything above this line trusts a column that any accepted collection
+	// editor can rewrite through PUT /api/vault/{id}, including a public-signup
+	// vault_only account. So the round-2 host-keyed allowlist held and the attack
+	// simply moved the host: rewrite the ceiling to a collector the attacker
+	// controls, mint, and the proxy delivered the OPERATOR's decrypted provider
+	// key there in cleartext, with a 200. Both checks above (token dests and the
+	// entry's CURRENT allow-list) said yes, because both read the rewritten
+	// column.
+	//
+	// The pin comes from settings ai_key_* (an AdminOnly write) joined to the
+	// compile-time aiProviders table, so no caller who can edit the entry can
+	// move it. Enforced HERE, before the nonce is spent and before the secret is
+	// decrypted: a refused call costs the caller nothing and leaks nothing. The
+	// write path refuses the same patterns (VaultHandler.Update), but a delivery
+	// gate is what makes the property hold for rows written by anything else:
+	// an older binary, a restored backup, a future second writer.
+	pin, pinErr := providerPinFor(ctx, h.settings, tok.SecretID)
+	if pinErr != nil {
+		slog.Error("capability.proxy: could not read the entry's provider pin, denying",
+			"secret_id", tok.SecretID, "error", pinErr)
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "egress_pin_unreadable", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_pinned", "the secret's provider binding could not be read")
+		return
+	}
+	if pin.pinned() && !pin.allowsHost(host) {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
+			r.Method, "denied", 0, "destination_outside_provider_pin", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_pinned",
+			fmt.Sprintf("this secret is the instance's AI provider key; it is only ever delivered to %s, never to %s",
+				pin.describe(), providerAPIHost(host)))
 		return
 	}
 
