@@ -26,6 +26,49 @@ import (
 // Both are contract bugs. These tests pin the contract so the clients can go
 // back to a plain merge.
 
+// TestVaultEntryMetaCustomFieldsWireShape pins the two-valued contract that
+// dropping `omitempty` created, because that drop changes the shape for EVERY
+// client of /api/vault and /api/vault/{id}, not just the browser extension.
+//
+// The decision, deliberately: keep it, and make the two values mean different
+// things.
+//
+//	null  the projection behind this response does not carry custom fields
+//	      (the list/match rows never SELECT or decrypt the column)
+//	[]    the entry genuinely has none
+//
+// With omitempty the key was simply absent in both cases, which is what made a
+// write response unmergeable: a client could not tell "your last custom field
+// is gone" from "this endpoint does not report them", so a deleted TOTP seed
+// stayed on screen until the next full unlock. Absent -> null is not a
+// meaningful regression for a consumer (a typed client decodes both to nil /
+// undefined and both blow up identically on a bare .map), and it buys a write
+// response that describes itself.
+func TestVaultEntryMetaCustomFieldsWireShape(t *testing.T) {
+	notReported, err := json.Marshal(vaultEntryMeta{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	m := decodeMeta(t, notReported)
+	if _, ok := m["custom_fields"]; !ok {
+		t.Error("vaultEntryMeta dropped the custom_fields key when it carries none; " +
+			"omitempty is back, and a client merging a write response keeps showing deleted secrets")
+	}
+	if got := m["custom_fields"]; got != nil {
+		t.Errorf("custom_fields=%v for a projection that does not read the column, want null", got)
+	}
+
+	reportedEmpty, err := json.Marshal(vaultEntryMeta{CustomFields: []CustomField{}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	m = decodeMeta(t, reportedEmpty)
+	fields, ok := m["custom_fields"].([]any)
+	if !ok || len(fields) != 0 {
+		t.Errorf("custom_fields=%v for an entry that reports none, want []", m["custom_fields"])
+	}
+}
+
 // decodeMeta returns the response body as a raw map, because half of what is
 // under test is whether a KEY is present at all, which a typed struct erases.
 func decodeMeta(t *testing.T, body []byte) map[string]any {
