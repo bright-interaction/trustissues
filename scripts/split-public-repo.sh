@@ -72,6 +72,20 @@ git subtree split --prefix="$PREFIX" -b "$SPLIT_BRANCH"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# refuse aborts a gate WITHOUT deleting the filtered tree.
+#
+# The cleanup trap used to fire on every exit, including a gate failure, so the
+# evidence was destroyed at exactly the moment an operator needs to inspect it.
+# A dry run whose output you cannot examine is not a dry run. Every refusal below
+# goes through here so the tree survives for exactly that.
+refuse() {
+  echo "$@" >&2
+  echo >&2
+  echo "Filtered tree kept for inspection: $CLONE" >&2
+  trap - EXIT
+  exit 1
+}
 CLONE="$WORK/trustissues-public"
 # --single-branch + --no-tags: the throwaway clone holds ONLY the disjoint subtree
 # history, never the monorepo's other branches (which carry unrelated project CI
@@ -145,7 +159,7 @@ if command -v go >/dev/null 2>&1; then
     echo "          contributors a red suite. Common cause: a redaction rewrote a" >&2
     echo "          Shield test fixture into a value the pattern no longer matches." >&2
     ( cd "$CLONE" && go test ./... 2>&1 | grep -E "^(---|FAIL|\s+.*_test\.go)" | head -20 ) >&2 || true
-    exit 1
+    refuse "REFUSING: the filtered mirror fails its own tests."
   fi
 else
   echo "  (go not found; skipping the Go build gate)" >&2
@@ -186,9 +200,8 @@ mirror_assert_module_path "$CLONE" "$REMOTE_URL"
 if command -v gitleaks >/dev/null 2>&1; then
   echo "Scanning mirror history for secrets (gitleaks) ..."
   if ! ( cd "$CLONE" && gitleaks detect --source . --config .gitleaks.toml --no-banner --redact >/dev/null 2>&1 ); then
-    echo "REFUSING: gitleaks found a secret in the mirror history:" >&2
     ( cd "$CLONE" && gitleaks detect --source . --config .gitleaks.toml --no-banner --redact ) >&2 || true
-    exit 1
+    refuse "REFUSING: gitleaks found a secret in the mirror history (above)."
   fi
   echo "  no secrets in mirror history: OK"
 else
