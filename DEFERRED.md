@@ -101,15 +101,23 @@ halves are separated below.
   systemd, each with explicit failure alerting because cron's own reporting
   needs an MTA nobody has.
 - `scripts/prune-backups.sh`: keep N daily / M weekly (defaults 7 and 4), refuse
-  a keep-nothing policy, never delete the newest, clean stale `.part` files.
+  a keep-nothing or non-numeric policy, refuse to run inside the live data
+  directory at all, clean stale `.part` files.
 - `scripts/restore-drill.sh`: restore the newest snapshot through the real
-  `restore.sh` into a throwaway directory, fail on a stale snapshot, and check a
-  named row survived the round trip.
+  `restore.sh` into a throwaway directory, fail on a stale (or future-stamped)
+  snapshot, refuse a non-numeric freshness limit rather than ignoring it, and
+  check a named row survived the round trip.
 - `scripts/backup.sh`: destination configurable via `TRUSTISSUES_BACKUP_DIR`,
-  refuses to write into the live data directory, warns when the backups share a
-  filesystem with the database.
+  refuses to write into the live data directory (physical paths, so a symlink is
+  not a way around it), warns when the backups share a filesystem with the
+  database.
 - Every one of those behaviours has a case in `scripts/test-backup-restore.sh`
-  that fails without it.
+  that has been watched to fail without it, with one deliberate exception:
+  `prune-backups.sh`'s "the newest snapshot is never a deletion candidate" guard
+  is belt-and-braces on top of the bucket arithmetic, so it only fires when that
+  arithmetic is already wrong. Deleting the guard keeps the suite green, which is
+  the honest state of it. The ablation specs are in
+  `scripts/ablations/backups.json`, runnable with `scripts/ablate.py`.
 
 **Still deferred: the in-process `trustissues backup` subcommand.** The scripts
 shell out to the `sqlite3` CLI, so a host without it cannot take a backup and

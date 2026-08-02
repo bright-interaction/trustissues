@@ -25,7 +25,8 @@
 #   TRUSTISSUES_DATA_DIR           the LIVE data dir; used read-only to pick a
 #                                  canary row. Optional, see "canary" below.
 #   TRUSTISSUES_DRILL_MAX_AGE_HOURS  fail if the newest snapshot is older than
-#                                  this (default 48, 0 disables)
+#                                  this (default 48, 0 disables). Must be digits
+#                                  only; anything else is REFUSED, not ignored.
 #   TRUSTISSUES_DRILL_CANARY_SQL   a query to run against the restored copy
 #   TRUSTISSUES_DRILL_CANARY_EXPECT  what that query must return
 #   TRUSTISSUES_DRILL_KEEP=1       keep the throwaway directory for inspection
@@ -53,6 +54,33 @@ BACKUP_DIR="${1:-${TRUSTISSUES_BACKUP_DIR:-}}"
 command -v sqlite3 >/dev/null 2>&1 || setup "sqlite3 CLI not found on PATH"
 [ -x "${HERE}/restore.sh" ] || setup "restore.sh not found next to this script"
 
+# 0. Resolve TRUSTISSUES_DATA_DIR ONCE, here, and refuse if it does not resolve.
+#
+# The containment check further down used to do this inline:
+#
+#   LIVE_ABS="$(cd "${TRUSTISSUES_DATA_DIR}" 2>/dev/null && pwd || echo "")"
+#
+# and when that cd failed LIVE_ABS became the EMPTY STRING, so the pattern
+# "${LIVE_ABS}"/* collapsed to /* and matched every absolute path in existence.
+# The drill then failed with "the drill directory ... is inside the LIVE data
+# dir; refusing" about a directory it had never gone near. Reachable from a plain
+# typo, an unmounted volume, or the Compose path in backup.env.example on a host
+# whose compose project is not named exactly "trustissues". That is a weekly page
+# with a reason that is not true, and a false page is how an operator learns to
+# ignore the real one. backup.sh reports the same misconfiguration honestly
+# ("database not found"); the two disagreed, and the alerter's hint table only
+# had an entry for backup.sh's wording.
+#
+# pwd -P, not pwd. Every same-directory refusal in this tooling compares absolute
+# paths, and bash's `cd sym && pwd` prints the SYMLINK path, so a directory
+# reached through a symlink compares unequal to itself and the guard is bypassed.
+LIVE_ABS=""
+if [ -n "${TRUSTISSUES_DATA_DIR:-}" ]; then
+  LIVE_ABS="$(cd "${TRUSTISSUES_DATA_DIR}" 2>/dev/null && pwd -P || echo "")"
+  [ -n "${LIVE_ABS}" ] \
+    || setup "TRUSTISSUES_DATA_DIR is set to ${TRUSTISSUES_DATA_DIR}, which does not resolve to a directory"
+fi
+
 # 1. The newest snapshot, by the timestamp in its name.
 #
 # NOT `list_snapshots ... | head -1`. head exits after the first line, the
@@ -77,9 +105,44 @@ SNAP_BASE="$(basename "${SNAPSHOT}")"
 #    that passes on a three month old snapshot is worse than no drill, because
 #    it reports green.
 MAX_AGE_HOURS="${TRUSTISSUES_DRILL_MAX_AGE_HOURS:-48}"
+
+# Refuse a non-numeric limit rather than silently ignoring it.
+#
+# `[ "${AGE_HOURS}" -gt "48h" ]` returns 2 and prints "integer expected" on
+# stderr, and inside an `if ... && ...` condition set -e does not apply, so the
+# branch is just FALSE: the freshness check is skipped entirely and the drill
+# goes on to print DRILL PASSED on a snapshot of any age. Measured on a 213 day
+# old snapshot: 48 -> exit 1 (correct), 48h -> exit 0 "DRILL PASSED", two ->
+# exit 0 "DRILL PASSED". The unit exits 0, systemd is green, OnFailure never
+# fires, and the one stderr line sits in a journal nobody opens because nothing
+# failed. One character in the file install.sh tells the operator to go and edit
+# disables the ONLY check that catches a dead backup timer, which is the exact
+# failure this whole workstream exists to kill.
+#
+# prune-backups.sh already validates its two numeric env vars with this same
+# regex and refuses. Enforcing a property at one call site and not the sibling
+# one is this codebase's signature defect; it had been reintroduced inside the
+# fix for it.
+#
+# A BLANK value is an unset line, not a typo, and falls back to the default via
+# the :- above rather than being refused. Same reading as prune-backups.sh.
+printf '%s' "${MAX_AGE_HOURS}" | grep -Eq '^[0-9]+$' \
+  || setup "TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check."
+
 NOW_EPOCH="$(date -u +%s)"
 SNAP_EPOCH="$(snapshot_epoch "${SNAP_BASE}")"
 AGE_HOURS=$(((NOW_EPOCH - SNAP_EPOCH) / 3600))
+
+# A snapshot stamped in the FUTURE is the other way to blind this check, and one
+# clock-skewed run is all it takes. trustissues-20300101T000000Z.db sorts newest
+# forever, its age comes out negative, `-gt 48` is false, and the drill reports
+# green while every real backup ages out underneath it. Retention makes it
+# permanent: the newest snapshot is never a deletion candidate, so the bogus file
+# is also the one file that never expires.
+if [ "${AGE_HOURS}" -lt 0 ]; then
+  fail "the newest snapshot ${SNAP_BASE} is stamped ${AGE_HOURS#-}h in the FUTURE. A run with a skewed clock wrote it, and while it is there it hides every real snapshot from the freshness check. Delete it and check the host clock."
+fi
+
 if [ "${MAX_AGE_HOURS}" != "0" ] && [ "${AGE_HOURS}" -gt "${MAX_AGE_HOURS}" ]; then
   fail "the newest snapshot ${SNAP_BASE} is ${AGE_HOURS}h old (limit ${MAX_AGE_HOURS}h). The backup timer is not running: check 'systemctl status trustissues-backup.timer'."
 fi
@@ -114,9 +177,9 @@ if [ -n "${TRUSTISSUES_DRILL_CANARY_SQL:-}" ]; then
   CANARY_SQL="${TRUSTISSUES_DRILL_CANARY_SQL}"
   CANARY_EXPECT="${TRUSTISSUES_DRILL_CANARY_EXPECT}"
 else
-  LIVE_DB="${TRUSTISSUES_DATA_DIR:-}/trustissues.db"
+  LIVE_DB="${LIVE_ABS}/trustissues.db"
   LIVE_ID=""
-  if [ -n "${TRUSTISSUES_DATA_DIR:-}" ] && [ -f "${LIVE_DB}" ]; then
+  if [ -n "${LIVE_ABS}" ] && [ -f "${LIVE_DB}" ]; then
     # -readonly, so a drill can never write to, checkpoint, or lock the live
     # database it is reporting on. If the open fails for any reason (a WAL with
     # no -shm and a read-only directory is the usual one) fall through quietly
@@ -160,11 +223,20 @@ chmod 700 "${DRILL_DIR}"
 # The one thing this script must never do is restore over production. mktemp
 # will not hand back a path inside the data dir, but the cost of checking is one
 # string comparison and the cost of being wrong is the live vault.
-if [ -n "${TRUSTISSUES_DATA_DIR:-}" ]; then
-  LIVE_ABS="$(cd "${TRUSTISSUES_DATA_DIR}" 2>/dev/null && pwd || echo "")"
-  DRILL_ABS="$(cd "${DRILL_DIR}" && pwd)"
+#
+# LIVE_ABS was resolved at step 0 and is known non-empty whenever
+# TRUSTISSUES_DATA_DIR is set. Do NOT recompute it here: the version of this
+# block that resolved the path inline and fell back to "" on failure is what made
+# the drill page every week claiming a refusal that had not happened.
+#
+# Both sides go through pwd -P. With the logical pwd, TMPDIR under a symlinked
+# path (or a data dir reached by a symlink) makes the two spellings of one
+# directory compare unequal, so the drill would happily restore a copy of the
+# vault INSIDE the live data dir and report success.
+if [ -n "${LIVE_ABS}" ]; then
+  DRILL_ABS="$(cd "${DRILL_DIR}" && pwd -P)"
   case "${DRILL_ABS}/" in
-    "${LIVE_ABS}"/*) fail "the drill directory ${DRILL_ABS} is inside the LIVE data dir; refusing" ;;
+    "${LIVE_ABS}"/*) fail "the drill directory ${DRILL_ABS} is inside the LIVE data dir ${LIVE_ABS}; refusing" ;;
   esac
 fi
 

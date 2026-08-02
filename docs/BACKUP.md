@@ -115,6 +115,13 @@ snapshot named `trustissues-<stamp>.db` never collides with `trustissues.db`, so
 it looks harmless, but retention pruning would then be an automated `rm` running
 inside the directory that holds the only live copy of the vault.
 
+`prune-backups.sh` refuses it too, and that is the copy of the check that
+matters, because it is the script that does the deleting. It refuses when the
+directory you pass is `TRUSTISSUES_DATA_DIR`, and also when the directory simply
+holds a file named `trustissues.db`, which covers a hand-run invocation with no
+environment set. Both comparisons use physical paths, so reaching the data
+directory through a symlink is not a way around either script.
+
 It **warns**, and continues, when the destination is merely on the same
 filesystem as the database:
 
@@ -313,10 +320,20 @@ It takes the newest snapshot by the timestamp in its name and:
 
 1. fails if that snapshot is older than `TRUSTISSUES_DRILL_MAX_AGE_HOURS`
    (default 48, `0` disables). This is what catches a timer that quietly stopped
-   weeks ago, which no other check on this page can see.
+   weeks ago, which no other check on this page can see. The value must be
+   **digits only**: `48h` or `two` is refused with exit 2, not ignored. It used
+   to be ignored, and `[ 5000 -gt 48h ]` is simply false, so a one-character typo
+   in this file skipped the freshness check and the drill printed `DRILL PASSED`
+   on a snapshot of any age.
+   A snapshot stamped in the **future** also fails here, for the same reason: it
+   sorts newest forever, its age is negative, and it would hide every real
+   snapshot from the check while retention protects it from ever being pruned.
 2. runs the real `scripts/restore.sh` into a fresh `mktemp -d`, so the drill
    exercises the actual restore path rather than a `cp`. It refuses to proceed
-   if that directory is anywhere inside the live data directory.
+   if that directory is anywhere inside the live data directory (compared by
+   physical path, so a symlink is not a way around it). If `TRUSTISSUES_DATA_DIR`
+   is set but does not resolve to a directory, the drill stops with exit 2 and
+   says so, rather than reporting a containment refusal that never happened.
 3. asserts on the restored copy: `PRAGMA integrity_check` is `ok`, the table
    count matches the snapshot, the `vault_entries` row count matches, no
    `-wal`/`-shm` sidecars were left behind, and the file is mode `0600`.

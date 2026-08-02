@@ -181,6 +181,29 @@ else
   ok "backup.sh refuses a destination that is the live data directory"
 fi
 
+# 8b. And it must still be the live data directory when it is spelled as a
+#     SYMLINK to it.
+#
+# The guard compared `cd "$dir" && pwd` on both sides, which is the LOGICAL path:
+# bash prints the symlink you asked for, not the directory you landed in, so the
+# two spellings of one directory compared unequal and the refusal never fired.
+# Proven before the fix: backup.sh exited 0 and the live data dir ended up
+# holding trustissues-<stamp>.db beside trustissues.db. The shipped
+# trustissues-backup.service sets TRUSTISSUES_BACKUP_PRUNE=1, so the next
+# scheduled run is then an automated rm inside the live data dir, which is the
+# precise outcome the guard's own comment says must never happen.
+# Assert on the DIRECTORY, not just the exit status: a refusal that still wrote
+# the file would be worse than no refusal.
+DATA8B="${WORK}/data8b"; mkdir -p "${DATA8B}"
+make_db "${DATA8B}/trustissues.db"
+ln -s "${DATA8B}" "${WORK}/backups8b-link"
+OUT8B="$(TRUSTISSUES_DATA_DIR="${DATA8B}" "${HERE}/backup.sh" "${WORK}/backups8b-link" 2>&1 || true)"
+if [ -z "$(find "${DATA8B}" -name 'trustissues-*.db' 2>/dev/null)" ]; then
+  ok "backup.sh refuses a destination that is a SYMLINK to the live data directory"
+else
+  bad "backup.sh wrote snapshots into the live data dir through a symlink: ${OUT8B}"
+fi
+
 # 9. Sharing a filesystem is allowed but must be said out loud. The shipped
 #    Compose deploy makes "point it at a subdirectory of the data volume" the
 #    obvious wrong move, and a silent success there is how one full disk ends up
@@ -296,6 +319,58 @@ if TRUSTISSUES_BACKUP_KEEP_DAILY="" TRUSTISSUES_BACKUP_KEEP_WEEKLY="" \
   ok "a blank retention value falls back to the default instead of deleting everything"
 else
   bad "a blank retention value did not fall back safely"
+fi
+
+# 13b. Retention must refuse to run inside the LIVE data directory.
+#
+# backup.sh refused this from the start and prune-backups.sh, the script that
+# does the actual deleting, had no such check at all. Proven before the fix:
+# `prune-backups.sh <live data dir>` deleted two snapshots in place. trustissues.db
+# itself survives because the name regex saves it, so the blast radius was
+# snapshots rather than the database, but the invariant was enforced in the script
+# that WRITES and not in the one that DELETES, which is where it matters.
+#
+# Three routes into the same directory, because each check alone has a hole:
+# the env var (set by the systemd unit), the env var through a symlink (logical
+# pwd compares one directory unequal to itself), and no env var at all, which is
+# every hand-run invocation.
+# Every case asserts the SNAPSHOTS SURVIVED, not merely that the exit code was
+# non-zero: a refusal that deletes first is not a refusal.
+PLIVE_SNAPS="20260802T100000Z 20260701T100000Z 20260601T100000Z 20260501T100000Z"
+for route in envvar symlink marker; do
+  PL="${WORK}/prune-live-${route}"; mkdir -p "${PL}"
+  make_db "${PL}/trustissues.db"
+  for s in ${PLIVE_SNAPS}; do make_snapshot "${PL}" "${s}"; done
+  BEFORE13B="$(snapshot_names "${PL}")"
+  case "${route}" in
+    envvar)  RAN="$(TRUSTISSUES_DATA_DIR="${PL}" TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
+                      "${HERE}/prune-backups.sh" "${PL}" 2>&1 || true)" ;;
+    symlink) ln -s "${PL}" "${WORK}/prune-live-link"
+             RAN="$(TRUSTISSUES_DATA_DIR="${WORK}/prune-live-link" TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
+                      "${HERE}/prune-backups.sh" "${PL}" 2>&1 || true)" ;;
+    # env -u, not just "do not set it": if the operator running this suite happens
+    # to have TRUSTISSUES_DATA_DIR exported, this case would silently be testing
+    # the env-var route again and the marker check would never be exercised.
+    marker)  RAN="$(env -u TRUSTISSUES_DATA_DIR TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
+                      "${HERE}/prune-backups.sh" "${PL}" 2>&1 || true)" ;;
+  esac
+  if [ "$(snapshot_names "${PL}")" = "${BEFORE13B}" ] && [ -f "${PL}/trustissues.db" ]; then
+    ok "retention refuses to delete inside the live data dir (${route}) and deletes nothing"
+  else
+    bad "retention DELETED inside the live data dir (${route}): ${RAN}"
+  fi
+done
+# The refusal must not be a blanket one: a genuine backup directory, which is
+# every real invocation, still has to prune. A guard that refuses everything
+# passes every refusal case ever written.
+PNL="${WORK}/prune-not-live"; mkdir -p "${PNL}"
+for s in ${PLIVE_SNAPS}; do make_snapshot "${PNL}" "${s}"; done
+TRUSTISSUES_DATA_DIR="${WORK}/data5" TRUSTISSUES_BACKUP_KEEP_DAILY=1 TRUSTISSUES_BACKUP_KEEP_WEEKLY=1 \
+  "${HERE}/prune-backups.sh" "${PNL}" >/dev/null 2>&1 || true
+if [ "$(snapshot_names "${PNL}" | grep -c .)" -lt 4 ]; then
+  ok "retention still prunes a directory that is not the live data dir"
+else
+  bad "the live-data-dir refusal blocked retention on a normal backup directory"
 fi
 
 # 14. August and September. Bash reads a zero-padded "08" as octal and aborts
@@ -473,6 +548,111 @@ else
   bad "the freshness check could not be disabled, so restoring from cold storage cannot be drilled"
 fi
 
+# 21d. A TYPO in the max-age value must be refused, not ignored.
+#
+# `[ "${AGE_HOURS}" -gt "48h" ]` returns 2 with "integer expected" on stderr, and
+# set -e does not apply inside an `if ... && ...` condition, so the branch is
+# simply false and the freshness check is skipped entirely. Measured against this
+# 30 day old fixture before the fix: 48 -> exit 1 (correct), 48h -> exit 0
+# "DRILL PASSED", two -> exit 0 "DRILL PASSED". The unit exits 0, systemd is
+# green, OnFailure never fires, and the stderr line lands in a journal nobody
+# reads because nothing failed. A drill that passes when it checked nothing is
+# worse than no drill, and this is one character in the file install.sh tells the
+# operator to edit.
+#
+# Assert on the OUTPUT as well as the exit code. "did not exit 0" would also be
+# satisfied by the drill dying for some unrelated reason; what has to be true is
+# that it never claims to have passed.
+for badage in "48h" "two" "48 " "-1" "4.8"; do
+  if OUT21D="$(TRUSTISSUES_DRILL_MAX_AGE_HOURS="${badage}" "${HERE}/restore-drill.sh" "${DRILL21}" 2>&1)"; then
+    bad "TRUSTISSUES_DRILL_MAX_AGE_HOURS='${badage}' was accepted and the drill exited 0 on a 30 day old snapshot"
+  elif printf '%s' "${OUT21D}" | grep -q "DRILL PASSED"; then
+    bad "TRUSTISSUES_DRILL_MAX_AGE_HOURS='${badage}' printed DRILL PASSED"
+  elif printf '%s' "${OUT21D}" | grep -q "TRUSTISSUES_DRILL_MAX_AGE_HOURS"; then
+    ok "a non-numeric TRUSTISSUES_DRILL_MAX_AGE_HOURS ('${badage}') is refused by name"
+  else
+    bad "TRUSTISSUES_DRILL_MAX_AGE_HOURS='${badage}' failed for some other reason: ${OUT21D}"
+  fi
+done
+# A BLANK value is a half-edited line, not a typo, and must fall back to the
+# shipped default rather than be refused. Same reading prune-backups.sh gives it.
+# The fixture is 30 days old, so "fell back to 48" and "was refused" are told
+# apart by which message comes out.
+if OUT21DB="$(TRUSTISSUES_DRILL_MAX_AGE_HOURS="" "${HERE}/restore-drill.sh" "${DRILL21}" 2>&1)"; then
+  bad "a blank TRUSTISSUES_DRILL_MAX_AGE_HOURS disabled the freshness check"
+elif printf '%s' "${OUT21DB}" | grep -q "timer"; then
+  ok "a blank TRUSTISSUES_DRILL_MAX_AGE_HOURS falls back to the default limit"
+else
+  bad "a blank TRUSTISSUES_DRILL_MAX_AGE_HOURS did not fall back to the default: ${OUT21DB}"
+fi
+
+# 21e. A snapshot stamped in the FUTURE must fail the drill.
+#
+# The other way to blind the freshness check, and one clock-skewed run is all it
+# takes. trustissues-20300101T000000Z.db sorts newest forever, its age comes out
+# NEGATIVE, `-gt 48` is false, and the drill reported
+# "snapshot: trustissues-20300101T000000Z.db (-29936h old) ... DRILL PASSED".
+# Retention then makes it permanent, because the newest snapshot is never a
+# deletion candidate, so the one file that never expires is the bogus one while
+# every real backup ages out around it.
+DRILL21E="${WORK}/drill21e"; mkdir -p "${DRILL21E}"
+make_snapshot "${DRILL21E}" "$(stamp_days_ago 0)"
+make_snapshot "${DRILL21E}" "20300101T000000Z"
+if OUT21E="$("${HERE}/restore-drill.sh" "${DRILL21E}" 2>&1)"; then
+  bad "the drill PASSED on a snapshot stamped in the future, so a skewed clock blinds it forever"
+elif printf '%s' "${OUT21E}" | grep -q "FUTURE"; then
+  ok "the drill fails on a future-stamped snapshot and says why"
+else
+  bad "the drill failed on a future-stamped snapshot for the wrong reason: ${OUT21E}"
+fi
+
+# 21f. A TRUSTISSUES_DATA_DIR that does not resolve must be reported as itself,
+#      not as a containment refusal that never happened.
+#
+# The containment check resolved the path inline and fell back to "" when cd
+# failed, so `case "${DRILL_ABS}/" in "${LIVE_ABS}"/*)` collapsed to `/*` and
+# matched every absolute path on the machine. The drill then failed with
+#   DRILL FAILED: the drill directory /var/folders/.../trustissues-drill.Cf2XWA
+#   is inside the LIVE data dir; refusing
+# about a directory it had never been near. Reachable from a typo, an unmounted
+# volume, or backup.env.example's Compose path on a host whose compose project is
+# not named exactly "trustissues". The alerter's hint table has no case for that
+# string, so the operator got a weekly mail asserting a refusal that did not
+# happen, while backup.sh reported the same misconfiguration correctly. A false
+# page every week is how a real one gets ignored.
+if OUT21F="$(TRUSTISSUES_DATA_DIR="${WORK}/no-such-data-dir" \
+     "${HERE}/restore-drill.sh" "${DRILL7}" 2>&1)"; then
+  bad "the drill ignored a TRUSTISSUES_DATA_DIR that does not exist"
+elif printf '%s' "${OUT21F}" | grep -q "inside the LIVE data dir"; then
+  bad "the drill blamed a containment refusal that never happened: ${OUT21F}"
+elif printf '%s' "${OUT21F}" | grep -q "does not resolve"; then
+  ok "an unresolvable TRUSTISSUES_DATA_DIR is named as itself, not as a false containment refusal"
+else
+  bad "the drill failed on an unresolvable TRUSTISSUES_DATA_DIR with an unhelpful message: ${OUT21F}"
+fi
+
+# 21g. And the containment refusal must still fire when the live data dir is
+#      reached through a SYMLINK.
+#
+# Both sides of that comparison used the logical pwd, which prints the symlink
+# you asked for rather than the directory you landed in, so one directory
+# compared unequal to itself. Point TRUSTISSUES_DATA_DIR at a symlink to the
+# drill's own TMPDIR and the check misses: the drill restores a full copy of the
+# vault INSIDE the live data dir and reports success. pwd -P on both sides is
+# what makes two names for one directory agree.
+DRILL21G="${WORK}/drill21g"; mkdir -p "${DRILL21G}"
+make_snapshot "${DRILL21G}" "$(stamp_days_ago 0)"
+TMP21G="${WORK}/tmp21g"; mkdir -p "${TMP21G}"
+ln -s "${TMP21G}" "${WORK}/data21g-link"
+if OUT21G="$(TMPDIR="${TMP21G}" TRUSTISSUES_DATA_DIR="${WORK}/data21g-link" \
+     "${HERE}/restore-drill.sh" "${DRILL21G}" 2>&1)"; then
+  bad "the drill restored INSIDE the live data dir because it was named through a symlink"
+elif printf '%s' "${OUT21G}" | grep -q "inside the LIVE data dir"; then
+  ok "the drill refuses to restore inside the live data dir named through a symlink"
+else
+  bad "the drill failed under a symlinked data dir for the wrong reason: ${OUT21G}"
+fi
+
 # 21b. A directory with MANY snapshots must still drill and still prune.
 #
 # `list_snapshots ... | head -1` looked correct and passed every case above,
@@ -610,6 +790,35 @@ for unit in trustissues-backup.service trustissues-restore-drill.service; do
     ok "${unit} has OnFailure= in [Unit]"
   else
     bad "${unit} has OnFailure= in ${SECTION}; systemd silently ignores it outside [Unit]"
+  fi
+done
+
+# 25b. Neither scheduled unit may carry a Condition*=, and both must keep an
+#      EnvironmentFile= with no `-` prefix.
+#
+# These two lines are one mechanism. EnvironmentFile=/etc/trustissues/backup.env
+# without a leading `-` FAILS the unit when the file is missing, which is what
+# fires OnFailure= and pages. ConditionPathExists= on that same file makes systemd
+# SKIP the unit and mark the job SUCCESSFUL instead: a condition that does not
+# hold never moves a unit to failed, so OnFailure= is never triggered. Both units
+# shipped with it, so renaming or losing backup.env would have silenced the backup
+# AND the drill that exists to notice the backup went silent, with
+# `systemctl list-timers` still green. That is the dockyard-backup incident
+# through a different door, and the estate has now been bitten four separate ways
+# by silent systemd alerting. Nothing in systemctl output distinguishes "skipped"
+# from "ran and was fine"; a text check does.
+for unit in trustissues-backup.service trustissues-restore-drill.service; do
+  [ -f "${SD}/${unit}" ] || { bad "${unit} is missing from deploy/systemd"; continue; }
+  COND="$(grep -E '^Condition[A-Za-z]+=' "${SD}/${unit}" || true)"
+  ENVF="$(grep -E '^EnvironmentFile=' "${SD}/${unit}" || true)"
+  if [ -n "${COND}" ]; then
+    bad "${unit} has ${COND}; a failed condition marks the job SUCCESSFUL, so OnFailure= never fires"
+  elif [ -z "${ENVF}" ]; then
+    bad "${unit} has no EnvironmentFile=, so a missing backup.env is not the loud failure it must be"
+  elif printf '%s' "${ENVF}" | grep -q '^EnvironmentFile=-'; then
+    bad "${unit} has ${ENVF}; the leading - makes a missing config file a silent no-op"
+  else
+    ok "${unit} fails loudly on a missing backup.env (no Condition*=, no EnvironmentFile=-)"
   fi
 done
 

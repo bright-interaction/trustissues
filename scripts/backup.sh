@@ -69,8 +69,17 @@ mkdir -p "${DEST_DIR}"
 # the live database must not share a directory, full stop. A separate directory
 # on the same disk is merely bad, and warned about below; the same directory is
 # refused.
-DEST_ABS="$(cd "${DEST_DIR}" && pwd)"
-DATA_ABS="$(cd "${DATA_DIR}" && pwd)"
+#
+# pwd -P, not pwd. This guard used to compare LOGICAL paths, and bash's
+# `cd sym && pwd` prints the symlink you asked for rather than the directory you
+# landed in. So `ln -s <data dir> <backup dir>` walked straight past it: backup.sh
+# exited 0 and the live data dir ended up holding trustissues-<stamp>.db next to
+# trustissues.db. With TRUSTISSUES_BACKUP_PRUNE=1, which the shipped
+# trustissues-backup.service sets, that is exactly the automated rm inside the
+# live data dir that the paragraph above says must never happen. The physical
+# path is the only spelling two names for one directory agree on.
+DEST_ABS="$(cd "${DEST_DIR}" && pwd -P)"
+DATA_ABS="$(cd "${DATA_DIR}" && pwd -P)"
 if [ "${DEST_ABS}" = "${DATA_ABS}" ]; then
   echo "error: the backup destination is the live data directory (${DEST_ABS})" >&2
   echo "       Snapshots must not live beside the database they protect: retention" >&2

@@ -1,7 +1,24 @@
 [Unit]
 Description=Trustissues database backup (WAL-safe SQLite online backup + retention)
 Documentation=file:///opt/trustissues/docs/BACKUP.md
-ConditionPathExists=/etc/trustissues/backup.env
+
+# There is deliberately NO ConditionPathExists= on /etc/trustissues/backup.env,
+# and adding one back would remove alerting rather than add safety.
+#
+# EnvironmentFile= below carries no `-` prefix, so a missing config file already
+# FAILS the unit, which is what fires OnFailure= and pages. A ConditionPathExists=
+# on that same file makes systemd SKIP the unit and mark the job SUCCESSFUL
+# instead: a condition that does not hold never moves a unit to failed, so
+# OnFailure= is never triggered. The line reads like it is handling the
+# missing-config case and its only real effect is to silence it.
+#
+# It shipped on BOTH this unit and the drill, so renaming or losing backup.env (a
+# rotation, a config-management run, a tidy-up) would have silenced the backup AND
+# the drill that exists to notice the backup went silent, while
+# `systemctl list-timers` stayed green. The estate has already been bitten four
+# separate ways by silent systemd alerting; this would have been the fifth.
+# scripts/test-backup-restore.sh asserts neither scheduled unit carries a
+# Condition*= line.
 
 # OnFailure BELONGS IN [Unit]. It is not a matter of taste.
 #

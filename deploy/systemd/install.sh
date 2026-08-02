@@ -129,6 +129,17 @@ for u in ${UNITS}; do
   section="$(awk '/^\[/{s=$0} /^OnFailure=/{print s; exit}' "${UNIT_DIR}/${u}")"
   [ "${section}" = "[Unit]" ] \
     || die "${u} has OnFailure= in ${section}; systemd only honours it in [Unit] and silently drops it anywhere else"
+  # A Condition*= undoes everything the two checks above just proved. When a
+  # condition does not hold, systemd SKIPS the unit and marks the job successful,
+  # and OnFailure= is only reached from the failed state. Both units shipped a
+  # ConditionPathExists= on the very EnvironmentFile whose absence is supposed to
+  # page, which converted the loud failure into a silent skip on the backup AND on
+  # the drill that exists to notice silence. Checked here as well as in
+  # scripts/test-backup-restore.sh because this reads the INSTALLED copies, which
+  # is where a hand edit lands.
+  cond="$(grep -E '^Condition[A-Za-z]+=' "${UNIT_DIR}/${u}" || true)"
+  [ -z "${cond}" ] \
+    || die "${u} has ${cond}; a condition that does not hold marks the job SUCCESSFUL, so OnFailure= never fires. Remove it."
 done
 
 say "seeding configuration"
