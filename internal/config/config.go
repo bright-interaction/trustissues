@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/brightinteraction/trustissues/internal/shield"
+	"github.com/bright-interaction/trustissues/internal/shield"
 )
 
 // Config holds all application configuration loaded from environment variables.

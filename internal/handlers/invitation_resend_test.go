@@ -9,8 +9,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // An invitation email must never carry a blank setup code.

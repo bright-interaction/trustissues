@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/capability"
+	"github.com/bright-interaction/trustissues/internal/capability"
 )
 
 // Clearing a secret's agent allow-list must revoke every outstanding token.

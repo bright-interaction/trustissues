@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestRemovedMemberCannotReadTargets closes the SEVENTH door onto the

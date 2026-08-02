@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // Shared rotation outcome logic: everything that happens AFTER the rotated value

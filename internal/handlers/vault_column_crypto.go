@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // vaultColumnEncPrefix marks a vault metadata column (provider_meta,

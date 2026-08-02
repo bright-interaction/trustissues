@@ -1,0 +1,8 @@
+# Trustissues-specific redactions, applied on top of the SHARED estate list in
+# scripts/mirror-redactions.txt (see CLAUDE.md section 15: an estate hostname or
+# the production IP belongs in the SHARED list, never here).
+#
+# Empty on purpose. Every internal reference this product carries is already an
+# estate-wide token (host, the production IP, maintainer paths) and is handled
+# by the shared list. Adding a duplicate here would create exactly the per-product
+# drift section 15 exists to prevent.

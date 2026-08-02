@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/columncrypto"
+	"github.com/bright-interaction/trustissues/internal/columncrypto"
 )
 
 // TestResolveSMTPPasswordNeverReturnsCiphertext locks the fix for the "send test

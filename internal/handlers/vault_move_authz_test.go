@@ -13,11 +13,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/config"
-	"github.com/brightinteraction/trustissues/internal/database"
-	"github.com/brightinteraction/trustissues/internal/db"
-	timw "github.com/brightinteraction/trustissues/internal/middleware"
-	"github.com/brightinteraction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/database"
+	"github.com/bright-interaction/trustissues/internal/db"
+	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 )
 
 // newCollectionAuthzEnv boots a real SQLite database with the embedded

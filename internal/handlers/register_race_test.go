@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/config"
 )
 
 // slowBody delivers a JSON body one chunk at a time, holding the request open the

@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // ChannelType represents the notification channel type.

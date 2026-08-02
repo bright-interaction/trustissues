@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // errAmbiguousVaultReference is returned when a name resolves to more than one

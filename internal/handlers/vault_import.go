@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/brightinteraction/trustissues/internal/db"
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // VaultImportHandler handles password manager imports to the vault.

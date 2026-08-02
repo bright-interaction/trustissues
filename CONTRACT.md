@@ -6,7 +6,7 @@ compiles and is smoke-tested on the branch. Build against these exports; if
 you need a change in a platform-owned file, request it in your notes file
 instead of editing.
 
-Module: `github.com/brightinteraction/trustissues`, Go 1.26.
+Module: `github.com/bright-interaction/trustissues`, Go 1.26.
 
 ## 1. Config (`internal/config`)
 

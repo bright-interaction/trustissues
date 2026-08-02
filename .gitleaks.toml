@@ -1,0 +1,36 @@
+# gitleaks config for Trustissues (used by the public-mirror publish gate and any
+# local scan). Extends the default ruleset, then allowlists PLACEHOLDERS and TEST
+# FIXTURES.
+#
+# The fixtures matter more here than in the other mirrors. Trustissues ships
+# Shield, a PII/secret redactor, and the only way to test a redactor is to feed it
+# things that look exactly like real secrets: sk_live_ keys, IBANs, personnummer,
+# API tokens. internal/shield/testdata/pii.corpus exists to hold those, and every
+# one of them is synthetic. Without this allowlist the publish gate would refuse
+# forever over the test data that proves the product works.
+#
+# A genuine leaked credential would not sit under testdata/ and would not carry a
+# change-me marker, so both are still caught.
+title = "trustissues"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Config placeholders and Shield's synthetic PII/secret corpus"
+paths = [
+  '''internal/shield/testdata/.*''',
+  '''internal/shield/.*_test\.go''',
+  '''internal/handlers/.*_test\.go''',
+]
+regexes = [
+  '''changeme''',
+  '''change[_-]?me''',
+  '''your_[a-z0-9_]*''',
+  '''YOUR_[A-Z0-9_]*''',
+  '''example\.com''',
+  '''example\.se''',
+  '''EXAMPLE''',
+  # Documented, deliberately-invalid sample values in .env.example and the docs.
+  '''openssl rand -hex 32''',
+]

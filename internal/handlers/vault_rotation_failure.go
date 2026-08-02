@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // Structural failure reasons. These strings are the ONLY thing an operator sees

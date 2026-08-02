@@ -15,8 +15,8 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/brightinteraction/trustissues/internal/columncrypto"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/columncrypto"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // vaultKeyCheckSetting is the settings row holding the key sentinel.

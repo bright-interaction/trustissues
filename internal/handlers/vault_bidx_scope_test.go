@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/config"
+	"github.com/bright-interaction/trustissues/internal/config"
 )
 
 // TestBlindIndexIsScopedAndUnlinkable locks the URL blind-index privacy fix.

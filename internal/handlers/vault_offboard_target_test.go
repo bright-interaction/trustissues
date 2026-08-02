@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestOffboardedMemberStopsReceivingTheRotatedSecret locks the fix for the worst

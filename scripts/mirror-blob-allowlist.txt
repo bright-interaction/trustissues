@@ -1,0 +1,7 @@
+# Oversized-blob allowlist for the Trustissues mirror. One path per line.
+#
+# Empty on purpose: this product ships no binaries, no vendored archives and no
+# generated bundles. slab published a 19.6MB compiled binary carrying 240 copies of
+# a maintainer laptop path because nothing refused it, which is why the shared
+# blob check exists and why this file stays empty until something genuinely needs
+# an exception.

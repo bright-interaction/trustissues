@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/brightinteraction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // A minted API key must never outlive the API key that minted it.

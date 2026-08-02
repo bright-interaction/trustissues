@@ -3,7 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/csv"
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 	"net/http"
 	"net/http/httptest"
 	"strconv"

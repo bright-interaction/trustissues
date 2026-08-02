@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestActivityCategoryFilterActuallyFilters locks the fix for the dead category

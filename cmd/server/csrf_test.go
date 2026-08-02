@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	timw "github.com/brightinteraction/trustissues/internal/middleware"
+	timw "github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // TestCSRFOriginCheck covers the defense-in-depth origin check that backs up

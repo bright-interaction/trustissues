@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/alerts"
 )
 
 // KeyProvider defines the interface for services that support programmatic API key rotation.

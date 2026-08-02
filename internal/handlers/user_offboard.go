@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // offboardUser runs every revocation step that must happen when a person loses

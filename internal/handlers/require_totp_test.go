@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/brightinteraction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/db"
 )
 
 // TestRequireTOTPPolicyIsActuallyEnforced locks the fix for a dead security

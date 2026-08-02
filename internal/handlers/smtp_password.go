@@ -3,7 +3,7 @@ package handlers
 import (
 	"fmt"
 
-	"github.com/brightinteraction/trustissues/internal/columncrypto"
+	"github.com/bright-interaction/trustissues/internal/columncrypto"
 )
 
 // resolveSMTPPassword turns the STORED smtp_password setting into the plaintext
