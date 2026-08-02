@@ -344,19 +344,26 @@ func TestCapabilityPresetPlaceholdersAreDeclaredHostKeys(t *testing.T) {
 	if len(CapabilityDefaults) < 20 {
 		t.Fatalf("ABORT: only %d capability presets; this guard is matching almost nothing", len(CapabilityDefaults))
 	}
-	declaredKeys := map[string]bool{}
-	for _, k := range egressInfluencingMetaKeys() {
-		declaredKeys[k] = true
-	}
 	placeholders := 0
 	for provider, def := range CapabilityDefaults {
+		// PER PROVIDER, not against the union of every provider's keys.
+		//
+		// An ablation caught this: dropping "instance" from grafana's metaKeys
+		// left the guard green, because zitadel and forgejo also declare a key
+		// called "instance" and a global set cannot tell whose it is. A key is
+		// host-choosing FOR A PROVIDER; asking the question any other way answers
+		// a different one.
+		declaredKeys := map[string]bool{}
+		for _, k := range providerEgress[provider].metaKeys {
+			declaredKeys[k] = true
+		}
 		for _, pattern := range def.Destinations {
 			host, _ := splitHostPath(pattern)
 			for _, m := range tenantPlaceholderRe.FindAllStringSubmatch(host, -1) {
 				placeholders++
 				if !declaredKeys[m[1]] {
 					t.Errorf("the %s preset expands {%s} from provider_meta into the HOST of a seeded "+
-						"destination, but %q is not declared host-choosing in providerEgress.\n"+
+						"destination, but %q is not in providerEgress[that provider].metaKeys.\n"+
 						"So a caller with manage can set it, the write gate sees no host change, and "+
 						"seedCapabilityDefaults then turns it into a ceiling host. Add it to the "+
 						"provider's metaKeys.", provider, m[1], m[1])

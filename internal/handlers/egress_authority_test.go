@@ -553,6 +553,90 @@ func TestProviderDoFailsClosed(t *testing.T) {
 	})
 }
 
+// failingSettingReader makes providerPinFor fail the way a database error does.
+type failingSettingReader struct{}
+
+func (failingSettingReader) GetSetting(context.Context, string) (string, error) {
+	return "", errFakeSettingsRead
+}
+
+var errFakeSettingsRead = &settingsReadError{}
+
+type settingsReadError struct{}
+
+func (*settingsReadError) Error() string { return "settings table unreadable" }
+
+// TestProviderEgressRefusesWhenThePinCannotBeRead closes a gap an ablation
+// found: nothing exercised the pin's READ-ERROR path.
+//
+// providerPinFor's own doc says callers deny on a read error, and the whole
+// guard stands between a decrypted provider key and an attacker-named host, so
+// "cannot tell" must not resolve to "allowed". Inverting that branch left every
+// test in this package green, which is the definition of an unguarded property.
+func TestProviderEgressRefusesWhenThePinCannotBeRead(t *testing.T) {
+	_, err := providerEgressContextFor(context.Background(), failingSettingReader{},
+		"some-entry", "openai", map[string]string{})
+	if err == nil {
+		t.Fatal("a failed settings read resolved to 'not pinned', so a transient database error " +
+			"opens the gate on the instance's AI provider key")
+	}
+	if !strings.Contains(err.Error(), "not sent anywhere") {
+		t.Errorf("the refusal should say the secret went nowhere, got %q", err)
+	}
+}
+
+// TestEgressAllowanceRefusesNearMisses is the other gap an ablation found.
+//
+// Every behavioural test in this file asserts that something was REFUSED, so a
+// loosened allowance makes them all pass harder. Nothing asserted the allowance
+// says no. The suffix form is the dangerous one: it exists for exactly one
+// vendor (Backblaze hands back its own storage host at runtime), and a sloppy
+// suffix match is "anything ending in roughly the right letters", which is the
+// same shape as the "*.supabase.co" preset this codebase already removed once.
+func TestEgressAllowanceRefusesNearMisses(t *testing.T) {
+	allow := egressAllowance{
+		hosts:    []string{"api.openai.com"},
+		suffixes: []string{".backblazeb2.com"},
+	}
+	for _, tc := range []struct {
+		host string
+		want bool
+		why  string
+	}{
+		{"api.openai.com", true, "the declared host itself"},
+		{"api.openai.com:443", true, "an explicit port is the same host"},
+		{"API.OpenAI.COM", true, "host comparison is case insensitive"},
+		{"api005.backblazeb2.com", true, "the storage host B2 returns, under the declared suffix"},
+
+		{"api.openai.com.attacker-controlled.example", false,
+			"a declared host used as a PREFIX of somebody else's domain"},
+		{"attacker-controlled.example", false, "an unrelated host"},
+		{"notapi.openai.com", false, "a sibling that merely ends the same way"},
+		{"backblazeb2.com", false,
+			"the suffix itself is not a host under it; allowing it would allow the apex"},
+		{"backblazeb2.com.attacker-controlled.example", false,
+			"the suffix in the middle: a substring match would allow this"},
+		{"bacon.example", false, "shares only the first letters of the suffix"},
+		{"", false, "an empty host is not a match for anything"},
+	} {
+		if got := allow.allows(tc.host); got != tc.want {
+			t.Errorf("allows(%q) = %v, want %v (%s)", tc.host, got, tc.want, tc.why)
+		}
+	}
+
+	// An EMPTY allowance permits nothing. This is the load-bearing default:
+	// declaredProviderEgress returns one for a provider with no declaration, and
+	// the zero-value egressAuthority carries one, so "we never said where this
+	// may go" has to mean "nowhere".
+	var empty egressAllowance
+	for _, h := range []string{"api.openai.com", "attacker-controlled.example", "localhost"} {
+		if empty.allows(h) {
+			t.Errorf("an empty allowance permitted %q. Empty must mean nowhere, or every provider "+
+				"and every call site that was never declared egresses freely", h)
+		}
+	}
+}
+
 // jsonQuote quotes a string for embedding in a hand-built JSON body.
 func jsonQuote(s string) string {
 	b, _ := json.Marshal(s)
