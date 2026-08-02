@@ -20,13 +20,38 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY="$(cd "${HERE}/../deploy" && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+
+# Compose projects and the throwaway image are torn down here rather than at the
+# end of their section, so an assertion that fails (or a Ctrl-C) does not leave a
+# container, a named volume holding a copy of a vault, and an image behind on the
+# machine. Every step is `|| true`: cleanup must not be able to change the exit
+# status of the run, and a docker that went away mid-run must not mask a failure.
+COMPOSE_PROJECT_DIRS=""
+COMPOSE_IMAGE=""
+cleanup() {
+  for d in ${COMPOSE_PROJECT_DIRS}; do
+    ( cd "${d}" 2>/dev/null && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
+  done
+  if [ -n "${COMPOSE_IMAGE}" ]; then
+    docker rmi -f "${COMPOSE_IMAGE}" >/dev/null 2>&1 || true
+  fi
+  rm -rf "${WORK}" || true
+}
+trap cleanup EXIT
 
 PASS=0
 FAIL=0
+SKIPPED=0
+SKIP_WHY=""
 
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
+# A skip is a case that could NOT be run here, and it is reported in the summary
+# line and again as a warning, because the failure this suite exists to prevent
+# is a green run that proved less than it looks like it proved. Nothing skips on
+# a host that has docker; the Compose cases are the only skippable ones.
+skip() { echo "  SKIP $1"; SKIPPED=$((SKIPPED + 1)); SKIP_WHY="${SKIP_WHY}
+  - $1"; }
 
 # Setup commands below end in `|| true` on purpose. This script runs under
 # `set -e`, so a bare `prune-backups.sh ...` that exits non-zero during FIXTURE
@@ -951,7 +976,13 @@ fi
 CRON="${DEPLOY}/cron/trustissues-backup.cron"
 if [ -f "${CRON}" ]; then
   JOBS="$(grep -E '^[0-9*]' "${CRON}" | grep -v '^PATH=' | grep -v '^SHELL=' || true)"
-  UNALERTED="$(printf '%s\n' "${JOBS}" | grep -v 'trustissues-backup-alert.sh' || true)"
+  # The alerter has to be REACHED ON FAILURE, not merely mentioned. Grepping the
+  # line for the string 'trustissues-backup-alert.sh' is satisfied by a job that
+  # names it in a trailing comment, or that pipes to it unconditionally, and this
+  # suite has already been bitten once by exactly that shape (--ssl-reqd matched
+  # inside a comment while the real curl call had lost the flag). Require the
+  # `|| <alerter>` that makes it a failure hook.
+  UNALERTED="$(printf '%s\n' "${JOBS}" | grep -v '|| *[^ ]*trustissues-backup-alert\.sh' || true)"
   if [ -n "${JOBS}" ] && [ -z "$(printf '%s' "${UNALERTED}" | tr -d '[:space:]')" ]; then
     ok "every cron job routes its failure to the alerter"
   else
@@ -967,6 +998,467 @@ else
   bad "deploy/cron/trustissues-backup.cron is missing"
 fi
 
+echo "multi-line numeric settings"
+
+# 30. A numeric setting whose FIRST LINE is digits must be refused too.
+#
+# Both validators used `printf '%s' "$v" | grep -Eq '^[0-9]+$'`, and grep anchors
+# ^ and $ to a LINE, not to the value. So $'48\nfoo' passed validation, and every
+# later `[ "${AGE_HOURS}" -gt "48\nfoo" ]` is an "integer expression expected"
+# error, which inside an `if ... &&` condition is simply FALSE. The freshness
+# check is then skipped and the drill prints DRILL PASSED on a snapshot of any
+# age: the same silent green the digits-only rule was written to close, reached
+# by a different encoding. A multi-line value is one unterminated quote away in
+# backup.env, because systemd keeps accumulating lines inside an open quote.
+NLDIR="${WORK}/newline-drill"; mkdir -p "${NLDIR}"
+make_snapshot "${NLDIR}" "$(stamp_days_ago 30)"
+NL_RC=0
+NL_OUT="$(TRUSTISSUES_DRILL_MAX_AGE_HOURS=$'48\nfoo' \
+  "${HERE}/restore-drill.sh" "${NLDIR}" 2>&1)" || NL_RC=$?
+if [ "${NL_RC}" = "2" ] \
+   && printf '%s' "${NL_OUT}" | grep -q "TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number" \
+   && ! printf '%s' "${NL_OUT}" | grep -q "DRILL PASSED"; then
+  ok "the drill refuses a multi-line TRUSTISSUES_DRILL_MAX_AGE_HOURS instead of skipping the freshness check"
+else
+  bad "TRUSTISSUES_DRILL_MAX_AGE_HOURS=\$'48\\nfoo' gave exit ${NL_RC} on a 30-day-old snapshot:
+${NL_OUT}"
+fi
+
+# 31. Same hole, same fix, in the sibling that DELETES.
+#
+# TRUSTISSUES_BACKUP_KEEP_DAILY=$'1\nfoo' passed the old regex, then every
+# `[ "${n_daily}" -lt "1\nfoo" ]` evaluated false, so keep-daily silently
+# degraded to zero and the prune deleted snapshots it had been told to keep.
+NLP="${WORK}/newline-prune"; mkdir -p "${NLP}"
+for d in 1 2 3; do make_snapshot "${NLP}" "$(stamp_days_ago "${d}")"; done
+NLP_BEFORE="$(snapshot_names "${NLP}")"
+NLP_RC=0
+NLP_OUT="$(TRUSTISSUES_BACKUP_KEEP_DAILY=$'1\nfoo' \
+  "${HERE}/prune-backups.sh" "${NLP}" 2>&1)" || NLP_RC=$?
+NLP_AFTER="$(snapshot_names "${NLP}")"
+if [ "${NLP_RC}" != "0" ] && [ "${NLP_AFTER}" = "${NLP_BEFORE}" ] \
+   && printf '%s' "${NLP_OUT}" | grep -q "TRUSTISSUES_BACKUP_KEEP_DAILY must be a non-negative integer"; then
+  ok "prune refuses a multi-line TRUSTISSUES_BACKUP_KEEP_DAILY and deletes nothing"
+else
+  bad "TRUSTISSUES_BACKUP_KEEP_DAILY=\$'1\\nfoo' exited ${NLP_RC} and left:
+${NLP_AFTER}"
+fi
+
+echo "backup.sh retention opt-in"
+
+# 32. --prune must beat TRUSTISSUES_BACKUP_PRUNE=0 in the environment.
+#
+# The scheduled unit used to opt into retention with
+# `Environment=TRUSTISSUES_BACKUP_PRUNE=1` beside
+# `EnvironmentFile=/etc/trustissues/backup.env`, and systemd documents that
+# settings from an EnvironmentFile OVERRIDE settings made with Environment=. So
+# one line in the config file the installer tells the operator to go and edit
+# switched retention off on the only path that fills the disk, and NOTHING
+# failed: the backup exits 0, the timer stays green, the drill keeps passing, and
+# the directory grows by a full copy of the database every night until SQLite
+# starts failing writes on the disk the LIVE database is on. The opt-in is an
+# ExecStart= argument now, which no environment file can override.
+PFD="${WORK}/prune-flag"; mkdir -p "${PFD}/data" "${PFD}/backups"
+make_db "${PFD}/data/trustissues.db"
+for d in 1 2 3 4 5 6 7 8 9 10 11 12; do make_snapshot "${PFD}/backups" "$(stamp_days_ago "${d}")"; done
+PF_BEFORE="$(snapshot_names "${PFD}/backups" | grep -c . || true)"
+PF_RC=0
+PF_OUT="$(TRUSTISSUES_DATA_DIR="${PFD}/data" TRUSTISSUES_BACKUP_PRUNE=0 \
+  "${HERE}/backup.sh" --prune "${PFD}/backups" 2>&1)" || PF_RC=$?
+PF_AFTER="$(snapshot_names "${PFD}/backups" | grep -c . || true)"
+if [ "${PF_RC}" = "0" ] && [ "${PF_AFTER}" -lt "$((PF_BEFORE + 1))" ] \
+   && printf '%s' "${PF_OUT}" | grep -q "  removed trustissues-"; then
+  ok "--prune runs retention even with TRUSTISSUES_BACKUP_PRUNE=0 in the environment"
+else
+  bad "--prune did not prune under TRUSTISSUES_BACKUP_PRUNE=0: exit ${PF_RC}, ${PF_BEFORE} snapshots before, ${PF_AFTER} after
+${PF_OUT}"
+fi
+
+# 33. And the flag wins in the other direction too, so a hand-run can refuse
+#     retention on a host whose backup.env turns it on. A flag that only works
+#     one way is a flag nobody can reason about.
+PFD2="${WORK}/prune-flag-off"; mkdir -p "${PFD2}/data" "${PFD2}/backups"
+make_db "${PFD2}/data/trustissues.db"
+for d in 1 2 3 4 5 6 7 8 9 10 11 12; do make_snapshot "${PFD2}/backups" "$(stamp_days_ago "${d}")"; done
+PF2_BEFORE="$(snapshot_names "${PFD2}/backups" | grep -c . || true)"
+PF2_RC=0
+PF2_OUT="$(TRUSTISSUES_DATA_DIR="${PFD2}/data" TRUSTISSUES_BACKUP_PRUNE=1 \
+  "${HERE}/backup.sh" --no-prune "${PFD2}/backups" 2>&1)" || PF2_RC=$?
+PF2_AFTER="$(snapshot_names "${PFD2}/backups" | grep -c . || true)"
+if [ "${PF2_RC}" = "0" ] && [ "${PF2_AFTER}" = "$((PF2_BEFORE + 1))" ] \
+   && printf '%s' "${PF2_OUT}" | grep -q "retention is OFF"; then
+  ok "--no-prune keeps every snapshot even with TRUSTISSUES_BACKUP_PRUNE=1 in the environment"
+else
+  bad "--no-prune still pruned: exit ${PF2_RC}, ${PF2_BEFORE} before, ${PF2_AFTER} after"
+fi
+
+# 34. The shipped unit must carry the flag and must NOT rely on Environment=.
+if grep -q '^ExecStart=/opt/trustissues/scripts/backup\.sh --prune$' "${SD}/trustissues-backup.service" \
+   && ! grep -q '^Environment=TRUSTISSUES_BACKUP_PRUNE' "${SD}/trustissues-backup.service"; then
+  ok "trustissues-backup.service opts into retention on the ExecStart= line, which no EnvironmentFile can override"
+else
+  bad "trustissues-backup.service still opts into retention through Environment=, which its own EnvironmentFile overrides"
+fi
+
+# 34b. A fresh destination directory must not be created world-readable.
+#      The file names in a backup directory are an inventory of the vault.
+UMD="${WORK}/umask-probe"; mkdir -p "${UMD}/data"
+make_db "${UMD}/data/trustissues.db"
+( umask 022; TRUSTISSUES_DATA_DIR="${UMD}/data" "${HERE}/backup.sh" "${UMD}/fresh-dest" >/dev/null 2>&1 ) || true
+UM_MODE="$(file_mode "${UMD}/fresh-dest" 2>/dev/null || echo "")"
+if [ "${UM_MODE}" = "700" ]; then
+  ok "backup.sh creates a missing destination directory 0700 regardless of the caller's umask"
+else
+  bad "backup.sh created its destination directory mode ${UM_MODE:-<missing>} under umask 022"
+fi
+
+echo "deploy/systemd/install.sh, executed"
+
+# 35. The installer has to RUN. This is the case whose absence shipped an
+#     install that could not complete on any host.
+#
+# install.sh had zero execution coverage: everything about it was checked by
+# reading the unit files it reads, never by running it. What shipped was a check
+# that refused one of its own units. The OnFailure= loop iterated over every unit
+# including the two .timer files, skipped only *@.service, and died on
+# `trustissues-backup.timer has no OnFailure=` after copying the units into
+# /etc/systemd/system and BEFORE seeding /etc/trustissues/backup.env, before
+# creating the backup directory and before enabling either timer. docs/BACKUP.md
+# makes `sudo ./deploy/systemd/install.sh` step 1 of the preferred path and every
+# later step depends on it, so the headline deliverable of this workstream did
+# not install, and the operator's first contact with it was an error accusing a
+# timer of a defect a timer cannot have (OnFailure= on a .timer fires when the
+# TIMER fails to start, not when the backup fails; the backup failing fails the
+# .SERVICE and leaves the timer green).
+#
+# `--root DIR` runs the real script, in order, with its real checks, against a
+# throwaway tree. Nothing here re-implements the installer.
+INSTALL_SH="${SD}/install.sh"
+STUBBIN="${WORK}/stubbin"; mkdir -p "${STUBBIN}"
+# systemctl stand-in, covering ONLY the offline `--root` enable the rehearsal
+# uses. It records every invocation and reproduces what systemd itself does on
+# disk for an enable: the WantedBy= symlink under <root>/etc/systemd/system.
+# macOS has no systemctl at all, so this is also what makes the case runnable
+# here rather than only on the target host.
+cat > "${STUBBIN}/systemctl" <<'STUBEOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"
+root=""; cmd=""; units=""
+for a in "$@"; do
+  case "$a" in
+    --root=*) root="${a#--root=}" ;;
+    -*) ;;
+    *) if [ -z "${cmd}" ]; then cmd="$a"; else units="${units} $a"; fi ;;
+  esac
+done
+[ "${cmd}" = "enable" ] || exit 0
+for u in ${units}; do
+  f="${root}/etc/systemd/system/${u}"
+  if [ ! -f "${f}" ]; then
+    echo "Failed to enable unit: Unit file ${u} does not exist." >&2
+    exit 1
+  fi
+  want="$(sed -n 's/^WantedBy=//p' "${f}" | head -1)"
+  if [ -z "${want}" ]; then
+    echo "The unit files have no installation config (WantedBy=, RequiredBy=)." >&2
+    exit 1
+  fi
+  mkdir -p "${root}/etc/systemd/system/${want}.wants"
+  ln -sf "${f}" "${root}/etc/systemd/system/${want}.wants/${u}"
+done
+STUBEOF
+chmod 0755 "${STUBBIN}/systemctl"
+
+INSTALL_RC=0
+INSTALL_OUT=""
+# run_install <repo-root> <staging-root>
+run_install() {
+  mkdir -p "$2"
+  INSTALL_RC=0
+  INSTALL_OUT="$(PATH="${STUBBIN}:${PATH}" SYSTEMCTL_LOG="$2/systemctl.log" \
+    "$1/deploy/systemd/install.sh" --root "$2" 2>&1)" || INSTALL_RC=$?
+}
+
+# fake_repo <dir> - a copy of exactly the files install.sh reads, so a case can
+# plant a defect in a unit and watch the installer refuse it without touching the
+# real tree.
+fake_repo() {
+  mkdir -p "$1/scripts" "$1/deploy/systemd" "$1/docs"
+  for f in backup.sh restore.sh prune-backups.sh restore-drill.sh snapshot-lib.sh; do
+    cp "${HERE}/${f}" "$1/scripts/${f}"
+  done
+  cp "${SD}"/*.service "${SD}"/*.timer "${SD}/install.sh" \
+     "${SD}/trustissues-backup-alert.sh" "${SD}/backup.env.example" "$1/deploy/systemd/"
+  cp "${HERE}/../docs/BACKUP.md" "$1/docs/BACKUP.md"
+  chmod 0755 "$1/deploy/systemd/install.sh" "$1/deploy/systemd/trustissues-backup-alert.sh"
+  chmod 0755 "$1"/scripts/*.sh
+}
+
+IROOT="${WORK}/instroot"
+run_install "${HERE}/.." "${IROOT}"
+if [ "${INSTALL_RC}" = "0" ]; then
+  ok "install.sh runs end to end on a clean host (exit 0)"
+else
+  bad "install.sh exited ${INSTALL_RC} on a clean host, so the documented install cannot complete:
+${INSTALL_OUT}"
+fi
+
+# 36. Both timers enabled. `systemctl enable` is the last step of the install, so
+#     this is also the assertion that the script got all the way there.
+IW="${IROOT}/etc/systemd/system/timers.target.wants"
+if [ -L "${IW}/trustissues-backup.timer" ] && [ -L "${IW}/trustissues-restore-drill.timer" ] \
+   && grep -q 'enable.*trustissues-backup\.timer.*trustissues-restore-drill\.timer' "${IROOT}/systemctl.log" 2>/dev/null; then
+  ok "install.sh enables BOTH timers"
+else
+  bad "install.sh did not enable both timers (wants dir: $(ls "${IW}" 2>/dev/null | tr '\n' ' '))"
+fi
+
+# 37. Configuration seeded, 0600, in place. The install dies before this line if
+#     any of the unit checks refuses, which is exactly what shipped.
+if [ -f "${IROOT}/etc/trustissues/backup.env" ] \
+   && [ "$(file_mode "${IROOT}/etc/trustissues/backup.env")" = "600" ]; then
+  ok "install.sh seeds backup.env at mode 0600"
+else
+  bad "install.sh did not seed backup.env (or seeded it with the wrong mode)"
+fi
+
+# 38. The backup directory from that config, 0700. It holds ciphertext copies of
+#     a credential store; 0755 there means every account on the box can read them.
+IBDIR="${IROOT}/var/backups/trustissues"
+if [ -d "${IBDIR}" ] && [ "$(file_mode "${IBDIR}")" = "700" ]; then
+  ok "install.sh creates the backup directory 0700"
+else
+  bad "install.sh left the backup directory missing or loose (mode $(file_mode "${IBDIR}" 2>/dev/null || echo none))"
+fi
+
+# 39. The scripts landed executable and the units point at where they landed.
+#     A unit whose ExecStart= names a path nothing was installed to enables
+#     cleanly and fails on its first trigger at 03:20.
+IMISS=""
+for f in backup.sh restore.sh prune-backups.sh restore-drill.sh snapshot-lib.sh; do
+  [ -f "${IROOT}/opt/trustissues/scripts/${f}" ] || IMISS="${IMISS} ${f}"
+done
+IEXEC="$(grep -h '^ExecStart=' "${IROOT}/etc/systemd/system/trustissues-backup.service" \
+  | sed 's/^ExecStart=//' | awk '{print $1}')"
+if [ -z "${IMISS}" ] && [ -x "${IEXEC}" ]; then
+  ok "install.sh installs the scripts and rewrites ExecStart= to where they went"
+else
+  bad "install.sh left${IMISS:- nothing} missing and ExecStart=${IEXEC} is not executable"
+fi
+
+# 40. Re-running must be safe. An installer that clobbers the operator's edited
+#     backup.env on every upgrade takes the SMTP password with it, and the alert
+#     path is then dead until somebody notices no mail.
+printf '\n# operator edit\nALERT_TO=someone@example.com\n' >> "${IROOT}/etc/trustissues/backup.env"
+run_install "${HERE}/.." "${IROOT}"
+if [ "${INSTALL_RC}" = "0" ] && grep -q 'someone@example.com' "${IROOT}/etc/trustissues/backup.env"; then
+  ok "a second install.sh run succeeds and leaves an edited backup.env alone"
+else
+  bad "re-running install.sh exited ${INSTALL_RC} or overwrote the operator's backup.env"
+fi
+
+# 41-44. The installer's own checks, watched refusing.
+#
+# Three of them existed and none had ever been executed, which is how the fourth
+# (the timer refusal above) shipped broken. Each case plants ONE defect in a copy
+# of the tree and asserts install.sh refuses it and never reaches the config
+# seeding. They are the same defects scripts/test-backup-restore.sh asserts
+# against the repo's unit files, checked here against the INSTALLED copies,
+# which is where a hand edit lands.
+FR1="${WORK}/fakerepo-onfailure"; fake_repo "${FR1}"
+grep -v '^OnFailure=' "${FR1}/deploy/systemd/trustissues-backup.service" \
+  > "${FR1}/deploy/systemd/trustissues-backup.service.new"
+mv "${FR1}/deploy/systemd/trustissues-backup.service.new" "${FR1}/deploy/systemd/trustissues-backup.service"
+run_install "${FR1}" "${WORK}/instroot-onfailure"
+if [ "${INSTALL_RC}" != "0" ] \
+   && printf '%s' "${INSTALL_OUT}" | grep -q 'trustissues-backup.service has no OnFailure=' \
+   && [ ! -f "${WORK}/instroot-onfailure/etc/trustissues/backup.env" ]; then
+  ok "install.sh refuses a backup service with no OnFailure= (and stops before seeding)"
+else
+  bad "install.sh accepted a unit with no OnFailure= (exit ${INSTALL_RC}):
+${INSTALL_OUT}"
+fi
+
+FR2="${WORK}/fakerepo-condition"; fake_repo "${FR2}"
+printf 'ConditionPathExists=/etc/trustissues/backup.env\n' \
+  >> "${FR2}/deploy/systemd/trustissues-restore-drill.service"
+run_install "${FR2}" "${WORK}/instroot-condition"
+if [ "${INSTALL_RC}" != "0" ] \
+   && printf '%s' "${INSTALL_OUT}" | grep -q 'ConditionPathExists'; then
+  ok "install.sh refuses a Condition*= that would turn a failure into a silent skip"
+else
+  bad "install.sh accepted a ConditionPathExists= (exit ${INSTALL_RC}):
+${INSTALL_OUT}"
+fi
+
+FR3="${WORK}/fakerepo-section"; fake_repo "${FR3}"
+# Move OnFailure= out of [Unit] and into [Service], the exact shape that made
+# every dockyard-backup failure silent for months.
+awk '/^OnFailure=/{next} {print} /^\[Service\]/{print "OnFailure=trustissues-backup-alert@%n.service"}' \
+  "${FR3}/deploy/systemd/trustissues-backup.service" > "${FR3}/deploy/systemd/tmp.service"
+mv "${FR3}/deploy/systemd/tmp.service" "${FR3}/deploy/systemd/trustissues-backup.service"
+run_install "${FR3}" "${WORK}/instroot-section"
+if [ "${INSTALL_RC}" != "0" ] \
+   && printf '%s' "${INSTALL_OUT}" | grep -q 'OnFailure= in \[Service\]'; then
+  ok "install.sh refuses OnFailure= outside [Unit], where systemd silently drops it"
+else
+  bad "install.sh accepted OnFailure= in [Service] (exit ${INSTALL_RC}):
+${INSTALL_OUT}"
+fi
+
+FR4="${WORK}/fakerepo-timer"; fake_repo "${FR4}"
+# A timer pointed at a unit nobody installed. This is what the timer branch of
+# the OnFailure check has to catch now that it no longer demands OnFailure= on
+# the timer itself: a waived check would pass this.
+sed 's/^Unit=trustissues-backup\.service$/Unit=trustissues-nope.service/' \
+  "${FR4}/deploy/systemd/trustissues-backup.timer" > "${FR4}/deploy/systemd/tmp.timer"
+mv "${FR4}/deploy/systemd/tmp.timer" "${FR4}/deploy/systemd/trustissues-backup.timer"
+run_install "${FR4}" "${WORK}/instroot-timer"
+if [ "${INSTALL_RC}" != "0" ] \
+   && printf '%s' "${INSTALL_OUT}" | grep -q 'trustissues-nope.service'; then
+  ok "install.sh refuses a timer that triggers a unit which is not installed"
+else
+  bad "install.sh accepted a timer pointing at a missing service (exit ${INSTALL_RC}):
+${INSTALL_OUT}"
+fi
+
+echo "restore.sh --compose, against a real docker daemon"
+
+# 45-48. The Compose branch, DRIVEN, not read.
+#
+# docker-compose.yml is the shipped deploy and `restore.sh --compose <snapshot>`
+# is its documented restore, but this suite drove only the native branch: it
+# contained the string "compose" exactly once, inside a comment. The Compose
+# branch is also where the three least verifiable fixes live, and their own
+# comments record why: `docker compose create` on a fresh host (without it,
+# `docker compose cp` fails with "no container found" in exactly the total-loss
+# case the procedure is written for), `--user 0` on the cleanup run (without it
+# the chown cannot run, the restored file stays owned by whoever docker cp made
+# it, and the app crash-loops on its first write right after a disaster), and the
+# `test -w` proof that the service user can actually write what was restored.
+#
+# So: a real daemon, a real named volume, a real unprivileged image user, and the
+# real script. The image is built from a locally present alpine and torn down at
+# exit. On a host with no docker these cases SKIP, loudly, and the summary says so.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  CIMG="ti-restore-drill-test:$$"
+  CPROJ="${WORK}/ti-compose-fresh"
+  mkdir -p "${CPROJ}"
+  cat > "${CPROJ}/Dockerfile" <<'DFEOF'
+FROM alpine:3.21
+RUN addgroup -S trustissues && adduser -S trustissues -G trustissues \
+ && mkdir -p /app/data && chown trustissues:trustissues /app/data
+WORKDIR /app
+VOLUME ["/app/data"]
+USER trustissues
+ENTRYPOINT ["/bin/sh", "-c", "sleep 86400"]
+DFEOF
+  if docker build -q -t "${CIMG}" "${CPROJ}" >/dev/null 2>&1; then
+    COMPOSE_IMAGE="${CIMG}"
+    cat > "${CPROJ}/docker-compose.yml" <<DCEOF
+services:
+  trustissues:
+    image: ${CIMG}
+    volumes:
+      - trustissues_data:/app/data
+volumes:
+  trustissues_data:
+DCEOF
+    COMPOSE_PROJECT_DIRS="${COMPOSE_PROJECT_DIRS} ${CPROJ}"
+
+    CSNAPD="${WORK}/compose-backups"; mkdir -p "${CSNAPD}"
+    make_snapshot "${CSNAPD}" "$(stamp_days_ago 0)"
+    CSNAP="$(find "${CSNAPD}" -name 'trustissues-*.db' | head -1)"
+
+    # 45. Fresh host: the compose project exists, no container does.
+    CR_RC=0
+    CR_OUT="$( cd "${CPROJ}" && "${HERE}/restore.sh" --compose "${CSNAP}" 2>&1 )" || CR_RC=$?
+    if [ "${CR_RC}" = "0" ]; then
+      ok "restore.sh --compose restores onto a fresh host with no container yet"
+    else
+      bad "restore.sh --compose failed on a fresh host (exit ${CR_RC}):
+${CR_OUT}"
+    fi
+
+    # 46. The data is IN the volume and comes back out intact. Copying it back
+    #     through docker and reading it with sqlite3 is the only assertion that
+    #     the restore put a usable database where the app will look for it.
+    CBACK="${WORK}/compose-roundtrip.db"
+    ( cd "${CPROJ}" && docker compose cp trustissues:/app/data/trustissues.db "${CBACK}" ) >/dev/null 2>&1 || true
+    if [ -f "${CBACK}" ] \
+       && [ "$(sqlite3 "${CBACK}" 'PRAGMA integrity_check;' 2>&1)" = "ok" ] \
+       && [ "$(sqlite3 "${CBACK}" "SELECT name FROM vault_entries WHERE id='e1';" 2>&1)" = "prod db password" ]; then
+      ok "the restored database is in the volume, intact, with its rows"
+    else
+      bad "the database in the trustissues volume is missing or unreadable after a --compose restore"
+    fi
+
+    # 47. Owned by the service user and 0600, proved from inside the container.
+    #     Without --user 0 on the cleanup run the chown cannot happen at all.
+    COWN="$( cd "${CPROJ}" && docker compose run --rm --no-deps --user 0 --entrypoint sh trustissues \
+      -c 'stat -c "%U %a" /app/data/trustissues.db' 2>/dev/null | tr -d '\r' )" || true
+    if [ "${COWN}" = "trustissues 600" ]; then
+      ok "the restored database is owned by the service user, mode 600, inside the volume"
+    else
+      bad "the restored database is '${COWN}' inside the volume, expected 'trustissues 600'; the app would crash-loop on its first write"
+    fi
+
+    # 48. Second restore over a volume holding a stale WAL and a root-owned
+    #     database: the real re-restore, and the case that proves the sidecar
+    #     removal and the chown both run on an existing container.
+    ( cd "${CPROJ}" && docker compose run --rm --no-deps --user 0 --entrypoint sh trustissues -c \
+        'echo stale > /app/data/trustissues.db-wal; echo stale > /app/data/trustissues.db-shm; chown root:root /app/data/trustissues.db' ) >/dev/null 2>&1 || true
+    CR2_RC=0
+    CR2_OUT="$( cd "${CPROJ}" && "${HERE}/restore.sh" --compose "${CSNAP}" 2>&1 )" || CR2_RC=$?
+    CLS="$( cd "${CPROJ}" && docker compose run --rm --no-deps --user 0 --entrypoint sh trustissues \
+      -c 'ls /app/data; stat -c "%U" /app/data/trustissues.db' 2>/dev/null | tr -d '\r' )" || true
+    if [ "${CR2_RC}" = "0" ] \
+       && ! printf '%s' "${CLS}" | grep -q 'trustissues.db-wal' \
+       && ! printf '%s' "${CLS}" | grep -q 'trustissues.db-shm' \
+       && printf '%s' "${CLS}" | grep -q '^trustissues$'; then
+      ok "a re-restore clears the stale WAL/SHM sidecars and re-chowns the database"
+    else
+      bad "re-restore left sidecars or the wrong owner (exit ${CR2_RC}):
+${CLS}
+${CR2_OUT}"
+    fi
+
+    # 49. The writability proof must REFUSE when the service user cannot write.
+    #     A compose file that pins `user:` to an id the image does not know is a
+    #     plausible operator config, and it is the shape where the chown succeeds
+    #     (root can always chown) and the app still cannot open its database.
+    CPROJ2="${WORK}/ti-compose-nowrite"
+    mkdir -p "${CPROJ2}"
+    cat > "${CPROJ2}/docker-compose.yml" <<DC2EOF
+services:
+  trustissues:
+    image: ${CIMG}
+    user: "12345"
+    volumes:
+      - trustissues_data:/app/data
+volumes:
+  trustissues_data:
+DC2EOF
+    COMPOSE_PROJECT_DIRS="${COMPOSE_PROJECT_DIRS} ${CPROJ2}"
+    CR3_RC=0
+    CR3_OUT="$( cd "${CPROJ2}" && "${HERE}/restore.sh" --compose "${CSNAP}" 2>&1 )" || CR3_RC=$?
+    if [ "${CR3_RC}" = "2" ] \
+       && printf '%s' "${CR3_OUT}" | grep -q 'not writable by the service user'; then
+      ok "restore.sh --compose refuses when the service user cannot write the restored database"
+    else
+      bad "restore.sh --compose reported success on a database the service user cannot write (exit ${CR3_RC}):
+${CR3_OUT}"
+    fi
+  else
+    skip "could not build the throwaway compose image, so the Compose restore branch was NOT exercised"
+  fi
+else
+  skip "docker is not available here, so the Compose restore branch was NOT exercised"
+fi
+
 echo
-echo "passed ${PASS}, failed ${FAIL}"
+echo "passed ${PASS}, failed ${FAIL}, skipped ${SKIPPED}"
+if [ "${SKIPPED}" -gt 0 ]; then
+  echo "WARNING: ${SKIPPED} case(s) did not run, so this green is narrower than it looks:${SKIP_WHY}"
+fi
 [ "${FAIL}" -eq 0 ]

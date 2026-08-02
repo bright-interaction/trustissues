@@ -111,12 +111,23 @@ KEEP_WEEKLY="${TRUSTISSUES_BACKUP_KEEP_WEEKLY:-4}"
 # refused for the same reason: `[ "" -lt 1 ]` is a syntax error under set -e in
 # some shells and a silent 0 in others, and neither is a safe way to decide
 # whether to delete the only copy of a credential store.
+#
+# `case`, not `grep -Eq '^[0-9]+$'`. grep anchors ^ and $ to a LINE, so it
+# accepted any value whose first line was digits: `TRUSTISSUES_BACKUP_KEEP_DAILY`
+# set to $'1\nfoo' passed validation, and every later `[ "${n_daily}" -lt "1
+# foo" ]` is an "integer expression expected" error that evaluates FALSE inside
+# an if, so keep-daily silently degrades to zero and the prune deletes snapshots
+# it was told to keep. A multi-line value is one unterminated quote away in
+# backup.env, because systemd keeps accumulating lines inside an open quote.
+# Shell pattern matching has no concept of lines; the same fix is in
+# restore-drill.sh.
 for pair in "TRUSTISSUES_BACKUP_KEEP_DAILY=${KEEP_DAILY}" "TRUSTISSUES_BACKUP_KEEP_WEEKLY=${KEEP_WEEKLY}"; do
   val="${pair#*=}"
-  if ! printf '%s' "${val}" | grep -Eq '^[0-9]+$'; then
-    echo "error: ${pair%%=*} must be a non-negative integer, got '${val}'" >&2
-    exit 1
-  fi
+  case "${val}" in
+    ''|*[!0-9]*)
+      echo "error: ${pair%%=*} must be a non-negative integer, got '${val}'" >&2
+      exit 1 ;;
+  esac
 done
 if [ "${KEEP_DAILY}" -eq 0 ] && [ "${KEEP_WEEKLY}" -eq 0 ]; then
   echo "error: keeping 0 daily AND 0 weekly would delete every snapshot; refusing" >&2

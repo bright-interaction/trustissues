@@ -29,7 +29,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SHELL=/bin/bash
 
 # Daily backup + retention prune at 03:20, matching trustissues-backup.timer.
-20 3 * * * root set -a; . /etc/trustissues/backup.env; set +a; export TRUSTISSUES_BACKUP_PRUNE=1 TRUSTISSUES_ALERT_LOG=/var/log/trustissues-backup.log; /opt/trustissues/scripts/backup.sh >>/var/log/trustissues-backup.log 2>&1 || /opt/trustissues/deploy/systemd/trustissues-backup-alert.sh trustissues-backup.service >>/var/log/trustissues-backup.log 2>&1
+#
+# Retention comes from the --prune FLAG, not from an exported variable, for the
+# same reason trustissues-backup.service passes it on the ExecStart= line: a
+# TRUSTISSUES_BACKUP_PRUNE=0 in backup.env (sourced one command earlier) must not
+# be able to switch retention off on the scheduled path and grow the disk that
+# the live database sits on, silently, with every run still exiting 0.
+20 3 * * * root set -a; . /etc/trustissues/backup.env; set +a; export TRUSTISSUES_ALERT_LOG=/var/log/trustissues-backup.log; /opt/trustissues/scripts/backup.sh --prune >>/var/log/trustissues-backup.log 2>&1 || /opt/trustissues/deploy/systemd/trustissues-backup-alert.sh trustissues-backup.service >>/var/log/trustissues-backup.log 2>&1
 
 # Weekly restore drill on Mondays at 04:10, matching trustissues-restore-drill.timer.
 # This is the line people leave out. Do not leave it out: the backup job above

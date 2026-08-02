@@ -168,7 +168,7 @@ What that installs:
 
 | file | what it is |
 |------|------------|
-| `trustissues-backup.service` | one-shot: `backup.sh` with `TRUSTISSUES_BACKUP_PRUNE=1` |
+| `trustissues-backup.service` | one-shot: `backup.sh --prune` |
 | `trustissues-backup.timer` | daily 03:20 UTC, `RandomizedDelaySec=20m`, `Persistent=true` |
 | `trustissues-restore-drill.service` | one-shot: `restore-drill.sh` |
 | `trustissues-restore-drill.timer` | Mondays 04:10 UTC, same jitter and persistence |
@@ -179,6 +179,18 @@ What that installs:
 `/opt/trustissues/deploy/systemd/`, which is where the units look for them. Set
 `TRUSTISSUES_INSTALL_DIR` to change that. `--uninstall` removes the units and
 leaves your configuration and your snapshots alone.
+
+Retention is opted into on the `ExecStart=` line (`backup.sh --prune`), not with
+`Environment=TRUSTISSUES_BACKUP_PRUNE=1`. systemd lets an `EnvironmentFile=`
+override an `Environment=`, so while it was a variable, one
+`TRUSTISSUES_BACKUP_PRUNE=0` in `backup.env` switched retention off on the only
+path that fills the disk and nothing failed. Setting that variable in
+`backup.env` does not affect the scheduled run either way; the flag wins.
+
+`./deploy/systemd/install.sh --root DIR` rehearses the whole install into a
+throwaway tree instead of `/`, needs no root, starts nothing, and is what
+`scripts/test-backup-restore.sh` runs on every suite run. Use it if you want to
+see what the installer would do before you let it near `/etc`.
 
 `Persistent=true` matters: a backup missed because the box was off runs at the
 next boot instead of silently not existing.
@@ -250,9 +262,11 @@ back from cold storage still ages from the moment it was taken.
 TRUSTISSUES_BACKUP_KEEP_DAILY=14 ./scripts/prune-backups.sh /secure/backups
 ```
 
-Run automatically after each scheduled backup, because the unit sets
-`TRUSTISSUES_BACKUP_PRUNE=1`. A **hand-run** `backup.sh` never prunes unless you
-set that yourself; it prints a one-line reminder instead. This is deliberate:
+Run automatically after each scheduled backup, because the unit runs
+`backup.sh --prune`. A **hand-run** `backup.sh` never prunes unless you pass
+`--prune` (or set `TRUSTISSUES_BACKUP_PRUNE=1`); it prints a one-line reminder
+instead. The flag beats the variable in both directions, so `--no-prune` also
+works on a host whose `backup.env` turns retention on. This is deliberate:
 the hand-run script is what you reach for right before doing something
 frightening, and it should not delete history as a side effect.
 
@@ -287,6 +301,12 @@ alerting on this estate before:
 - The unit named by `OnFailure=` has to exist. `install.sh` resolves every
   `OnFailure=` target to a file before enabling anything, and
   `scripts/test-backup-restore.sh` asserts both of these.
+- It belongs on the **service**, not on the timer. `OnFailure=` on a `.timer`
+  fires when the timer itself fails to start, which is not what a failed backup
+  does: a backup that exits 2 fails `trustissues-backup.service` and leaves the
+  timer active and green. `install.sh` used to demand `OnFailure=` on the timers
+  too and aborted the whole install over it; it now requires instead that every
+  timer triggers a unit which carries one.
 - Use **port 587 with STARTTLS**, not 465. The alerter passes `--ssl-reqd` so
   587 is still encrypted. Several providers block outbound 465, and a send to
   `smtps://host:465` does not error, it **hangs**, which looks exactly like the
@@ -329,7 +349,15 @@ It takes the newest snapshot by the timestamp in its name and:
    sorts newest forever, its age is negative, and it would hide every real
    snapshot from the check while retention protects it from ever being pruned.
 2. runs the real `scripts/restore.sh` into a fresh `mktemp -d`, so the drill
-   exercises the actual restore path rather than a `cp`. It refuses to proceed
+   exercises the actual restore code rather than a `cp`. To be exact about which
+   half: the drill always drives the **native** branch (`restore.sh <snapshot>`
+   into a directory), never `restore.sh --compose`, because a drill must not go
+   near the running deploy's volume. On the Compose deploy the weekly drill
+   therefore proves the snapshot restores and the rows survive, and does **not**
+   prove the container-side steps of your real restore. Those (`docker compose
+   create` on a fresh host, the chown, the writability check) are covered by
+   `scripts/test-backup-restore.sh` against a throwaway compose project on any
+   machine with docker. It refuses to proceed
    if that directory is anywhere inside the live data directory (compared by
    physical path, so a symlink is not a way around it). If `TRUSTISSUES_DATA_DIR`
    is set but does not resolve to a directory, the drill stops with exit 2 and
@@ -458,6 +486,13 @@ thinking about it, and anything not on the list below you still have to do.
   because it never has the key. Only starting the server against a restored
   database and revealing one secret proves that, which is step 5 of
   [Restoring](#restoring).
+- **Watching the drill itself.** The chain is one link long. A dead backup timer
+  is caught by the drill (the freshness check); a dead *drill* timer is caught by
+  nothing, because a timer that never fires produces no failure and no mail. It
+  looks identical to a quiet month. Put `systemctl list-timers 'trustissues-*'`
+  in whatever you already read weekly, or have your monitoring alert on the
+  absence of the drill's journal line, and check `NEXT`/`LAST` after any host
+  upgrade.
 
 ## Testing this yourself
 
@@ -465,8 +500,19 @@ thinking about it, and anything not on the list below you still have to do.
 SQLite files in a temp directory: truncated snapshots, foreign databases,
 corrupted-in-place snapshots, retention keeping exactly the right files, a drill
 against a stale snapshot, and the systemd traps (`OnFailure=` section, the alert
-unit existing, the alerter's timeout and TLS). It needs `sqlite3` and nothing
-else, and it never touches a real deployment.
+unit existing, the alerter's timeout and TLS). It also **runs the installer**
+(`install.sh --root <tempdir>`) and asserts it completes, enables both timers and
+seeds the config, because the version of it that refused its own `.timer` file
+was caught by nothing until somebody ran it. It needs `sqlite3` and nothing else,
+and it never touches a real deployment.
+
+Where docker is available it additionally drives `restore.sh --compose` against a
+throwaway compose project with a real named volume and a real unprivileged image
+user: a fresh-host restore with no container yet, a re-restore over a stale WAL,
+and the refusal when the service user cannot write the restored file. Without
+docker those cases are reported as `SKIP` in the summary, and the summary says
+how many, because a green run that quietly proved less is the failure mode this
+whole page is about.
 
 ```bash
 ./scripts/test-backup-restore.sh

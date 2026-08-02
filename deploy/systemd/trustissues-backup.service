@@ -40,10 +40,20 @@ Type=oneshot
 EnvironmentFile=/etc/trustissues/backup.env
 
 # Retention is opt-in inside backup.sh so a hand-run backup never deletes
-# anything. The SCHEDULED path is the one that fills a disk, so it opts in here.
-Environment=TRUSTISSUES_BACKUP_PRUNE=1
-
-ExecStart=/opt/trustissues/scripts/backup.sh
+# anything. The SCHEDULED path is the one that fills a disk, so it opts in here,
+# ON THE COMMAND LINE and not with Environment=.
+#
+# This used to be `Environment=TRUSTISSUES_BACKUP_PRUNE=1`. systemd documents that
+# settings from an EnvironmentFile= OVERRIDE settings made with Environment=, so
+# a single line in /etc/trustissues/backup.env (TRUSTISSUES_BACKUP_PRUNE=0, or a
+# copy of a hand-run's export) silently switched retention off on the only path
+# that fills the disk. Nothing fails when that happens: the backup exits 0, the
+# timer stays green, the drill keeps passing, and the directory grows by a full
+# copy of the database every night until SQLite starts failing writes because the
+# disk the LIVE database is on is full. An ExecStart= argument cannot be
+# overridden by any environment file, and backup.sh makes the flag win over the
+# variable in both directions.
+ExecStart=/opt/trustissues/scripts/backup.sh --prune
 
 # The vault can be large and the destination can be a network mount. Two hours
 # is generous; the point is that a hung backup eventually fails and PAGES,
