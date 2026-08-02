@@ -2,9 +2,9 @@
  {
   "id": "updatetargets-oracle-always-true",
   "mech": "authority",
-  "file": "internal/handlers/vault.go",
-  "old": "\t\t\treturn h.mayDirectSecretEgress(ctx, userID, isAdmin, entryID)",
-  "new": "\t\t\t_ = h.mayDirectSecretEgress(ctx, userID, isAdmin, entryID)\n\t\t\treturn true",
+  "file": "internal/handlers/vault_egress_writes.go",
+  "old": "\t\tMayRedirect: func() bool {\n\t\t\treturn h.mayDirectSecretEgress(ctx, userID, isAdmin, entryID)\n\t\t},",
+  "new": "\t\tMayRedirect: func() bool {\n\t\t\t_ = h.mayDirectSecretEgress(ctx, userID, isAdmin, entryID)\n\t\t\treturn true\n\t\t},",
   "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
   "why": "the round-5 defect itself: an accepted vault_only editor may again point a rotation webhook wherever it likes"
  },
@@ -40,7 +40,7 @@
   "mech": "chokepoint",
   "file": "cmd/server/main.go",
   "old": "func main() {",
-  "new": "// backfillTargets stands in for a second writer OUTSIDE package handlers, which\n// a guard scoped to one package would never see.\nfunc backfillTargets(ctx context.Context, q *db.Queries, entryID, payload string) error {\n\treturn q.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{\n\t\tRotationTargets: sql.NullString{String: payload, Valid: true},\n\t\tID:              entryID,\n\t})\n}\n\nfunc main() {",
+  "new": "// backfillTargets stands in for a second writer OUTSIDE package handlers, which\n// a guard scoped to one package would never see.\nfunc backfillTargets(ctx context.Context, q *db.Queries, entryID string) error {\n\treturn q.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{\n\t\tID: entryID,\n\t})\n}\n\nfunc main() {",
   "test": "TestEveryHostChoosingWriteGoesThroughTheChokepoint",
   "pkg": "./internal/handlers/",
   "why": "the same door opened from cmd/, to prove the guard walks the whole module rather than its own package"
