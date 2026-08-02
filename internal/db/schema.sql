@@ -120,6 +120,18 @@ CREATE TABLE collection_members (
 );
 CREATE INDEX idx_collection_members_user ON collection_members(user_id);
 
+-- 00033_collection_invitations.sql (a pending seat recorded by the invited
+-- EMAIL, so the members list cannot be used to probe which addresses have an
+-- account; see the migration for the oracle it closes).
+CREATE TABLE collection_invitations (
+  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'editor', 'manager')),
+  invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (collection_id, email)
+);
+
 -- 00010_vault.sql
 CREATE TABLE vault_entries (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

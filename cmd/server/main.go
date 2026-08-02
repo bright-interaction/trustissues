@@ -610,6 +610,12 @@ func main() {
 					r.Get("/members", collectionHandler.ListMembers)
 					r.Post("/members", collectionHandler.AddMember)
 					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
+					// Withdraw a PENDING invitation by email. The members list
+					// no longer hands out a user id for a pending seat (that
+					// was the account-enumeration oracle), and an address with
+					// no account never had one, so rescinding needs its own
+					// email-addressed route or an invite could never be undone.
+					r.Delete("/invitations", collectionHandler.RescindInvitation)
 					r.Post("/accept", collectionHandler.AcceptInvite)
 					r.Post("/decline", collectionHandler.DeclineInvite)
 				})

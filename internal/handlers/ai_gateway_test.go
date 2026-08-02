@@ -82,7 +82,11 @@ func seedProviderKey(t *testing.T, conn *sql.DB, vh *VaultHandler, settingKey, p
 	if err != nil {
 		t.Fatalf("encrypt key: %v", err)
 	}
-	id := "entry_" + hex.EncodeToString([]byte(settingKey))[:8]
+	// Full hex, not a prefix. "ai_key_anthropic" and "ai_key_openai" share their
+	// first eight hex characters ("ai_k"), so truncating made the second seed in
+	// one test collide on vault_entries.id, which reads as a fixture bug rather
+	// than the name clash it is.
+	id := "entry_" + hex.EncodeToString([]byte(settingKey))
 	if _, err := conn.Exec(`INSERT INTO vault_entries (id, name, encrypted_value, nonce) VALUES (?,?,?,?)`,
 		id, "provider-key", ct, nonce); err != nil {
 		t.Fatalf("insert entry: %v", err)

@@ -296,6 +296,10 @@ func (h *CollectionHandler) AcceptInvite(w http.ResponseWriter, r *http.Request)
 		writeNotFound(w, r, "no pending invitation for this collection")
 		return
 	}
+	// The seat has been answered, so it stops being pending. Leaving it behind
+	// would show the manager a phantom pending invitation for someone who is now
+	// listed as an accepted member.
+	h.dropInvitationSeat(r, id, middleware.GetUserID(r.Context()))
 	LogActivityFromRequest(h.queries, r, "collection.invite_accepted", fmt.Sprintf("Accepted invitation to collection %s", id))
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -340,6 +344,9 @@ func (h *CollectionHandler) DeclineInvite(w http.ResponseWriter, r *http.Request
 		writeNotFound(w, r, "no invitation or membership for this collection")
 		return
 	}
+	// Declining answers the seat, and leaving vacates one. Either way it must not
+	// stay in the members list as a pending invitation that nobody can act on.
+	h.dropInvitationSeat(r, id, userID)
 	// Same cleanup RemoveMember runs. Leaving and being removed are the same
 	// DELETE of the membership row (the code says so, and the UI ships a Leave
 	// button on every collection at every role), but only the remove path
@@ -370,8 +377,8 @@ func (h *CollectionHandler) ListMembers(w http.ResponseWriter, r *http.Request) 
 		writeNotFound(w, r, "collection not found")
 		return
 	}
-	// A manager sees pending identities because they issued the invitations and
-	// must be able to see and rescind them. Everyone else does not (see below).
+	// A manager sees the address they invited, because they typed it. Everyone
+	// else sees an anonymous pending seat (see below).
 	canSeePending := callerRole == collRoleManager
 	rows, err := h.queries.ListCollectionMembers(r.Context(), id)
 	if err != nil {
@@ -379,40 +386,157 @@ func (h *CollectionHandler) ListMembers(w http.ResponseWriter, r *http.Request) 
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	// A PENDING row proves only that a manager typed an address, not that an
-	// account exists, so returning its email/name/user_id re-opened the oracle
-	// AddMember was written to close: AddMember deliberately answers identically
-	// whether or not the address matches an account, and this endpoint then
-	// showed the answer one call later, to ANY member of the collection
-	// including a vault_only user, who is the most restricted role in the
-	// product. An invitation the invitee has not accepted is also not yet a
-	// relationship they have agreed to expose to the rest of the team.
+	invites, err := h.queries.ListCollectionInvitations(r.Context(), id)
+	if err != nil {
+		logError(r, "collections.members: invitation query failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	// Pending seats come from collection_invitations, NEVER from a pending
+	// collection_members row, and they carry no user_id and no display name.
 	//
-	// Managers keep the identity: they typed the address, so it tells them
-	// nothing new, and they need it to rescind. The row is still listed for
-	// everyone so the seat is visible; it just carries no identity below manager.
-	out := make([]memberResponse, 0, len(rows))
+	// Both halves of that are load-bearing. AddMember deliberately answers
+	// identically whether or not the address matches an account, but it could
+	// only write a membership row when the address HAD one (user_id is a foreign
+	// key), so this endpoint answered the same question one call later: the
+	// pending row appeared, with the account's user id and real name, exactly
+	// when the account existed. Any authenticated user can create a collection
+	// and is seeded as its accepted manager, so the whole user directory was
+	// enumerable by a vault_only account, which is the role
+	// /api/invitations/redeem hands out over a PUBLIC endpoint. On a shared
+	// instance that is one client harvesting another client's people.
+	//
+	// So the seat is now recorded by the invited EMAIL either way (migration
+	// 00033) and the identity stays withheld until the invitee accepts, at which
+	// point they are a real member and being visible is the point of a shared
+	// collection. An unanswered invitation is also not yet a relationship the
+	// invitee has agreed to expose to the rest of the team.
+	out := make([]memberResponse, 0, len(rows)+len(invites))
+	invited := make(map[string]struct{}, len(invites))
+	acceptedEmail := make(map[string]struct{}, len(rows))
 	for _, m := range rows {
-		if !m.AcceptedAt.Valid && !canSeePending {
-			out = append(out, memberResponse{
-				Role: m.Role, AddedAt: nullTimePtr(m.AddedAt), Pending: true,
-			})
-			continue
-		}
 		if !m.AcceptedAt.Valid {
-			out = append(out, memberResponse{
-				UserID: m.UserID, Email: m.Email, Name: nullStringToString(m.Name),
-				Role: m.Role, AddedAt: nullTimePtr(m.AddedAt), Pending: true,
-			})
 			continue
 		}
+		acceptedEmail[strings.ToLower(m.Email)] = struct{}{}
 		out = append(out, memberResponse{
 			UserID: m.UserID, Email: m.Email, Name: nullStringToString(m.Name),
 			Role: m.Role, AddedAt: nullTimePtr(m.AddedAt),
 			AcceptedAt: nullTimePtr(m.AcceptedAt), Pending: false,
 		})
 	}
+	for _, inv := range invites {
+		invited[strings.ToLower(inv.Email)] = struct{}{}
+		// Clearing the seat on accept is best-effort (the membership row is the
+		// authoritative record), so a failed cleanup must not list a real member
+		// twice, once accepted and once as a phantom pending invitation.
+		if _, done := acceptedEmail[strings.ToLower(inv.Email)]; done {
+			continue
+		}
+		seat := memberResponse{Role: inv.Role, AddedAt: nullTimePtr(inv.CreatedAt), Pending: true}
+		if canSeePending {
+			seat.Email = inv.Email
+		}
+		out = append(out, seat)
+	}
+	// A pending membership with no invitation row can only come from a path that
+	// predates migration 00033. Show the seat so it is not invisible (and can be
+	// rescinded), but with no identity at all: emitting its email here would
+	// reopen exactly the oracle above. The member's email is read only to match
+	// it against a seat already listed, never to answer with.
+	for _, m := range rows {
+		if m.AcceptedAt.Valid {
+			continue
+		}
+		if _, ok := invited[strings.ToLower(m.Email)]; ok {
+			continue
+		}
+		out = append(out, memberResponse{
+			Role: m.Role, AddedAt: nullTimePtr(m.AddedAt), Pending: true,
+		})
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// RescindInvitation handles DELETE /api/collections/{id}/invitations (manager or
+// admin) and withdraws a pending invitation by EMAIL.
+//
+// Removing a member is by user id, and a pending seat no longer carries one
+// (ListMembers withholds it, and an address with no account never had one), so
+// without this endpoint an invitation to an address that has not accepted could
+// not be withdrawn at all. That is the same dead end RemoveMember's
+// acceptance-agnostic existence check was written to fix.
+//
+// The response is 204 no matter what: whether a seat existed, whether the
+// address matches an account, and whether that account had a pending membership.
+// A 404 on "no such invitation" would hand back the enumeration oracle this
+// whole change closes.
+func (h *CollectionHandler) RescindInvitation(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	role, ok := h.role(r, id)
+	if !ok {
+		writeNotFound(w, r, "collection not found")
+		return
+	}
+	if role != collRoleManager {
+		writeForbidden(w, r, "only a collection manager can manage members")
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeBadRequest(w, r, "invalid JSON")
+		return
+	}
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	if email == "" {
+		writeBadRequest(w, r, "email is required")
+		return
+	}
+	if _, err := h.queries.DeleteCollectionInvitation(r.Context(), db.DeleteCollectionInvitationParams{
+		CollectionID: id, Email: email,
+	}); err != nil {
+		logError(r, "collections.rescind: delete invitation failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	// If the address does have an account, drop its PENDING membership too, or
+	// the invitation would still be acceptable after the manager withdrew it.
+	// An ACCEPTED membership is left alone on purpose: removing a real member
+	// goes through RemoveMember, which carries the last-manager guard.
+	if user, err := h.queries.GetUserByEmail(r.Context(), email); err == nil && user.ID != "" {
+		if m, mErr := h.queries.GetCollectionMembership(r.Context(), db.GetCollectionMembershipParams{
+			CollectionID: id, UserID: user.ID,
+		}); mErr == nil && !m.AcceptedAt.Valid {
+			if _, rErr := h.queries.RemoveCollectionMember(r.Context(), db.RemoveCollectionMemberParams{
+				CollectionID: id, UserID: user.ID,
+			}); rErr != nil {
+				logError(r, "collections.rescind: remove pending membership failed", "error", rErr)
+				writeInternalError(w, r, "internal server error")
+				return
+			}
+		}
+	}
+	LogActivityFromRequest(h.queries, r, "collection.invite_rescinded",
+		fmt.Sprintf("Withdrew the invitation to collection %s", id))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// dropInvitationSeat removes the pending seat recorded for a user's address once
+// their membership is settled (accepted, declined, or removed). Best-effort: the
+// membership row is the authoritative record, and a leftover seat would only
+// show a phantom "pending" entry in the members list.
+func (h *CollectionHandler) dropInvitationSeat(r *http.Request, collectionID, userID string) {
+	email, err := h.queries.GetUserEmailByID(r.Context(), userID)
+	if err != nil {
+		return
+	}
+	if _, err := h.queries.DeleteCollectionInvitation(r.Context(), db.DeleteCollectionInvitationParams{
+		CollectionID: collectionID, Email: strings.ToLower(email),
+	}); err != nil {
+		logError(r, "collections: could not clear the invitation seat", "collection", collectionID, "error", err)
+	}
 }
 
 // AddMember handles POST /api/collections/{id}/members (manager or admin). The
@@ -460,6 +584,33 @@ func (h *CollectionHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	// any authenticated user (create a throwaway collection, probe addresses).
 	// The invitee learns of the invitation through their own pending list.
 	user, err := h.queries.GetUserByEmail(r.Context(), req.Email)
+	// The SEAT is recorded either way, and it is what the members list shows.
+	// Writing it only on a hit was the whole bug: the constant-time answer above
+	// meant nothing when GET /members revealed one call later whether the row had
+	// appeared. Written before the membership row so a failure here cannot leave
+	// an account-only seat, which would be the leaky state again.
+	//
+	// An already-ACCEPTED member is skipped: this endpoint doubles as the
+	// role-change path, and a real member must not be pushed back into the
+	// pending list by someone editing their role.
+	accepted := false
+	if err == nil && user.ID != "" {
+		if m, mErr := h.queries.GetCollectionMembership(r.Context(), db.GetCollectionMembershipParams{
+			CollectionID: id, UserID: user.ID,
+		}); mErr == nil && m.AcceptedAt.Valid {
+			accepted = true
+		}
+	}
+	if !accepted {
+		if invErr := h.queries.UpsertCollectionInvitation(r.Context(), db.UpsertCollectionInvitationParams{
+			CollectionID: id, Email: req.Email, Role: req.Role,
+			InvitedBy: toNullString(middleware.GetUserID(r.Context())),
+		}); invErr != nil {
+			logError(r, "collections.addmember: record invitation failed", "error", invErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+	}
 	if err == nil {
 		// AddCollectionMember is an UPSERT, so this endpoint doubles as the
 		// role-CHANGE path: the members UI sends it when a dropdown changes.
@@ -565,6 +716,9 @@ func (h *CollectionHandler) RemoveMember(w http.ResponseWriter, r *http.Request)
 		writeNotFound(w, r, "member not found")
 		return
 	}
+	// Same cleanup the accept and decline paths do: an emptied seat must not keep
+	// showing up as a pending invitation.
+	h.dropInvitationSeat(r, id, targetUser)
 	LogActivityFromRequest(h.queries, r, "collection.member_removed", fmt.Sprintf("Member %s removed from collection %s", targetUser, id))
 
 	// Offboarding cleanup. A collection editor can configure rotation delivery

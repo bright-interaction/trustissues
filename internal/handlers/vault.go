@@ -1532,14 +1532,57 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeBadRequest(w, r, "name must be 255 characters or less")
 			return
 		}
-		if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
-			if strings.Contains(err.Error(), "UNIQUE constraint") {
-				writeConflict(w, r, "a vault entry with that name already exists")
-				return
-			}
-			logError(r, "vault.update: update name failed", "error", err)
+		// Who owns the entry decides whether a rename may be attempted at all.
+		//
+		// UNIQUE(user_id, name) is scoped to the entry's CREATOR, and a shared
+		// entry keeps its creator's user_id forever. So an editor in a shared
+		// collection renaming somebody else's entry ran a query against a vault
+		// they have no read path to: a 409 meant "the creator holds an entry with
+		// exactly that name privately", and a 204 meant they do not. That is an
+		// existence oracle over another user's personal vault, spendable one
+		// guessed name at a time, and on a shared instance the creator is
+		// somebody else's client.
+		//
+		// The refusal is therefore constant: it does not consult the creator's
+		// namespace, so it says the same thing whether or not the name is taken
+		// there. The owner and an instance admin keep the precise duplicate-name
+		// feedback below, because for them the conflicting entry is one they can
+		// already see (an admin lists every entry with ?all=true).
+		//
+		// A rename by a non-owner is also a correctness problem in its own right:
+		// the name is the lookup key for service_identities.allowed_secrets and
+		// for MCP list_secrets/use_secret, so renaming another user's entry
+		// silently breaks resolution they configured and cannot see was broken.
+		//
+		// An UNCHANGED name is not a rename, and the edit form resubmits every
+		// field, so it must not be refused: otherwise an editor could no longer
+		// save a URL or a note on a shared entry at all.
+		ownerID, ownerErr := qtx.GetVaultEntryOwner(ctx, id)
+		if ownerErr != nil {
+			logError(r, "vault.update: owner lookup for rename failed", "entry", id, "error", ownerErr)
 			writeInternalError(w, r, "internal server error")
 			return
+		}
+		currentName, nameErr := qtx.GetVaultEntryName(ctx, id)
+		if nameErr != nil {
+			logError(r, "vault.update: current-name lookup for rename failed", "entry", id, "error", nameErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if newName != currentName {
+			if !middleware.IsAdmin(ctx) && userID != ownerID {
+				writeForbidden(w, r, "only the entry's owner or an instance admin can rename it")
+				return
+			}
+			if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
+				if strings.Contains(err.Error(), "UNIQUE constraint") {
+					writeConflict(w, r, "a vault entry with that name already exists")
+					return
+				}
+				logError(r, "vault.update: update name failed", "error", err)
+				writeInternalError(w, r, "internal server error")
+				return
+			}
 		}
 	}
 	if req.Category != nil {

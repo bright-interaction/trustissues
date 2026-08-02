@@ -126,6 +126,19 @@ func (q *Queries) DeleteCollection(ctx context.Context, id string) error {
 	return err
 }
 
+const deleteCollectionInvitation = `-- name: DeleteCollectionInvitation :execresult
+DELETE FROM collection_invitations WHERE collection_id = ? AND email = ?
+`
+
+type DeleteCollectionInvitationParams struct {
+	CollectionID string `json:"collection_id"`
+	Email        string `json:"email"`
+}
+
+func (q *Queries) DeleteCollectionInvitation(ctx context.Context, arg DeleteCollectionInvitationParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteCollectionInvitation, arg.CollectionID, arg.Email)
+}
+
 const getCollection = `-- name: GetCollection :one
 SELECT id, name, description, created_by, created_at, updated_at FROM collections WHERE id = ?
 `
@@ -443,6 +456,40 @@ func (q *Queries) ListAllCollections(ctx context.Context) ([]Collection, error) 
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCollectionInvitations = `-- name: ListCollectionInvitations :many
+SELECT collection_id, email, role, invited_by, created_at FROM collection_invitations
+WHERE collection_id = ? ORDER BY email ASC
+`
+
+func (q *Queries) ListCollectionInvitations(ctx context.Context, collectionID string) ([]CollectionInvitation, error) {
+	rows, err := q.db.QueryContext(ctx, listCollectionInvitations, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CollectionInvitation{}
+	for rows.Next() {
+		var i CollectionInvitation
+		if err := rows.Scan(
+			&i.CollectionID,
+			&i.Email,
+			&i.Role,
+			&i.InvitedBy,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -899,5 +946,41 @@ type UpdateCollectionParams struct {
 
 func (q *Queries) UpdateCollection(ctx context.Context, arg UpdateCollectionParams) error {
 	_, err := q.db.ExecContext(ctx, updateCollection, arg.Name, arg.Description, arg.ID)
+	return err
+}
+
+const upsertCollectionInvitation = `-- name: UpsertCollectionInvitation :exec
+
+INSERT INTO collection_invitations (collection_id, email, role, invited_by) VALUES (?, ?, ?, ?)
+ON CONFLICT(collection_id, email) DO UPDATE SET
+  role = excluded.role,
+  invited_by = excluded.invited_by
+`
+
+type UpsertCollectionInvitationParams struct {
+	CollectionID string         `json:"collection_id"`
+	Email        string         `json:"email"`
+	Role         string         `json:"role"`
+	InvitedBy    sql.NullString `json:"invited_by"`
+}
+
+// ============================================================================
+// Pending invitations, keyed by the invited EMAIL
+// ============================================================================
+//
+// These exist so a pending seat is recorded whether or not the address matches
+// an account. collection_members can only hold a row for an address that HAS an
+// account (user_id is a foreign key), so listing pending memberships told any
+// collection manager, including a vault_only user who just created a throwaway
+// collection, exactly which addresses are registered. See migration 00033.
+// Re-inviting the same address updates the seat's role rather than adding a
+// second one, which is also how the members UI sends a role change.
+func (q *Queries) UpsertCollectionInvitation(ctx context.Context, arg UpsertCollectionInvitationParams) error {
+	_, err := q.db.ExecContext(ctx, upsertCollectionInvitation,
+		arg.CollectionID,
+		arg.Email,
+		arg.Role,
+		arg.InvitedBy,
+	)
 	return err
 }

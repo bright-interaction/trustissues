@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -29,7 +30,59 @@ type aiProvider struct {
 	baseURL    string
 	settingKey string // settings key holding the vault entry id of the API key
 	inject     func(h http.Header, key string)
+	// routes is the allowlist of what a caller may reach on the OPERATOR's
+	// provider account. See allowedUpstreamRoute.
+	routes []upstreamRoute
 }
+
+// upstreamRoute is one allowed (method, path) shape on a provider API. prefix
+// routes exist for the handful of endpoints that carry an id in the path
+// (GET /v1/models/{model}); everything else is matched exactly.
+type upstreamRoute struct {
+	method string
+	path   string
+	prefix bool
+}
+
+// Inference routes only, per provider.
+//
+// The gateway holds the OPERATOR's provider key and injects it server-side, so
+// whatever path and method a caller names is executed with the operator's full
+// account rights. There was no per-caller scoping at all: any role-'user'
+// account with an API key could reach any path with any verb, so
+//
+//	curl -X DELETE -H 'X-API-Key: ti_<client>' https://host/api/ai/openai/v1/files/file-abc123
+//
+// deleted an object on the operator's OpenAI account, and the same shape reaches
+// fine-tuning jobs, assistants, uploads and the batch API. Unlimited POSTs to
+// anything bill the operator. A vault_only caller is already refused by
+// VaultOnlyBlock on the route group, but role 'user' is the role every client of
+// a shared instance gets.
+//
+// So the surface is cut to what a non-streaming inference client actually needs:
+// send a completion, count its tokens, and discover which models exist. Anything
+// else is refused before the key is even resolved. New endpoints are added here
+// deliberately rather than inherited by default.
+var (
+	anthropicRoutes = []upstreamRoute{
+		{method: http.MethodPost, path: "/v1/messages"},
+		{method: http.MethodPost, path: "/v1/messages/count_tokens"},
+		// Legacy text completions, still live for older SDKs.
+		{method: http.MethodPost, path: "/v1/complete"},
+		{method: http.MethodGet, path: "/v1/models"},
+		{method: http.MethodGet, path: "/v1/models/", prefix: true},
+	}
+	openaiRoutes = []upstreamRoute{
+		{method: http.MethodPost, path: "/v1/chat/completions"},
+		{method: http.MethodPost, path: "/v1/responses"},
+		{method: http.MethodPost, path: "/v1/embeddings"},
+		{method: http.MethodPost, path: "/v1/moderations"},
+		// Legacy text completions, still live for older SDKs.
+		{method: http.MethodPost, path: "/v1/completions"},
+		{method: http.MethodGet, path: "/v1/models"},
+		{method: http.MethodGet, path: "/v1/models/", prefix: true},
+	}
+)
 
 var aiProviders = map[string]aiProvider{
 	"anthropic": {
@@ -41,6 +94,7 @@ var aiProviders = map[string]aiProvider{
 				h.Set("anthropic-version", "2023-06-01")
 			}
 		},
+		routes: anthropicRoutes,
 	},
 	"openai": {
 		baseURL:    "https://api.openai.com",
@@ -48,7 +102,41 @@ var aiProviders = map[string]aiProvider{
 		inject: func(h http.Header, key string) {
 			h.Set("Authorization", "Bearer "+key)
 		},
+		routes: openaiRoutes,
 	},
+}
+
+// allowedUpstreamRoute reports whether (method, upstreamPath) is on the
+// provider's inference allowlist, and returns the cleaned path to forward.
+//
+// The path is cleaned FIRST and the cleaned value is what gets both matched and
+// forwarded. Matching a raw path and forwarding it would let
+// "/v1/chat/completions/../../v1/files/file-abc" pass the allowlist and still
+// resolve to the files API at the provider, which is the same bypass the
+// allowlist exists to stop. Deciding on one string and sending another is how
+// path allowlists usually fail.
+func allowedUpstreamRoute(p aiProvider, method, upstreamPath string) (string, bool) {
+	clean := path.Clean(upstreamPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	for _, rt := range p.routes {
+		if rt.method != method {
+			continue
+		}
+		if rt.prefix {
+			// A prefix route must still match a non-empty remainder, so
+			// "/v1/models/" alone does not slip through as an id.
+			if strings.HasPrefix(clean, rt.path) && len(clean) > len(rt.path) {
+				return clean, true
+			}
+			continue
+		}
+		if clean == rt.path {
+			return clean, true
+		}
+	}
+	return clean, false
 }
 
 // AIGatewayHandler proxies LLM requests to Claude/OpenAI while (1) injecting the
@@ -103,6 +191,24 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Scope the caller BEFORE the operator's key is decrypted, so a refused call
+	// never touches the vault and never bills anyone. See aiProviders.routes.
+	upstreamPath, ok := allowedUpstreamRoute(p, r.Method, "/"+chi.URLParam(r, "*"))
+	if !ok {
+		logError(r, "ai_gateway: refused a call outside the inference allowlist",
+			"provider", providerName, "method", r.Method, "path", upstreamPath)
+		// Attributed, same as a successful call. A client reaching for the
+		// operator's files or fine-tuning API is the shape an operator most needs
+		// to see, and it would otherwise leave no trace in the audit trail at all
+		// while every ordinary completion does.
+		LogActivityFromRequest(h.queries, r, "ai.gateway_refused",
+			fmt.Sprintf("AI call refused: provider=%s method=%s path=%s user=%s (not an inference route)",
+				providerName, r.Method, upstreamPath, middleware.GetUserID(ctx)))
+		writeError(w, r, http.StatusForbidden, "route_not_allowed",
+			fmt.Sprintf("the AI gateway only proxies inference calls; %s %s is not one of them", r.Method, upstreamPath))
+		return
+	}
+
 	// Resolve the provider key: an admin points a setting at a vault entry that
 	// holds the key. It is decrypted server-side and never returned to the caller.
 	entryID, _ := h.queries.GetSetting(ctx, p.settingKey)
@@ -151,7 +257,6 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		body = shielded
 	}
 
-	upstreamPath := "/" + chi.URLParam(r, "*")
 	// Carry the caller's query string. Concatenating baseURL+path dropped it, so
 	// every documented GET through the gateway (pagination cursors, filters,
 	// limits) silently returned an unfiltered first page with a 200 and no hint

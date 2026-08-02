@@ -203,6 +203,19 @@ it), tokenizes PII in the prompt through Shield before it egresses, resolves the
 markers in the response, and logs attributed usage. Non-streaming only in v1
 (`"stream": false`).
 
+The gateway proxies **inference calls only**, and refuses anything else with
+403 `route_not_allowed`. The call runs with the operator's provider account
+rights, so an unscoped proxy let any caller delete objects, start fine-tunes or
+create assistants on that account, and bill it for the privilege. Allowed:
+
+| provider | allowed |
+|----------|---------|
+| anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/complete`, `GET /v1/models`, `GET /v1/models/{id}` |
+| openai | `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/moderations`, `POST /v1/completions`, `GET /v1/models`, `GET /v1/models/{id}` |
+
+Adding an endpoint is a deliberate edit to `aiProviders` in
+`internal/handlers/ai_gateway.go`, never something a new provider API inherits.
+
 **MCP.** A remote MCP endpoint at `https://<your-host>/api/mcp` (JSON-RPC) that
 Claude and ChatGPT connectors can add, authenticated with an API key
 (`X-API-Key`). It exposes `list_secrets` (names only) and `use_secret` (mints a

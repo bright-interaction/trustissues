@@ -991,6 +991,19 @@ function CollectionManageModal({
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  // Withdrawing an unanswered invitation is a different call from removing a
+  // member: a pending seat has no user id (the server withholds it so the
+  // members list cannot be used to test which addresses have an account), so it
+  // is addressed by the email the manager typed.
+  const rescindInviteMutation = useMutation({
+    mutationFn: (email: string) => api.collections.rescindInvite(collection.id, email),
+    onSuccess: () => {
+      toast.success('Invitation withdrawn');
+      invalidateMembers();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   const updateCollectionMutation = useMutation({
     mutationFn: (data: { name: string; description: string }) =>
       api.collections.update(collection.id, data),
@@ -1123,15 +1136,17 @@ function CollectionManageModal({
               <p className="py-4 text-center text-sm text-slate-400">No members yet.</p>
             ) : (
               <ul className="divide-y divide-slate-100 rounded-lg border border-slate-100">
-                {members.map((m) => (
+                {members.map((m, i) => (
                   <li
-                    key={m.user_id || m.email}
+                    // A pending seat has no user id and, below manager, no email
+                    // either, so neither is a usable key on its own.
+                    key={m.user_id || m.email || `pending-${i}`}
                     className="flex items-center justify-between gap-3 px-3 py-2.5"
                   >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <p className="truncate text-sm font-medium text-slate-900">
-                          {m.name || m.email}
+                          {m.name || m.email || 'Invitation pending'}
                         </p>
                         {m.pending && (
                           <span
@@ -1155,7 +1170,9 @@ function CollectionManageModal({
                             existing: true,
                           })
                         }
-                        disabled={addMemberMutation.isPending}
+                        // Changing a role is addressed by email, and a pending
+                        // seat only carries one for the manager who typed it.
+                        disabled={addMemberMutation.isPending || !m.email}
                         className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs outline-none focus:border-slate-400 disabled:opacity-50"
                       >
                         {COLLECTION_ROLES.map((r) => (
@@ -1165,9 +1182,17 @@ function CollectionManageModal({
                         ))}
                       </select>
                       <button
-                        onClick={() => removeMemberMutation.mutate(m.user_id)}
-                        disabled={removeMemberMutation.isPending}
-                        title="Remove member"
+                        onClick={() =>
+                          m.pending
+                            ? rescindInviteMutation.mutate(m.email)
+                            : removeMemberMutation.mutate(m.user_id)
+                        }
+                        disabled={
+                          removeMemberMutation.isPending ||
+                          rescindInviteMutation.isPending ||
+                          (m.pending && !m.email)
+                        }
+                        title={m.pending ? 'Withdraw invitation' : 'Remove member'}
                         className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
                       >
                         <Trash2 className="h-4 w-4" />

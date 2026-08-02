@@ -68,6 +68,14 @@ type Collection struct {
 	UpdatedAt   sql.NullTime   `json:"updated_at"`
 }
 
+type CollectionInvitation struct {
+	CollectionID string         `json:"collection_id"`
+	Email        string         `json:"email"`
+	Role         string         `json:"role"`
+	InvitedBy    sql.NullString `json:"invited_by"`
+	CreatedAt    sql.NullTime   `json:"created_at"`
+}
+
 type CollectionMember struct {
 	CollectionID string         `json:"collection_id"`
 	UserID       string         `json:"user_id"`

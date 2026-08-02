@@ -170,6 +170,7 @@ type Querier interface {
 	DeleteAPIKey(ctx context.Context, arg DeleteAPIKeyParams) (sql.Result, error)
 	DeleteAPIKeysByUser(ctx context.Context, userID string) error
 	DeleteCollection(ctx context.Context, id string) error
+	DeleteCollectionInvitation(ctx context.Context, arg DeleteCollectionInvitationParams) (sql.Result, error)
 	DeleteNotificationChannel(ctx context.Context, id string) (sql.Result, error)
 	DeletePendingInvitation(ctx context.Context, id string) (sql.Result, error)
 	// Hard user delete: their PERSONAL entries go with them.
@@ -341,6 +342,7 @@ type Querier interface {
 	// auto-rotation keeps running on those after the account is disabled.
 	ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
+	ListCollectionInvitations(ctx context.Context, collectionID string) ([]CollectionInvitation, error)
 	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
 	// The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
 	//
@@ -546,6 +548,18 @@ type Querier interface {
 	// Update entry - encrypted value (re-encrypt + rotate timestamp)
 	// ============================================================================
 	UpdateVaultEntryValue(ctx context.Context, arg UpdateVaultEntryValueParams) error
+	// ============================================================================
+	// Pending invitations, keyed by the invited EMAIL
+	// ============================================================================
+	//
+	// These exist so a pending seat is recorded whether or not the address matches
+	// an account. collection_members can only hold a row for an address that HAS an
+	// account (user_id is a foreign key), so listing pending memberships told any
+	// collection manager, including a vault_only user who just created a throwaway
+	// collection, exactly which addresses are registered. See migration 00033.
+	// Re-inviting the same address updates the seat's role rather than adding a
+	// second one, which is also how the members UI sends a role change.
+	UpsertCollectionInvitation(ctx context.Context, arg UpsertCollectionInvitationParams) error
 	UpsertSetting(ctx context.Context, arg UpsertSettingParams) error
 }
 
