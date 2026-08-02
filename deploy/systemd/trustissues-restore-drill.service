@@ -1,0 +1,47 @@
+[Unit]
+Description=Trustissues restore drill (restore the newest snapshot into a throwaway dir and check a known row)
+Documentation=file:///opt/trustissues/docs/BACKUP.md
+ConditionPathExists=/etc/trustissues/backup.env
+
+# Same rule as the backup unit: [Unit], not [Service]. See the long note there.
+#
+# This is the unit whose failure matters MOST and is easiest to leave silent.
+# The backup unit fails loudly when sqlite3 errors; the drill is the only thing
+# that fails when the backups are fine as files and useless as backups, and when
+# the timer quietly stopped weeks ago.
+OnFailure=trustissues-backup-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/trustissues/backup.env
+ExecStart=/opt/trustissues/scripts/restore-drill.sh
+
+# Restoring a large database into /tmp takes as long as a copy plus a full
+# integrity_check, which walks every page. Same reasoning as the backup unit:
+# it must eventually fail rather than hang forever.
+TimeoutStartSec=1h
+
+Nice=15
+IOSchedulingClass=idle
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustissues-restore-drill
+
+# PrivateTmp gives the drill its own /tmp, so the throwaway copy of the vault it
+# creates is not visible to anything else on the box and is gone with the unit
+# even if the script's cleanup trap is skipped by a SIGKILL. That is the whole
+# reason this unit does not set TRUSTISSUES_DRILL_KEEP.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

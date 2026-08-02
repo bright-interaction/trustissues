@@ -1,0 +1,68 @@
+[Unit]
+Description=Trustissues database backup (WAL-safe SQLite online backup + retention)
+Documentation=file:///opt/trustissues/docs/BACKUP.md
+ConditionPathExists=/etc/trustissues/backup.env
+
+# OnFailure BELONGS IN [Unit]. It is not a matter of taste.
+#
+# The estate shipped this exact line inside [Service] on dockyard-backup.service
+# and systemd logged "Unknown key name 'OnFailure' in section 'Service',
+# ignoring" and dropped it, so every nightly backup failure from the day the
+# unit was written until 2026-07-27 was completely silent. Nobody noticed until
+# a stale lock killed a run and no mail arrived. The referenced alert unit had
+# never been written either, so even in the right section it would have done
+# nothing. Both traps are checked by scripts/test-backup-restore.sh now; do not
+# move this line and do not rename the alert unit without renaming its file.
+#
+# %n expands to this unit's own name, so the alerter is told WHICH unit failed
+# and one templated alert unit serves both the backup and the restore drill.
+OnFailure=trustissues-backup-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/trustissues/backup.env
+
+# Retention is opt-in inside backup.sh so a hand-run backup never deletes
+# anything. The SCHEDULED path is the one that fills a disk, so it opts in here.
+Environment=TRUSTISSUES_BACKUP_PRUNE=1
+
+ExecStart=/opt/trustissues/scripts/backup.sh
+
+# The vault can be large and the destination can be a network mount. Two hours
+# is generous; the point is that a hung backup eventually fails and PAGES,
+# instead of sitting in "activating" forever while the timer refuses to start
+# the next run because the last one never finished.
+TimeoutStartSec=2h
+
+# Backups compete with the live server for the same disk. Losing five minutes on
+# the snapshot is free; adding latency to a credential fetch is not.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustissues-backup
+
+# Sandbox. ProtectSystem=full rather than strict, deliberately: strict requires
+# every writable path as a literal ReadWritePaths= entry, and the backup
+# destination is set in backup.env, which systemd does NOT expand in
+# ReadWritePaths. full leaves /var, /opt, /srv and /mnt writable, which covers
+# every sane destination. ProtectHome means the destination must NOT be under
+# /home or /root; install.sh warns when you pick one of those.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# The snapshot is a credential store. 0077 makes both the file and any directory
+# this script creates user-only even if a future edit forgets an explicit chmod.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
