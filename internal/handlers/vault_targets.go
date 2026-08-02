@@ -327,14 +327,20 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 	payload, _ := json.Marshal(map[string]string{"data": newValue})
 	url := strings.TrimRight(target.Instance, "/") + "/api/v1/repos/" + target.Repo + "/actions/secrets/" + target.SecretName
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(payload))
+	// The authority for this one delivery is the target row that was authorized
+	// above (its configurer still has write, and the provider pin allowed it).
+	// Naming it here rather than letting providerDo default to something is the
+	// whole discipline: there is no default. See egress_authority.go.
+	req, err := http.NewRequestWithContext(
+		withDeliveryEgress(ctx, target.Instance, "this forgejo_secret delivery target"),
+		"PUT", url, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "token "+string(tokenPlaintext))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -361,7 +367,9 @@ func deliverToWebhook(ctx context.Context, target RotationTarget, entryName stri
 		"rotated_at": time.Now().UTC().Format(time.RFC3339),
 	})
 
-	req, err := http.NewRequestWithContext(ctx, "POST", target.WebhookURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(
+		withDeliveryEgress(ctx, target.WebhookURL, "this webhook delivery target"),
+		"POST", target.WebhookURL, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -376,7 +384,7 @@ func deliverToWebhook(ctx context.Context, target RotationTarget, entryName stri
 		req.Header.Set("X-Vault-Signature", "sha256="+sig)
 	}
 
-	resp, err := providerHTTP.Do(req)
+	resp, err := providerDo(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}

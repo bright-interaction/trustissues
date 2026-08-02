@@ -39,6 +39,10 @@ var providerEgressRegistry = map[string]string{
 		"directly (no client, no socket), so it egresses nothing on its own. What it mints IS spendable at " +
 		"capability.Proxy, which is gated.",
 
+	"egress_authority.go:providerDo": "THE chokepoint, not a call site. Every other outbound provider or " +
+		"delivery request in this package goes through it, and it refuses any host outside the egress " +
+		"authority the caller installed when it decrypted the secret. See egress_authority.go.",
+
 	"vault_targets.go:deliverToWebhook": "operator-configured delivery endpoint for a ROTATED secret, not an LLM " +
 		"provider key. Its own authorization lives in DeliverRotatedKey (a target configured by a departed member " +
 		"is refused); the URL is validated and SSRF-guarded, and no caller picks the method.",
@@ -49,9 +53,15 @@ var providerEgressRegistry = map[string]string{
 // providerEgressExemptFiles are whole files of first-party outbound calls where
 // no caller influences the method or the path.
 var providerEgressExemptFiles = map[string]string{
-	"vault_providers.go": "key rotation and validation. Every endpoint is a compile-time literal for one provider " +
-		"and the method is fixed in the source; nothing here forwards a caller's request. Literal provider URLs are " +
-		"still checked against the inference allowlist below.",
+	"vault_providers.go": "key rotation and validation. The METHOD is fixed in the source at every site and " +
+		"nothing here forwards a caller's request, so the inference allowlist is not the right question for this " +
+		"file. The HOST is a different matter and this exemption used to claim otherwise: it said every endpoint " +
+		"was a compile-time literal, which is false for datadog (site), grafana / zitadel / forgejo (instance), " +
+		"auth0 (tenant) and supabase (project_ref), all of which build the host out of provider_meta. That false " +
+		"sentence is how round 4 walked past this guard. Those sites are now covered by providerDo plus the " +
+		"providerEgress declarations, and by TestProviderRequestsStayInsideTheirDeclaredHosts, which drives every " +
+		"registered provider with attacker-controlled meta. Literal provider URLs are still checked against the " +
+		"inference allowlist below.",
 }
 
 // TestProviderEgressCallSitesAreRegistered is the guard the review asked for:

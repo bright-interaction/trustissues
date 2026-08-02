@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"net/http"
 	"regexp"
 	"strings"
@@ -58,7 +57,8 @@ func TestProviderBodyIsActuallyTruncated(t *testing.T) {
 
 	// Any provider will do; Validate is the cheapest path that reads a body.
 	p := &TwilioProvider{}
-	_, _ = p.Validate(context.Background(), "k", map[string]string{"account_sid": "AC"})
+	meta := map[string]string{"account_sid": "AC"}
+	_, _ = p.Validate(providerCtx(p, meta), "k", meta)
 
 	// The assertion is on the helper itself, since Validate discards the body.
 	resp, err := providerHTTP.Get("http://example.invalid/x")

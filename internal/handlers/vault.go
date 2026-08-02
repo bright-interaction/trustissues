@@ -1388,8 +1388,15 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// hold) rewrote destination_patterns here and had /proxy deliver the
 	// operator's decrypted provider key to a host they chose. See
 	// mayDirectSecretEgress and secret_egress.go.
+	//
+	// req.ProviderMeta is in this list, and adding it is the round-4 fix. The
+	// previous cut asked the question only for destination_patterns and provider,
+	// which is exactly the shape this stream keeps repeating: the guard names the
+	// columns that were attacked last time and the next writer of a DIFFERENT
+	// column walks straight past it. The set of egress-influencing fields is now
+	// stated once in egress_authority.go and every one of them lands here.
 	mayWidenEgress := false
-	if req.DestinationPatterns != nil || req.Provider != nil {
+	if req.DestinationPatterns != nil || req.Provider != nil || req.ProviderMeta != nil {
 		mayWidenEgress = h.mayDirectSecretEgress(ctx, userID, middleware.IsAdmin(ctx), id)
 	}
 
@@ -1810,6 +1817,74 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			if req.AutoRotate != nil {
 				autoRotate = boolToInt64(*req.AutoRotate)
 			}
+
+			// THE SECOND HOST-CHOOSING SURFACE, held to the same right as the first.
+			//
+			// destination_patterns was pinned in round 3 and the attack simply moved
+			// one column over: provider and provider_meta together decide the host a
+			// rotation or a validation sends the decrypted secret to, and neither was
+			// gated. datadog's "site" becomes "https://api."+site; grafana's
+			// "instance" becomes "https://"+instance+".grafana.net". Neither reads
+			// like a URL, both are one.
+			//
+			// The comparison is on the DECLARED HOST SET, never on the raw column
+			// text, so it does not need to know which key is a host: providerEgress
+			// says what the pair resolves to and this asks whether the resolution
+			// grew. That is what makes a provider added next year covered on the day
+			// it is added rather than after it is exploited.
+			beforeMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", "provider_meta"))
+			afterMeta := beforeMeta
+			if req.ProviderMeta != nil {
+				afterMeta = ParseProviderMeta(*req.ProviderMeta)
+				// Server-owned transient markers. pending_revoke_url is issued by
+				// performPendingRevoke with the NEW secret as its bearer token, so a
+				// client that could plant one would have the scheduler post the fresh
+				// credential wherever it said. providerDo already refuses the request;
+				// refusing the WRITE keeps the attempt out of the row entirely.
+				if bad, found := rejectReservedProviderMetaKeys(afterMeta); found {
+					logError(r, "vault.update: refused a client-supplied server-owned provider_meta key",
+						"entry", id, "user", userID, "key", bad)
+					writeValidationError(w, r,
+						"provider_meta may not contain "+bad+": that key is written by the rotation engine itself")
+					return
+				}
+			}
+			if change := authorityForEgressChange(current.Provider.String, beforeMeta, provider, afterMeta); change.widensEgress() {
+				if !mayWidenEgress {
+					logError(r, "vault.update: refused an egress widening through provider/provider_meta",
+						"entry", id, "user", userID, "added", change.added)
+					writeError(w, r, http.StatusForbidden, "egress_widening_denied",
+						fmt.Sprintf("changing the provider configuration would let this secret be sent to %v, "+
+							"which takes the secret's owner or an instance admin. Editing an entry does not carry "+
+							"the right to choose where its value is delivered (the fields that decide this are the "+
+							"provider and the provider_meta keys %v)", change.added, egressInfluencingMetaKeys()))
+					return
+				}
+				// The pin outranks the widening right, exactly as it does for
+				// destination_patterns: while an admin has the instance pointed at
+				// this entry, its key goes to that provider and nowhere else, and
+				// not even the creator may move it.
+				pin, pinErr := providerPinFor(ctx, qtx, id)
+				if pinErr != nil {
+					logError(r, "vault.update: could not read the entry's provider pin", "entry", id, "error", pinErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				if pin.pinned() {
+					for _, host := range change.after {
+						if pin.allowsHost(host) {
+							continue
+						}
+						logError(r, "vault.update: refused a provider change outside the provider pin",
+							"entry", id, "user", userID, "host", host)
+						writeError(w, r, http.StatusForbidden, "destination_pinned",
+							fmt.Sprintf("this secret is the instance's AI provider key; it is only ever delivered to %s, "+
+								"so a provider configuration reaching %q cannot be stored. Unwire it in "+
+								"Settings > AI gateway first", pin.describe(), host))
+						return
+					}
+				}
+			}
 			// provider_meta at rest. The two cases are kept explicitly apart:
 			// client-supplied meta is ALWAYS encrypted, while an untouched column
 			// is carried forward exactly as stored. Never decide by content
@@ -2170,7 +2245,18 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		if providerRoleFor == providerAuto {
 			provider := resolvedProvider
 			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
-			rotatedValue, rotErr := provider.Rotate(ctx, oldValue, providerMeta)
+			// The egress authority for this whole rotation, resolved here because
+			// here is where the stored (provider, provider_meta) pair becomes a
+			// destination. Rotate, and the deferred revoke that follows the CAS,
+			// both run under it. See egress_authority.go.
+			rotateCtx, egressErr := providerEgressContextFor(ctx, h.queries, id, providerName, providerMeta)
+			if egressErr != nil {
+				logError(r, "vault.rotate: refusing to rotate through this provider configuration",
+					"entry", id, "user", userID, "error", egressErr)
+				writeError(w, r, http.StatusForbidden, "destination_pinned", egressErr.Error())
+				return
+			}
+			rotatedValue, rotErr := provider.Rotate(rotateCtx, oldValue, providerMeta)
 			if rotErr != nil {
 				// Do NOT fall through to a locally generated value. The upstream
 				// credential is untouched, so storing a random string here would
@@ -2398,8 +2484,14 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Shared with the sweep from here. See vault_rotation_core.go.
+	//
+	// Under the entry's egress authority, like the Rotate call itself: the
+	// deferred revoke sends "Authorization: Bearer <the new secret>" to a method
+	// and URL taken out of provider_meta, so it is the same question as every
+	// other outbound call and it gets the same answer.
 	deps := rotationDeps{queries: h.queries, vault: h}
-	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerMeta, newValue); warn != "" {
+	if warn := revokeOldKeyAndPersistMeta(withProviderEgress(ctx, providerName, providerMeta),
+		deps, id, meta.Name, providerMeta, newValue); warn != "" {
 		revokeWarn = warn
 	}
 
@@ -2629,7 +2721,22 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", "provider_meta"))
-	valid, validErr := provider.Validate(ctx, string(plaintext), providerMeta)
+	// Validate AUTHENTICATES with the decrypted key against the provider, so it
+	// is a live spend of the credential and the fastest of the three paths that
+	// carry it off the box: no scheduler wait, no rotation, just the caller's own
+	// password. Whoever holds this key may only ever send it to the hosts the
+	// entry's provider declares. See egress_authority.go.
+	egressCtx, egressErr := providerEgressContextFor(ctx, h.queries, id, meta.Provider.String, providerMeta)
+	if egressErr != nil {
+		for i := range plaintext {
+			plaintext[i] = 0
+		}
+		logError(r, "vault.validate: refusing to spend the secret against this provider configuration",
+			"entry", id, "user", userID, "error", egressErr)
+		writeError(w, r, http.StatusForbidden, "destination_pinned", egressErr.Error())
+		return
+	}
+	valid, validErr := provider.Validate(egressCtx, string(plaintext), providerMeta)
 
 	// Zero plaintext
 	for i := range plaintext {
