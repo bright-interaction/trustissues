@@ -129,6 +129,54 @@ func (q *Queries) ListEnabledNotificationChannels(ctx context.Context) ([]ListEn
 	return items, nil
 }
 
+const listNotificationChannelConfigsForRekey = `-- name: ListNotificationChannelConfigsForRekey :many
+SELECT id, name, config, config_nonce, encryption_version
+FROM notification_channels
+ORDER BY id
+`
+
+type ListNotificationChannelConfigsForRekeyRow struct {
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	Config            string        `json:"config"`
+	ConfigNonce       []byte        `json:"config_nonce"`
+	EncryptionVersion sql.NullInt64 `json:"encryption_version"`
+}
+
+// Channel configs are raw AES-GCM under the vault value key, with the nonce in
+// its own column and NO marker in the payload. encryption_version 0 means the
+// config was written before at-rest encryption and is plain JSON; the sweep must
+// see those rows too so it can report them rather than silently treat a
+// cleartext webhook URL (which can carry a bearer token) as already converted.
+func (q *Queries) ListNotificationChannelConfigsForRekey(ctx context.Context) ([]ListNotificationChannelConfigsForRekeyRow, error) {
+	rows, err := q.db.QueryContext(ctx, listNotificationChannelConfigsForRekey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListNotificationChannelConfigsForRekeyRow{}
+	for rows.Next() {
+		var i ListNotificationChannelConfigsForRekeyRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Config,
+			&i.ConfigNonce,
+			&i.EncryptionVersion,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNotificationChannels = `-- name: ListNotificationChannels :many
 SELECT id, name, type, enabled, events, encryption_version, created_at, updated_at
 FROM notification_channels
@@ -176,6 +224,29 @@ func (q *Queries) ListNotificationChannels(ctx context.Context) ([]ListNotificat
 		return nil, err
 	}
 	return items, nil
+}
+
+const rekeyNotificationChannelConfig = `-- name: RekeyNotificationChannelConfig :exec
+UPDATE notification_channels
+SET config = ?, config_nonce = ?, encryption_version = ?
+WHERE id = ?
+`
+
+type RekeyNotificationChannelConfigParams struct {
+	Config            string        `json:"config"`
+	ConfigNonce       []byte        `json:"config_nonce"`
+	EncryptionVersion sql.NullInt64 `json:"encryption_version"`
+	ID                string        `json:"id"`
+}
+
+func (q *Queries) RekeyNotificationChannelConfig(ctx context.Context, arg RekeyNotificationChannelConfigParams) error {
+	_, err := q.db.ExecContext(ctx, rekeyNotificationChannelConfig,
+		arg.Config,
+		arg.ConfigNonce,
+		arg.EncryptionVersion,
+		arg.ID,
+	)
+	return err
 }
 
 const updateNotificationChannelEnabled = `-- name: UpdateNotificationChannelEnabled :execresult

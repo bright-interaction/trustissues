@@ -298,7 +298,7 @@ func main() {
 	// "healthy", shows every entry as blank, and the first UI save overwrites
 	// still-recoverable ciphertext with NULL. Self-heals on first boot by writing
 	// the sentinel. Exits on mismatch unless TRUSTISSUES_ALLOW_KEY_MISMATCH=1.
-	handlers.EnforceVaultKey(context.Background(), queries, cfg.VaultKey)
+	handlers.EnforceVaultKey(context.Background(), queries, cfg.VaultKey, cfg.VaultKeyPrevious)
 
 	// appCtx scopes background workers and dispatcher work to the server's
 	// lifetime; cancelled on shutdown.
@@ -337,6 +337,33 @@ func main() {
 	// enc:v1: prefix guards it), retried next boot on failure.
 	if _, err := vaultHandler.BackfillMetadataAtRest(); err != nil {
 		slog.Error("vault metadata-at-rest backfill failed", "error", err)
+	}
+
+	// Master-key rotation, headless path. The interactive path (admin UI /
+	// POST /api/admin/vault-key/rekey) is the primary one; this flag exists so a
+	// compose-only deploy with nobody logging in can still complete a rotation.
+	//
+	// It runs BEFORE the server accepts traffic and exits non-zero on failure, on
+	// purpose. An operator who set this flag is mid-rotation and asked for the
+	// conversion to happen; booting anyway would serve a store the operator
+	// believes is converted, and the next step in their runbook is deleting the
+	// old key. Better to fail the deploy loudly than to hand them a false green.
+	if cfg.RekeyOnBoot {
+		rep, err := vaultHandler.RekeyVault(context.Background())
+		if err != nil {
+			slog.Error("vault: boot re-encrypt sweep failed, refusing to start",
+				"error", err, "status", rekeyStatusOf(rep))
+			if rep != nil {
+				for _, b := range rep.Blockers {
+					slog.Error("vault: value opens under no configured key",
+						"table", b.Table, "column", b.Column, "row_id", b.RowID)
+				}
+			}
+			os.Exit(1)
+		}
+		slog.Info("vault: boot re-encrypt sweep finished",
+			"status", rep.Status, "rows_converted", rep.RowsConverted,
+			"current_key_fingerprint", rep.CurrentKeyFingerprint)
 	}
 	// Built after vaultHandler: the collection handler needs it to decrypt and
 	// re-encrypt rotation_targets when purging a departing member's endpoints.
@@ -571,6 +598,14 @@ func main() {
 					r.Delete("/{id}", notificationChannelsHandler.Delete)
 					r.Post("/{id}/test", notificationChannelsHandler.Test)
 				})
+
+				// Master-key rotation. The status read is cheap and safe to poll;
+				// the sweep is a whole-database rewrite, so it shares the
+				// sensitive-op budget with rotate and validate. Both are admin
+				// only: this is the one action that can decide whether the vault
+				// key an operator is about to delete is still load-bearing.
+				r.Get("/vault-key", vaultHandler.VaultKeyStatus)
+				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/vault-key/rekey", vaultHandler.VaultKeyRekey)
 			})
 
 			// Vault (all roles incl. vault_only; per-entry ownership is
@@ -751,4 +786,14 @@ func main() {
 	// Wait for the drain before main returns, or the deferred dbConn.Close()
 	// and appCancel() fire while handlers are still mid-write.
 	<-drained
+}
+
+// rekeyStatusOf reads the status off a possibly-nil rekey report, so a failed
+// boot sweep logs "the report says blocked" rather than panicking on the nil
+// return that some failure paths produce.
+func rekeyStatusOf(rep *handlers.RekeyReport) string {
+	if rep == nil {
+		return "unknown"
+	}
+	return rep.Status
 }

@@ -175,6 +175,42 @@ func (q *Queries) GetUserIDByEmailForInvite(ctx context.Context, email string) (
 	return id, err
 }
 
+const listInvitationCodesForRekey = `-- name: ListInvitationCodesForRekey :many
+SELECT id, code FROM invitations WHERE code != '' ORDER BY id
+`
+
+type ListInvitationCodesForRekeyRow struct {
+	ID   string `json:"id"`
+	Code string `json:"code"`
+}
+
+// Pending invitation codes are encrypted at rest with the vault handler's
+// enc:v1: column scheme so "resend invitation" can mail the original code. A
+// master-key rotation that skipped this column would leave every pending invite
+// unresendable, which reads as a broken feature rather than as a rotation bug.
+func (q *Queries) ListInvitationCodesForRekey(ctx context.Context) ([]ListInvitationCodesForRekeyRow, error) {
+	rows, err := q.db.QueryContext(ctx, listInvitationCodesForRekey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListInvitationCodesForRekeyRow{}
+	for rows.Next() {
+		var i ListInvitationCodesForRekeyRow
+		if err := rows.Scan(&i.ID, &i.Code); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listInvitations = `-- name: ListInvitations :many
 SELECT id, code, email, name, status, target_role, expires_at, created_at
 FROM invitations
@@ -237,5 +273,19 @@ type MarkInvitationRedeemedParams struct {
 
 func (q *Queries) MarkInvitationRedeemed(ctx context.Context, arg MarkInvitationRedeemedParams) error {
 	_, err := q.db.ExecContext(ctx, markInvitationRedeemed, arg.RedeemedBy, arg.ID)
+	return err
+}
+
+const rekeyInvitationCode = `-- name: RekeyInvitationCode :exec
+UPDATE invitations SET code = ? WHERE id = ?
+`
+
+type RekeyInvitationCodeParams struct {
+	Code string `json:"code"`
+	ID   string `json:"id"`
+}
+
+func (q *Queries) RekeyInvitationCode(ctx context.Context, arg RekeyInvitationCodeParams) error {
+	_, err := q.db.ExecContext(ctx, rekeyInvitationCode, arg.Code, arg.ID)
 	return err
 }

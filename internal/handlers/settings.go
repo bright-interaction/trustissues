@@ -376,7 +376,7 @@ func (h *SettingsHandler) TestSMTP(w http.ResponseWriter, r *http.Request) {
 	// smtp_password is ciphertext at rest, so it has to be decrypted before it
 	// can be used as a credential. Passing the stored value straight through
 	// authenticated with "tienc:v1:..." and failed against every real relay.
-	password, err := resolveSMTPPassword(get("smtp_password"), h.cfg.VaultKey)
+	password, err := resolveSMTPPassword(get("smtp_password"), h.cfg.VaultKey, h.cfg.VaultKeyPrevious)
 	if err != nil {
 		logError(r, "settings.smtp_test: password decrypt failed", "error", err)
 		writeInternalError(w, r, "internal server error")

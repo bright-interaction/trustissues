@@ -34,6 +34,17 @@ type VaultHandler struct {
 	encryptionKey [32]byte // PBKDF2-derived key (current, version 2)
 	legacyKey     [32]byte // SHA-256 key (version 1, only used during migration)
 	bidxKey       [32]byte // PBKDF2-derived key for the URL blind index (HMAC)
+	// keySource is the master key string these three were derived from. The
+	// rekey sweep needs it because columncrypto derives internally from the raw
+	// string rather than taking a derived key.
+	keySource string
+	// previous holds the same three derivations for TRUSTISSUES_VAULT_KEY_PREVIOUS,
+	// or nil when no rotation is configured. Every DECRYPT path falls back to it;
+	// no ENCRYPT path ever touches it. That asymmetry is the whole design: reads
+	// tolerate a half-rotated store, writes always land on the current key, so
+	// the store converges on the current key with ordinary use and the sweep only
+	// has to finish the job for rows nobody edits.
+	previous *vaultKeyMaterial
 	// delivery tracks the detached rotation-delivery goroutines so shutdown can
 	// wait for them. srv.Shutdown only drains in-flight HTTP requests; a manual
 	// rotate returns as soon as the value is stored and finishes delivery in the
@@ -70,42 +81,75 @@ func (h *VaultHandler) WaitForDelivery(budget time.Duration) bool {
 	}
 }
 
-// NewVaultHandler creates a new VaultHandler keyed off cfg.VaultKey. The
-// encryption key is derived using PBKDF2-SHA256 with 600,000 iterations
-// (OWASP 2024 recommendation). A legacy SHA-256 key is also derived to
-// support transparent migration of version-1 entries (a fresh Trustissues
-// database only ever writes version 2, but the v1 path keeps DecryptValue's
-// encVersion contract honest for imported data).
-func NewVaultHandler(dbConn *sql.DB, queries *db.Queries, cfg *config.Config) *VaultHandler {
-	keySource := cfg.VaultKey
+// vaultKeyMaterial is every key the vault derives from ONE master key string.
+//
+// It exists so the previous key can be carried alongside the current one without
+// three more loose fields on the handler. Grouping them also makes the rotation
+// invariant checkable at a glance: a master key opens a row only if the RIGHT
+// member of its material opens it, and the three members are not interchangeable
+// (value is AES, bidx is HMAC, legacy is the pre-PBKDF2 derivation).
+type vaultKeyMaterial struct {
+	// source is the raw master key. columncrypto derives internally from the
+	// string rather than accepting a derived key, so it has to be kept.
+	source string
+	value  [32]byte // PBKDF2("trustissues:vault:v2"), encryption_version 2 + enc:v1: columns
+	legacy [32]byte // sha256(source + ":secrets-vault"), encryption_version 1
+	bidx   [32]byte // PBKDF2("trustissues:vault:bidx:v1"), URL blind index HMAC
+}
+
+// deriveVaultKeyMaterial performs all three derivations for one master key.
+func deriveVaultKeyMaterial(keySource string) vaultKeyMaterial {
+	m := vaultKeyMaterial{source: keySource}
 
 	// Version 2: PBKDF2-SHA256, 600k iterations, 32-byte output
-	salt := []byte("trustissues:vault:v2")
-	derived := pbkdf2.Key([]byte(keySource), salt, 600_000, 32, sha256.New)
-	var newKey [32]byte
-	copy(newKey[:], derived)
+	derived := pbkdf2.Key([]byte(keySource), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New)
+	copy(m.value[:], derived)
 	// Zero the intermediate slice
 	for i := range derived {
 		derived[i] = 0
 	}
 
 	// Version 1 (legacy): single SHA-256 pass
-	legacyKey := sha256.Sum256([]byte(keySource + ":secrets-vault"))
+	m.legacy = sha256.Sum256([]byte(keySource + ":secrets-vault"))
 
 	// Blind-index key: a SEPARATE PBKDF2 derivation (distinct salt) from the same
 	// vault key, used to HMAC normalized URLs so autofill can match on an
 	// encrypted url column without ever storing the host in cleartext. It must
 	// not equal the value-encryption key: reusing an encryption key as a MAC key
 	// is a well-known cross-primitive footgun.
-	bidxSalt := []byte("trustissues:vault:bidx:v1")
-	bidxDerived := pbkdf2.Key([]byte(keySource), bidxSalt, 600_000, 32, sha256.New)
-	var bidxKey [32]byte
-	copy(bidxKey[:], bidxDerived)
+	bidxDerived := pbkdf2.Key([]byte(keySource), []byte("trustissues:vault:bidx:v1"), 600_000, 32, sha256.New)
+	copy(m.bidx[:], bidxDerived)
 	for i := range bidxDerived {
 		bidxDerived[i] = 0
 	}
+	return m
+}
 
-	return &VaultHandler{db: dbConn, queries: queries, encryptionKey: newKey, legacyKey: legacyKey, bidxKey: bidxKey}
+// NewVaultHandler creates a new VaultHandler keyed off cfg.VaultKey. The
+// encryption key is derived using PBKDF2-SHA256 with 600,000 iterations
+// (OWASP 2024 recommendation). A legacy SHA-256 key is also derived to
+// support transparent migration of version-1 entries (a fresh Trustissues
+// database only ever writes version 2, but the v1 path keeps DecryptValue's
+// encVersion contract honest for imported data).
+//
+// When cfg.VaultKeyPrevious is set the same three keys are derived for the OLD
+// master key and kept for reads only. See VaultHandler.previous.
+func NewVaultHandler(dbConn *sql.DB, queries *db.Queries, cfg *config.Config) *VaultHandler {
+	cur := deriveVaultKeyMaterial(cfg.VaultKey)
+
+	h := &VaultHandler{
+		db:            dbConn,
+		queries:       queries,
+		encryptionKey: cur.value,
+		legacyKey:     cur.legacy,
+		bidxKey:       cur.bidx,
+		keySource:     cur.source,
+	}
+	if cfg.VaultKeyPrevious != "" && cfg.VaultKeyPrevious != cfg.VaultKey {
+		prev := deriveVaultKeyMaterial(cfg.VaultKeyPrevious)
+		h.previous = &prev
+	}
+	return h
 }
 
 // normalizeVaultHost reduces a raw URL to the deterministic form used for the
@@ -151,13 +195,49 @@ func bidxScope(userID string, collectionID sql.NullString) string {
 // An empty scope yields an empty index: an unscoped index would be linkable
 // across users, so it is never written.
 func (h *VaultHandler) urlBlindIndex(scope, raw string) string {
+	return blindIndexWith(h.bidxKey, scope, raw)
+}
+
+func blindIndexWith(key [32]byte, scope, raw string) string {
 	host := normalizeVaultHost(raw)
 	if host == "" || scope == "" {
 		return ""
 	}
-	mac := hmac.New(sha256.New, h.bidxKey[:])
+	mac := hmac.New(sha256.New, key[:])
 	fmt.Fprintf(mac, "%d:%s|%s", len(scope), scope, host)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// urlBlindIndexCandidates returns every index value that could legitimately be
+// stored for this host and scope: the current key's, plus the previous key's
+// when a rotation is configured.
+//
+// The blind index is the one keyed surface a dual-key READ cannot cover the way
+// every other one does. Ciphertext can be tried against both keys; an index is
+// an equality lookup, so a row whose index was computed under the old key simply
+// does not match the value the new key computes. Nothing errors. Autofill just
+// returns nothing, the extension shows an empty list, and the user concludes the
+// entry was deleted.
+//
+// So the lookup asks under both keys instead. The alternative, relying on the
+// boot backfill to recompute every index before anyone uses autofill, is a
+// boot-ordering accident rather than a guarantee: BackfillMetadataAtRest is
+// explicitly best-effort and retried next boot on failure, and the sweep can
+// also be triggered from the admin API long after boot.
+//
+// Returns at most two values, deduplicated, empty ones dropped.
+func (h *VaultHandler) urlBlindIndexCandidates(scope, raw string) []string {
+	cur := h.urlBlindIndex(scope, raw)
+	out := []string{}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	if h.previous != nil {
+		if prev := blindIndexWith(h.previous.bidx, scope, raw); prev != "" && prev != cur {
+			out = append(out, prev)
+		}
+	}
+	return out
 }
 
 // encryptMetaColumns encrypts the free-text metadata columns of a vault entry
@@ -283,8 +363,14 @@ func (h *VaultHandler) MigrateEncryption() error {
 
 	migrated := 0
 	for _, e := range entries {
-		// Decrypt with legacy SHA-256 key
-		plaintext, err := decryptWithKey(h.legacyKey, e.EncryptedValue, e.Nonce)
+		// Decrypt with the legacy SHA-256 key. Routed through DecryptValue so it
+		// also tries the PREVIOUS master key's legacy derivation: on the first
+		// boot after a master-key change, a v1 row is sealed under the OLD key and
+		// a direct decryptWithKey(h.legacyKey, ...) fails. This function's error
+		// exits the process in main.go, so that failure is a boot loop the
+		// operator cannot get out of without reverting the key, which is exactly
+		// what TRUSTISSUES_VAULT_KEY_PREVIOUS exists to avoid.
+		plaintext, err := h.DecryptValue(e.EncryptedValue, e.Nonce, 1)
 		if err != nil {
 			return fmt.Errorf("decrypting entry %s with legacy key: %w", e.ID, err)
 		}
@@ -650,26 +736,24 @@ func (h *VaultHandler) encrypt(plaintext []byte) (ciphertext, nonce []byte, err 
 	return ciphertext, nonce, nil
 }
 
-// decrypt decrypts data using AES-256-GCM.
+// decrypt decrypts data using AES-256-GCM under the CURRENT v2 key, falling back
+// to the previous key when a rotation is configured. AES-GCM authenticates, so
+// the fallback cannot produce a false positive: a wrong key fails the tag check.
 func (h *VaultHandler) decrypt(ciphertext, nonce []byte) ([]byte, error) {
-	block, err := aes.NewCipher(h.encryptionKey[:])
-	if err != nil {
-		return nil, err
+	pt, err := decryptWithKey(h.encryptionKey, ciphertext, nonce)
+	if err == nil {
+		return pt, nil
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
+	if h.previous != nil {
+		if pt, prevErr := decryptWithKey(h.previous.value, ciphertext, nonce); prevErr == nil {
+			return pt, nil
+		}
 	}
-
-	// Guard the nonce length ourselves: gcm.Open PANICS on a wrong-length
-	// (e.g. nil/empty) nonce rather than returning an error, which would
-	// otherwise surface as a bare HTTP 500 via chi's Recoverer. A malformed
-	// stored nonce must degrade to a handled decrypt error, never a panic.
-	if len(nonce) != gcm.NonceSize() {
-		return nil, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
-	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	// Report the CURRENT key's error. The previous key is a transitional
+	// convenience; the operator's configuration is the current one, and a
+	// message naming a key they are trying to retire would send them the wrong
+	// way.
+	return nil, err
 }
 
 // DecryptedValueByID returns the decrypted secret value of an entry by id. It
@@ -699,9 +783,23 @@ func (h *VaultHandler) EncryptValue(plaintext []byte) (ciphertext, nonce []byte,
 // and v2 (PBKDF2) encryption versions. This method satisfies the
 // alerts.ConfigDecrypter interface so the vault handler can be passed to
 // alerts.NewChannelDispatcher at integration.
+//
+// Both versions fall back to the previous master key when one is configured. v1
+// matters here even though MigrateEncryption upgrades v1 rows at boot: that
+// migration itself has to read v1 rows sealed under the OLD key on the first
+// boot after a key change, and it exits the process on failure.
 func (h *VaultHandler) DecryptValue(ciphertext, nonce []byte, encVersion int) ([]byte, error) {
 	if encVersion == 1 {
-		return decryptWithKey(h.legacyKey, ciphertext, nonce)
+		pt, err := decryptWithKey(h.legacyKey, ciphertext, nonce)
+		if err == nil {
+			return pt, nil
+		}
+		if h.previous != nil {
+			if pt, prevErr := decryptWithKey(h.previous.legacy, ciphertext, nonce); prevErr == nil {
+				return pt, nil
+			}
+		}
+		return nil, err
 	}
 	return h.decrypt(ciphertext, nonce)
 }
@@ -2761,19 +2859,23 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		entries = append(entries, e)
 	}
 
-	personalBidx := h.urlBlindIndex(bidxScope(userID, sql.NullString{}), rawURL)
-	personalRows, err := h.queries.MatchPersonalVaultEntriesByURL(ctx, db.MatchPersonalVaultEntriesByURLParams{
-		UserID:       userID,
-		UrlBidx:      personalBidx,
-		AliasUrlBidx: personalBidx,
-	})
-	if err != nil {
-		logError(r, "vault.match: personal query failed", "error", err)
-		writeInternalError(w, r, "internal server error")
-		return
-	}
-	for _, row := range personalRows {
-		appendRow(h.vaultMetaFromMatchPersonalRow(row))
+	// One query per candidate index (see urlBlindIndexCandidates): normally one,
+	// two while a master-key rotation is in flight. appendRow dedupes, so an entry
+	// whose index has already been converted cannot appear twice.
+	for _, personalBidx := range h.urlBlindIndexCandidates(bidxScope(userID, sql.NullString{}), rawURL) {
+		personalRows, err := h.queries.MatchPersonalVaultEntriesByURL(ctx, db.MatchPersonalVaultEntriesByURLParams{
+			UserID:       userID,
+			UrlBidx:      personalBidx,
+			AliasUrlBidx: personalBidx,
+		})
+		if err != nil {
+			logError(r, "vault.match: personal query failed", "error", err)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		for _, row := range personalRows {
+			appendRow(h.vaultMetaFromMatchPersonalRow(row))
+		}
 	}
 
 	// ListCollectionsForUser returns accepted memberships only, so a pending
@@ -2785,21 +2887,19 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, c := range cols {
-		cb := h.urlBlindIndex(bidxScope("", sql.NullString{String: c.ID, Valid: true}), rawURL)
-		if cb == "" {
-			continue
-		}
-		rows, cErr := h.queries.MatchCollectionVaultEntriesByURL(ctx, db.MatchCollectionVaultEntriesByURLParams{
-			CollectionID: sql.NullString{String: c.ID, Valid: true},
-			UrlBidx:      cb,
-			AliasUrlBidx: cb,
-		})
-		if cErr != nil {
-			logError(r, "vault.match: collection query failed", "collection", c.ID, "error", cErr)
-			continue
-		}
-		for _, row := range rows {
-			appendRow(h.vaultMetaFromMatchCollectionRow(row))
+		for _, cb := range h.urlBlindIndexCandidates(bidxScope("", sql.NullString{String: c.ID, Valid: true}), rawURL) {
+			rows, cErr := h.queries.MatchCollectionVaultEntriesByURL(ctx, db.MatchCollectionVaultEntriesByURLParams{
+				CollectionID: sql.NullString{String: c.ID, Valid: true},
+				UrlBidx:      cb,
+				AliasUrlBidx: cb,
+			})
+			if cErr != nil {
+				logError(r, "vault.match: collection query failed", "collection", c.ID, "error", cErr)
+				continue
+			}
+			for _, row := range rows {
+				appendRow(h.vaultMetaFromMatchCollectionRow(row))
+			}
 		}
 	}
 
