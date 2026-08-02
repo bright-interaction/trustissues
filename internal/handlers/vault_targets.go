@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,6 +55,15 @@ type RotationTarget struct {
 	ConfiguredBy string `json:"configured_by,omitempty"`
 }
 
+// targetTransmitsSecret reports whether this target type actually carries the
+// secret VALUE off the box. webhook POSTs it as new_value; forgejo_secret writes
+// it into a repository secret. notify sends a channel message about the
+// rotation and never includes the value, and an unknown type sends nothing at
+// all (DeliverRotatedKey fails it), so neither is a delivery destination.
+func targetTransmitsSecret(t RotationTarget) bool {
+	return t.Type == "webhook" || t.Type == "forgejo_secret"
+}
+
 // DeliveryResult records the outcome of delivering a key to a target.
 type DeliveryResult struct {
 	Target  RotationTarget `json:"target"`
@@ -87,8 +97,40 @@ func ParseRotationTargets(raw string) []RotationTarget {
 func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryID string, entryName string, oldValue string, newValue string, targets []RotationTarget, userID string) []DeliveryResult {
 	results := make([]DeliveryResult, 0, len(targets))
 
+	// The provider pin, at delivery. An entry an admin wired into the AI gateway
+	// is only ever sent to that provider, so it has no delivery targets at all:
+	// deliverToWebhook POSTs the fresh secret to a URL somebody configured, which
+	// is the same "who chooses where this goes" question the capability proxy
+	// asks. UpdateTargets refuses to store one; this refuses to deliver one that
+	// is already stored (older binary, restored backup, a row written before the
+	// pin existed). A read error denies: an unreadable pin must not open a door.
+	var pin egressPin
+	var pinErr error
+	if queries == nil {
+		// No handle, no way to ask. Same posture as targetStillAuthorized's
+		// vault == nil branch: refuse to deliver rather than deliver unverified.
+		pinErr = errors.New("no database handle")
+	} else {
+		pin, pinErr = providerPinFor(ctx, queries, entryID)
+	}
+	pinRefusal := ""
+	switch {
+	case pinErr != nil:
+		pinRefusal = "delivery target skipped: the entry's AI provider binding could not be read"
+		slog.Error("vault delivery: provider pin unreadable, refusing delivery", "entry", entryName, "error", pinErr)
+	case pin.pinned():
+		pinRefusal = fmt.Sprintf("delivery target skipped: this secret is the instance's AI provider key (%s) "+
+			"and is only ever sent to the provider", pin.describe())
+	}
+
 	for _, target := range targets {
 		var err error
+		if pinRefusal != "" && targetTransmitsSecret(target) {
+			results = append(results, DeliveryResult{Target: target, Success: false, Error: pinRefusal})
+			slog.Error("vault delivery: target refused by the provider pin",
+				"type", target.Type, "entry", entryName, "configured_by", target.ConfiguredBy)
+			continue
+		}
 		// Every target must still be traceable to someone who currently has
 		// write on this entry, checked at DELIVERY rather than only at write.
 		//

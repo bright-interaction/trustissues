@@ -237,9 +237,83 @@ The rebuild runs `DROP TABLE`, which with `_foreign_keys=on` (how the app opens
 the database) fires `capability_grants`' `ON DELETE CASCADE` and wipes every
 agent grant. `PRAGMA foreign_keys` cannot be toggled inside the transaction goose
 wraps a migration in, and toggling it from a pooled `*sql.DB` outside one is not
-reliably the same connection the DDL runs on. It wants a dedicated single-conn
-migration path, which is worth doing once rather than improvising here.
+reliably the same connection the DDL runs on (the pool is 10 connections).
+
+**The judgment, restated 2026-08-02.** This is NOT load-bearing for security any
+more, and that is why it stays deferred a second time rather than being rushed.
+The oracle is closed at the handler: no caller can drive a uniqueness check
+against a namespace they cannot read, proven by five subtests that each redden
+under ablation. What is left is ergonomics (adoption, and its cost to the
+departed creator's recovery read) and a data model that says "unique per
+creator" where "unique per collection" is meant. Weighed against that: the fix
+rewrites the table holding every secret, and a half-correct rebuild loses them.
+It deserves its own pass with a restore test, not a corner of a security round.
+
+**What that pass needs, so it does not start from scratch.**
+
+1. The FK cascade is avoidable without touching `PRAGMA foreign_keys`. Inside the
+   single migration transaction: `CREATE TABLE capability_grants_backup AS SELECT
+   * FROM capability_grants` first, do the rebuild, then re-insert from the
+   backup (the ids are unchanged, so the FK is satisfiable again) and drop the
+   backup. Any other table that gains an FK to `vault_entries` needs the same
+   treatment, so the migration should assert the referrer list it knows about.
+2. Existing data can VIOLATE the new collection-scoped index (two members can
+   legitimately hold the same name in one collection today), so the migration
+   needs a deterministic dedup pass before `CREATE UNIQUE INDEX`, or a deploy
+   fails on data it created itself.
+3. Test it with `goose.UpTo(previous)`, seed entries plus grants plus a duplicate
+   pair, then `Up()`: assert no grant was lost, the duplicates were renamed
+   predictably, and both partial indexes enforce what they claim.
+4. The rename branch and its five subtests in `VaultHandler.Update` change shape
+   when the constraint moves; treat that as part of the work, not fallout.
 
 **Interim guidance:** the rule is stated in THREAT-MODEL.md and in the code
 comment above the rename branch in `VaultHandler.Update`, including its cost
 (adoption ends the departed creator's residual recovery read on that entry).
+
+## (i) Rotation delivery targets are not held to the egress-widening right
+
+**Status:** deliberate, named here because it is the one door the round-3 egress
+work did NOT close in general.
+
+Adding a rotation target is the same ACT as widening `destination_patterns`:
+`deliverToWebhook` POSTs `{"new_value": <the secret>}` to a URL somebody named,
+and `forgejo_secret` writes the value into a repository. Since 2026-08-02,
+widening `destination_patterns` takes the entry's creator or an instance admin
+(`mayDirectSecretEgress`). Configuring a delivery target still takes only
+`manage`, so any accepted editor of the collection can add one to a secret they
+did not deposit.
+
+**The escalation that keeps it interesting.** A session-authenticated member can
+already read a shared secret through `/api/vault/unlock` (their own password) and
+through `POST /api/vault/{id}/rotate` (also password-gated), so for them this
+adds nothing. An API-KEY-only caller (a stolen extension key) can do neither, but
+CAN add a webhook target and then set `auto_rotate` with a short interval through
+`PUT /api/vault/{id}`, neither of which asks for a password. The scheduler then
+rotates and hands their endpoint a fresh, live provider credential.
+
+**Why it is not closed in this pass.** Four earlier rounds looked directly at
+"an editor configures a target on somebody else's shared entry" and hardened it
+instead of forbidding it: `ConfiguredBy` is stamped server-side, an `auth_token`
+resolves as the CONFIGURER rather than the entry owner, delivery re-checks that
+the configurer still has write access, leaving a collection purges their targets,
+and a stale panel cannot resurrect a purged one. Four guards encode that
+behaviour as the intended one. Forbidding it is a change to how teams run shared
+rotation, i.e. a product decision, and making it inside a security round would
+have rewritten the premise of those four guards in the same commit that claims no
+regressions.
+
+**What IS closed.** The case this audit is about: an entry wired into the AI
+gateway carries no secret-transmitting delivery target at all, refused at the
+write (`UpdateTargets`) and at delivery (`DeliverRotatedKey`), so the operator's
+provider key cannot be handed to a rotation webhook by anyone.
+
+**Design when picked up.** Gate a NEW secret-transmitting target (one whose
+`rotationTargetIdentity` is not already stored) on `mayDirectSecretEgress`, the
+same helper `destination_patterns` uses, and re-shape the four fixtures so the
+configurer is a principal who may direct egress: the leaver/editor becomes the
+entry's creator in the purge and stale-panel tests, and an admin configures the
+target in the read-authz test so the removed creator is still harvesting somebody
+else's HMAC secret. Consider requiring re-auth (the password `Rotate` already
+asks for) instead, which closes the API-key path specifically while leaving the
+team workflow alone.

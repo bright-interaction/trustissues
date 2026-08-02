@@ -94,12 +94,15 @@ func TestProviderEgressCallSitesAreRegistered(t *testing.T) {
 			site := name + ":" + funcIdentity(fn)
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
-				if !ok || !isHTTPNewRequest(call) {
+				if !ok || !isOutboundRequestBuilder(call) {
 					return true
 				}
 				// (2) A literal provider URL is held to the allowlist directly.
-				method, methodStatic := staticString(call.Args[argMethod(call)])
-				rawURL, urlStatic := staticString(call.Args[argURL(call)])
+				urlIdx, method, methodStatic, hasURL := requestURLArg(call)
+				rawURL, urlStatic := "", false
+				if hasURL && len(call.Args) > urlIdx {
+					rawURL, urlStatic = staticString(call.Args[urlIdx])
+				}
 				if urlStatic && isProviderURL(rawURL) {
 					if !methodStatic {
 						t.Errorf("%s builds a request to %s with a non-literal method; route it through "+
@@ -154,6 +157,96 @@ func TestProviderEgressCallSitesAreRegistered(t *testing.T) {
 	}
 }
 
+// TestProviderURLLiteralsAreOnTheInferenceAllowlist closes the blind spot the
+// re-review found by ablation.
+//
+// The check inside TestProviderEgressCallSitesAreRegistered only inspects URLs
+// passed DIRECTLY to http.NewRequest*, so a literal routed through a wrapper is
+// invisible to it. The reviewer changed
+// OpenAIProvider.Validate's providerGet(ctx, "https://api.openai.com/v1/models")
+// to "/v1/organization/admin_api_keys" and the guard stayed green: a first-party
+// call to a non-inference endpoint on the operator's account, with the operator's
+// key, past every gate.
+//
+// So this asks the question of the LITERAL, wherever it appears, and however it
+// is passed on. The method is not knowable from a bare string, so the rule is the
+// weaker but still decisive one: the path must be reachable by at least ONE
+// method on that provider's inference allowlist. Anything on the files, batch,
+// fine-tuning, assistants or admin surfaces is reachable by none.
+func TestProviderURLLiteralsAreOnTheInferenceAllowlist(t *testing.T) {
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	checked := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(".", name), nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		check := func(raw string, pos token.Pos) {
+			if !isProviderURL(raw) {
+				return
+			}
+			u, perr := url.Parse(raw)
+			if perr != nil || u.Host == "" {
+				return
+			}
+			path := u.EscapedPath()
+			if path == "" || path == "/" {
+				return // a base URL, not an endpoint
+			}
+			checked++
+			if !pathReachableOnAllowlist(u.Host, path) {
+				t.Errorf("%s hardcodes %s%s, which no method on the inference allowlist reaches. "+
+					"This is first-party egress with the operator's provider key on it: add the route to "+
+					"providerInferenceRoutes deliberately, or do not call it.",
+					fset.Position(pos), u.Host, path)
+			}
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.BinaryExpr:
+				// "https://api.openai.com" + path, assembled in source.
+				if joined, ok := staticString(v); ok {
+					check(joined, v.Pos())
+					return false
+				}
+			case *ast.BasicLit:
+				if v.Kind == token.STRING {
+					if lit, ok := staticString(v); ok {
+						check(lit, v.Pos())
+					}
+				}
+			}
+			return true
+		})
+	}
+	// A scan that finds nothing to check is a scan that has stopped working: the
+	// package holds provider URLs today (the gateway base URLs and the two
+	// key-validation calls), so zero means the walk broke, not that the tree got
+	// safer.
+	if checked == 0 {
+		t.Error("no provider URL literals were inspected at all; this guard is no longer looking at anything")
+	}
+}
+
+// pathReachableOnAllowlist reports whether ANY HTTP method reaches path on that
+// provider's inference allowlist.
+func pathReachableOnAllowlist(host, path string) bool {
+	for _, m := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"} {
+		if _, isProvider, allowed := allowedProviderRoute(host, m, path); isProvider && allowed {
+			return true
+		}
+	}
+	return false
+}
+
 // funcIdentity renders "Receiver.Name" (or "Name" for a plain function).
 func funcIdentity(fn *ast.FuncDecl) string {
 	if fn.Recv == nil || len(fn.Recv.List) == 0 {
@@ -169,28 +262,53 @@ func funcIdentity(fn *ast.FuncDecl) string {
 	return fn.Name.Name
 }
 
-func isHTTPNewRequest(call *ast.CallExpr) bool {
+// isOutboundRequestBuilder recognises every shape in this package that puts a
+// request on the wire, not just http.NewRequest*.
+//
+// The re-review found the narrow version blind twice over: it saw neither
+// http.Get / http.Post / client.Do, so a future call site could egress without
+// ever appearing in the registry. Registration is the part that forces an author
+// to say why a new site is safe, so a shape it cannot see is a shape that skips
+// the argument.
+func isOutboundRequestBuilder(call *ast.CallExpr) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
-	pkg, ok := sel.X.(*ast.Ident)
-	if !ok || pkg.Name != "http" {
-		return false
+	if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "http" {
+		switch sel.Sel.Name {
+		case "NewRequest", "NewRequestWithContext", "Get", "Post", "PostForm", "Head":
+			return true
+		}
 	}
-	return sel.Sel.Name == "NewRequest" || sel.Sel.Name == "NewRequestWithContext"
+	// client.Do(req) / h.httpClient.Do(req). The receiver is not inspected: this
+	// package has no other Do method, and a false positive costs one registry
+	// line with a reason, while a false negative costs an unregistered egress.
+	return sel.Sel.Name == "Do"
 }
 
-// argMethod / argURL locate the method and URL arguments for both spellings:
-// NewRequest(method, url, body) and NewRequestWithContext(ctx, method, url, body).
-func argMethod(call *ast.CallExpr) int {
-	if sel := call.Fun.(*ast.SelectorExpr); sel.Sel.Name == "NewRequestWithContext" {
-		return 1
+// requestURLArg reports the index of the URL argument for the shapes that carry
+// one, and the method that shape implies. ok is false for client.Do, which has
+// no literal URL to check (the request was built elsewhere, at a site this guard
+// sees separately).
+func requestURLArg(call *ast.CallExpr) (idx int, method string, methodStatic bool, ok bool) {
+	sel := call.Fun.(*ast.SelectorExpr)
+	switch sel.Sel.Name {
+	case "NewRequest":
+		m, static := staticString(call.Args[0])
+		return 1, m, static, true
+	case "NewRequestWithContext":
+		m, static := staticString(call.Args[1])
+		return 2, m, static, true
+	case "Get":
+		return 0, "GET", true, true
+	case "Head":
+		return 0, "HEAD", true, true
+	case "Post", "PostForm":
+		return 0, "POST", true, true
 	}
-	return 0
+	return 0, "", false, false
 }
-
-func argURL(call *ast.CallExpr) int { return argMethod(call) + 1 }
 
 // staticString renders a compile-time string expression, following "a" + "b"
 // concatenation. It reports false when any part is computed at run time.

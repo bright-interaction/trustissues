@@ -228,6 +228,27 @@ Adding an endpoint is a deliberate edit to `providerInferenceRoutes` in
 `internal/handlers/provider_routes.go`, never something a new provider API
 inherits: a provider with no entry there is refused entirely.
 
+**The provider key is pinned to its provider.** The allowlist above is keyed by
+the provider's HOST, and the host a `/proxy` call reaches comes from the entry's
+`destination_patterns`, which any accepted collection editor can edit. So
+scoping the route alone left the destination open: rewrite the ceiling, mint,
+and the operator's decrypted key is delivered in cleartext to a host of the
+editor's choosing. An entry an admin has selected in **Settings > AI gateway** is
+now pinned to that provider's API host, at mint, at `/proxy`, at the
+`destination_patterns` write and on rotation delivery targets. The pin comes from
+the admin-only setting plus the compile-time provider table, so nobody who can
+edit the entry can move it. To repurpose such an entry, unwire it in Settings >
+AI gateway first.
+
+Separately, on **every** secret: anyone with write access may NARROW or clear the
+agent destination list (clearing is how you revoke an agent), but ADDING a
+destination takes the entry's creator or an instance admin. Editing an entry does
+not carry the right to choose where its value is delivered.
+
+Minting is not open to `vault_only` either. That role comes out of the public
+invite endpoint and exists for the browser extension, so `/api/secrets/issue` and
+`/api/mcp` refuse it, the same way `/api/ai/*` already did.
+
 **MCP.** A remote MCP endpoint at `https://<your-host>/api/mcp` (JSON-RPC) that
 Claude and ChatGPT connectors can add, authenticated with an API key
 (`X-API-Key`). It exposes `list_secrets` (names only) and `use_secret` (mints a

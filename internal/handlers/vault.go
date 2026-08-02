@@ -1374,6 +1374,25 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// May this caller ADD or WIDEN a destination this secret is delivered to?
+	//
+	// Computed BEFORE the transaction opens, deliberately: mayDirectSecretEgress
+	// reads through h.queries (the pool), and a pool read issued while this
+	// handler holds the SQLite write lock contends with it on a second
+	// connection. That is the measured 5.3s stall documented on
+	// seedCapabilityDefaults, and the answer does not depend on anything the
+	// transaction writes.
+	//
+	// manage is not enough for this, and that gap is the round-3 blocker: an
+	// accepted collection editor (a role a public-signup vault_only account can
+	// hold) rewrote destination_patterns here and had /proxy deliver the
+	// operator's decrypted provider key to a host they chose. See
+	// mayDirectSecretEgress and secret_egress.go.
+	mayWidenEgress := false
+	if req.DestinationPatterns != nil || req.Provider != nil {
+		mayWidenEgress = h.mayDirectSecretEgress(ctx, userID, middleware.IsAdmin(ctx), id)
+	}
+
 	// Everything from here down runs in ONE transaction.
 	//
 	// Update writes each column with its own statement and validates as it goes,
@@ -1430,6 +1449,50 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeValidationError(w, r, err.Error())
 			return
 		}
+
+		// Read the stored ceiling through qtx, not the pool: same connection,
+		// under the write lock this transaction already holds, so the comparison
+		// below cannot race a concurrent widening.
+		stored, storedErr := qtx.GetVaultEntryMeta(ctx, id)
+		if storedErr != nil {
+			logError(r, "vault.update: could not read the current destination ceiling", "entry", id, "error", storedErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+
+		// A gateway-wired entry has a fixed destination and nobody edits it here,
+		// admin included. Refusing the WRITE as well as the delivery keeps the
+		// stored row honest: the alternative is a database that says the key may
+		// go somewhere the proxy will always refuse, which reads as a bug at
+		// exactly the moment an operator is trying to understand a refusal. The
+		// documented way out is to unwire the entry in Settings > AI gateway,
+		// which is an admin action and an audited one.
+		pin, pinErr := providerPinFor(ctx, qtx, id)
+		if pinErr != nil {
+			logError(r, "vault.update: could not read the entry's provider pin", "entry", id, "error", pinErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if bad, outside := firstDestinationOutsidePin(pin, patterns); outside {
+			logError(r, "vault.update: refused a destination outside the provider pin",
+				"entry", id, "user", userID, "destination", bad)
+			writeError(w, r, http.StatusForbidden, "destination_pinned",
+				fmt.Sprintf("this secret is the instance's AI provider key; it is only ever delivered to %s, "+
+					"so %q cannot be added. Unwire it in Settings > AI gateway first if it is meant to be a general-purpose secret",
+					pin.describe(), bad))
+			return
+		}
+
+		// Narrowing is open to anyone with manage (clearing the list is the only
+		// per-secret agent revocation the product has). Widening is not.
+		if widened := widenedDestinations(parseDestinationPatterns(stored.DestinationPatterns), patterns); len(widened) > 0 && !mayWidenEgress {
+			logError(r, "vault.update: refused an egress widening", "entry", id, "user", userID, "added", widened)
+			writeError(w, r, http.StatusForbidden, "egress_widening_denied",
+				fmt.Sprintf("you can narrow where this secret may be sent, but adding %v takes the secret's owner or an instance admin. "+
+					"Editing an entry does not carry the right to choose where its value is delivered", widened))
+			return
+		}
+
 		encoded, mErr := json.Marshal(patterns)
 		if mErr != nil {
 			logError(r, "vault.update: encode destination patterns failed", "error", mErr)
@@ -1774,8 +1837,22 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			}
 			// A newly set provider seeds the capability-bridge columns
 			// (untouched rows only, same as Create).
+			//
+			// Gated by the same right as an explicit ceiling write, because this
+			// IS a ceiling write: it turns "no agent access" into "one host",
+			// and three presets (supabase, auth0, grafana) expand a tenant value
+			// out of the entry's own provider_meta, which an editor can set. So
+			// an editor enrolling a provider could otherwise seed
+			// attacker.auth0.com/* on somebody else's secret. Skipping leaves the
+			// ceiling empty, which is fail-closed: the bridge refuses to mint at
+			// all until the owner sets one.
 			if req.Provider != nil {
-				h.seedCapabilityDefaults(ctx, qtx, r, id, provider)
+				if mayWidenEgress {
+					h.seedCapabilityDefaults(ctx, qtx, r, id, provider)
+				} else {
+					logError(r, "vault.update: provider preset not seeded; the caller may not widen this secret's egress",
+						"entry", id, "user", userID, "provider", provider)
+				}
 			}
 		}
 	}
@@ -2735,6 +2812,57 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 			// no extra fields needed
 		default:
 			writeBadRequest(w, r, "unknown target type: "+t.Type)
+			return
+		}
+	}
+
+	// NOTE, deliberately not a check. Adding a delivery target is the same ACT as
+	// widening destination_patterns (deliverToWebhook POSTs {"new_value": <the
+	// secret>} to a URL somebody named), but it is not held to the same right,
+	// and that is a decision rather than an oversight.
+	//
+	// Any member with manage may configure delivery here. Four earlier rounds
+	// looked straight at that and hardened it instead of forbidding it:
+	// ConfiguredBy is stamped server-side and an auth_token resolves as the
+	// CONFIGURER, delivery re-checks that they still have write access
+	// (targetStillAuthorized), leaving purges their targets, and a stale panel
+	// cannot resurrect one. Reversing it is a product change to how teams run
+	// shared rotation, not a fix, and it would rewrite the premise of those four
+	// guards.
+	//
+	// What is closed here is the case this audit is about: an entry wired into
+	// the AI gateway carries no delivery target at all (the pin below, and its
+	// twin in DeliverRotatedKey). The residual, and the exact escalation path
+	// that keeps it interesting (an API-key caller who cannot unlock or rotate
+	// sets auto_rotate and waits for the scheduler to hand their webhook a fresh
+	// provider credential), is written up in DEFERRED (i) and THREAT-MODEL rather
+	// than left for the next reviewer to rediscover.
+	//
+	// The provider pin covers this door too. A rotation target is a DELIVERY
+	// destination: deliverToWebhook POSTs {"new_value": <the secret>} to a URL
+	// the caller names. So an entry wired as the instance's AI provider key must
+	// not carry one, or "the operator's key only ever goes to the provider"
+	// would hold at /proxy and fail here, which is precisely the two-doors
+	// pattern this audit stream keeps re-finding. Refused at the write AND at
+	// delivery (DeliverRotatedKey), so a row planted by anything else is refused
+	// too.
+	pin, pinErr := providerPinFor(r.Context(), h.queries, id)
+	if pinErr != nil {
+		logError(r, "vault.targets: could not read the entry's provider pin", "entry", id, "error", pinErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if pin.pinned() {
+		for _, t := range targets {
+			if !targetTransmitsSecret(t) {
+				continue
+			}
+			logError(r, "vault.targets: refused a delivery target on the instance's AI provider key",
+				"entry", id, "user", userID, "type", t.Type)
+			writeError(w, r, http.StatusForbidden, "destination_pinned",
+				fmt.Sprintf("this secret is the instance's AI provider key (%s); it is only ever sent to the provider, "+
+					"so it cannot have a %s delivery target. Unwire it in Settings > AI gateway first",
+					pin.describe(), t.Type))
 			return
 		}
 	}

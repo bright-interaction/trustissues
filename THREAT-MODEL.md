@@ -258,12 +258,58 @@ protections differ by asset, and it is important to be precise:
 
 **Confused-deputy / prompt-injection controls.** Because an assistant can invoke
 `use_secret`, a malicious prompt could try to make it act toward an
-attacker-chosen destination. Mitigations, all enforced server-side: the secret's
-`destination_patterns` allow-list is a hard ceiling a token request can only
-narrow; tokens are single-use and destination-bound; per-(agent, secret) grants
-gate issuance; the `/proxy` client refuses redirects (no key egress) and forwards
-only to the bound host. High-risk automations should still keep a human in the
-loop.
+attacker-chosen destination. Mitigations, all enforced server-side: a token
+request can only NARROW the secret's `destination_patterns`; tokens are
+single-use and destination-bound; per-(agent, secret) grants gate issuance; the
+`/proxy` client refuses redirects (no key egress) and forwards only to the bound
+host. High-risk automations should still keep a human in the loop.
+
+**Who may move the ceiling itself.** The sentence above used to say the
+allow-list is "a hard ceiling", which was true of the token REQUEST and false of
+the ceiling: `PUT /api/vault/{id}` is mounted for every role and authorized by
+`grantFor` row 5, so any accepted collection editor (a role the PUBLIC invite
+endpoint hands out as `vault_only`) could rewrite `destination_patterns` and have
+`/proxy` deliver the operator's decrypted provider key, in cleartext, to a host
+they named. That is an escalation even though a collection member can read a
+shared secret through `/api/vault/unlock`, because unlock re-verifies the
+caller's password and the proxy path does not: an API key alone turned "use
+without seeing" into "see". Two rules now hold the boundary (`secret_egress.go`):
+
+- **A provider key is pinned.** An entry an admin has wired into the AI gateway
+  (`settings.ai_key_openai` / `ai_key_anthropic`, an `AdminOnly` write) is only
+  ever delivered to that provider's own API host. The pin is derived from that
+  admin-only row and the compile-time `aiProviders` table, never from the entry,
+  so no one who can edit the entry can move it. It is enforced at mint, at
+  delivery through `/proxy`, at the `destination_patterns` write, and on rotation
+  delivery targets (a webhook target POSTs the value, so it is the same
+  question). The delivery-side check is the load-bearing one: it also refuses
+  rows written by an older binary, an import, or a restored backup.
+- **Widening takes more than `manage`.** Anyone with manage may NARROW or clear a
+  secret's destinations (clearing is the per-secret agent revocation). ADDING a
+  destination takes the entry's creator, who deposited the plaintext, or an
+  instance admin, and the creator must still be a current member. Enrolling a
+  provider is gated the same way, because three presets expand a tenant value out
+  of `provider_meta` into the host (`{tenant}.auth0.com`), which put the host in
+  an editor's hands.
+
+**What the pin does not cover.** Rotation DELIVERY targets on entries that are
+not the gateway key still take only `manage`, so an accepted editor can point a
+shared secret's rotation webhook at a host they choose. That is bounded (it needs
+a rotation to fire, it is audited and alerted, and delivery re-checks the
+configurer's access) but it is a real path for an API-key-only caller, who can
+set `auto_rotate` without a password and let the scheduler deliver. Written up as
+DEFERRED (i) with the design, deliberately not changed here: four earlier guards
+encode "a member with manage configures delivery" as the intended behaviour.
+
+**Timing on membership writes.** `POST /collections/{id}/members` and
+`DELETE /collections/{id}/invitations` answer identically whether or not an
+address has an account, and write the same activity row either way, but a hit
+does three more reads and one more insert. That difference cannot be removed
+while one branch records a seat the other cannot, short of dummy writes. What is
+removed is the sample count: both routes now sit behind a dedicated 30-per-15-
+minutes limiter instead of the shared 500/min API budget, which is far above real
+member management and far below averaging a sub-millisecond difference over a
+network.
 
 **Fail-safe posture.** A set-but-wrong-length `TRUSTISSUES_SHIELD_KEY` refuses to
 boot rather than silently disabling tokenization; the gateway rejects (never
