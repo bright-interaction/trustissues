@@ -308,6 +308,17 @@ gateway carries no secret-transmitting delivery target at all, refused at the
 write (`UpdateTargets`) and at delivery (`DeliverRotatedKey`), so the operator's
 provider key cannot be handed to a rotation webhook by anyone.
 
+**Narrowed on 2026-08-02.** The other half of that escalation is now gone. It
+needed TWO ungated fields: `auto_rotate` to make the scheduler act, and a
+destination for it to act toward. `provider` and `provider_meta` were the second
+one and were ungated, so the same API-key caller could point the entry at their
+own Grafana or Zitadel instance and let the sweep deliver there, with no rotation
+target involved at all. That now takes the widening right
+(`authorityForEgressChange`). `auto_rotate` stays `manage`-gated and is
+classified `egressTriggersDelivery` in `vaultEntryEgressClass`: it decides
+WHETHER the secret moves, never WHERE, so on its own it can only trigger delivery
+to destinations an authorised principal already chose.
+
 **Design when picked up.** Gate a NEW secret-transmitting target (one whose
 `rotationTargetIdentity` is not already stored) on `mayDirectSecretEgress`, the
 same helper `destination_patterns` uses, and re-shape the four fixtures so the
@@ -317,3 +328,49 @@ target in the read-authz test so the removed creator is still harvesting somebod
 else's HMAC secret. Consider requiring re-auth (the password `Rotate` already
 asks for) instead, which closes the API-key path specifically while leaving the
 team workflow alone.
+
+## (j) A meta-derived provider's declared hosts come out of the same column a forged row would carry
+
+**Status:** deliberate and bounded. Written down because the 2026-08-02 egress
+work rests on it and a future reviewer will otherwise re-derive it from scratch.
+
+`providerEgress` declares each adapter's reachable hosts as a function of the
+entry's `provider_meta`. For a self-hosted or per-tenant provider that function
+is meta-derived by necessity: grafana is `{instance}.grafana.net`, zitadel and
+forgejo are whatever `instance` says, datadog is `api.{site}`. So the DERIVATION
+gate (`providerDo`) cannot, on its own, tell a legitimate row from one somebody
+forged: it compares the host on the wire against a declaration computed from the
+same bytes, and the two agree either way.
+
+That is not a hole in the derivation gate, it is what the derivation gate is for.
+Its job is to catch an adapter that dials a host its declaration does not
+mention, which is the round-4 shape (`site` became a host while datadog was
+declared as a fixed vendor endpoint) and the round-5 shape (a provider added
+later grows a `region` or `workspace` key nobody classified). Both are caught,
+by `TestProviderRequestsStayInsideTheirDeclaredHosts`.
+
+**What actually guards a forged row, per case:**
+
+- **Written through the API.** The WRITE gate (`authorityForEgressChange`)
+  refuses it. Adding a host takes the entry's creator or an instance admin.
+- **The instance's AI provider key.** The PIN closes it completely, including a
+  row written by an older binary, a restored backup or an import: the pin comes
+  from an AdminOnly `ai_key_*` settings row joined to a compile-time host table,
+  so nothing an entry editor can write contributes to it. Enforced at the write,
+  at mint, at `/proxy`, at rotation-target write and delivery, and now at
+  validate and both rotation paths (`providerEgressContextFor`).
+- **Any other shared secret, row forged by direct database access.** Not
+  guarded, and not guardable at this layer: a writer with `sqlite3` on the data
+  directory can also read `encrypted_value` and, with the host key material, the
+  secret itself. This is the R-series "operator with filesystem access" residual
+  in `THREAT-MODEL.md`, not a new one.
+
+**If it is ever wanted anyway,** the shape is an authorised-configuration
+fingerprint: store an HMAC of `(provider, the declared host set)` under the vault
+key when an authorised principal writes it, and refuse to spend a row whose
+fingerprint does not verify. That upgrades "who wrote this row" from a
+handler-level question to a durable one. It is real work (a migration, a
+backfill decision for existing rows, and an answer for restores) and it buys
+nothing against the API path, which the write gate already closes, so it is not
+worth doing until there is a threat model where the database is writable and the
+key is not.

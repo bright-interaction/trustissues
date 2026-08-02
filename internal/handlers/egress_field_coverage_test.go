@@ -452,7 +452,18 @@ func adversarialMeta(provider string, allKeys []string) map[string]string {
 // stubUpstream answers every request with a small, well-formed JSON object so
 // adapters get far enough to make their SECOND call (backblaze's revoke,
 // twilio's deferred delete) rather than bailing on a parse error.
-type stubUpstream struct{ hits *int }
+//
+// status is mutable because the adapters disagree about what success looks
+// like: datadog, resend, sendgrid, twilio and forgejo want 201 on their mint,
+// grafana and backblaze want 200, and an adapter that gets the wrong one
+// returns early. An ablation found this the hard way: planting a host write-back
+// in datadog's Rotate was MISSED, because the probe's fixed 200 made Rotate bail
+// before it reached the planted line. A probe that never reaches an adapter's
+// success path is not probing that adapter.
+type stubUpstream struct {
+	hits   *int
+	status *int
+}
 
 func (s stubUpstream) RoundTrip(r *http.Request) (*http.Response, error) {
 	if s.hits != nil {
@@ -461,8 +472,12 @@ func (s stubUpstream) RoundTrip(r *http.Request) (*http.Response, error) {
 	body := `{"id":"x","key":"x","token":"x","sha1":"x","secret":"x","sid":"SKx","api_key":"x",` +
 		`"api_key_id":"x","applicationKey":"x","applicationKeyId":"x","result":{"id":"x","value":"x"},` +
 		`"data":{"id":"x","attributes":{"key":"x"}}}`
+	code := 200
+	if s.status != nil {
+		code = *s.status
+	}
 	return &http.Response{
-		StatusCode: 200,
+		StatusCode: code,
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Request:    r,
@@ -488,8 +503,8 @@ func TestProviderRequestsStayInsideTheirDeclaredHosts(t *testing.T) {
 		len(ProviderRegistry), len(allKeys))
 
 	prev := providerHTTP
-	hits := 0
-	providerHTTP = &http.Client{Transport: stubUpstream{hits: &hits}}
+	hits, status := 0, 200
+	providerHTTP = &http.Client{Transport: stubUpstream{hits: &hits, status: &status}}
 	t.Cleanup(func() { providerHTTP = prev })
 
 	names := make([]string, 0, len(ProviderRegistry))
@@ -504,53 +519,64 @@ func TestProviderRequestsStayInsideTheirDeclaredHosts(t *testing.T) {
 			declaredEmpty := providerEgress[name].hosts == nil
 			var attempts []egressAttempt
 
-			for _, op := range []struct {
+			type providerOp struct {
 				what string
 				run  func(ctx context.Context, meta map[string]string)
-			}{
+			}
+			ops := []providerOp{
 				{"Rotate", func(ctx context.Context, meta map[string]string) {
 					_, _ = p.Rotate(ctx, "THE-OPERATORS-DECRYPTED-SECRET", meta)
 				}},
 				{"Validate", func(ctx context.Context, meta map[string]string) {
 					_, _ = p.Validate(ctx, "THE-OPERATORS-DECRYPTED-SECRET", meta)
 				}},
-			} {
-				meta := adversarialMeta(name, allKeys)
-				declaredBefore := declaredProviderEgress(name, meta).describe()
-				// Exactly what production installs: the authority declared for this
-				// provider, resolved against the same meta the adapter reads.
-				ctx := withEgressRecorder(withProviderEgress(context.Background(), name, meta), &attempts)
-				before := len(attempts)
-				op.run(ctx, meta)
+			}
 
-				// An adapter WRITES BACK into meta (twilio's key_sid, backblaze's
-				// key_id) and revokeOldKeyAndPersistMeta then persists it, with no
-				// authorization check anywhere: it is the server recording its own
-				// work. So an adapter that wrote a host-influencing key would move
-				// the entry's destination with nobody's permission, from inside
-				// the rotation it was asked to perform.
-				if got := declaredProviderEgress(name, meta).describe(); got != declaredBefore {
-					t.Errorf("%s.%s changed its own entry's reachable hosts by writing back into "+
-						"provider_meta: %s -> %s.\nrevokeOldKeyAndPersistMeta persists that map "+
-						"unconditionally, so this moves the destination with no authority behind it",
-						name, op.what, declaredBefore, got)
-				}
+			// Both success codes, because the adapters disagree about which one
+			// means success and a probe that never reaches an adapter's success
+			// path cannot see what happens on it.
+			for _, code := range []int{200, 201} {
+				status = code
+				for _, op := range ops {
+					meta := adversarialMeta(name, allKeys)
+					declaredBefore := declaredProviderEgress(name, meta).describe()
+					// Exactly what production installs: the authority declared for
+					// this provider, resolved against the same meta the adapter reads.
+					ctx := withEgressRecorder(withProviderEgress(context.Background(), name, meta), &attempts)
+					before := len(attempts)
+					op.run(ctx, meta)
 
-				for _, a := range attempts[before:] {
-					if !a.refused {
-						continue
+					// An adapter WRITES BACK into meta (twilio's key_sid,
+					// backblaze's key_id) and revokeOldKeyAndPersistMeta then
+					// persists it, with no authorization check anywhere: it is the
+					// server recording its own work. So an adapter that wrote a
+					// host-influencing key would move the entry's destination with
+					// nobody's permission, from inside the rotation it was asked to
+					// perform.
+					if got := declaredProviderEgress(name, meta).describe(); got != declaredBefore {
+						t.Errorf("%s.%s (upstream %d) changed its own entry's reachable hosts by "+
+							"writing back into provider_meta: %s -> %s.\n"+
+							"revokeOldKeyAndPersistMeta persists that map unconditionally, so this "+
+							"moves the destination with no authority behind it",
+							name, op.what, code, declaredBefore, got)
 					}
-					t.Errorf("%s.%s dialled %q, which is OUTSIDE the hosts declared for %q.\n"+
-						"  declared: %s\n"+
-						"  refusal:  %s\n\n"+
-						"Either this adapter builds its host out of a provider_meta key that is not in "+
-						"providerEgress[%q].metaKeys (the round-4 defect: a field that does not look "+
-						"like a host still becomes one), or the declaration is out of date. Fix the "+
-						"declaration AND check that the key is gated at its write site, because the "+
-						"write gate compares declared host sets and cannot see a key it does not "+
-						"know about.",
-						name, op.what, a.host, name,
-						declaredProviderEgress(name, meta).describe(), a.reason, name)
+
+					for _, a := range attempts[before:] {
+						if !a.refused {
+							continue
+						}
+						t.Errorf("%s.%s dialled %q, which is OUTSIDE the hosts declared for %q.\n"+
+							"  declared: %s\n"+
+							"  refusal:  %s\n\n"+
+							"Either this adapter builds its host out of a provider_meta key that is not in "+
+							"providerEgress[%q].metaKeys (the round-4 defect: a field that does not look "+
+							"like a host still becomes one), or the declaration is out of date. Fix the "+
+							"declaration AND check that the key is gated at its write site, because the "+
+							"write gate compares declared host sets and cannot see a key it does not "+
+							"know about.",
+							name, op.what, a.host, name,
+							declaredProviderEgress(name, meta).describe(), a.reason, name)
+					}
 				}
 			}
 
