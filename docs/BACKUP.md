@@ -96,9 +96,12 @@ physically and logically separate from wherever the database backups live.
 
 - Not in the same object-storage bucket as the backups.
 - Not in the same repo, the same `.env` you also archive, or the same disk image.
-- Back it up once, deliberately. It never changes on its own, and there is no
-  rotation path in this build (see `../DEFERRED.md`), so a single safe copy is
-  enough. Guard it like a root password.
+- Back it up once, deliberately. It never changes on its own. If you DO rotate it
+  (see "Rotating the vault key" in `../SECURITY.md`), keep the old key until the
+  re-encrypt sweep reports the store fully on the new one, because every backup
+  taken before that sweep is still sealed under the old key. A restore is a
+  rotation in reverse: restoring a pre-sweep backup means setting the old key as
+  `TRUSTISSUES_VAULT_KEY_PREVIOUS` again. Guard both like a root password.
 
 If you only ever remember one sentence from this page: the backup and the key
 must never be recoverable from the same place.

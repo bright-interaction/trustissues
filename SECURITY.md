@@ -68,25 +68,76 @@ secret fetches are recorded and exportable (CSV / JSON) by an admin.
 - Losing `TRUSTISSUES_JWT_SECRET` only forces re-login. It does not threaten
   stored data.
 
-## Rotating the vault key (manual, do this carefully)
+## Rotating the vault key
 
-This build has no automatic key rotation and no dual-key read. Changing
-`TRUSTISSUES_VAULT_KEY` in place will make all existing data unreadable. If you
-must rotate the key (suspected compromise, policy), do it as an explicit
-migration while the old key still works:
+Rotation is a supported, in-place operation. It has two halves:
 
-1. Announce a short maintenance window. Take a backup first (see README).
-2. With the server running under the OLD key, export every secret in plaintext
-   through the authenticated API or the vault UI (unlock, reveal, record). There
-   is no bulk re-key command, so this is a manual export/re-import.
-3. Stand up a fresh data directory with the NEW key.
-4. Re-create the entries (and re-enroll TOTP) under the new instance.
-5. Verify you can unlock and read every secret under the new key, then retire the
-   old data directory and destroy the old key.
+- a **dual-key read**: with `TRUSTISSUES_VAULT_KEY_PREVIOUS` set to the old key,
+  every decrypt tries the current key and then the previous one, so a store that
+  has not been re-encrypted yet keeps serving normally;
+- a **re-encrypt sweep**: one transaction that moves every keyed column in the
+  database onto the current key, verifies the result before committing, and
+  refuses outright if any stored value opens under neither key.
 
-Do not simply restart with a new env value and expect the data to migrate. It
-will not. Until a code-side dual-key rotation ships, treat key rotation as a
-supervised re-import, never an env edit.
+Take a backup first (see `docs/BACKUP.md`). Then:
+
+1. Generate the new key: `openssl rand -hex 32`.
+2. Move the current value of `TRUSTISSUES_VAULT_KEY` into
+   `TRUSTISSUES_VAULT_KEY_PREVIOUS`, and put the new value in
+   `TRUSTISSUES_VAULT_KEY`.
+3. Restart. The instance boots and serves normally. The boot log and
+   **Settings -> Encryption** both say the store is still on the previous key.
+4. Run the sweep. Any of:
+   - **Settings -> Encryption -> "Re-encrypt everything with the current key"**
+     (the normal path; it shows you what moved and what, if anything, refused),
+   - `POST /api/admin/vault-key/rekey` as an admin,
+   - `TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT=1` plus a restart, for headless
+     deploys where nobody logs in.
+5. Confirm **Settings -> Encryption** reports everything on the current key.
+6. **Remove `TRUSTISSUES_VAULT_KEY_PREVIOUS` and restart.** Until you do, the
+   key you are retiring is still loaded and still opens all of this data, which
+   defeats the point of rotating after a compromise.
+
+`GET /api/admin/vault-key` returns the same report as the UI: a per-column count
+of how many values are on the current key, on the previous key, or unreadable.
+It needs no configuration, so it is also the fastest way to check the state of an
+instance somebody else deployed.
+
+### What the sweep covers
+
+Every column that holds material derived from the master key, across all four
+crypto schemes in use: the vault secret values (both derivation versions), the
+eight `enc:v1:` metadata columns on `vault_entries`, the two URL blind indexes,
+invitation codes, TOTP seeds, the SMTP password, the boot key sentinel, and
+notification-channel configs.
+
+The blind indexes are worth calling out because their failure is silent: they are
+keyed HMACs, not ciphertext, so a stale one does not fail to decrypt, it just
+stops matching and browser autofill quietly returns nothing. The sweep recomputes
+them, and autofill looks up under both keys while a rotation is configured.
+
+The list is enforced by a test that walks the real database schema and fails when
+any column is neither registered as a keyed surface nor explicitly classified as
+unkeyed, so a new encrypted column cannot ship without a decision about rotation.
+
+### If the sweep refuses
+
+A refusal means the store holds ciphertext that neither configured key opens: a
+row restored from an older backup, or a previous rotation that was never
+finished. **Nothing is written** when this happens, and the report names the
+table, column and row id of every such value (never the value itself).
+
+Do not treat a refusal as "close enough". The one genuinely destructive action
+available at that moment is deleting the old key while some rows still need it.
+Find the key those values were sealed under, set it as
+`TRUSTISSUES_VAULT_KEY_PREVIOUS`, restart, and run the sweep again.
+
+### If you already changed the key with no previous key set
+
+The boot gate refuses to start, which is correct: the data is still recoverable.
+Put the ORIGINAL key back in `TRUSTISSUES_VAULT_KEY` and restart, then follow the
+procedure above. `TRUSTISSUES_ALLOW_KEY_MISMATCH=1` boots anyway and is a
+last-resort tool that accepts losing the data; it is not part of rotation.
 
 ## Supported versions
 

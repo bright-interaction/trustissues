@@ -12,6 +12,7 @@ import {
   Copy,
   KeyRound,
   Loader2,
+  Lock,
   Mail,
   Send,
   ShieldCheck,
@@ -23,7 +24,13 @@ import { api, ApiError } from '@/lib/api';
 import { vaultApi } from '@/lib/vault-types';
 import { queryKeys } from '@/lib/query-keys';
 import { useAuth } from '@/hooks/useAuth';
-import type { SMTPConfig, VaultPolicy, ApiKeyCreated, AIConfig } from '@/lib/types';
+import type {
+  SMTPConfig,
+  VaultPolicy,
+  ApiKeyCreated,
+  AIConfig,
+  VaultKeyStatus,
+} from '@/lib/types';
 import { NOTIFICATION_EVENTS, type NotificationEvent } from '@/lib/types';
 
 type SettingsTab =
@@ -33,6 +40,7 @@ type SettingsTab =
   | 'email'
   | 'channels'
   | 'apikeys'
+  | 'encryption'
   | 'ai';
 
 function errorMessage(err: unknown): string {
@@ -1580,6 +1588,282 @@ function AITab() {
   );
 }
 
+// EncryptionTab is the operator surface for master-key rotation.
+//
+// The design constraint that drove this: an operator should not have to know the
+// feature exists. A rotation is either policy work or an incident, and in the
+// incident case the person at the keyboard may not be the person who deployed
+// the instance. So the tab always answers three questions without being asked:
+// which key this store is on, whether anything is unreadable, and what to do
+// next. The status read needs no configuration, which means the naive-rotation
+// case (someone changed TRUSTISSUES_VAULT_KEY in place) shows up here as a red
+// banner rather than as blank fields in someone's vault entry a week later.
+function EncryptionTab() {
+  const queryClient = useQueryClient();
+  const { data, isLoading, error } = useQuery<VaultKeyStatus>({
+    queryKey: queryKeys.admin.vaultKey(),
+    queryFn: api.admin.getVaultKeyStatus,
+  });
+
+  // A blocked sweep answers 409 with a full status body. That body is the most
+  // useful thing on the screen (it names the rows nothing can open), so it is
+  // held here rather than being reduced to a toast and thrown away.
+  const [blocked, setBlocked] = useState<VaultKeyStatus | null>(null);
+
+  const rekeyMutation = useMutation({
+    mutationFn: api.admin.rekeyVault,
+    onSuccess: (rep) => {
+      setBlocked(null);
+      queryClient.setQueryData(queryKeys.admin.vaultKey(), rep);
+      if (rep.rows_converted === 0) {
+        toast.success('Everything was already on the current key');
+      } else {
+        toast.success(`Re-encrypted ${rep.rows_converted} row(s)`);
+      }
+    },
+    onError: (err) => {
+      const body = err instanceof ApiError ? err.body : undefined;
+      if (body && typeof body === 'object' && 'surfaces' in body) {
+        setBlocked(body as VaultKeyStatus);
+        toast.error('Sweep refused. Nothing was written.');
+        return;
+      }
+      toast.error(errorMessage(err));
+    },
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+      </div>
+    );
+  }
+  if (error || !data) {
+    return (
+      <div className={cardClass}>
+        <p className="text-sm text-rose-600">{errorMessage(error)}</p>
+      </div>
+    );
+  }
+
+  const view = blocked ?? data;
+  const state = view.status;
+
+  return (
+    <div className="space-y-4">
+      <div className={cardClass}>
+        <h2 className="mb-1 text-base font-semibold text-slate-900">
+          Encryption key
+        </h2>
+        <p className="mb-4 text-sm text-slate-500">
+          Every secret, TOTP seed, invite code and channel config in this
+          instance is encrypted with the master key. This is where you rotate it.
+        </p>
+
+        {state === 'blocked' && (
+          <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 p-4">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+              <div className="text-sm text-rose-800">
+                <p className="font-medium">
+                  {view.values_unreadable} stored value(s) open under no key this
+                  server holds.
+                </p>
+                <p className="mt-1">
+                  Nothing has been written. The data is not lost, it is encrypted
+                  with a key that is not loaded. Set{' '}
+                  <code className="font-mono text-xs">
+                    TRUSTISSUES_VAULT_KEY_PREVIOUS
+                  </code>{' '}
+                  to the key those values were sealed under, restart, and run the
+                  sweep again.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {state === 'needs_rekey' && (
+          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div className="text-sm text-amber-800">
+                <p className="font-medium">
+                  {view.values_on_previous} value(s) are still encrypted with the
+                  previous key.
+                </p>
+                <p className="mt-1">
+                  Everything reads correctly right now, but only because the old
+                  key is still loaded. Run the sweep, then remove{' '}
+                  <code className="font-mono text-xs">
+                    TRUSTISSUES_VAULT_KEY_PREVIOUS
+                  </code>{' '}
+                  from the environment and restart.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {(state === 'already_current' || state === 'converted') && (
+          <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
+            <p className="font-medium">
+              Every stored value is encrypted with the current key.
+            </p>
+            {view.previous_key_configured && (
+              <p className="mt-1">
+                You can now remove{' '}
+                <code className="font-mono text-xs">
+                  TRUSTISSUES_VAULT_KEY_PREVIOUS
+                </code>{' '}
+                from the environment and restart. Until you do, the retired key
+                is still loaded and still opens this data.
+              </p>
+            )}
+          </div>
+        )}
+
+        <dl className="mb-4 grid gap-3 sm:grid-cols-2">
+          <div>
+            <dt className="text-xs font-medium text-slate-500">Current key</dt>
+            <dd className="mt-0.5 font-mono text-sm text-slate-900">
+              {view.current_key_fingerprint}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs font-medium text-slate-500">Previous key</dt>
+            <dd className="mt-0.5 font-mono text-sm text-slate-900">
+              {view.previous_key_configured ? (
+                view.previous_key_fingerprint
+              ) : (
+                <span className="font-sans text-slate-400">not configured</span>
+              )}
+            </dd>
+          </div>
+        </dl>
+        <p className="mb-4 text-xs text-slate-400">
+          Those are short fingerprints, not keys. They exist so you can tell two
+          keys apart without pasting one anywhere.
+        </p>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={() => rekeyMutation.mutate()}
+            disabled={rekeyMutation.isPending || !view.previous_key_configured}
+            className={primaryButtonClass}
+          >
+            {rekeyMutation.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <ShieldCheck className="h-4 w-4" />
+            )}
+            Re-encrypt everything with the current key
+          </button>
+          <button
+            onClick={() =>
+              queryClient.invalidateQueries({
+                queryKey: queryKeys.admin.vaultKey(),
+              })
+            }
+            className="text-sm font-medium text-slate-500 hover:text-slate-900"
+          >
+            Refresh
+          </button>
+        </div>
+        {!view.previous_key_configured && (
+          <p className="mt-3 text-sm text-slate-500">
+            To rotate: generate a new key, move the old value of{' '}
+            <code className="font-mono text-xs">TRUSTISSUES_VAULT_KEY</code> to{' '}
+            <code className="font-mono text-xs">
+              TRUSTISSUES_VAULT_KEY_PREVIOUS
+            </code>
+            , put the new one in{' '}
+            <code className="font-mono text-xs">TRUSTISSUES_VAULT_KEY</code>, and
+            restart. Then come back here and press the button.
+          </p>
+        )}
+      </div>
+
+      {view.blockers.length > 0 && (
+        <div className={cardClass}>
+          <h2 className="mb-1 text-base font-semibold text-slate-900">
+            Values nothing can open
+          </h2>
+          <p className="mb-4 text-sm text-slate-500">
+            Showing {view.blockers.length} of {view.blockers_total}. Row ids
+            only, never values.
+          </p>
+          <ul className="space-y-1 font-mono text-xs text-slate-700">
+            {view.blockers.map((b, i) => (
+              <li key={`${b.table}.${b.column}.${b.row_id}.${i}`}>
+                {b.table}.{b.column}
+                {b.setting_key ? `[${b.setting_key}]` : ''} @ {b.row_id}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className={cardClass}>
+        <h2 className="mb-1 text-base font-semibold text-slate-900">Coverage</h2>
+        <p className="mb-4 text-sm text-slate-500">
+          Every column in this database that holds material derived from the
+          master key. A rotation converts all of them or refuses.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b border-slate-200 text-xs font-medium text-slate-500">
+                <th className="py-2 pr-4">Column</th>
+                <th className="py-2 pr-4">Holds</th>
+                <th className="py-2 pr-4 text-right">Current</th>
+                <th className="py-2 pr-4 text-right">Previous</th>
+                <th className="py-2 text-right">Unreadable</th>
+              </tr>
+            </thead>
+            <tbody>
+              {view.surfaces.map((s) => (
+                <tr
+                  key={`${s.table}.${s.column}.${s.setting_key ?? ''}`}
+                  className="border-b border-slate-100 last:border-0"
+                >
+                  <td className="py-2 pr-4 font-mono text-xs text-slate-800">
+                    {s.table}.{s.column}
+                    {s.setting_key ? `[${s.setting_key}]` : ''}
+                  </td>
+                  <td className="py-2 pr-4 text-slate-500">{s.why}</td>
+                  <td className="py-2 pr-4 text-right tabular-nums text-slate-700">
+                    {s.on_current}
+                  </td>
+                  <td
+                    className={`py-2 pr-4 text-right tabular-nums ${
+                      s.on_previous > 0
+                        ? 'font-medium text-amber-700'
+                        : 'text-slate-400'
+                    }`}
+                  >
+                    {s.on_previous}
+                  </td>
+                  <td
+                    className={`py-2 text-right tabular-nums ${
+                      s.unreadable > 0
+                        ? 'font-medium text-rose-700'
+                        : 'text-slate-400'
+                    }`}
+                  >
+                    {s.unreadable}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const { isAdmin, isVaultOnly } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1597,6 +1881,7 @@ export default function Settings() {
           { id: 'session', label: 'Sessions', icon: Clock },
           { id: 'email', label: 'Email', icon: Mail },
           { id: 'channels', label: 'Alerts', icon: Bell },
+          { id: 'encryption', label: 'Encryption', icon: Lock },
         ] as const)
       : []),
   ];
@@ -1643,6 +1928,7 @@ export default function Settings() {
       {activeTab === 'session' && isAdmin && <SessionTab />}
       {activeTab === 'email' && isAdmin && <EmailTab />}
       {activeTab === 'channels' && isAdmin && <ChannelsTab />}
+      {activeTab === 'encryption' && isAdmin && <EncryptionTab />}
     </Layout>
   );
 }

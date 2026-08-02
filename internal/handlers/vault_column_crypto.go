@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -71,15 +72,56 @@ func (h *VaultHandler) encryptColumn(plaintext string) (string, error) {
 // decryptColumn reverses encryptColumn. An unprefixed value (pre-migration
 // cleartext, empty, or a passthrough) is returned as-is, so it is safe to apply
 // at every read choke unconditionally.
+//
+// When a rotation is configured it also tries the PREVIOUS master key, so an
+// unswept row still reads. Every read choke in the vault funnels through here,
+// so this one fallback is what keeps a half-rotated store serving instead of
+// blanking url/username/category/notes (and then having the edit form write
+// those blanks back over recoverable ciphertext, which is the data loss
+// VerifyVaultKey exists to stop).
 func (h *VaultHandler) decryptColumn(stored string) (string, error) {
+	plain, _, err := h.decryptColumnWithKeyAge(stored)
+	return plain, err
+}
+
+// decryptColumnWithKeyAge is decryptColumn plus WHICH key opened the value.
+//
+// The rekey sweep needs this: "did this open under the current key" is the only
+// self-describing statement about a row's key, because nothing stamps a key id
+// on the row. Trial decryption is the authority rather than a stored marker on
+// purpose. A stored key id is a second source of truth that can disagree with
+// the bytes, and this codebase has been bitten repeatedly by a declared property
+// nothing enforces; the ciphertext cannot lie about which key opens it.
+//
+// onPrevious is false for cleartext and empty values: there is nothing to
+// convert, so they must not be counted as needing a rewrite.
+func (h *VaultHandler) decryptColumnWithKeyAge(stored string) (plain string, onPrevious bool, err error) {
 	if !strings.HasPrefix(stored, vaultColumnEncPrefix) {
-		return stored, nil
+		return stored, false, nil
 	}
 	packed, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, vaultColumnEncPrefix))
 	if err != nil {
-		return "", fmt.Errorf("decode encrypted column: %w", err)
+		return "", false, fmt.Errorf("decode encrypted column: %w", err)
 	}
-	block, err := aes.NewCipher(h.encryptionKey[:])
+	if out, oErr := openVaultColumn(h.encryptionKey, packed); oErr == nil {
+		return out, false, nil
+	}
+	if h.previous != nil {
+		if out, oErr := openVaultColumn(h.previous.value, packed); oErr == nil {
+			return out, true, nil
+		}
+	}
+	return "", false, fmt.Errorf("decrypt column: %w", errVaultColumnUndecryptable)
+}
+
+// errVaultColumnUndecryptable is the sentinel wrapped by decryptColumnWithKeyAge
+// when no configured key opens a marked column. It carries no key material and
+// no ciphertext: this string reaches logs.
+var errVaultColumnUndecryptable = errors.New("no configured vault key opens this column")
+
+// openVaultColumn opens a packed nonce||ciphertext blob under one derived key.
+func openVaultColumn(key [32]byte, packed []byte) (string, error) {
+	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return "", err
 	}
@@ -94,7 +136,7 @@ func (h *VaultHandler) decryptColumn(stored string) (string, error) {
 	nonce, ciphertext := packed[:ns], packed[ns:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return "", fmt.Errorf("decrypt column: %w", err)
+		return "", err
 	}
 	return string(plaintext), nil
 }

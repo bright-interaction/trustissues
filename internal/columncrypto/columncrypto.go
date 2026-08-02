@@ -112,6 +112,41 @@ func EncryptString(plaintext, key string) (string, error) {
 	return marker + base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
+// DecryptStringAny tries every key in order and returns the first that opens
+// the value. It is the dual-key read used while a master-key rotation is in
+// flight: pass the CURRENT key first and TRUSTISSUES_VAULT_KEY_PREVIOUS second,
+// so a store that is half-swept (or restored from a backup taken before the
+// sweep) keeps reading instead of returning "[decryption error]" for every row.
+//
+// Order matters and current-first is deliberate. AES-GCM authenticates, so a
+// wrong key cannot produce a false positive and the fallback is safe, but the
+// common case must not pay two PBKDF2 lookups. Both are memoized anyway
+// (deriveKey), so the second attempt costs one AES-GCM open.
+//
+// Empty keys are skipped rather than tried: an unset TRUSTISSUES_VAULT_KEY_PREVIOUS
+// is the normal state and must not turn into a decrypt attempt under "".
+// The error returned is the FIRST key's error, because that is the one the
+// operator is configured on and the one they need to see.
+func DecryptStringAny(encrypted string, keys ...string) (string, error) {
+	var firstErr error
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		plain, err := DecryptString(encrypted, k)
+		if err == nil {
+			return plain, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		return "", fmt.Errorf("no decryption key configured")
+	}
+	return "", firstErr
+}
+
 // DecryptString decrypts a value produced by EncryptString. It accepts both the
 // current marked form (marker + base64) and legacy bare-base64 ciphertext
 // written before the marker was introduced, so existing rows keep decrypting.

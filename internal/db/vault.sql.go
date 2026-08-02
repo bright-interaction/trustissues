@@ -832,6 +832,92 @@ func (q *Queries) ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVa
 	return items, nil
 }
 
+const listVaultEntriesForRekey = `-- name: ListVaultEntriesForRekey :many
+
+SELECT id, user_id, collection_id, encrypted_value, nonce, encryption_version,
+       url, alias_url, username, category, notes,
+       provider_meta, rotation_targets, custom_fields,
+       url_bidx, alias_url_bidx
+FROM vault_entries
+ORDER BY id
+`
+
+type ListVaultEntriesForRekeyRow struct {
+	ID                string         `json:"id"`
+	UserID            string         `json:"user_id"`
+	CollectionID      sql.NullString `json:"collection_id"`
+	EncryptedValue    []byte         `json:"encrypted_value"`
+	Nonce             []byte         `json:"nonce"`
+	EncryptionVersion sql.NullInt64  `json:"encryption_version"`
+	Url               sql.NullString `json:"url"`
+	AliasUrl          sql.NullString `json:"alias_url"`
+	Username          sql.NullString `json:"username"`
+	Category          sql.NullString `json:"category"`
+	Notes             sql.NullString `json:"notes"`
+	ProviderMeta      sql.NullString `json:"provider_meta"`
+	RotationTargets   sql.NullString `json:"rotation_targets"`
+	CustomFields      string         `json:"custom_fields"`
+	UrlBidx           string         `json:"url_bidx"`
+	AliasUrlBidx      string         `json:"alias_url_bidx"`
+}
+
+// ============================================================================
+// Master-key rotation (VaultHandler.RekeyVault, see vault_rekey.go).
+//
+// One list + one write per keyed surface. The list queries are deliberately
+// UNFILTERED: the sweep has to SEE every row to answer "does this open under the
+// current key", and a WHERE clause that excludes a row excludes it from the
+// rotation too. The boot key gate has already been burned twice by a probe query
+// that filtered away the rows that mattered (encryption_version = 2 only, then a
+// trailing LIMIT on a compound SELECT), and both times the result was a store
+// that silently reported "nothing to protect here". Filtering happens in Go,
+// where the reason for skipping a row can be reported.
+// ============================================================================
+// Every vault_entries column that holds material derived from the master key, in
+// one read: the secret value (+ its nonce and derivation version), the eight
+// enc:v1: metadata columns, and the two blind indexes. user_id and collection_id
+// come along because the blind index is keyed PER SCOPE, so recomputing it needs
+// to know which scope the row lives in.
+func (q *Queries) ListVaultEntriesForRekey(ctx context.Context) ([]ListVaultEntriesForRekeyRow, error) {
+	rows, err := q.db.QueryContext(ctx, listVaultEntriesForRekey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListVaultEntriesForRekeyRow{}
+	for rows.Next() {
+		var i ListVaultEntriesForRekeyRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.CollectionID,
+			&i.EncryptedValue,
+			&i.Nonce,
+			&i.EncryptionVersion,
+			&i.Url,
+			&i.AliasUrl,
+			&i.Username,
+			&i.Category,
+			&i.Notes,
+			&i.ProviderMeta,
+			&i.RotationTargets,
+			&i.CustomFields,
+			&i.UrlBidx,
+			&i.AliasUrlBidx,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listVaultEntriesNeedingRotation = `-- name: ListVaultEntriesNeedingRotation :many
 SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, CAST(updated_at AS TEXT) AS updated_at_text
 FROM vault_entries
@@ -1205,6 +1291,62 @@ type ReassignCollectionVaultEntryOwnerParams struct {
 // Re-own ONE entry, so a single name collision cannot block the rest.
 func (q *Queries) ReassignCollectionVaultEntryOwner(ctx context.Context, arg ReassignCollectionVaultEntryOwnerParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, reassignCollectionVaultEntryOwner, arg.UserID, arg.ID)
+}
+
+const rekeyVaultEntry = `-- name: RekeyVaultEntry :exec
+UPDATE vault_entries
+SET encrypted_value = ?, nonce = ?, encryption_version = ?,
+    url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
+    provider_meta = ?, rotation_targets = ?, custom_fields = ?,
+    url_bidx = ?, alias_url_bidx = ?
+WHERE id = ?
+`
+
+type RekeyVaultEntryParams struct {
+	EncryptedValue    []byte         `json:"encrypted_value"`
+	Nonce             []byte         `json:"nonce"`
+	EncryptionVersion sql.NullInt64  `json:"encryption_version"`
+	Url               sql.NullString `json:"url"`
+	AliasUrl          sql.NullString `json:"alias_url"`
+	Username          sql.NullString `json:"username"`
+	Category          sql.NullString `json:"category"`
+	Notes             sql.NullString `json:"notes"`
+	ProviderMeta      sql.NullString `json:"provider_meta"`
+	RotationTargets   sql.NullString `json:"rotation_targets"`
+	CustomFields      string         `json:"custom_fields"`
+	UrlBidx           string         `json:"url_bidx"`
+	AliasUrlBidx      string         `json:"alias_url_bidx"`
+	ID                string         `json:"id"`
+}
+
+// Writes every keyed column of one entry at once.
+//
+// One statement rather than per-column updates on purpose: a row must never be
+// half-converted, with (say) the value on the new key and notes still on the old
+// one. The sweep also runs inside a transaction, so this is belt and braces, but
+// the single statement is what makes the invariant local to the row.
+//
+// updated_at is deliberately NOT touched. Re-encryption is not a user edit, and
+// bumping it would make every entry look freshly modified in the UI right after
+// an incident, which is the worst possible moment to lose that signal.
+func (q *Queries) RekeyVaultEntry(ctx context.Context, arg RekeyVaultEntryParams) error {
+	_, err := q.db.ExecContext(ctx, rekeyVaultEntry,
+		arg.EncryptedValue,
+		arg.Nonce,
+		arg.EncryptionVersion,
+		arg.Url,
+		arg.AliasUrl,
+		arg.Username,
+		arg.Category,
+		arg.Notes,
+		arg.ProviderMeta,
+		arg.RotationTargets,
+		arg.CustomFields,
+		arg.UrlBidx,
+		arg.AliasUrlBidx,
+		arg.ID,
+	)
+	return err
 }
 
 const renameVaultEntry = `-- name: RenameVaultEntry :execresult

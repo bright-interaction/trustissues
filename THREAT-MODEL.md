@@ -36,12 +36,15 @@ This has two consequences you must internalize:
    every rotation target becomes permanently unreadable. This was verified: a
    database booted under a different key returns `[decryption error]` for every
    secret and the plaintext cannot be recovered by any means.
-2. **Change the key the wrong way and you also lose everything.** There is no
-   built-in key-rotation routine and no dual-key read path in this build.
-   Swapping `TRUSTISSUES_VAULT_KEY` for a new value is identical to losing the
-   old one. Do not rotate the key by editing the env var. See SECURITY.md for
-   the manual re-key procedure (export, re-import under the new key) if you ever
-   must.
+2. **Change the key the wrong way and you still lose everything.** Rotation is
+   supported now, but only through the documented sequence: set
+   `TRUSTISSUES_VAULT_KEY_PREVIOUS` to the old key, restart, run the re-encrypt
+   sweep, confirm it reports the store fully on the current key, and only then
+   remove the previous key. Swapping `TRUSTISSUES_VAULT_KEY` for a new value on
+   its own, with no previous key set, is still identical to losing the old one:
+   the boot gate refuses to start (which keeps the data recoverable), and forcing
+   past it with `TRUSTISSUES_ALLOW_KEY_MISMATCH=1` does not. See SECURITY.md,
+   "Rotating the vault key".
 
 Back the key up, once, in a password manager or secret store that is physically
 and logically separate from where the database backup lives. If the backup and
@@ -165,7 +168,7 @@ mitigation until the code-side fix ships.
 
 | # | Risk | Impact | Operator mitigation |
 |---|------|--------|---------------------|
-| R1 | **No master-key rotation path.** Changing `TRUSTISSUES_VAULT_KEY` silently orphans all data. | Total data loss on a naive rotation. | Deferred to Phase 2 (dual-key read + re-encrypt sweep; see `DEFERRED.md` (a)). Until then never rotate by editing env; use the export/re-import procedure in SECURITY.md. Guard the key like a root password. |
+| R1 | ~~No master-key rotation path.~~ **Resolved.** Dual-key read (`TRUSTISSUES_VAULT_KEY_PREVIOUS`) plus an exhaustive re-encrypt sweep across every keyed column, in one verified transaction. | Was: total data loss on a naive rotation. | Follow SECURITY.md "Rotating the vault key". A naive in-place key change with no previous key set is still refused at boot rather than accepted, and `Settings -> Encryption` (or `GET /api/admin/vault-key`) reports which key the store is actually on. Remove the previous key once the sweep reports everything current. Guard the key like a root password. |
 | R2 | **Backups are manual.** A hand-copied `.db` in WAL mode can be torn/stale. | Silent backup corruption; unrecoverable if paired with key loss. | Resolved for correctness: use `scripts/backup.sh` (SQLite online `.backup`, WAL-safe, mode 0600) per `docs/BACKUP.md`. Store the key separately. Scheduling is deferred (`DEFERRED.md` (d)); run it from cron/systemd. |
 | R3 | ~~DB file world-readable.~~ **Resolved.** The server now sets umask 0o077 and chmods the db + `-wal`/`-shm` to 0600 (dir 0700) on boot. | Was: local users could read hashes + ciphertext. | Keep `TRUSTISSUES_DATA_DIR` on a non-shared path; the 0600 mode is enforced automatically. |
 | R4 | **Bind host is configurable; default must be loopback.** Publishing 0.0.0.0 in plain HTTP exposes the API. | On a VPS this exposes the API to the internet in cleartext. | Set `TRUSTISSUES_BIND_HOST=127.0.0.1` (the safe default) and bind the compose port to `127.0.0.1:8080:8080` behind a TLS proxy. See README deploy section. Mandatory, not optional. |

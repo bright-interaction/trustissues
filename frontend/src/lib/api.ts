@@ -23,13 +23,23 @@ import type {
   CollectionRole,
   CollectionInviteResult,
   PendingInvite,
+  VaultKeyStatus,
 } from './types';
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  // body is the decoded error response, when there was one.
+  //
+  // Some failures carry a structured payload that IS the useful part of the
+  // answer. The re-encrypt sweep is the first: a 409 means it refused and wrote
+  // nothing, and the body names every row no configured key opens. Reducing
+  // that to `message` and dropping the rest would leave the operator with
+  // "sweep refused" and no way to find out what refused it.
+  body?: unknown;
+  constructor(message: string, status: number, body?: unknown) {
     super(message);
     this.status = status;
+    this.body = body;
     this.name = 'ApiError';
   }
 }
@@ -100,7 +110,7 @@ export async function request<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new ApiError(body.error || res.statusText, res.status);
+    throw new ApiError(body.error || res.statusText, res.status, body);
   }
 
   if (res.status === 204) {
@@ -255,6 +265,18 @@ export const api = {
       request<void>(`/admin/notification-channels/${id}/test`, {
         method: 'POST',
       }),
+
+    // Master-key rotation. The status read is safe to poll and is deliberately
+    // useful even when no rotation is configured: it is how an operator finds
+    // out that a naive TRUSTISSUES_VAULT_KEY change left values unreadable,
+    // instead of finding out when a teammate opens an entry and sees blanks.
+    getVaultKeyStatus: () => request<VaultKeyStatus>('/admin/vault-key'),
+    // Runs the re-encrypt sweep. A 409 means either a sweep is already running
+    // or the store holds values no configured key opens; in the second case the
+    // body is a full VaultKeyStatus naming where they are, and NOTHING was
+    // written, so the caller must show it rather than retrying.
+    rekeyVault: () =>
+      request<VaultKeyStatus>('/admin/vault-key/rekey', { method: 'POST' }),
   },
 
   settings: {

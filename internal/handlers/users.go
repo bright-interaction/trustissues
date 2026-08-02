@@ -881,7 +881,7 @@ func (h *UserHandler) trySendInvitationEmail(toEmail, name, code string) {
 	username := scanSetting("smtp_username")
 	// Stored encrypted at rest. Shared with the "send test email" path so both
 	// resolve the credential identically; they used to disagree.
-	password, pwErr := resolveSMTPPassword(scanSetting("smtp_password"), h.cfg.VaultKey)
+	password, pwErr := resolveSMTPPassword(scanSetting("smtp_password"), h.cfg.VaultKey, h.cfg.VaultKeyPrevious)
 	if pwErr != nil {
 		slog.Error("invitations: smtp password decrypt failed", "error", pwErr)
 		return
