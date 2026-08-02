@@ -22,6 +22,18 @@ paths = [
   '''internal/shield/testdata/.*''',
   '''internal/shield/.*_test\.go''',
   '''internal/handlers/.*_test\.go''',
+  # A sequential hex placeholder that exists only to make the rest of the config
+  # valid so one field is under test, and a key whose value literally reads
+  # "test-vault-key-with-enough-entropy". Both verified to appear in zero
+  # non-test files.
+  '''internal/config/.*_test\.go''',
+  '''internal/columncrypto/.*_test\.go''',
+  # The gate's own source. mirror-secret-allowlist.txt documents each synthetic
+  # fixture BY VALUE with the reason it is safe, so the file necessarily contains
+  # credential-shaped strings and gitleaks flags its Stripe-shaped example. This
+  # is the self-trip CLAUDE.md section 15 names: a gate refusing its own source
+  # because the file carrying the marker ships inside the tree it scans.
+  '''scripts/mirror-secret-allowlist\.txt''',
 ]
 regexes = [
   '''changeme''',
