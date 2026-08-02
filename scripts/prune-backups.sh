@@ -61,6 +61,44 @@ if [ ! -d "${DEST_DIR}" ]; then
   exit 1
 fi
 
+# Refuse to prune the LIVE data directory. This is THE deletion site.
+#
+# backup.sh has always refused to WRITE snapshots into the live data dir, and its
+# comment gives the reason: retention would then be an automated rm loose inside
+# the directory holding the only live copy of the vault. The check lived in the
+# script that writes and was absent from the script that deletes, so
+# `prune-backups.sh /opt/trustissues/data` deleted snapshots in place, and
+# backup.sh's guard could be walked past anyway by pointing TRUSTISSUES_BACKUP_DIR
+# at a symlink to the data dir. An invariant belongs where the damage happens.
+#
+# Two independent tests, because each alone has a hole. TRUSTISSUES_DATA_DIR is
+# set on the scheduled path (the unit's EnvironmentFile) and usually not on a
+# hand-run one; the marker file covers the hand-run case and any spelling of the
+# path the env var does not mention.
+DEST_ABS="$(cd "${DEST_DIR}" && pwd -P)"
+if [ -n "${TRUSTISSUES_DATA_DIR:-}" ]; then
+  # pwd -P on both sides: `cd sym && pwd` prints the symlink, so the logical
+  # spelling of one directory compares unequal to itself.
+  DATA_ABS="$(cd "${TRUSTISSUES_DATA_DIR}" 2>/dev/null && pwd -P || echo "")"
+  if [ -n "${DATA_ABS}" ] && [ "${DEST_ABS}" = "${DATA_ABS}" ]; then
+    echo "error: refusing to prune ${DEST_ABS}: it is the LIVE data directory (TRUSTISSUES_DATA_DIR)" >&2
+    echo "       Retention must never run an automated rm inside the directory that holds" >&2
+    echo "       the live vault. Point TRUSTISSUES_BACKUP_DIR at separate storage." >&2
+    exit 1
+  fi
+fi
+# backup.sh names every snapshot trustissues-<stamp>.db, so a file named exactly
+# trustissues.db is never something this tooling put in a backup directory. It is
+# the live database. Refusing loudly (the unit fails, OnFailure pages) is the safe
+# side of this trade: the other side is deleting files beside a live vault.
+if [ -f "${DEST_ABS}/trustissues.db" ]; then
+  echo "error: refusing to prune ${DEST_ABS}: it holds trustissues.db, so it is a LIVE data directory" >&2
+  echo "       Snapshots are named trustissues-<stamp>.db; retention never writes or expects" >&2
+  echo "       a bare trustissues.db beside them. Move that file, or point this at the" >&2
+  echo "       backup directory rather than the data directory." >&2
+  exit 1
+fi
+
 KEEP_DAILY="${TRUSTISSUES_BACKUP_KEEP_DAILY:-7}"
 KEEP_WEEKLY="${TRUSTISSUES_BACKUP_KEEP_WEEKLY:-4}"
 

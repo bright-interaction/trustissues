@@ -1,7 +1,12 @@
 [Unit]
 Description=Trustissues restore drill (restore the newest snapshot into a throwaway dir and check a known row)
 Documentation=file:///opt/trustissues/docs/BACKUP.md
-ConditionPathExists=/etc/trustissues/backup.env
+
+# No ConditionPathExists= here either. See the long note in
+# trustissues-backup.service: a failed condition marks the job successful, so a
+# Condition on the EnvironmentFile converts the missing-config failure (which
+# EnvironmentFile= already raises, and which pages) into a silent skip. It
+# mattered most on THIS unit, the one whose whole job is to notice silence.
 
 # Same rule as the backup unit: [Unit], not [Service]. See the long note there.
 #
