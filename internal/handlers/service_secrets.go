@@ -586,18 +586,24 @@ func (h *ServiceSecretsHandler) audit(identityID, serviceName, event string, nam
 	}
 }
 
-// requestRemoteIP extracts the best-effort client IP for the audit row. It takes
-// the RIGHTMOST X-Forwarded-For entry, which our own reverse proxy (Caddy)
-// appends from the peer it actually observed; any leftmost entries are
-// client-supplied and spoofable, so trusting the first entry would let an
-// attacker forge the IP recorded in the service-secret audit trail. Falls back
-// to the direct socket peer when no XFF is present.
+// requestRemoteIP returns the client IP for the service-secret audit row.
+//
+// It delegates to middleware.ClientIP, which is THE single client-IP derivation
+// for the whole codebase. This used to be a second implementation, which is
+// precisely what rate_limit.go's doc warns against: "a second implementation
+// that trusts the leftmost X-Forwarded-For entry (or X-Real-IP unconditionally)
+// lets an attacker reset their own throttle bucket and write a forged source IP
+// into the audit trail."
+//
+// This one took the rightmost XFF entry with NO trusted-peer gate, so unlike
+// ClientIP it honoured a forwarded header even when TRUSTISSUES_TRUSTED_PROXY_HOPS
+// is 0 or the socket peer is a public address. A caller reaching the server
+// directly could therefore choose the IP recorded against their own
+// service-secret access, which is the one column that trail exists to hold.
+//
+// Keeping the shim rather than inlining the call: it is the name the audit
+// writers already use, and a single definition is what stops a third derivation
+// appearing next to it.
 func requestRemoteIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		parts := strings.Split(v, ",")
-		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
-			return last
-		}
-	}
-	return r.RemoteAddr
+	return middleware.ClientIP(r)
 }

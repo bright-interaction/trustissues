@@ -617,9 +617,19 @@ func main() {
 
 			// AI gateway: proxy LLM calls to Claude/OpenAI with the team's
 			// provider key injected server-side and PII tokenized via Shield.
-			// Any authenticated caller (session or API key) may use it; the key
-			// itself is never exposed. Non-streaming only in v1.
-			r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
+			// The key itself is never exposed. Non-streaming only in v1.
+			//
+			// NOT open to vault_only. That role is what RedeemInvitation hands
+			// out over the PUBLIC invite endpoint, and it exists to let a
+			// teammate use the browser extension against their own secrets, not
+			// to spend the team's Claude/OpenAI budget. The handler has no role
+			// check of its own, and VaultOnlyBlock's doc says to mount it on
+			// every group that is not part of the vault surface; it was on
+			// /service-identities alone.
+			r.Group(func(r chi.Router) {
+				r.Use(timw.VaultOnlyBlock())
+				r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
+			})
 
 			// AI gateway + MCP config: any user reads status + connection URLs;
 			// only an admin points a provider at a key.

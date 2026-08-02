@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -82,5 +83,42 @@ func TestRetryAfterIsDeltaSeconds(t *testing.T) {
 			"RFC 9110 allows only delta-seconds or an HTTP-date, so a Go duration string "+
 			"like \"1m0s\" is silently ignored by every client that would otherwise back off.",
 			got)
+	}
+}
+
+// A vault_only account cannot spend the team's AI budget.
+//
+// vault_only is the role RedeemInvitation hands out over the PUBLIC invite endpoint. It
+// exists so a teammate can point the browser extension at their own secrets, not so they
+// can proxy LLM calls with the team's Claude/OpenAI key injected server-side. The AI
+// gateway handler has no role check of its own, and VaultOnlyBlock was mounted on
+// /service-identities alone even though its own doc says to mount it on every group that
+// is not part of the vault surface.
+func TestVaultOnlyIsBlockedFromNonVaultSurfaces(t *testing.T) {
+	reached := false
+	h := VaultOnlyBlock()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/ai/anthropic/v1/messages", nil)
+	req = req.WithContext(context.WithValue(req.Context(), UserRoleKey, "vault_only"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if reached || rec.Code != http.StatusForbidden {
+		t.Errorf("a vault_only caller reached the handler (status %d).\n"+
+			"That role comes from the PUBLIC invite-redemption endpoint, so anyone who "+
+			"redeems an invitation could spend the team's provider key.", rec.Code)
+	}
+
+	// And an ordinary user must still get through, or the guard is just "deny".
+	reached = false
+	req2 := httptest.NewRequest(http.MethodPost, "/api/ai/anthropic/v1/messages", nil)
+	req2 = req2.WithContext(context.WithValue(req2.Context(), UserRoleKey, "user"))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if !reached {
+		t.Error("an ordinary user was blocked too; the guard is too broad")
 	}
 }
