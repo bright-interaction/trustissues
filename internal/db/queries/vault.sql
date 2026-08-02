@@ -64,6 +64,17 @@ UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2,
 -- name: UpdateVaultEntryName :exec
 UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: AdoptAndRenameVaultEntry :exec
+-- Rename an ORPHANED shared entry and take ownership of it in one statement.
+--
+-- Uniqueness is UNIQUE(user_id, name), scoped to the entry's creator, so any
+-- rename by somebody else asks a question about the creator's private namespace
+-- and the answer (409 or 200) is readable by the person asking. Writing the new
+-- owner and the new name together moves the uniqueness question into the
+-- renamer's OWN namespace, where a conflict is with an entry they can see and
+-- saying so leaks nothing. See the rule in vault.go's Update.
+UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+
 -- name: UpdateVaultEntryCategory :exec
 UPDATE vault_entries SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 

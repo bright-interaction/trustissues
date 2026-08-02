@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/bright-interaction/trustissues/internal/db"
 )
@@ -102,4 +103,39 @@ func (h *VaultHandler) grantFor(ctx context.Context, userID string, isAdmin bool
 
 	// Row 8: everyone else, nothing.
 	return none
+}
+
+// managerMayAdoptOrphanedEntry reports whether callerID may rename an entry that
+// somebody else created, by taking ownership of it.
+//
+// True only when all three hold: the entry lives in a collection, the caller is
+// an accepted MANAGER of that collection, and the creator is no longer an
+// accepted member of it. The third condition is the whole point: while the
+// creator is still on the team they can rename their own entry, and letting
+// anyone else do it would put a uniqueness check against their private vault
+// back on a path a colleague can drive (see the rule in VaultHandler.Update).
+//
+// Every fact it reads is one the caller can already read: they know their own
+// role, and GET /api/collections/{id}/members lists who is a member. So the
+// answer adds no information about anyone's private namespace.
+func (h *VaultHandler) managerMayAdoptOrphanedEntry(ctx context.Context, callerID, creatorID string, collectionID sql.NullString) bool {
+	if callerID == "" || !collectionID.Valid || collectionID.String == "" {
+		return false
+	}
+	callerRole, err := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
+		CollectionID: collectionID.String,
+		UserID:       callerID,
+	})
+	if err != nil || callerRole != collRoleManager {
+		return false
+	}
+	// GetCollectionMemberRole returns no row for a pending or absent membership,
+	// which is exactly "cannot reach this entry through the collection".
+	if _, err := h.queries.GetCollectionMemberRole(ctx, db.GetCollectionMemberRoleParams{
+		CollectionID: collectionID.String,
+		UserID:       creatorID,
+	}); err == nil {
+		return false // the creator is still here; it is theirs to rename
+	}
+	return true
 }

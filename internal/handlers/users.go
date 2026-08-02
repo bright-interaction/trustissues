@@ -150,6 +150,10 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A seat may already be waiting for this address (invited before it had an
+	// account). See claimCollectionInvitations.
+	claimCollectionInvitationsBestEffort(r.Context(), h.queries, row.ID, row.Email)
+
 	LogActivityFromRequest(h.queries, r, "admin.user_created",
 		fmt.Sprintf("User %s created with role %s", req.Email, req.Role))
 
@@ -786,6 +790,13 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to create user")
 		return
 	}
+
+	// The address may have been invited to a collection before it had an
+	// account. This is the client-onboarding path: a manager invites the client,
+	// the operator sends them an instance invitation code, and the collection
+	// seat has to become a pending membership they can accept. See
+	// claimCollectionInvitations.
+	claimCollectionInvitationsBestEffort(ctx, h.queries, userID, inv.Email)
 
 	resp := redeemInvitationResponse{
 		ServerURL: h.cfg.BaseURL,
