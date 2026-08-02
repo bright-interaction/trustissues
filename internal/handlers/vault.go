@@ -424,25 +424,31 @@ func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 
 // vaultEntryMeta is the JSON response for vault entries (metadata only, no secret value).
 type vaultEntryMeta struct {
-	ID                   string        `json:"id"`
-	UserID               string        `json:"user_id,omitempty"`
-	CollectionID         *string       `json:"collection_id"`
-	Name                 string        `json:"name"`
-	URL                  string        `json:"url"`
-	AliasURL             string        `json:"alias_url"`
-	Username             string        `json:"username"`
-	Category             string        `json:"category"`
-	Notes                string        `json:"notes"`
-	AutoLogin            bool          `json:"auto_login"`
-	RotationIntervalDays *int          `json:"rotation_interval_days"`
-	ExpiresAt            *string       `json:"expires_at"`
-	LastRotatedAt        *string       `json:"last_rotated_at"`
-	RotationStatus       string        `json:"rotation_status"`
-	Provider             string        `json:"provider"`
-	ProviderMeta         string        `json:"provider_meta"`
-	AutoRotate           bool          `json:"auto_rotate"`
-	LastRotationError    string        `json:"last_rotation_error"`
-	CustomFields         []CustomField `json:"custom_fields,omitempty"`
+	ID                   string  `json:"id"`
+	UserID               string  `json:"user_id,omitempty"`
+	CollectionID         *string `json:"collection_id"`
+	Name                 string  `json:"name"`
+	URL                  string  `json:"url"`
+	AliasURL             string  `json:"alias_url"`
+	Username             string  `json:"username"`
+	Category             string  `json:"category"`
+	Notes                string  `json:"notes"`
+	AutoLogin            bool    `json:"auto_login"`
+	RotationIntervalDays *int    `json:"rotation_interval_days"`
+	ExpiresAt            *string `json:"expires_at"`
+	LastRotatedAt        *string `json:"last_rotated_at"`
+	RotationStatus       string  `json:"rotation_status"`
+	Provider             string  `json:"provider"`
+	ProviderMeta         string  `json:"provider_meta"`
+	AutoRotate           bool    `json:"auto_rotate"`
+	LastRotationError    string  `json:"last_rotation_error"`
+	// No omitempty. With it, an entry whose last custom field was just deleted
+	// answered without the key at all, which is indistinguishable from "this
+	// response does not carry custom fields" to any client that merges a write
+	// response into a cached entry: the deleted TOTP seed stayed on screen until
+	// the next full unlock. Always sending the key (null or []) makes the
+	// response self-describing.
+	CustomFields []CustomField `json:"custom_fields"`
 	// The capability ceiling, returned so the edit form can show what is set.
 	// Not a secret: it is a list of hosts, and the operator needs to see it to
 	// narrow it. An empty list means no agent token can be minted at all.
@@ -472,7 +478,12 @@ type vaultEntryFull struct {
 // column before it is emitted to a client.
 func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEntryMeta {
 	e := vaultEntryMeta{
-		ID:                   row.ID,
+		ID: row.ID,
+		// The projection used to omit collection_id, so every write response
+		// built from this row claimed the entry was personal. A client that
+		// merges the response into its cache moved every shared entry back to
+		// "Personal" on save until it re-read the whole vault.
+		CollectionID:         nullStringPtr(row.CollectionID),
 		Name:                 row.Name,
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
