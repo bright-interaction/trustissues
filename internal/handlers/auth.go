@@ -230,6 +230,13 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Same claim every account-creation path runs. Nothing can have invited the
+	// FIRST admin (there are no other accounts and no collections yet), but the
+	// rule is "every path that creates an account claims its seats", and a rule
+	// with an exception is the shape that lets the next path forget. Costs one
+	// indexed read on a once-per-instance route.
+	claimCollectionInvitationsBestEffort(r.Context(), h.queries, row.ID, row.Email)
+
 	user := userInfo{
 		ID:        row.ID,
 		Email:     row.Email,

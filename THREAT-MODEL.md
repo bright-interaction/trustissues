@@ -153,14 +153,40 @@ If you need the property that even the operator cannot read secrets
   the rest of the directory. Inviting an address answers identically whether or
   not it matches an account, a pending seat is recorded by the invited EMAIL
   either way and carries no user id or display name until the invitee accepts,
-  and withdrawing an invitation always answers 204. Renaming an entry somebody
-  else created is refused outright rather than checked against their private
-  namespace, because `UNIQUE(user_id, name)` is scoped to the creator and a
-  conflict answer would read out of a vault the caller cannot see.
-- The AI gateway proxies inference calls only. It runs with the operator's
-  provider account rights, so the reachable methods and paths are an explicit
-  per-provider allowlist (see `aiProviders` in `internal/handlers/ai_gateway.go`)
-  rather than whatever the caller names.
+  and withdrawing an invitation always answers 204. A seat created for an address
+  with no account becomes a real pending membership when that account is created,
+  so the invitation is still redeemable and the members list does not change
+  shape when the address registers. The activity-log row is written on both
+  branches with the same text, so the audit trail does not answer the question
+  either.
+  **What this does not hide: response timing.** Inviting or rescinding an address
+  that matches an account runs three more SQLite reads than one that does not, so
+  a caller who can measure the difference over enough samples still learns it.
+  Nothing asserts constant time, and padding it would be a false promise on a
+  single-file database whose page cache dominates the signal. Rate-limit
+  `/api/collections/*` at the proxy if that matters for your instance.
+- **Who may rename a shared entry.** `UNIQUE(user_id, name)` is scoped to the
+  entry's creator, so a rename asks a question about the creator's private
+  namespace and the answer (409 or 200) is readable by whoever asked. The rule:
+  the creator and an instance admin rename freely; a **manager** of the
+  collection may rename an entry whose creator has left that collection, and
+  that rename **adopts** the entry (the new owner and the new name are written in
+  one statement, so the uniqueness question lands in the manager's own namespace
+  and the creator's vault is never consulted); everybody else, including a
+  manager while the creator is still a member, is refused with a constant 403.
+  Adoption's cost is deliberate: it ends the departed creator's residual recovery
+  read on that one entry. The complete fix is scope-aware uniqueness (partial
+  indexes on `(user_id, name) WHERE collection_id IS NULL` and
+  `(collection_id, name)`), which SQLite cannot do without rebuilding
+  `vault_entries`, and that rebuild would cascade-delete `capability_grants`.
+- LLM provider keys are spendable only on inference. Trustissues holds the
+  operator's provider key and injects it server-side, so the reachable methods
+  and paths are an explicit allowlist (`providerInferenceRoutes` in
+  `internal/handlers/provider_routes.go`) rather than whatever the caller names.
+  It is enforced at BOTH doors onto that key, the AI gateway (`/api/ai/...`) and
+  the capability bridge (`/proxy/{host}/...`), and the path is decoded and
+  cleaned before it is matched so an encoded traversal cannot leave an allowed
+  prefix. A provider host with no allowlist entry is refused entirely.
 
 ## The vault "lock" is a client-side convenience, not a server control
 

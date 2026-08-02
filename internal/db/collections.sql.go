@@ -504,6 +504,52 @@ func (q *Queries) ListCollectionInvitations(ctx context.Context, collectionID st
 	return items, nil
 }
 
+const listCollectionInvitationsForEmail = `-- name: ListCollectionInvitationsForEmail :many
+SELECT collection_id, role, invited_by FROM collection_invitations
+WHERE email = ? ORDER BY collection_id ASC
+`
+
+type ListCollectionInvitationsForEmailRow struct {
+	CollectionID string         `json:"collection_id"`
+	Role         string         `json:"role"`
+	InvitedBy    sql.NullString `json:"invited_by"`
+}
+
+// Every seat waiting for one address, read at ACCOUNT CREATION.
+//
+// Recording the seat by email fixed the enumeration oracle but broke redemption:
+// a seat for an address with no account never became a membership, so the
+// invitee could not accept it after signing up and the manager stared at a
+// pending row that would never resolve. That is the exact client-onboarding flow
+// (invite the client, they register, they join) this work exists to enable.
+//
+// The seat row is deliberately NOT deleted when it is claimed. The seat is what
+// ListMembers renders, so removing it would change the pending entry's shape the
+// moment the address registered, which is the account-existence answer again by
+// another route.
+func (q *Queries) ListCollectionInvitationsForEmail(ctx context.Context, email string) ([]ListCollectionInvitationsForEmailRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCollectionInvitationsForEmail, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCollectionInvitationsForEmailRow{}
+	for rows.Next() {
+		var i ListCollectionInvitationsForEmailRow
+		if err := rows.Scan(&i.CollectionID, &i.Role, &i.InvitedBy); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCollectionMembers = `-- name: ListCollectionMembers :many
 SELECT cm.user_id, cm.role, cm.added_at, cm.accepted_at, u.email, u.name
 FROM collection_members cm

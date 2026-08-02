@@ -1557,12 +1557,42 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// An UNCHANGED name is not a rename, and the edit form resubmits every
 		// field, so it must not be refused: otherwise an editor could no longer
 		// save a URL or a note on a shared entry at all.
-		ownerID, ownerErr := qtx.GetVaultEntryOwner(ctx, id)
-		if ownerErr != nil {
-			logError(r, "vault.update: owner lookup for rename failed", "entry", id, "error", ownerErr)
+		//
+		// THE RULE, in full, because the first cut of this fix silently took
+		// renaming away from collection MANAGERS and did not say so:
+		//
+		//  1. the entry's creator and an instance admin rename freely, with the
+		//     precise 409 duplicate-name feedback, since the conflicting entry
+		//     is one they can already see;
+		//  2. a MANAGER of the collection may rename an entry whose creator has
+		//     left that collection, and doing so ADOPTS it (user_id and name are
+		//     written in one statement). Adoption is what makes it safe: the
+		//     uniqueness question moves into the manager's own namespace, so the
+		//     answer is about entries they can see and the creator's private
+		//     vault is never consulted. It is unconditional on that path, not a
+		//     fallback after a conflict, because a fallback would be the oracle
+		//     again by its timing;
+		//  3. everyone else, including a manager while the creator is still an
+		//     accepted member of the collection, gets the constant 403. The
+		//     creator is right there and can do it themselves, and the name is
+		//     the lookup key for service_identities.allowed_secrets and MCP
+		//     use_secret, so a rename behind their back breaks resolution they
+		//     configured and cannot see is broken.
+		//
+		// Rule 2 exists because without it the name of a shared entry froze the
+		// moment its creator left the team, with only an instance admin able to
+		// fix a typo. Its cost is real and deliberate: adoption ends the
+		// departed creator's residual recovery READ on that one entry
+		// (grantFor row 7), so a manager takes responsibility for a secret that
+		// was stranded in their collection. Rule 3 keeps the creator's own
+		// namespace unreadable while they are still a colleague.
+		access, accessErr := qtx.GetVaultEntryAccess(ctx, id)
+		if accessErr != nil {
+			logError(r, "vault.update: owner lookup for rename failed", "entry", id, "error", accessErr)
 			writeInternalError(w, r, "internal server error")
 			return
 		}
+		ownerID := access.UserID
 		currentName, nameErr := qtx.GetVaultEntryName(ctx, id)
 		if nameErr != nil {
 			logError(r, "vault.update: current-name lookup for rename failed", "entry", id, "error", nameErr)
@@ -1570,17 +1600,40 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if newName != currentName {
-			if !middleware.IsAdmin(ctx) && userID != ownerID {
-				writeForbidden(w, r, "only the entry's owner or an instance admin can rename it")
-				return
-			}
-			if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
-				if strings.Contains(err.Error(), "UNIQUE constraint") {
-					writeConflict(w, r, "a vault entry with that name already exists")
+			switch {
+			case middleware.IsAdmin(ctx) || userID == ownerID:
+				if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
+					if strings.Contains(err.Error(), "UNIQUE constraint") {
+						writeConflict(w, r, "a vault entry with that name already exists")
+						return
+					}
+					logError(r, "vault.update: update name failed", "error", err)
+					writeInternalError(w, r, "internal server error")
 					return
 				}
-				logError(r, "vault.update: update name failed", "error", err)
-				writeInternalError(w, r, "internal server error")
+			case h.managerMayAdoptOrphanedEntry(ctx, userID, ownerID, access.CollectionID):
+				if err := qtx.AdoptAndRenameVaultEntry(ctx, db.AdoptAndRenameVaultEntryParams{
+					UserID: userID, Name: newName, ID: id,
+				}); err != nil {
+					if strings.Contains(err.Error(), "UNIQUE constraint") {
+						// The conflict is inside the manager's OWN namespace, so
+						// naming it leaks nothing they cannot already list.
+						writeConflict(w, r, "you already have a vault entry with that name")
+						return
+					}
+					logError(r, "vault.update: adopt and rename failed", "error", err)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				// Queued, not written here: LogActivityFromRequest runs on its
+				// own connection and would contend with the write lock this
+				// transaction holds (measured 5.1s of stall and a lost row).
+				deferredActivity = append(deferredActivity, queuedActivity{
+					action: "vault.entry_adopted",
+					detail: fmt.Sprintf("Entry %s renamed and adopted by a collection manager (its creator has left the collection)", id),
+				})
+			default:
+				writeForbidden(w, r, "only the entry's owner or an instance admin can rename it")
 				return
 			}
 		}

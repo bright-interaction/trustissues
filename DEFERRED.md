@@ -206,3 +206,40 @@ Backfill via the existing `BackfillMetadataAtRest` pattern using
 **Interim guidance:** a leaked backup reveals the inventory, not the secrets.
 This is stated plainly in THREAT-MODEL.md so nobody plans around a guarantee the
 product does not offer.
+
+## (h) Scope-aware uniqueness for `vault_entries.name`
+
+**Status:** designed, not implemented. The complete fix for the rename oracle
+found in the cross-client isolation pass (2026-08-02).
+
+`UNIQUE(user_id, name)` is scoped to the entry's CREATOR, and a collection entry
+keeps its creator's `user_id` forever. So the uniqueness question a rename asks
+lands in a namespace the renamer usually cannot read, and the answer (409 versus
+200) is an existence oracle over another user's private vault. The shipped fix
+routes around it: only the creator or an instance admin renames normally, and a
+collection MANAGER may rename an entry whose creator has left the collection by
+ADOPTING it, which moves the uniqueness question into the manager's own
+namespace. Nothing consults a namespace the caller cannot see.
+
+**What complete looks like:** drop the table-level `UNIQUE(user_id, name)` and
+replace it with two partial indexes,
+
+    CREATE UNIQUE INDEX ... ON vault_entries(user_id, name) WHERE collection_id IS NULL;
+    CREATE UNIQUE INDEX ... ON vault_entries(collection_id, name) WHERE collection_id IS NOT NULL;
+
+so a shared entry's name is unique within its COLLECTION, which is exactly the
+namespace every member can already see. Then any editor could rename, with honest
+duplicate feedback, and adoption would not be needed.
+
+**Why it is deferred.** SQLite cannot drop a table-level UNIQUE without the
+12-step table rebuild, and `vault_entries` is the table every secret lives in.
+The rebuild runs `DROP TABLE`, which with `_foreign_keys=on` (how the app opens
+the database) fires `capability_grants`' `ON DELETE CASCADE` and wipes every
+agent grant. `PRAGMA foreign_keys` cannot be toggled inside the transaction goose
+wraps a migration in, and toggling it from a pooled `*sql.DB` outside one is not
+reliably the same connection the DDL runs on. It wants a dedicated single-conn
+migration path, which is worth doing once rather than improvising here.
+
+**Interim guidance:** the rule is stated in THREAT-MODEL.md and in the code
+comment above the rename branch in `VaultHandler.Update`, including its cost
+(adoption ends the departed creator's residual recovery read on that entry).

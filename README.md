@@ -213,8 +213,20 @@ create assistants on that account, and bill it for the privilege. Allowed:
 | anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/complete`, `GET /v1/models`, `GET /v1/models/{id}` |
 | openai | `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/moderations`, `POST /v1/completions`, `GET /v1/models`, `GET /v1/models/{id}` |
 
-Adding an endpoint is a deliberate edit to `aiProviders` in
-`internal/handlers/ai_gateway.go`, never something a new provider API inherits.
+The same allowlist applies to the **capability bridge**: a token minted for a
+vault entry that points at `api.openai.com` or `api.anthropic.com` can only spend
+those routes through `/proxy/{host}/...` either. The team key is an ordinary
+vault entry, usually kept in a collection, so both surfaces reach it and scoping
+only one of them scopes nothing.
+
+The path is fully decoded, then cleaned, then matched, and the matched string is
+what gets forwarded, so `%2e%2e` and friends cannot walk out of an allowed
+prefix. A model id may be one plain segment
+(`[A-Za-z0-9._~:-]+`, e.g. `ft:gpt-4o-mini-2024-07-18:acme::9abc`).
+
+Adding an endpoint is a deliberate edit to `providerInferenceRoutes` in
+`internal/handlers/provider_routes.go`, never something a new provider API
+inherits: a provider with no entry there is refused entirely.
 
 **MCP.** A remote MCP endpoint at `https://<your-host>/api/mcp` (JSON-RPC) that
 Claude and ChatGPT connectors can add, authenticated with an API key

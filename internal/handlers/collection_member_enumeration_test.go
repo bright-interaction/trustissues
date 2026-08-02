@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +99,17 @@ func TestPendingInviteDoesNotRevealWhetherAnAccountExists(t *testing.T) {
 		t.Fatalf("AddMember answered differently for a registered and an unregistered address:\n hit:  %s\n miss: %s", hit, miss)
 	}
 
+	// Pin both seat rows to one timestamp before listing. added_at is the field
+	// most likely to drift back into a distinguisher (the membership row has its
+	// own added_at), and comparing two live clock values would pass by
+	// coincidence rather than by rule. With the source rows pinned, any seat
+	// whose added_at comes from somewhere else shows up as a difference.
+	if _, err := vh.db.Exec(
+		`UPDATE collection_invitations SET created_at = '2026-01-01 00:00:00' WHERE collection_id = ?`,
+		collID); err != nil {
+		t.Fatalf("pin seat timestamps: %v", err)
+	}
+
 	// Step 3: the members list. This is where the answer used to leak.
 	listMembers := func(who, role string) (int, string, []memberResponse) {
 		t.Helper()
@@ -158,6 +171,38 @@ func TestPendingInviteDoesNotRevealWhetherAnAccountExists(t *testing.T) {
 	}
 	if hitSeat.Role != missSeat.Role {
 		t.Errorf("pending seats differ in role: %q vs %q", hitSeat.Role, missSeat.Role)
+	}
+	// Field-by-field checks only cover the fields somebody thought to list, and
+	// added_at was not one of them: both seats read it from
+	// collection_invitations.created_at today, but a change that sourced the hit
+	// seat from collection_members.added_at instead would reintroduce a
+	// distinguisher and keep every assertion above green. Compare the WHOLE
+	// struct, with the address the attacker typed themselves zeroed out.
+	hitCmp, missCmp := *hitSeat, *missSeat
+	hitCmp.Email, missCmp.Email = "", ""
+	if !reflect.DeepEqual(hitCmp, missCmp) {
+		t.Errorf("the two pending seats are not byte-identical, so one of the fields answers "+
+			"'does this address have an account':\n registered:   %s\n unregistered: %s",
+			renderSeat(hitCmp), renderSeat(missCmp))
+	}
+
+	// The audit trail is a surface too. collection.member_invited used to be
+	// written only when the address matched an account, so activity_log answered
+	// the question this endpoint refuses to answer, for anyone who can read it.
+	var hitRows, missRows int
+	if err := vh.db.QueryRow(
+		`SELECT COUNT(*) FROM activity_log WHERE action = 'collection.member_invited' AND detail LIKE ?`,
+		"%victim@other-client.example%").Scan(&hitRows); err != nil {
+		t.Fatalf("count activity rows: %v", err)
+	}
+	if err := vh.db.QueryRow(
+		`SELECT COUNT(*) FROM activity_log WHERE action = 'collection.member_invited' AND detail LIKE ?`,
+		"%nobody-here@other-client.example%").Scan(&missRows); err != nil {
+		t.Fatalf("count activity rows: %v", err)
+	}
+	if hitRows != missRows {
+		t.Errorf("the activity log recorded %d rows for the registered address and %d for the unregistered one; "+
+			"that difference is the same oracle in the audit trail", hitRows, missRows)
 	}
 
 	// Step 4: a member below manager gets no address at all. They did not type
@@ -282,4 +327,19 @@ func TestRescindInvitationWithdrawsSeatWithoutAnOracle(t *testing.T) {
 		strings.Contains(rr.Body.String(), "never-registered@example.com") {
 		t.Errorf("a withdrawn invitation is still listed: %s", rr.Body.String())
 	}
+}
+
+// renderSeat prints a member row with its timestamp POINTERS dereferenced. %+v
+// on the struct prints addresses for added_at and accepted_at, which is exactly
+// the field a differential is most likely to hide in, and an address tells the
+// reader nothing about whether the two seats differ.
+func renderSeat(m memberResponse) string {
+	str := func(p *string) string {
+		if p == nil {
+			return "<nil>"
+		}
+		return *p
+	}
+	return fmt.Sprintf("user_id=%q email=%q name=%q role=%q added_at=%s accepted_at=%s pending=%t",
+		m.UserID, m.Email, m.Name, m.Role, str(m.AddedAt), str(m.AcceptedAt), m.Pending)
 }

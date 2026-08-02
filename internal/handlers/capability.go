@@ -222,6 +222,31 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	if method == "" {
 		method = "*"
 	}
+
+	// A CONCRETE destination on an LLM provider is held to the inference
+	// allowlist at mint time too, so an agent gets one clear refusal here rather
+	// than a token the proxy will always reject. The proxy is the authority (it
+	// sees the real request); this is the early, honest error.
+	//
+	// Globbed dests ("api.openai.com/*") and method "*" still mint: the ceiling
+	// is a host+path shape rather than a route, and narrowing it to the
+	// allowlist here would refuse every legitimate default. Every request spent
+	// against such a token still passes allowedProviderRoute in Proxy.
+	if method != "*" {
+		for _, d := range dests {
+			dHost, dPath := splitHostPath(d)
+			if strings.Contains(d, "*") {
+				continue
+			}
+			if _, isProvider, ok := allowedProviderRoute(dHost, method, dPath); isProvider && !ok {
+				h.logCapabilityEvent(ctx, req.AgentID, &entry.ID, entry.Name, d, method, "denied", 0, "not_an_inference_route", "")
+				writeError(w, r, http.StatusForbidden, "route_not_allowed",
+					fmt.Sprintf("%s only proxies inference calls; %s %s is not one of them", dHost, strings.ToUpper(method), dPath))
+				return
+			}
+		}
+	}
+
 	ttl := time.Duration(req.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		ttl = h.defaultTTL
@@ -362,6 +387,35 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "method_mismatch", tok.Nonce)
 		writeError(w, r, http.StatusForbidden, "method_mismatch", "token does not authorise this method")
 		return
+	}
+
+	// An LLM provider host is held to the SAME inference allowlist the AI
+	// gateway enforces. This is the second door onto one property.
+	//
+	// The vault entry an admin points ai_key_openai / ai_key_anthropic at is an
+	// ordinary entry, and the natural way to manage a team key is to keep it in
+	// a collection, where every accepted member resolves it through
+	// accessibleEntriesPredicate. So a role-'user' client could mint a token for
+	// api.openai.com/v1/files with DELETE and spend the operator's key on the
+	// files, batch, fine-tuning and assistants APIs, while the gateway's
+	// allowlist guarded a door that caller never used. Scoping one call site and
+	// not its sibling is how this class of fix gets reported as closed and is
+	// not.
+	//
+	// Enforced HERE, before the nonce is spent and before the secret is
+	// decrypted, so a refused call costs the caller nothing and leaks nothing.
+	// The normalized path is what gets forwarded, so the string checked and the
+	// string sent are the same one.
+	if clean, isProvider, allowed := allowedProviderRoute(host, r.Method, upstreamPath); isProvider {
+		if !allowed {
+			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
+				r.Method, "denied", 0, "not_an_inference_route", tok.Nonce)
+			writeError(w, r, http.StatusForbidden, "route_not_allowed",
+				fmt.Sprintf("%s only proxies inference calls; %s %s is not one of them",
+					host, r.Method, displayUpstreamPath(upstreamPath)))
+			return
+		}
+		upstreamPath = clean
 	}
 
 	// Replay protection: spend the nonce. Any concurrent re-use loses

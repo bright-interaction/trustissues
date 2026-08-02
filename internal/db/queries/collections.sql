@@ -114,6 +114,22 @@ ON CONFLICT(collection_id, email) DO UPDATE SET
 SELECT collection_id, email, role, invited_by, created_at FROM collection_invitations
 WHERE collection_id = ? ORDER BY email ASC;
 
+-- name: ListCollectionInvitationsForEmail :many
+-- Every seat waiting for one address, read at ACCOUNT CREATION.
+--
+-- Recording the seat by email fixed the enumeration oracle but broke redemption:
+-- a seat for an address with no account never became a membership, so the
+-- invitee could not accept it after signing up and the manager stared at a
+-- pending row that would never resolve. That is the exact client-onboarding flow
+-- (invite the client, they register, they join) this work exists to enable.
+--
+-- The seat row is deliberately NOT deleted when it is claimed. The seat is what
+-- ListMembers renders, so removing it would change the pending entry's shape the
+-- moment the address registered, which is the account-existence answer again by
+-- another route.
+SELECT collection_id, role, invited_by FROM collection_invitations
+WHERE email = ? ORDER BY collection_id ASC;
+
 -- name: DeleteCollectionInvitation :execresult
 DELETE FROM collection_invitations WHERE collection_id = ? AND email = ?;
 

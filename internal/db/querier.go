@@ -24,6 +24,15 @@ type Querier interface {
 	// change on an already-accepted member must not rewrite the history of who
 	// brought them in.
 	AddCollectionMember(ctx context.Context, arg AddCollectionMemberParams) error
+	// Rename an ORPHANED shared entry and take ownership of it in one statement.
+	//
+	// Uniqueness is UNIQUE(user_id, name), scoped to the entry's creator, so any
+	// rename by somebody else asks a question about the creator's private namespace
+	// and the answer (409 or 200) is readable by the person asking. Writing the new
+	// owner and the new name together moves the uniqueness question into the
+	// renamer's OWN namespace, where a conflict is with an entry they can see and
+	// saying so leaks nothing. See the rule in vault.go's Update.
+	AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error
 	// Boot key-gate probe 3: every OTHER columncrypto surface.
 	//
 	// Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
@@ -343,6 +352,19 @@ type Querier interface {
 	ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
 	ListCollectionInvitations(ctx context.Context, collectionID string) ([]CollectionInvitation, error)
+	// Every seat waiting for one address, read at ACCOUNT CREATION.
+	//
+	// Recording the seat by email fixed the enumeration oracle but broke redemption:
+	// a seat for an address with no account never became a membership, so the
+	// invitee could not accept it after signing up and the manager stared at a
+	// pending row that would never resolve. That is the exact client-onboarding flow
+	// (invite the client, they register, they join) this work exists to enable.
+	//
+	// The seat row is deliberately NOT deleted when it is claimed. The seat is what
+	// ListMembers renders, so removing it would change the pending entry's shape the
+	// moment the address registered, which is the account-existence answer again by
+	// another route.
+	ListCollectionInvitationsForEmail(ctx context.Context, email string) ([]ListCollectionInvitationsForEmailRow, error)
 	ListCollectionMembers(ctx context.Context, collectionID string) ([]ListCollectionMembersRow, error)
 	// The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
 	//

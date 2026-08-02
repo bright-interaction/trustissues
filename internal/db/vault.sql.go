@@ -10,6 +10,29 @@ import (
 	"database/sql"
 )
 
+const adoptAndRenameVaultEntry = `-- name: AdoptAndRenameVaultEntry :exec
+UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+`
+
+type AdoptAndRenameVaultEntryParams struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+	ID     string `json:"id"`
+}
+
+// Rename an ORPHANED shared entry and take ownership of it in one statement.
+//
+// Uniqueness is UNIQUE(user_id, name), scoped to the entry's creator, so any
+// rename by somebody else asks a question about the creator's private namespace
+// and the answer (409 or 200) is readable by the person asking. Writing the new
+// owner and the new name together moves the uniqueness question into the
+// renamer's OWN namespace, where a conflict is with an entry they can see and
+// saying so leaks nothing. See the rule in vault.go's Update.
+func (q *Queries) AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error {
+	_, err := q.db.ExecContext(ctx, adoptAndRenameVaultEntry, arg.UserID, arg.Name, arg.ID)
+	return err
+}
+
 const anyEncryptedColumnSample = `-- name: AnyEncryptedColumnSample :many
 SELECT family, blob FROM (SELECT 'columncrypto' AS family, value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL

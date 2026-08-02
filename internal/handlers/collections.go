@@ -647,12 +647,22 @@ func (h *CollectionHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		LogActivityFromRequest(h.queries, r, "collection.member_invited",
-			fmt.Sprintf("Invited %s to collection %s as %s (pending acceptance)", req.Email, id, req.Role))
 	} else {
 		// Log the miss server-side for the operator without telling the caller.
+		// slog output is not an API surface; the activity_log row below is, and
+		// it is written identically on both branches.
 		logError(r, "collections.addmember: no account for invited email", "collection", id)
 	}
+	// One activity row, same text, whether or not the address has an account.
+	//
+	// It used to be written only on a hit, so activity_log itself answered the
+	// question the rest of this endpoint refuses to answer. /api/activity is
+	// admin-only today, which is the only thing that kept it from being a live
+	// oracle, and "safe because of an authorization rule somewhere else" is how
+	// a leak survives the next refactor. The manager typed the address, so
+	// echoing it back in their own audit trail costs nothing.
+	LogActivityFromRequest(h.queries, r, "collection.member_invited",
+		fmt.Sprintf("Invited %s to collection %s as %s (pending acceptance)", req.Email, id, req.Role))
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "invited",
 		"detail": "If that address belongs to an account, an invitation is now pending their acceptance.",
