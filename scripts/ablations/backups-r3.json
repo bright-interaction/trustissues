@@ -1,0 +1,167 @@
+[
+ {
+  "id": "installer-refuses-its-own-timer",
+  "mech": "installer-runs",
+  "file": "deploy/systemd/install.sh",
+  "test": "35 install.sh runs end to end on a clean host",
+  "why": "ROUND-3 BLOCKER: the OnFailure loop demanded the directive on the two .timer units, which do not carry it and must not, so the documented install aborted on every host after copying the units and before seeding backup.env or enabling either timer. Removing the timer branch restores exactly that",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "    *.timer)\n      svc=\"$(grep -E '^Unit=' \"${UNIT_DIR}/${u}\" | sed 's/^Unit=//' | tail -1)\"\n      [ -n \"${svc}\" ] || die \"${u} has no Unit=, so it triggers nothing at all\"\n      [ -f \"${UNIT_DIR}/${svc}\" ] \\\n        || die \"${u} triggers ${svc}, which is NOT installed; the timer would fire into nothing\"\n      grep -qE '^OnFailure=' \"${UNIT_DIR}/${svc}\" \\\n        || die \"${u} triggers ${svc}, which has no OnFailure=; a silent backup failure is the bug this ships to prevent\"\n      continue ;;\n",
+  "new": ""
+ },
+ {
+  "id": "installer-timer-check-waived",
+  "mech": "installer-checks",
+  "file": "deploy/systemd/install.sh",
+  "test": "44 install.sh refuses a timer that triggers a unit which is not installed",
+  "why": "the cheap way out of the blocker was `*.timer) continue`, i.e. waiving the check instead of asking the right question of a timer. A waived check accepts a timer pointed at a unit nobody installed, which enables cleanly and fires into nothing at 03:20",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "    *.timer)\n      svc=\"$(grep -E '^Unit=' \"${UNIT_DIR}/${u}\" | sed 's/^Unit=//' | tail -1)\"\n      [ -n \"${svc}\" ] || die \"${u} has no Unit=, so it triggers nothing at all\"\n      [ -f \"${UNIT_DIR}/${svc}\" ] \\\n        || die \"${u} triggers ${svc}, which is NOT installed; the timer would fire into nothing\"\n      grep -qE '^OnFailure=' \"${UNIT_DIR}/${svc}\" \\\n        || die \"${u} triggers ${svc}, which has no OnFailure=; a silent backup failure is the bug this ships to prevent\"\n      continue ;;\n",
+  "new": "    *.timer) continue ;;\n"
+ },
+ {
+  "id": "installer-no-unit-dir",
+  "mech": "installer-runs",
+  "file": "deploy/systemd/install.sh",
+  "test": "35 install.sh runs end to end on a clean host",
+  "why": "the second defect execution coverage found: install.sh never created the unit directory, so on any tree where /etc/systemd/system does not already exist it died with a bare 'No such file or directory' naming BSD install's own temp file",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "install -d -m 0755 \"${UNIT_DIR}\"\n",
+  "new": ""
+ },
+ {
+  "id": "installer-no-onfailure-requirement",
+  "mech": "installer-checks",
+  "file": "deploy/systemd/install.sh",
+  "test": "41 install.sh refuses a backup service with no OnFailure=",
+  "why": "the check that the estate did not have: dockyard-backup.service ran for months with no reachable alerting and systemd reports that as nothing at all",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  [ -n \"${targets}\" ] || die \"${u} has no OnFailure=; a silent backup failure is the bug this ships to prevent\"\n",
+  "new": ""
+ },
+ {
+  "id": "installer-no-section-check",
+  "mech": "installer-checks",
+  "file": "deploy/systemd/install.sh",
+  "test": "43 install.sh refuses OnFailure= outside [Unit]",
+  "why": "OnFailure= in [Service] is logged once as 'Unknown key name' and dropped, which is how every dockyard-backup failure was silent from the day the unit was written",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  section=\"$(awk '/^\\[/{s=$0} /^OnFailure=/{print s; exit}' \"${UNIT_DIR}/${u}\")\"\n  [ \"${section}\" = \"[Unit]\" ] \\\n    || die \"${u} has OnFailure= in ${section}; systemd only honours it in [Unit] and silently drops it anywhere else\"\n",
+  "new": ""
+ },
+ {
+  "id": "installer-no-condition-check",
+  "mech": "installer-checks",
+  "file": "deploy/systemd/install.sh",
+  "test": "42 install.sh refuses a Condition*= that would turn a failure into a silent skip",
+  "why": "a condition that does not hold marks the job SUCCESSFUL, so OnFailure= is never reached. Both scheduled units shipped one on the very EnvironmentFile whose absence is supposed to page",
+  "build": "bash -n deploy/systemd/install.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "say \"checking no unit carries a Condition*= that would turn a failure into a silent skip\"\nfor u in ${UNITS}; do\n  cond=\"$(grep -E '^Condition[A-Za-z]+=' \"${UNIT_DIR}/${u}\" || true)\"\n  [ -z \"${cond}\" ] \\\n    || die \"${u} has ${cond}; a condition that does not hold marks the job SUCCESSFUL, so OnFailure= never fires. Remove it.\"\ndone\n",
+  "new": ""
+ },
+ {
+  "id": "prune-flag-loses-to-environment",
+  "mech": "retention-opt-in",
+  "file": "scripts/backup.sh",
+  "test": "32 --prune runs retention even with TRUSTISSUES_BACKUP_PRUNE=0",
+  "why": "REVIEW ITEM 9: with the opt-in read only from the environment, an EnvironmentFile= line beats the unit's Environment= and TRUSTISSUES_BACKUP_PRUNE=0 in backup.env silently stops retention on the only path that fills the disk, with nothing failing",
+  "build": "bash -n scripts/backup.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "PRUNE=\"${TRUSTISSUES_BACKUP_PRUNE:-}\"\nif [ -n \"${PRUNE_FLAG}\" ]; then\n  PRUNE=\"${PRUNE_FLAG}\"\nfi\nif [ \"${PRUNE}\" = \"1\" ]; then\n",
+  "new": "if [ \"${TRUSTISSUES_BACKUP_PRUNE:-}\" = \"1\" ]; then\n"
+ },
+ {
+  "id": "unit-opts-in-through-environment",
+  "mech": "retention-opt-in",
+  "file": "deploy/systemd/trustissues-backup.service",
+  "test": "34 the unit opts in on the ExecStart= line",
+  "why": "REVIEW ITEM 9, the unit half: Environment= is overridden by the EnvironmentFile= two lines above it, so the scheduled opt-in was defeatable from the config file the installer tells the operator to edit",
+  "build": "grep -q '^Environment=TRUSTISSUES_BACKUP_PRUNE=1' deploy/systemd/trustissues-backup.service",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "ExecStart=/opt/trustissues/scripts/backup.sh --prune\n",
+  "new": "Environment=TRUSTISSUES_BACKUP_PRUNE=1\nExecStart=/opt/trustissues/scripts/backup.sh\n"
+ },
+ {
+  "id": "drill-max-age-line-oriented",
+  "mech": "numeric-validation",
+  "file": "scripts/restore-drill.sh",
+  "test": "30 the drill refuses a multi-line TRUSTISSUES_DRILL_MAX_AGE_HOURS",
+  "why": "grep anchors ^ and $ to a LINE, so $'48\\nfoo' passed the digits-only rule, the -gt comparison then errored to false, and the drill printed DRILL PASSED on a 30-day-old snapshot",
+  "build": "bash -n scripts/restore-drill.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "case \"${MAX_AGE_HOURS}\" in\n  ''|*[!0-9]*)\n    setup \"TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check.\" ;;\nesac\n",
+  "new": "printf '%s' \"${MAX_AGE_HOURS}\" | grep -Eq '^[0-9]+$' \\\n  || setup \"TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check.\"\n"
+ },
+ {
+  "id": "prune-keep-line-oriented",
+  "mech": "numeric-validation",
+  "file": "scripts/prune-backups.sh",
+  "test": "31 prune refuses a multi-line TRUSTISSUES_BACKUP_KEEP_DAILY",
+  "why": "the same hole in the sibling that DELETES: $'1\\nfoo' passed, every -lt comparison against it errored to false, and keep-daily silently degraded to zero",
+  "build": "bash -n scripts/prune-backups.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  case \"${val}\" in\n    ''|*[!0-9]*)\n      echo \"error: ${pair%%=*} must be a non-negative integer, got '${val}'\" >&2\n      exit 1 ;;\n  esac\n",
+  "new": "  if ! printf '%s' \"${val}\" | grep -Eq '^[0-9]+$'; then\n    echo \"error: ${pair%%=*} must be a non-negative integer, got '${val}'\" >&2\n    exit 1\n  fi\n"
+ },
+ {
+  "id": "umask-after-mkdir",
+  "mech": "snapshot-perms",
+  "file": "scripts/backup.sh",
+  "test": "34b backup.sh creates a missing destination directory 0700",
+  "why": "REVIEW ITEM 11: with the umask set after the mkdir, a hand-run that CREATES the destination leaves it at the ambient umask, and the file names in a backup directory are an inventory of the vault",
+  "build": "bash -n scripts/backup.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "umask 077\nmkdir -p \"${DEST_DIR}\"\n",
+  "new": "mkdir -p \"${DEST_DIR}\"\numask 077\n"
+ },
+ {
+  "id": "compose-no-create-on-fresh-host",
+  "mech": "compose-restore",
+  "file": "scripts/restore.sh",
+  "test": "45 restore.sh --compose restores onto a fresh host with no container yet",
+  "why": "REVIEW ITEM 6: `docker compose cp` needs a container to EXIST, and on the total-host-loss case this procedure is written for, none does. Without the create the documented restore fails with 'no container found' in exactly the situation it exists for",
+  "build": "bash -n scripts/restore.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  if [ -z \"$(docker compose ps -aq \"${SERVICE}\" 2>/dev/null)\" ]; then\n    echo \"no ${SERVICE} container yet (fresh host); creating it stopped so the volume exists...\"\n    if ! docker compose create \"${SERVICE}\" >/dev/null 2>&1; then\n      echo \"error: could not create the ${SERVICE} container; check docker-compose.yml and .env\" >&2\n      exit 2\n    fi\n  fi\n",
+  "new": ""
+ },
+ {
+  "id": "compose-cleanup-not-as-root",
+  "mech": "compose-restore",
+  "file": "scripts/restore.sh",
+  "test": "45/47 the restored database is owned by the service user",
+  "why": "REVIEW ITEM 6: docker compose cp writes the file as the host user, the service runs unprivileged, and without --user 0 the chown cannot run at all, so the app starts and crash-loops on its first write right after a disaster recovery",
+  "build": "bash -n scripts/restore.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  docker compose run --rm --no-deps --user 0 --entrypoint sh \"${SERVICE}\" -c \\\n",
+  "new": "  docker compose run --rm --no-deps --entrypoint sh \"${SERVICE}\" -c \\\n"
+ },
+ {
+  "id": "compose-no-writability-proof",
+  "mech": "compose-restore",
+  "file": "scripts/restore.sh",
+  "test": "49 restore.sh --compose refuses when the service user cannot write",
+  "why": "REVIEW ITEM 6: the chown succeeding is not the same as the service user being able to write (a compose file that pins user: to another id is enough). Without this the script reports a successful restore of a database the app cannot open",
+  "build": "bash -n scripts/restore.sh",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "  if ! docker compose run --rm --no-deps --entrypoint sh \"${SERVICE}\" -c \\\n      'test -w /app/data/trustissues.db'; then\n    echo \"error: the restored database is not writable by the service user; the app would crash-loop\" >&2\n    exit 2\n  fi\n",
+  "new": ""
+ },
+ {
+  "id": "cron-alerter-mentioned-not-invoked",
+  "mech": "cron-alerting",
+  "file": "deploy/cron/trustissues-backup.cron",
+  "test": "29 every cron job routes its failure to the alerter",
+  "why": "REVIEW ITEM 12: the check grepped each job line for the STRING trustissues-backup-alert.sh, which a mention in a trailing comment satisfies. Same family as the --ssl-reqd-in-a-comment trap this suite was already bitten by once",
+  "build": "grep -q 'on failure, see trustissues-backup-alert.sh' deploy/cron/trustissues-backup.cron",
+  "cmd": "./scripts/test-backup-restore.sh",
+  "old": "|| /opt/trustissues/deploy/systemd/trustissues-backup-alert.sh trustissues-backup.service >>/var/log/trustissues-backup.log 2>&1",
+  "new": "# on failure, see trustissues-backup-alert.sh"
+ }
+]

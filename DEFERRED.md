@@ -96,7 +96,10 @@ halves are separated below.
 - `deploy/systemd/`: a backup service + daily timer, a restore-drill service +
   weekly timer, a templated failure alerter, one `backup.env` for all of them,
   and an `install.sh` that installs, verifies the `OnFailure=` chain resolves to
-  a real unit, and can fire a test alert.
+  a real unit, and can fire a test alert. `install.sh --root DIR` rehearses the
+  whole install into a throwaway tree, which is how the suite executes it: the
+  version that demanded `OnFailure=` on the `.timer` units aborted every real
+  install and no test noticed, because nothing ever ran the installer.
 - `deploy/cron/trustissues-backup.cron`: the same two jobs for hosts without
   systemd, each with explicit failure alerting because cron's own reporting
   needs an MTA nobody has.
@@ -111,6 +114,12 @@ halves are separated below.
   refuses to write into the live data directory (physical paths, so a symlink is
   not a way around it), warns when the backups share a filesystem with the
   database.
+- `scripts/restore.sh --compose`: driven end to end by the suite against a real
+  docker daemon (a throwaway compose project, a real named volume, a real
+  unprivileged image user), covering the fresh-host `docker compose create`, the
+  chown that keeps the app from crash-looping on its first write, and the refusal
+  when the service user cannot write what was restored. Those cases SKIP loudly
+  on a machine without docker and the summary line says how many skipped.
 - Every one of those behaviours has a case in `scripts/test-backup-restore.sh`
   that has been watched to fail without it, with one deliberate exception:
   `prune-backups.sh`'s "the newest snapshot is never a deletion candidate" guard

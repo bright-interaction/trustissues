@@ -17,6 +17,12 @@
 #   TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/backup.sh /secure/backups
 #   ./scripts/backup.sh /secure/backups            # uses TRUSTISSUES_DATA_DIR or ./data
 #   TRUSTISSUES_BACKUP_DIR=/secure/backups ./scripts/backup.sh   # destination from env
+#   ./scripts/backup.sh --prune /secure/backups    # run retention afterwards
+#
+# Flags:
+#   --prune / --no-prune      run (or skip) retention after a successful snapshot.
+#                             The FLAG WINS over TRUSTISSUES_BACKUP_PRUNE, which is
+#                             why the scheduled unit uses it: see the note below.
 #
 # Env:
 #   TRUSTISSUES_DATA_DIR      the live data dir holding trustissues.db (default ./data)
@@ -32,6 +38,31 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Retention, as a flag, because an EnvironmentFile= beats an Environment=.
+#
+# The scheduled unit used to opt in with `Environment=TRUSTISSUES_BACKUP_PRUNE=1`
+# next to `EnvironmentFile=/etc/trustissues/backup.env`, and systemd documents
+# that settings from an EnvironmentFile OVERRIDE settings made with Environment=.
+# So one line in the config file the installer tells the operator to go and edit
+# (TRUSTISSUES_BACKUP_PRUNE=0, or a stray unset copied from a hand-run) silently
+# switched retention off on the ONLY path that fills the disk, with nothing
+# failing: the backup still exits 0, the timer stays green, the directory grows
+# by a full database copy a night until SQLite starts failing writes on a full
+# disk. An argument in ExecStart= cannot be overridden by any environment file,
+# which is the whole point of moving it here.
+PRUNE_FLAG=""
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --prune)    PRUNE_FLAG=1; shift ;;
+    --no-prune) PRUNE_FLAG=0; shift ;;
+    --)         shift; break ;;
+    -*)         echo "error: unknown option $1" >&2
+                echo "usage: $0 [--prune|--no-prune] <backup-directory>" >&2
+                exit 1 ;;
+    *)          break ;;
+  esac
+done
+
 DATA_DIR="${TRUSTISSUES_DATA_DIR:-./data}"
 DB_NAME="trustissues.db"
 DB_PATH="${DATA_DIR%/}/${DB_NAME}"
@@ -42,7 +73,7 @@ DB_PATH="${DATA_DIR%/}/${DB_NAME}"
 # wins, so every documented command line keeps working unchanged.
 DEST_DIR="${1:-${TRUSTISSUES_BACKUP_DIR:-}}"
 if [ -z "${DEST_DIR}" ]; then
-  echo "usage: $0 <backup-directory>" >&2
+  echo "usage: $0 [--prune|--no-prune] <backup-directory>" >&2
   echo "  or set TRUSTISSUES_BACKUP_DIR" >&2
   echo "  set TRUSTISSUES_DATA_DIR to point at the live data dir (default ./data)" >&2
   exit 1
@@ -59,6 +90,14 @@ if [ ! -f "${DB_PATH}" ]; then
   exit 1
 fi
 
+# umask BEFORE the mkdir, not just before the write.
+#
+# It used to sit further down, next to the sqlite3 call, so a run that CREATED
+# the destination made it at the ambient umask: 0755 on most hosts, and the file
+# names in a backup directory are an inventory of when the vault was copied and
+# how big it is. The shipped paths both `install -d -m 0700` first, so this only
+# ever bit a hand-run, which is exactly the run nobody is watching.
+umask 077
 mkdir -p "${DEST_DIR}"
 
 # Refuse to write snapshots INTO the live data directory.
@@ -105,9 +144,8 @@ if command -v df >/dev/null 2>&1; then
   fi
 fi
 
-# Create the destination file with tight perms before sqlite writes into it, so
-# the snapshot never briefly exists as world-readable.
-umask 077
+# (The umask that keeps the snapshot from briefly existing world-readable is set
+# above, before the mkdir that can create the destination directory.)
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST_PATH="${DEST_DIR%/}/trustissues-${STAMP}.db"
@@ -158,12 +196,20 @@ echo "backup written: ${DEST_PATH}"
 # unit call two commands. It is here instead so the notice below exists: an
 # operator running from cron with no retention needs to be told once, in the
 # output they are already reading, that the directory grows without bound.
-if [ "${TRUSTISSUES_BACKUP_PRUNE:-}" = "1" ]; then
+#
+# The FLAG wins over the environment variable, in both directions. That is what
+# makes `ExecStart=... backup.sh --prune` in the scheduled unit un-overridable by
+# a line in backup.env; see the note at the top of this file.
+PRUNE="${TRUSTISSUES_BACKUP_PRUNE:-}"
+if [ -n "${PRUNE_FLAG}" ]; then
+  PRUNE="${PRUNE_FLAG}"
+fi
+if [ "${PRUNE}" = "1" ]; then
   echo
   "${HERE}/prune-backups.sh" "${DEST_DIR}"
 else
   echo "note: retention is OFF, so ${DEST_DIR} grows by one full database copy per run."
-  echo "      Enable it with TRUSTISSUES_BACKUP_PRUNE=1, or run scripts/prune-backups.sh."
+  echo "      Enable it with --prune (or TRUSTISSUES_BACKUP_PRUNE=1), or run scripts/prune-backups.sh."
 fi
 
 echo

@@ -126,8 +126,22 @@ MAX_AGE_HOURS="${TRUSTISSUES_DRILL_MAX_AGE_HOURS:-48}"
 #
 # A BLANK value is an unset line, not a typo, and falls back to the default via
 # the :- above rather than being refused. Same reading as prune-backups.sh.
-printf '%s' "${MAX_AGE_HOURS}" | grep -Eq '^[0-9]+$' \
-  || setup "TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check."
+#
+# `case`, not `grep -Eq '^[0-9]+$'`. grep is LINE oriented: ^ and $ anchor to a
+# line, not to the value, so it accepts anything whose FIRST LINE is digits.
+# `TRUSTISSUES_DRILL_MAX_AGE_HOURS=$'48\nfoo'` passed that regex, then
+# `[ "${AGE_HOURS}" -gt "48
+# foo" ]` is an "integer expression expected" error, which inside an `if ... && `
+# condition is simply FALSE, so the freshness check is skipped and the drill
+# prints DRILL PASSED on a snapshot of any age. Exactly the bypass the digits-only
+# rule was added to close, reached by a different encoding. A multi-line value is
+# reachable from an unterminated quote in backup.env: systemd keeps accumulating
+# lines inside an open quote, so `TRUSTISSUES_DRILL_MAX_AGE_HOURS="48` swallows
+# whatever comes next. Shell pattern matching has no concept of lines.
+case "${MAX_AGE_HOURS}" in
+  ''|*[!0-9]*)
+    setup "TRUSTISSUES_DRILL_MAX_AGE_HOURS must be a whole number of hours (digits only), got '${MAX_AGE_HOURS}'. Use 0 to disable the freshness check." ;;
+esac
 
 NOW_EPOCH="$(date -u +%s)"
 SNAP_EPOCH="$(snapshot_epoch "${SNAP_BASE}")"
