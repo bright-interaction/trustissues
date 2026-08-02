@@ -240,7 +240,7 @@ var redactPatterns = []redactPattern{
 		re:   regexp.MustCompile(`(?:[A-Fa-f0-9]{1,4}:){1,7}:|:(?::[A-Fa-f0-9]{1,4}){1,7}|(?:[A-Fa-f0-9]{1,4}:){1,6}:[A-Fa-f0-9]{1,4}`),
 	},
 	{
-		// Hostnames / FQDNs (crm.example.com, host.internal). Most general,
+		// Hostnames / FQDNs (crm.example.com, edge-node.internal). Most general,
 		// so it runs LAST; emails are already tokenized above, and shield
 		// markers contain no dotted FQDN so they are not re-matched.
 		kind: KindHostname,
@@ -432,7 +432,7 @@ var unambiguousSuffixes = map[string]bool{
 	"sg": true, "hk": true, "tw": true, "il": true, "ae": true, "sa": true,
 	"za": true, "ng": true, "ke": true,
 	// Internal / non-public suffixes: the case the hostname pattern's own
-	// comment calls out (host.internal).
+	// comment calls out (edge-node.internal).
 	"internal": true, "local": true, "lan": true, "corp": true,
 	"intranet": true, "arpa": true, "localhost": true, "onion": true,
 }
@@ -480,7 +480,7 @@ func looksLikeHostname(s string) bool {
 
 // hostSignal looks for structure that a member-access expression does not have:
 // three or more labels (api.eu.example.io), or a hyphen or digit inside a label
-// (host.local, db01.host). Identifiers are overwhelmingly two bare
+// (edge-node.local, db01.host). Identifiers are overwhelmingly two bare
 // alphabetic labels, which is exactly what this refuses.
 func hostSignal(s string) bool {
 	labels := strings.Split(s, ".")

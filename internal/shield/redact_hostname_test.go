@@ -63,9 +63,9 @@ func TestRealHostnamesStillTokenize(t *testing.T) {
 		// label. A two-bare-word host under an ambiguous TLD is deliberately
 		// NOT tokenized, which is the accepted cost of not mangling res.data.
 		hosts := []string{
-			"crm.example.com", "host.internal", "trustissues.brightinteraction.com",
+			"crm.example.com", "edge-node.internal", "vault.example.com",
 			"api.stripe.com", "db01.corp.local", "foo.se", "svc.cluster.lan",
-			"registry.example.io", "mail.example.dev", "host.io",
+			"registry.example.io", "mail.example.dev", "edge-node.io",
 			"api.eu.example.data", "db01.host",
 		}
 		for _, h := range hosts {

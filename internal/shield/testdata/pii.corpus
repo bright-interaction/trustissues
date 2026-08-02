@@ -34,7 +34,7 @@ secret	google key AIzaSyD-abcdefghijklmnopqrstuvwxyz01234 exposed
 secret	our own key ti_a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4 pasted
 secret	github token ghp_a123456789012345678901 committed
 hostname	connect to crm.example.com now
-hostname	host.internal is unreachable
+hostname	edge-node.internal is unreachable
 hostname	connect to skåne-db.example.se now
 
 # --- round-14 input classes (2026-07-30) ---
