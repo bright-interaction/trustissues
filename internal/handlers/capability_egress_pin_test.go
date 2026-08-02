@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -452,6 +453,50 @@ func TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret(t *testing.T) {
 		if row.Provider.String == "auth0" {
 			t.Fatalf("the provider was stored anyway; provider_meta then names the host the "+
 				"rotation scheduler dials: provider=%q", row.Provider.String)
+		}
+	})
+
+	t.Run("an editor cannot seed the ceiling by re-saving an unchanged provider", func(t *testing.T) {
+		// The narrower version of the case above, and the one an ablation found
+		// nothing covering.
+		//
+		// With provider_meta carrying an attacker tenant the provider WRITE is
+		// refused, so the seed is never reached and the seed's own gate is
+		// untested. Re-saving a provider that is already stored changes no host at
+		// all, so it sails past the write gate, and seedCapabilityDefaults then
+		// turns an entry whose owner deliberately left the ceiling EMPTY (no agent
+		// may spend this secret) into one with a live destination. That is a
+		// ceiling write in everything but name, and it belongs to the owner.
+		if err := env.queries.UpdateVaultEntryProvider(context.Background(), db.UpdateVaultEntryProviderParams{
+			Provider: sql.NullString{String: "stripe", Valid: true},
+			ID:       entryID,
+		}); err != nil {
+			t.Fatalf("establish the provider: %v", err)
+		}
+		env.forceDestinations(t, entryID, `[]`)
+
+		body, _ := json.Marshal(map[string]any{"provider": "stripe"})
+		rec := httptest.NewRecorder()
+		env.vault.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+entryID, editor, "user", entryID, string(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ABORT: re-saving an unchanged provider was refused (%d: %s), so this subtest never "+
+				"reaches the seed it is about", rec.Code, rec.Body.String())
+		}
+		if got := env.storedDestinations(t, entryID); got != "[]" {
+			t.Errorf("an editor's no-op provider save seeded the capability ceiling: %s\n"+
+				"The owner had left it empty, which is how a secret is kept off the agent bridge "+
+				"entirely, and enrolling a preset is the same act as writing the ceiling by hand", got)
+		}
+
+		// The positive half, or the fix is just a broken feature: the owner doing
+		// exactly the same thing DOES get the preset.
+		rec = httptest.NewRecorder()
+		env.vault.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+entryID, owner, "user", entryID, string(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("the owner could not enrol a provider on their own secret: %d %s", rec.Code, rec.Body.String())
+		}
+		if got := env.storedDestinations(t, entryID); !strings.Contains(got, "api.stripe.com") {
+			t.Errorf("the owner's provider enrolment did not seed the preset: %s", got)
 		}
 	})
 
