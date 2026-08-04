@@ -126,10 +126,23 @@ const DB_PRESET_LABELS = ['Host', 'Port', 'Database', 'SSL mode'];
 
 // Drop rows with no label and trim what remains, so blank editor rows never
 // reach the API. The value is kept as typed (may be intentionally empty).
+// cleanCustomFields normalizes the editor rows for the wire.
+//
+// `withheld` is CARRIED, not dropped. The server sets it on a secret field it did
+// not release to this caller and blanks the value, so a save that stripped the
+// flag would send a blank value that reads as a deliberate clear and would
+// replace a live credential permanently, with a 200 and a success toast. Sending
+// it back is what lets the server refuse the save and tell the operator to
+// reload.
 function cleanCustomFields(fields: CustomField[]): CustomField[] {
   return fields
     .filter((f) => f.label.trim() !== '')
-    .map((f) => ({ label: f.label.trim(), value: f.value, secret: f.secret }));
+    .map((f) => ({
+      label: f.label.trim(),
+      value: f.value,
+      secret: f.secret,
+      ...(f.withheld ? { withheld: true } : {}),
+    }));
 }
 
 // Editable list of custom fields used inside both the add and edit forms. Each
@@ -301,10 +314,20 @@ function CustomFieldsDisplay({ fields }: { fields: CustomField[] }) {
             >
               {field.label}
             </span>
-            <div className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-slate-700">
-              {visible ? field.value : '••••••••••••'}
+            <div
+              className={
+                'flex-1 break-all rounded px-2 py-1 font-mono ' +
+                (field.withheld ? 'bg-amber-50 text-amber-700' : 'bg-white text-slate-700')
+              }
+              title={
+                field.withheld
+                  ? 'This value was not released to you. It is unchanged on the server; saving this entry will be refused until you reload.'
+                  : undefined
+              }
+            >
+              {field.withheld ? 'not released to you' : visible ? field.value : '••••••••••••'}
             </div>
-            {field.secret && (
+            {field.secret && !field.withheld && (
               <button
                 onClick={() => toggleShown(index)}
                 className="rounded p-1 text-slate-400 hover:text-slate-600"
