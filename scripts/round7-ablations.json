@@ -1,0 +1,236 @@
+[
+  {
+    "id": "exit-asks-can-you-read-it-instead",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif !h.grantFor(ctx, chooser, h.instanceAdminByRecord(ctx, chooser), o.EntryID).use {",
+    "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
+    "why": "the question the six earlier rounds kept asking. A viewer HAS use on a shared secret by design, so 'can you reach it' is a yes and the exfiltration goes through"
+  },
+  {
+    "id": "exit-asks-can-you-manage-it-instead",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif !h.grantFor(ctx, chooser, h.instanceAdminByRecord(ctx, chooser), o.EntryID).manage {",
+    "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
+    "why": "round 3's mistake restated: manage is not the right to choose where a secret goes, and an accepted editor and manager both have it"
+  },
+  {
+    "id": "authority-says-yes-to-everything",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "func (h *VaultHandler) AuthorizeSecretExit(ctx context.Context, o secretexit.Origin, d secretexit.Destination) error {\n\tif d.IsCaller() {",
+    "new": "func (h *VaultHandler) AuthorizeSecretExit(ctx context.Context, o secretexit.Origin, d secretexit.Destination) error {\n\tif true {\n\t\treturn nil\n\t}\n\tif d.IsCaller() {",
+    "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
+    "why": "the one implementation of the rule stops deciding. Everything else in the construction survives, so this is what the wire assertions are actually for"
+  },
+  {
+    "id": "no-chooser-is-treated-as-allowed",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tchooser := d.ChoosingUser()\n\t\tif chooser == \"\" {",
+    "new": "\t\tchooser := d.ChoosingUser()\n\t\tif chooser == \"\" {\n\t\t\treturn nil\n\t\t}\n\t\tif false {",
+    "test": "TestOwnerRuleRefusesAnUnattributedDestination",
+    "why": "a target with no ConfiguredBy is exactly the row an older binary, an import or a restored backup leaves behind, and 'nobody to ask' must not resolve to 'allowed'"
+  },
+  {
+    "id": "owner-recorded-hosts-allows-anything",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tfor _, host := range d.Hosts().Hosts {\n\t\t\tif !recorded.Allows(host) {",
+    "new": "\t\tfor _, host := range d.Hosts().Hosts {\n\t\t\tif false && !recorded.Allows(host) {",
+    "test": "TestOwnerRecordedDestinationsIsNotJustTheColumnBackAgain",
+    "why": "the entry's-own-record branch stops being a check, so a destination_patterns row planted by anything other than the write gate is honoured again"
+  },
+  {
+    "id": "read-error-on-owner-hosts-opens-the-gate",
+    "mech": "fail-closed",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\t\treturn fmt.Errorf(\"the destinations recorded on %s could not be read, so its secret was not \"+\n\t\t\t\t\"sent anywhere: %w\", o.Describe(), err)",
+    "new": "\t\t\t_ = err\n\t\t\treturn nil",
+    "test": "TestOwnerRecordedDestinationsFailsClosedOnAReadError",
+    "why": "treating 'cannot tell' as 'allowed' is how a guard stops guarding without anybody noticing, and this one stands between a decrypted secret and a host somebody named"
+  },
+  {
+    "id": "planted-target-reauthorises-its-own-host",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\t\tif t.ConfiguredBy == \"\" || !h.mayConfigureDelivery(ctx, t.ConfiguredBy, entryID) {\n\t\t\t\tcontinue\n\t\t\t}",
+    "new": "\t\t\tif false {\n\t\t\t\tcontinue\n\t\t\t}",
+    "test": "TestOwnerRecordedDestinationsIsNotJustTheColumnBackAgain",
+    "why": "the owner's recorded set would be read out of the very rows it is supposed to be judging: a target planted by an editor would re-authorise its own host"
+  },
+  {
+    "id": "forgejo-skips-the-bearer-exit",
+    "mech": "chokepoint",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\tctx, bearer, err := secretexit.ExitString(ctx, tokenPlaintext,\n\t\tsecretexit.ToHost(\"this forgejo_secret delivery target's auth_token\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), host))",
+    "new": "\tctx, bearer, err := secretexit.ExitString(ctx, tokenPlaintext,\n\t\tsecretexit.ToHost(\"this forgejo_secret delivery target's auth_token\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), host))",
+    "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
+    "why": "the exit is called, with the wrong chooser. ChosenByTheInstance is the one kind the authority answers yes to unconditionally, so a call site that reaches for it is the sharpest misuse available"
+  },
+  {
+    "id": "webhook-skips-the-exit-chooser",
+    "mech": "chokepoint",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), hostFromRawURL(target.WebhookURL)))",
+    "new": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), hostFromRawURL(target.WebhookURL)))",
+    "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
+    "why": "the round-5 attack again, through the round-7 exit, with the chooser misstated"
+  },
+  {
+    "id": "receipt-check-is-a-no-op",
+    "mech": "chokepoint",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\trs, _ := ctx.Value(receiptKey).([]receipt)\n\tif len(rs) == 0 {\n\t\treturn fmt.Errorf(\"egress refused: an outbound request to %q was built with no secret-exit \"+",
+    "new": "\trs, _ := ctx.Value(receiptKey).([]receipt)\n\tif false {\n\t\treturn fmt.Errorf(\"egress refused: an outbound request to %q was built with no secret-exit \"+",
+    "test": "TestProviderDoFailsClosed",
+    "why": "a request built without going through the exit inherits permission instead of failing closed, which is how a NEW call site gets a free pass"
+  },
+  {
+    "id": "receipt-does-not-bind-the-host",
+    "mech": "chokepoint",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\tfor _, r := range rs {\n\t\tif !r.dest.hosts.Allows(host) {",
+    "new": "\tfor _, r := range rs {\n\t\tif false && !r.dest.hosts.Allows(host) {",
+    "test": "TestReceiptBindsTheHostTheExitWasAuthorisedFor",
+    "why": "claim a destination the owner allows, then send somewhere else. This is the residual an argument-shaped gate always leaves and the receipt is the only thing that closes it"
+  },
+  {
+    "id": "one-of-two-receipts-is-enough",
+    "mech": "chokepoint",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\tfor _, r := range rs {\n\t\tif !r.dest.hosts.Allows(host) {\n\t\t\treturn fmt.Errorf(\"egress refused: %s may only reach %s, and %q is not that. %s\",\n\t\t\t\tr.dest.what, r.dest.hosts.Describe(), NormalizeHost(host), r.origin.Describe())\n\t\t}\n\t}\n\treturn nil",
+    "new": "\tfor _, r := range rs {\n\t\tif r.dest.hosts.Allows(host) {\n\t\t\treturn nil\n\t\t}\n\t}\n\tif len(rs) > 0 {\n\t\treturn nil\n\t}\n\treturn nil",
+    "test": "TestReceiptBindsTheHostTheExitWasAuthorisedFor",
+    "why": "a forgejo delivery carries TWO secrets and 'some receipt allows it' is not 'every owner allowed it'. The round-6 case is exactly one allowed and one not"
+  },
+  {
+    "id": "zero-plaintext-releases-its-bytes",
+    "mech": "fail-closed",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\tif p.a == nil {\n\t\treturn ctx, nil, fmt.Errorf(\"%w: %s was not sent to %s\", ErrNoAuthority, p.o.Describe(), d.Describe())\n\t}",
+    "new": "\tif p.a == nil {\n\t\treturn ctx, p.b, nil\n\t}",
+    "test": "TestExitFailsClosed",
+    "why": "'nobody to ask' must mean 'no'. A handler assembled by hand, a test fixture or a future refactor would otherwise disable the rule silently"
+  },
+  {
+    "id": "zero-destination-is-allowed",
+    "mech": "fail-closed",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\tif d.chooser.kind == chooserNobody {",
+    "new": "\tif false {",
+    "test": "TestExitFailsClosed",
+    "why": "a Destination built with a struct literal instead of a constructor carries no chooser, and 'I forgot to ask' must not be spellable as 'I asked and was allowed'"
+  },
+  {
+    "id": "in-process-release-mints-a-receipt",
+    "mech": "chokepoint",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "\tout := ctx\n\tif d.kind == destNetwork {\n\t\tout = withReceipt(ctx, receipt{origin: p.o, dest: d})\n\t}",
+    "new": "\tout := withReceipt(ctx, receipt{origin: p.o, dest: d})",
+    "test": "TestReceiptBindsTheHostTheExitWasAuthorisedFor",
+    "why": "a local generator that grows an HTTP call would inherit permission to make it rather than failing closed for having no receipt"
+  },
+  {
+    "id": "plaintext-prints-itself",
+    "mech": "construction",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "func (p Plaintext) Format(f fmt.State, verb rune) { _, _ = io.WriteString(f, redaction) }",
+    "new": "func (p Plaintext) Format(f fmt.State, verb rune) { _, _ = f.Write(p.b) }",
+    "test": "TestPlaintextRedactsUnderEveryFormattingVerb",
+    "why": "the log and error-text exit. A secret interpolated into a slog line or a wrapped error is out of the process and nothing else in this design would notice"
+  },
+  {
+    "id": "plaintext-marshals-itself",
+    "mech": "construction",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "func (p Plaintext) MarshalJSON() ([]byte, error) { return []byte(strconv.Quote(redaction)), nil }",
+    "new": "func (p Plaintext) MarshalJSON() ([]byte, error) { return []byte(strconv.Quote(string(p.b))), nil }",
+    "test": "TestPlaintextRedactsUnderEveryFormattingVerb",
+    "why": "a response struct that happens to hold a Plaintext would serialise the secret to the caller with no exit call anywhere"
+  },
+  {
+    "id": "a-second-way-out-of-the-package",
+    "mech": "guard",
+    "file": "internal/secretexit/secretexit.go",
+    "old": "// Wipe zeroes the backing array. Best effort: any []byte already handed out by",
+    "new": "// Bytes is a second way out, added the way a real one would be.\nfunc (p Plaintext) Bytes() []byte { return p.b }\n\n// Wipe zeroes the backing array. Best effort: any []byte already handed out by",
+    "test": "TestExitIsTheOnlyWayOut",
+    "why": "the completeness claim is 'Exit is the only accessor'. A getter added tomorrow has to fail on the day it is written or the claim is a comment"
+  },
+  {
+    "id": "a-new-exit-nobody-wrote-down",
+    "mech": "guard",
+    "file": "internal/handlers/vault_keycheck.go",
+    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
+    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+    "test": "TestEveryExitIsRegistered",
+    "why": "the list is as much the deliverable as the code. A new exit has to fail loudly on the day it is written, naming the file, the way the providerHTTP.Do guard does"
+  },
+  {
+    "id": "a-second-implementation-of-the-rule",
+    "mech": "guard",
+    "file": "internal/handlers/vault_keycheck.go",
+    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
+    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+    "test": "TestVaultHandlerIsTheOnlyProductionAuthority",
+    "why": "round 5 is what a second copy of one rule costs: the write gate and the delivery gate both implemented it, disagreed about instance admins, and an admin's target was accepted and then silently never delivered"
+  },
+  {
+    "id": "instance-config-door-opens-an-entry-secret",
+    "mech": "guard",
+    "file": "internal/handlers/vault_keycheck.go",
+    "old": "\t_, err = gcm.Open(nil, packed[:gcm.NonceSize()], packed[gcm.NonceSize():], nil)\n\treturn err == nil\n}",
+    "new": "\t_, err = gcm.Open(nil, packed[:gcm.NonceSize()], packed[gcm.NonceSize():], nil)\n\treturn err == nil\n}\n\n// The instance-config door, pointed at a vault entry's value.\nfunc openAnEntryThroughTheWrongDoor(h *VaultHandler, ct, nonce []byte) ([]byte, error) {\n\treturn h.DecryptInstanceConfig(ct, nonce, 2)\n}",
+    "test": "TestOnlyTheAlertsPathDecryptsInstanceConfig",
+    "why": "DecryptInstanceConfig is the one door left that returns raw bytes, justified only by what it opens. A handler calling it routes around the exit entirely"
+  },
+  {
+    "id": "caller-exit-skips-the-read-question",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\tif !h.grantFor(ctx, who, h.instanceAdminByRecord(ctx, who), o.EntryID).read {",
+    "new": "\tif false {",
+    "test": "TestUnlockOnlyReleasesEntriesTheCallerMayRead",
+    "why": "the caller half of the exit stops asking, so a list query that widened by accident hands over rows the caller may not read"
+  },
+  {
+    "id": "unlock-does-not-go-through-the-exit",
+    "mech": "chokepoint",
+    "file": "internal/handlers/vault.go",
+    "old": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", userID))",
+    "new": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", row.UserID))",
+    "test": "TestUnlockOnlyReleasesEntriesTheCallerMayRead",
+    "why": "asking about the ENTRY OWNER instead of the caller. The owner always passes their own read check, so the question becomes a tautology and answers yes for every row the query returned"
+  },
+  {
+    "id": "chooser-branch-stops-asking",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif false {",
+    "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
+    "why": "THE PRE-FIX STATE. Nothing asked the origin-owner question for the auth_token secret, which is the round-6 break exactly"
+  },
+  {
+    "id": "chooser-branch-stops-asking-scheduler",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif false {",
+    "test": "TestTheSchedulerIsHeldToTheSameRule",
+    "why": "the same defect on the path that runs with nobody watching"
+  },
+  {
+    "id": "chooser-branch-stops-asking-matrix",
+    "mech": "owner-rule",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif false {",
+    "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
+    "why": "the same defect read across every principal class at once"
+  }
+]
