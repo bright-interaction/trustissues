@@ -816,8 +816,13 @@ func (h *VaultHandler) DecryptInstanceConfig(ciphertext, nonce []byte, encVersio
 // which is the rule internal/vaultfield enforces without exception: a
 // declaration belongs where the plaintext is produced, because that is the only
 // place that cannot be forgotten.
+// The column is notification_channels.config. The round-17 prose boundary and
+// the round-18 ledger both called it "alert_channels.config", a table this
+// database has never had, and nothing noticed for two rounds because no guard
+// ever compared the ledger to the schema. TestEveryLedgerColumnExistsInTheSchema
+// does now, and this was its first catch.
 var vaultFieldAlertChannelConfig = vaultfield.Declare(
-	"alert_channels.config", vaultfield.InstanceOwned, "",
+	"notification_channels.config", vaultfield.InstanceOwned, "",
 	"notification-channel configuration (a Slack webhook URL, relay credentials), written only through "+
 		"the admin-only notification-channel routes. It carries no entry's value: Dispatch sends the "+
 		"entry NAME and a redacted detail string. TestOnlyTheAlertsPathDecryptsInstanceConfig pins its "+
