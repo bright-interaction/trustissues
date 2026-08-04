@@ -105,6 +105,17 @@ type sqlCandidate struct {
 // The whole module, not just this package: a second writer of these columns in
 // cmd/ or in a future internal/scheduler would be exactly the "one more door"
 // this series keeps finding.
+//
+// THE SKIP RULE IS ANCHORED, and it did not use to be. This walk skipped by
+// directory BASENAME at any depth:
+//
+//	switch info.Name() { case ".git", "node_modules", "frontend", "docs", "scripts", "testdata": ... }
+//
+// so internal/handlers/scripts/, internal/docs/ or internal/frontend/ would have
+// been invisible to every guard built on it, and those are ordinary directory
+// names that the Go tool compiles into the binary like any other. A guard whose
+// coverage can be dropped by choosing a directory name is a guard with a
+// spelling for "not checked". See skipDirEntry for the rule that replaced it.
 func moduleGoFiles(t *testing.T) map[string]string {
 	t.Helper()
 	root := filepath.Join("..", "..")
@@ -114,8 +125,7 @@ func moduleGoFiles(t *testing.T) map[string]string {
 			return err
 		}
 		if info.IsDir() {
-			switch info.Name() {
-			case ".git", "node_modules", "frontend", "docs", "scripts", "testdata":
+			if skipDirEntry(root, path, info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -138,6 +148,52 @@ func moduleGoFiles(t *testing.T) map[string]string {
 			"the code and this guard is checking nothing", len(out))
 	}
 	return out
+}
+
+// notPartOfTheModule are directory basenames THE GO TOOL ITSELF ignores at any
+// depth, so a .go file inside one is not part of any package and cannot be
+// linked into the binary.
+//
+// This is the only class that may be skipped by basename, and the reason is that
+// the compiler agrees: cmd/go/internal/load treats a path element of "testdata",
+// or one beginning with "." or "_", as not-a-package. Skipping them is not a
+// coverage decision, it is reading the same rule the toolchain reads.
+//
+// internal/vaultfield/declscan/testdata holds the fixture that proves the
+// declaration scanner can see code nothing links, and it is reached by scanning
+// it EXPLICITLY. That only works while an implicit walk does not pick it up.
+var notPartOfTheModule = map[string]bool{"testdata": true}
+
+// projectDirsWithNoGo are directories that hold no Go at all. They are skipped
+// for speed and they are ANCHORED AT THE MODULE ROOT, because "frontend" or
+// "scripts" or "docs" nested inside a package is ordinary Go that the tool
+// builds and every guard here must read.
+var projectDirsWithNoGo = map[string]bool{
+	"frontend": true, "docs": true, "scripts": true, "node_modules": true,
+}
+
+// skipDirEntry decides whether a walk descends into a directory.
+//
+// root is the walk's starting path, dir is the path the walk handed over, and
+// name is its basename. The anchoring is the point: a root-relative match for
+// the project directories, a match at any depth only for the class the Go tool
+// itself ignores.
+func skipDirEntry(root, dir, name string) bool {
+	if notPartOfTheModule[name] {
+		return true
+	}
+	if name != "." && name != ".." && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+		return true
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		// Cannot place it under the root, so cannot claim it is a root-level
+		// project directory. Descend: over-reading is the safe direction for a
+		// guard that is looking for doors.
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return !strings.Contains(rel, "/") && projectDirsWithNoGo[rel]
 }
 
 // foldConstantString folds a compile-time-constant string expression, resolving

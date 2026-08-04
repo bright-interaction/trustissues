@@ -267,3 +267,19 @@ export interface OwnershipReport {
   entries: UnownedEntry[];
   total: number;
 }
+
+// What a claim took OUT of the row on its way in.
+//
+// The destinations recorded on an unowned entry were chosen by whoever held it
+// before the migration withheld its owner, and claiming ownership is what would
+// otherwise bring them back to life under the new owner's authority. So the
+// claim withdraws them and hands them back here. The admin re-enters the ones
+// they actually want, through the ordinary edit, with themselves as the
+// authority behind the write.
+export interface WithdrawnEvidence {
+  entry_id: string;
+  secret_owner_user_id: string;
+  cleared_destination_patterns: string[] | null;
+  cleared_provider_meta: Record<string, string> | null;
+  why: string;
+}

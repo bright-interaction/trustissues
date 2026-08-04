@@ -178,22 +178,53 @@ func (h *VaultHandler) authorizeSecretToCaller(ctx context.Context, o secretexit
 // ownerRecordedDestinations is every network host the OWNER of this entry has
 // recorded as somewhere its secret may go.
 //
-// Each source is a column whose write already requires the widening right, so
-// this is not a new rule, it is the same rule read back at delivery time:
+// EVERY SOURCE ANSWERS "WHOSE IS THIS". That sentence is the round-8 fix and it
+// used to be true of exactly one of the four:
 //
-//	the AI gateway pin           settings ai_key_*, AdminOnly, joined to a
-//	                             compile-time host table.
-//	destination_patterns         the capability ceiling. Widening it takes the
-//	                             creator or an admin (mayDirectSecretEgress).
-//	provider + provider_meta     the declared provider hosts. Widening them takes
-//	                             the same right (authorityForEgressChange).
-//	its own rotation targets     each target's host, but ONLY when its recorded
-//	                             ConfiguredBy still holds the widening right on
-//	                             THIS entry.
+//	the AI gateway pin           the INSTANCE's. An AdminOnly settings row joined
+//	                             to a compile-time host table. No member can
+//	                             write either side, so there is no narrower
+//	                             principal to ask about, and it CAPS rather than
+//	                             contributes.
+//	destination_patterns         the entry's RECORDED OWNER's, and counted only
+//	                             while that owner still holds the widening right
+//	                             on this entry.
+//	provider + provider_meta     split. The hosts a provider reaches with NO meta
+//	                             at all are compile-time constants and belong to
+//	                             nobody, so they always count. The hosts
+//	                             provider_meta chooses (datadog's site, grafana's
+//	                             instance, forgejo's whole base URL) are the
+//	                             owner's, under the same test as the ceiling.
+//	its own rotation targets     each target's recorded ConfiguredBy, under that
+//	                             same test. This one already did it.
 //
-// UNION, not enumeration-of-inputs. A caller cannot add to this set without
-// passing one of those gates, and a NEW host-choosing column contributes nothing
-// until somebody deliberately adds it here, which fails safe.
+// # Why the answer for steps 2 and 3 is "the owner's"
+//
+// Both columns are written through internal/vaultegress, and every wrapper there
+// refuses without an egressgate.Ticket for that entry and that field. A Ticket
+// that ADDS a destination is minted only when the authority oracle says yes, and
+// the oracle is mayDirectSecretEgress: the recorded owner, or an instance admin,
+// in both cases only while they still hold manage. So a host sitting in either
+// column was put there by the owner of the time or by an admin. Asking whether
+// the RECORDED OWNER may still direct this secret is therefore the same question
+// step 4 asks about ConfiguredBy, asked about the principal these two columns
+// record implicitly rather than in a field of their own.
+//
+// WHAT THAT FIXES. On a database where the round-7 adoption already ran, both
+// migrations withhold secret_owner_user_id and mayDirectSecretEgress refuses
+// everybody. Before this change that refusal governed step 4 alone, and the
+// attacker's planted ceiling and planted provider_meta still authorised their
+// own host: the migration cleared the ANSWER and left the QUESTION EVIDENCE in
+// place. Now an entry with no recorded owner records no destinations either,
+// which is the fail-closed reading of "nobody has answered".
+//
+// WHAT IT COSTS, stated rather than discovered. An entry whose owner is recorded
+// but who no longer holds manage (they were removed from the collection the
+// entry lives in) stops contributing recorded destinations, exactly as its
+// delivery targets already did. Settings -> Ownership is where an admin takes
+// such a row back, and ClaimSecretOwnership deliberately CLEARS the plantable
+// evidence as it does so, so a repair cannot silently re-arm a host the previous
+// holder chose.
 //
 // A read error is returned, never swallowed.
 func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID string) (secretexit.HostSet, error) {
@@ -218,6 +249,13 @@ func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID st
 		return secretexit.HostSet{}, fmt.Errorf("read entry %s: %w", entryID, err)
 	}
 
+	// WHOSE RECORD THIS IS, asked once for the two columns that record it
+	// implicitly. A read error denies, like every other read on this path.
+	ownerMayDirect, err := h.recordedOwnerMayDirect(ctx, entryID)
+	if err != nil {
+		return secretexit.HostSet{}, fmt.Errorf("read the recorded owner of entry %s: %w", entryID, err)
+	}
+
 	seen := map[string]bool{}
 	add := func(host string) {
 		x := secretexit.NormalizeHost(host)
@@ -228,23 +266,35 @@ func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID st
 		set.Hosts = append(set.Hosts, x)
 	}
 
-	// 2. destination_patterns, the capability ceiling.
-	for _, pat := range parseDestinationPatterns(meta.DestinationPatterns) {
-		if hostIsWildcarded(pat) {
-			// destMatches refuses to honour these at match time, so honouring
-			// them here would authorise a host the matcher would then reject,
-			// or worse the sibling domains it exists to keep out.
-			continue
+	// 2. destination_patterns, the capability ceiling. The owner's record, and
+	// it counts only while the owner is somebody who may direct this secret.
+	if ownerMayDirect {
+		for _, pat := range parseDestinationPatterns(meta.DestinationPatterns) {
+			if hostIsWildcarded(pat) {
+				// destMatches refuses to honour these at match time, so honouring
+				// them here would authorise a host the matcher would then reject,
+				// or worse the sibling domains it exists to keep out.
+				continue
+			}
+			host, _ := splitHostPath(strings.TrimSpace(pat))
+			add(host)
 		}
-		host, _ := splitHostPath(strings.TrimSpace(pat))
-		add(host)
 	}
 
 	// 3. provider + provider_meta, through the same declaration table the
 	// derivation gate uses, so "site: datadoghq.eu" is read as api.datadoghq.eu
 	// rather than as an opaque string.
+	//
+	// SPLIT BY WHO CHOSE THE HOST, not by which column it came out of. A fixed
+	// vendor host is a compile-time constant in providerEgress and no writable
+	// field moves it, so no principal has to vouch for it. A meta-derived host
+	// IS a writable field, and it is the round-4 class: it needs the same answer
+	// the ceiling needs.
 	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", vaultFieldProviderMeta))
-	declared := declaredProviderEgress(meta.Provider.String, providerMeta)
+	declared := metaIndependentProviderEgress(meta.Provider.String, providerMeta)
+	if ownerMayDirect {
+		declared = declaredProviderEgress(meta.Provider.String, providerMeta)
+	}
 	for _, host := range declared.Hosts {
 		add(host)
 	}
@@ -277,6 +327,35 @@ func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID st
 
 	sort.Strings(set.Hosts)
 	return set, nil
+}
+
+// recordedOwnerMayDirect answers "is there somebody recorded as this entry's
+// secret owner who may still choose where its plaintext goes".
+//
+// It is deliberately the SAME call step 4 makes about a rotation target's
+// ConfiguredBy, so the uniform rule is uniform by construction rather than by
+// two functions agreeing. mayConfigureDelivery resolves the admin question from
+// the users row, which is what keeps the write half and the delivery half from
+// disagreeing (round 5), and it refuses a principal who has lost manage.
+//
+// An EMPTY owner is not a principal, so it answers nothing and the caller counts
+// nothing. That is the migration's own ruling read back at delivery: 00034 and
+// 00035 withhold the owner on every row the database cannot prove, and a
+// withheld answer must not leave the evidence standing.
+//
+// The error is a READ error and is returned rather than folded into false, so a
+// caller cannot mistake "the database is unreachable" for "this entry has no
+// owner". Both deny; only one of them is worth an operator's attention.
+func (h *VaultHandler) recordedOwnerMayDirect(ctx context.Context, entryID string) (bool, error) {
+	info, err := h.queries.GetVaultEntryAccess(ctx, entryID)
+	if err != nil {
+		return false, err
+	}
+	owner := strings.TrimSpace(info.SecretOwnerUserID)
+	if owner == "" {
+		return false, nil
+	}
+	return h.mayConfigureDelivery(ctx, owner, entryID), nil
 }
 
 // hostFromRawURL pulls the host out of a stored URL. An unparseable value

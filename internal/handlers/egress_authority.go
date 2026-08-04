@@ -368,6 +368,51 @@ func declaredProviderEgress(provider string, meta map[string]string) egressAllow
 	return allow
 }
 
+// metaIndependentProviderEgress is the part of a provider's allowance that NO
+// writable field can move.
+//
+// It exists for the one question ownerRecordedDestinations has to ask about
+// step 3: which of these hosts did somebody CHOOSE, and which are compile-time
+// constants nobody had to vouch for. "openai -> api.openai.com" is written in
+// providerEgress and in the adapter; no column moves it, so it needs no
+// provenance. "forgejo -> whatever meta[instance] says" is the round-4 class and
+// is exactly what an attacker holding the row writes.
+//
+// The answer is computed rather than listed: resolve the allowance with the
+// entry's real meta, resolve it again with NO meta, and keep the intersection. A
+// provider whose hosts ignore meta yields the same set both times and loses
+// nothing. A provider whose hosts are built out of meta yields either nothing
+// (grafana, auth0, supabase, zitadel, forgejo, whose builders return nil for an
+// absent key) or its own vendor default (datadog's api.datadoghq.com), and keeps
+// only the host it would have reached with the column blank.
+//
+// Computing it means a NEW meta-derived provider is covered on the day it is
+// added, with nobody having to remember this function exists. Listing the
+// meta-derived providers here instead would be the enumeration-of-inputs shape
+// that rounds 3 through 6 kept losing to.
+//
+// Suffixes are carried through unchanged: only backblaze declares one, it is a
+// compile-time constant, and declaredProviderEgress reads it straight off the
+// declaration without consulting meta.
+func metaIndependentProviderEgress(provider string, meta map[string]string) egressAllowance {
+	withMeta := declaredProviderEgress(provider, meta)
+	blank := declaredProviderEgress(provider, nil)
+
+	keep := make(map[string]bool, len(blank.Hosts))
+	for _, h := range blank.Hosts {
+		keep[h] = true
+	}
+	var out egressAllowance
+	for _, h := range withMeta.Hosts {
+		if keep[h] {
+			out.Hosts = append(out.Hosts, h)
+		}
+	}
+	out.Suffixes = append(out.Suffixes, blank.Suffixes...)
+	sort.Strings(out.Hosts)
+	return out
+}
+
 // ── the write gate ──────────────────────────────────────────────────────────
 
 // egressChange is what one write does to an entry's reachable host set.
