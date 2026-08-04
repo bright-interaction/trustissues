@@ -66,8 +66,8 @@
     "id": "handwritten-alias-sql-in-a-handler",
     "mech": "chokepoint",
     "file": "internal/handlers/vault_target_purge.go",
-    "old": "func (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
-    "new": "func (h *VaultHandler) plantedAliasWrite(ctx context.Context, entryID, targets string) error {\n\t_, err := h.db.ExecContext(ctx,\n\t\t`UPDATE vault_entries AS ve SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?`,\n\t\ttargets, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "old": "func (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID string) string {",
+    "new": "func (h *VaultHandler) plantedAliasWrite(ctx context.Context, entryID, targets string) error {\n\t_, err := h.db.ExecContext(ctx,\n\t\t`UPDATE vault_entries AS ve SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?`,\n\t\ttargets, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID string) string {",
     "test": "TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn",
     "why": "THE SHAPE THAT BEAT ROUND 5. `UPDATE vault_entries AS ve SET rotation_targets` is invisible to `update\\s+vault_entries\\s+set`; SQLite refuses to prepare it against a schema where the column is GENERATED, whatever it is spelled like"
   },
@@ -85,8 +85,8 @@
     "id": "dynamic-sql-hides-the-statement",
     "mech": "chokepoint",
     "file": "internal/handlers/vault_target_purge.go",
-    "old": "func (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
-    "new": "func (h *VaultHandler) plantedDynamicWrite(ctx context.Context, col, entryID, v string) error {\n\t_, err := h.db.ExecContext(ctx, fmt.Sprintf(\"UPDATE vault_entries SET %s = ? WHERE id = ?\", col), v, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "old": "func (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID string) string {",
+    "new": "func (h *VaultHandler) plantedDynamicWrite(ctx context.Context, col, entryID, v string) error {\n\t_, err := h.db.ExecContext(ctx, fmt.Sprintf(\"UPDATE vault_entries SET %s = ? WHERE id = ?\", col), v, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID string) string {",
     "test": "TestEverySQLStatementInTheModuleIsACompileTimeConstant",
     "why": "the way to make a statement invisible to a guard that asks SQLite about statements: do not have one at compile time. Refusing the shape is what makes the prepare-based guard complete rather than merely broad"
   },
@@ -121,10 +121,10 @@
     "id": "provider-coverage-swallows-everything",
     "mech": "derivation",
     "file": "internal/handlers/vault_egress_writes.go",
-    "old": "\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {\n\t\treturn strings.HasSuffix(want, suffix) && len(want) > len(suffix)\n\t}\n\treturn false",
-    "new": "\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {\n\t\t_ = suffix\n\t\treturn true\n\t}\n\treturn false",
+    "old": "\tif have == want {\n\t\treturn true\n\t}\n\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {",
+    "new": "\tif have != \"\" {\n\t\treturn true\n\t}\n\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {",
     "test": "TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret",
-    "why": "a subsumption rule that says yes too often turns every widening into a no-op addition, and the oracle is never asked"
+    "why": "a subsumption rule that says yes to everything makes no provider_meta change look like an addition, which is round 4 reopened through the new gate"
   },
   {
     "id": "seed-preset-ignores-the-oracle",
