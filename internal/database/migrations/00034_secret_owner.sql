@@ -159,6 +159,83 @@ WHERE user_id != ''
 -- +goose StatementEnd
 
 -- +goose StatementBegin
+-- ===========================================================================
+-- A REPAIR MAY ONLY UNDO THIS MIGRATION'S OWN WORK
+-- ===========================================================================
+--
+-- 00035 and 00036 re-derive the withholding by re-running the predicate over
+-- the WHOLE table. That is right for the rows this migration decided about and
+-- wrong for every row created afterwards, because "is it in a collection" is
+-- outside the provable class and a shared entry created next week was stamped
+-- by its CREATING STATEMENT, which is the authority the whole design rests on.
+-- Re-running the predicate withdraws it anyway.
+--
+-- On an instance that takes 00034 in one deploy and 00035 in the next, that is
+-- every shared secret created in between: their scheduled rotation stops, and
+-- repairing each one DELETES its destination_patterns and host-choosing
+-- provider_meta. An availability outage produced by a security migration.
+--
+-- So this migration records what it looked at. A row absent from this table was
+-- never its business and no repair may touch it. That is narrower than "created
+-- after 00034", needs no clock and no reading of goose's own timestamps, and it
+-- stays true for a repair written later by somebody who never read this file.
+CREATE TABLE IF NOT EXISTS secret_owner_backfill (
+  entry_id      TEXT PRIMARY KEY,
+  decided_owner TEXT NOT NULL DEFAULT '',
+  decided_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+INSERT OR IGNORE INTO secret_owner_backfill (entry_id, decided_owner)
+SELECT id, secret_owner_user_id FROM vault_entries;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+-- ===========================================================================
+-- AN ADMIN'S DELIBERATE CLAIM IS A ROW, NOT A SENTENCE
+-- ===========================================================================
+--
+-- 00035 and 00036 need to know which ownerships an admin took deliberately, so
+-- they can spare those while withdrawing the ones nothing can prove. Both asked
+-- the activity log:
+--
+--   instr(al.detail, 'Entry ' || vault_entries.id || ':') > 0
+--
+-- and that detail is a prose sentence into which ClaimSecretOwnership
+-- interpolated the withdrawn destination_patterns and provider_meta VALUES,
+-- every one of them written by the previous holder of the row. instr() is
+-- unanchored, so the previous holder of entry A could put "Entry <B>:" in a
+-- field of A and spare a laundered ownership on B. Reproduced byte for byte.
+--
+-- The answer is not a better pattern. A claim is a fact the product knows at
+-- the moment it happens, so it gets a table, and nothing downstream reads a
+-- human-readable string to decide who owns a secret.
+CREATE TABLE IF NOT EXISTS secret_ownership_claims (
+  entry_id       TEXT PRIMARY KEY,
+  claimed_by     TEXT NOT NULL DEFAULT '',
+  claimed_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  withdrawn_json TEXT NOT NULL DEFAULT '{}'
+);
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+-- The historical rows, read with an ANCHORED match rather than instr().
+--
+-- The handler writes the repaired entry's id first and always, so position 1 is
+-- the one part of that sentence no caller can move. Anchoring is what makes
+-- reading the old format safe, and it is the last time anything reads it.
+INSERT OR IGNORE INTO secret_ownership_claims (entry_id, claimed_by)
+SELECT ve.id, ''
+FROM vault_entries ve
+WHERE EXISTS (
+  SELECT 1 FROM activity_log al
+  WHERE al.action = 'vault.ownership_claimed'
+    AND substr(al.detail, 1, length('Entry ' || ve.id || ':')) = 'Entry ' || ve.id || ':'
+);
+-- +goose StatementEnd
+
+-- +goose StatementBegin
 -- Tell the operator, durably, in the surface they already read. A fail-closed
 -- migration that strands secrets silently is its own outage; this row is what
 -- makes the Activity page say so on the first login after the deploy, and it
