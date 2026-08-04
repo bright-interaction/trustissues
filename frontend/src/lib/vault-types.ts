@@ -13,6 +13,11 @@ export interface CustomField {
   label: string;
   value: string;
   secret: boolean;
+  // Set by the server when a secret:true field was NOT released to this caller.
+  // The value comes back blank in that case, so a form that dropped this flag on
+  // save would write the blank over the real secret. It is carried back on every
+  // save and the server refuses any array containing one.
+  withheld?: boolean;
 }
 
 export interface VaultEntry {
