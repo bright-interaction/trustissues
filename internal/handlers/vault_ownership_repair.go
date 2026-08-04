@@ -221,7 +221,7 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	withdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID)
+	withdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID, actor)
 	if wErr != nil {
 		logError(r, "vault.ownership: could not clear the recorded destinations", "entry", entryID,
 			"error", wErr)
@@ -369,7 +369,25 @@ func (wd withdrawnEvidence) auditSuffix() string {
 // authority oracle, and that is the same rule that keeps "clear the ceiling"
 // available as the product's only per-secret agent revocation.
 func (h *VaultHandler) disarmRecordedDestinations(ctx context.Context, q *db.Queries,
-	entryID string) (withdrawnEvidence, error) {
+	entryID, actor string) (withdrawnEvidence, error) {
+	// THE ORACLE THIS DISARM ANSWERS TO.
+	//
+	// It used to pass none, which meant egressgate.Decide denied any request it
+	// read as a widening, and a disarm CAN read as one: clearing datadog's "site"
+	// does not remove a host, it swaps api.datadoghq.eu for the compile-time
+	// default api.datadoghq.com. Added() sees a host that was not there before,
+	// MayRedirect was nil, the disarm returned DeniedError, and the handler 500d.
+	// Every datadog entry on a regional site was therefore permanently
+	// unrepairable, and Settings -> Ownership is the page the migration notice
+	// sends the operator to. datadoghq.eu is what an EU-sovereign product's
+	// customers are on.
+	//
+	// The honest question is not "is this a narrowing" but "may this principal
+	// direct this secret", and the answer is the same oracle every other egress
+	// decision uses. instanceAdminByRecord reads the users row, so it is not
+	// affected by the ownership transfer happening in this same transaction,
+	// which a mayConfigureDelivery call here would not yet be able to see.
+	mayRedirect := func() bool { return h.instanceAdminByRecord(ctx, actor) }
 
 	wd := withdrawnEvidence{
 		Why: "nothing was recorded on this entry, so the claim withdrew nothing",
@@ -383,10 +401,11 @@ func (h *VaultHandler) disarmRecordedDestinations(ctx context.Context, q *db.Que
 	if stored := parseDestinationPatterns(meta.DestinationPatterns); len(stored) > 0 {
 		wd.DestinationPatterns = stored
 		tk, dErr := egressgate.Decide(egressgate.Request{
-			EntryID: entryID,
-			What:    vaultegress.FieldDestinations,
-			Before:  ceilingDestinations(stored),
-			After:   nil,
+			EntryID:     entryID,
+			What:        vaultegress.FieldDestinations,
+			Before:      ceilingDestinations(stored),
+			After:       nil,
+			MayRedirect: mayRedirect,
 		})
 		if dErr != nil {
 			return wd, fmt.Errorf("decide the ceiling clear: %w", dErr)
@@ -415,11 +434,12 @@ func (h *VaultHandler) disarmRecordedDestinations(ctx context.Context, q *db.Que
 	if len(cleared) > 0 {
 		wd.ProviderMetaKeys = cleared
 		tk, dErr := egressgate.Decide(egressgate.Request{
-			EntryID: entryID,
-			What:    vaultegress.FieldProviderMeta,
-			Before:  providerDestinations(meta.Provider.String, stored),
-			After:   providerDestinations(meta.Provider.String, next),
-			Covers:  providerDestinationCovers,
+			EntryID:     entryID,
+			What:        vaultegress.FieldProviderMeta,
+			Before:      providerDestinations(meta.Provider.String, stored),
+			After:       providerDestinations(meta.Provider.String, next),
+			Covers:      providerDestinationCovers,
+			MayRedirect: mayRedirect,
 		})
 		if dErr != nil {
 			return wd, fmt.Errorf("decide the provider_meta clear: %w", dErr)
