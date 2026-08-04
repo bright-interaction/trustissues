@@ -412,3 +412,78 @@ func TestAnEntryNameCarriesForeignEntryIDsIntoTheMoveDetail(t *testing.T) {
 			len(hit), detail, hit)
 	}
 }
+
+// TestTheStrandedEntryIsVISIBLEToTheAdminWhoHasToRepairIt is the operator half
+// of the stranded-row fix.
+//
+// Making the claim route accept these rows is not enough. GET
+// /api/admin/vault/ownership listed exactly "secret_owner_user_id = ”", which
+// is the set the backfill withheld and NOT the set of entries that cannot accept
+// a delivery destination. A row whose recorded owner was removed from the
+// collection has an owner column that still names somebody, so it never
+// appeared, and an admin cannot repair a row they cannot find. That is the state
+// where an operator reaches for sqlite3, which is the laundering step with a
+// human running it.
+func TestTheStrandedEntryIsVISIBLEToTheAdminWhoHasToRepairIt(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	owner := mustUser(t, queries, "visible-owner@example.com", "user", "owner-login-password")
+	manager := mustUser(t, queries, "visible-manager@example.com", "user", "manager-login-password")
+	admin := mustUser(t, queries, "visible-admin@example.com", "admin", "admin-login-password")
+	mustCollection(t, queries, "c-visible", owner, map[string]string{
+		owner: collRoleManager, manager: collRoleManager,
+	})
+
+	const strandedID = "entry-visible-stranded"
+	mustEntry(t, h, queries, strandedID, owner, "team-key-visible", "sk_live_VISIBLE")
+	placeInCollection(t, queries, strandedID, "c-visible")
+
+	// A healthy entry the same admin owns, which must NOT be listed. Without it
+	// a handler that returns every entry on the instance passes.
+	const healthyID = "entry-visible-healthy"
+	mustEntry(t, h, queries, healthyID, admin, "admin-own-key", "sk_live_HEALTHY")
+
+	before := httptest.NewRecorder()
+	h.ListUnownedEntries(before, vaultAuthzRequest(http.MethodGet,
+		"/api/admin/vault/ownership", admin, "admin", "", ""))
+	if strings.Contains(before.Body.String(), strandedID) {
+		t.Fatalf("ABORT: the entry is listed before it is stranded, so the assertion below proves "+
+			"nothing.\n  %s", before.Body.String())
+	}
+
+	// THE ONE CALL. Manager-gated, nothing written on the entry.
+	if _, err := queries.RemoveCollectionMember(ctx, db.RemoveCollectionMemberParams{
+		CollectionID: "c-visible", UserID: owner,
+	}); err != nil {
+		t.Fatalf("remove the owner from the collection: %v", err)
+	}
+	stillDirects, err := h.recordedOwnerMayDirect(ctx, strandedID)
+	if err != nil {
+		t.Fatalf("recordedOwnerMayDirect: %v", err)
+	}
+	if stillDirects {
+		t.Skip("the recorded owner still directs, so there is nothing stranded to list")
+	}
+
+	after := httptest.NewRecorder()
+	h.ListUnownedEntries(after, vaultAuthzRequest(http.MethodGet,
+		"/api/admin/vault/ownership", admin, "admin", "", ""))
+	if after.Code != http.StatusOK {
+		t.Fatalf("the ownership list failed: %d %s", after.Code, after.Body.String())
+	}
+	body := after.Body.String()
+	if !strings.Contains(body, strandedID) {
+		t.Fatalf("THE STRANDED ENTRY IS INVISIBLE ON THE PAGE THAT REPAIRS IT.\n"+
+			"  entry %s records an owner who may no longer direct it, so it contributes no "+
+			"destinations\n  GET /api/admin/vault/ownership -> %s", strandedID, body)
+	}
+	if !strings.Contains(body, owner) {
+		t.Errorf("the row does not name the owner of record, so an admin cannot tell this apart "+
+			"from a row the migration withheld.\n  %s", body)
+	}
+	if strings.Contains(body, healthyID) {
+		t.Errorf("a healthy entry with a live owner was listed too; this page would be every entry "+
+			"on the instance.\n  %s", body)
+	}
+}

@@ -1222,7 +1222,7 @@ function OwnershipTab() {
     <div className="max-w-3xl space-y-6">
       <div className={cardClass}>
         <h2 className="text-sm font-semibold text-slate-900">
-          Secrets with no recorded owner
+          Secrets that cannot accept a delivery destination
         </h2>
         <p className="mt-1 text-sm text-slate-500">
           Every secret records the principal whose authority decides where its
@@ -1233,6 +1233,13 @@ function OwnershipTab() {
           <span className="font-medium text-slate-700">new</span> delivery
           destinations, and existing webhook or Forgejo targets that a non-admin
           configured stay unauthorised, until an admin takes ownership here.
+        </p>
+        <p className="mt-3 text-sm text-slate-500">
+          The list also includes entries that do record an owner who can no
+          longer reach them. Removing someone from a collection is enough:
+          nothing is written on the entry, and it silently stops contributing
+          every destination it has. Those rows are marked{' '}
+          <span className="font-medium text-slate-700">owner unreachable</span>.
         </p>
         <p className="mt-3 text-sm text-slate-500">
           Claiming makes you the owner and the custodian of that one entry. It
@@ -1342,6 +1349,12 @@ function OwnershipTab() {
                         {entry.collection_name}
                       </span>
                     )}
+                    {entry.recorded_owner_user_id && (
+                      <span className="flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">
+                        <AlertTriangle className="h-3 w-3" />
+                        owner unreachable
+                      </span>
+                    )}
                     {entry.adoption_recorded && (
                       <span className="flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">
                         <AlertTriangle className="h-3 w-3" />
@@ -1351,6 +1364,14 @@ function OwnershipTab() {
                   </div>
                   <p className="mt-1 text-xs text-slate-500">
                     Held by {entry.custodian_email || entry.custodian_user_id}
+                    {entry.recorded_owner_user_id && (
+                      <>
+                        {' '}
+                        &middot; owner of record{' '}
+                        {entry.recorded_owner_email ||
+                          entry.recorded_owner_user_id}
+                      </>
+                    )}
                   </p>
                   <p className="mt-1 text-xs text-slate-500">{entry.why}</p>
                 </div>

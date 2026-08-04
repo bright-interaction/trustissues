@@ -63,6 +63,11 @@ type unownedEntry struct {
 	AdoptionRecorded bool   `json:"adoption_recorded"`
 	CreatedAt        string `json:"created_at"`
 	UpdatedAt        string `json:"updated_at"`
+	// RecordedOwnerUserID is set only for the second class below: a row that HAS
+	// an owner who may no longer direct it. Empty for the backfill's own rows,
+	// which is what the page already knew how to render.
+	RecordedOwnerUserID string `json:"recorded_owner_user_id"`
+	RecordedOwnerEmail  string `json:"recorded_owner_email"`
 	// Why is the operator-facing reason this row has no owner, in the words the
 	// migration would use. It is derived here rather than stored, because the
 	// migration cannot write a per-row explanation into a column the exit reads.
@@ -112,8 +117,87 @@ func (h *VaultHandler) ListUnownedEntries(w http.ResponseWriter, r *http.Request
 		e.Why = whyNoRecordedOwner(e)
 		report.Entries = append(report.Entries, e)
 	}
+	// THE SECOND CLASS: a row that HAS a recorded owner who can no longer direct
+	// it.
+	//
+	// The list used to be exactly "secret_owner_user_id = ''", which is the set
+	// the backfill withheld. That is not the set of entries that cannot accept a
+	// delivery destination. ownerRecordedDestinations counts a recorded owner's
+	// destinations only while that owner still holds manage, so a collection
+	// manager runs DELETE /api/collections/{id}/members/{owner}, writes nothing
+	// on the entry, and the entry silently stops contributing every destination
+	// it has. Its owner column still names somebody, so it never appeared here.
+	//
+	// An admin who cannot SEE a stranded row cannot repair it, and the whole
+	// reason this page exists is that an operator with no surface reaches for
+	// sqlite3 instead. The claim route accepts these now; this is how they are
+	// found.
+	expired, xErr := h.expiredOwnerEntries(ctx)
+	if xErr != nil {
+		logError(r, "vault.ownership: expired-owner scan failed", "error", xErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	report.Entries = append(report.Entries, expired...)
+
 	report.Total = len(report.Entries)
 	writeJSON(w, http.StatusOK, report)
+}
+
+// expiredOwnerEntries lists entries whose recorded owner may no longer direct
+// the secret.
+//
+// Raw SQL rather than a generated query because the authority question is not
+// expressible in it: "may this principal still direct this secret" is
+// mayConfigureDelivery, which resolves collection membership and the admin flag
+// from rows this select does not join. So the SQL narrows to entries that have
+// an owner at all, and the oracle decides, one row at a time. Admin-only route,
+// bounded by the instance's own vault.
+func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry, error) {
+	rows, err := h.db.QueryContext(ctx, `
+		SELECT e.id, e.name, e.user_id, e.collection_id, e.created_at, e.updated_at,
+		       COALESCE(cu.email, ''), COALESCE(c.name, ''),
+		       e.secret_owner_user_id, COALESCE(ou.email, '')
+		FROM vault_entries e
+		LEFT JOIN users cu ON cu.id = e.user_id
+		LEFT JOIN users ou ON ou.id = e.secret_owner_user_id
+		LEFT JOIN collections c ON c.id = e.collection_id
+		WHERE e.secret_owner_user_id != ''
+		ORDER BY e.created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list entries with a recorded owner: %w", err)
+	}
+	defer rows.Close()
+
+	out := []unownedEntry{}
+	for rows.Next() {
+		var e unownedEntry
+		var collectionID, createdAt, updatedAt sql.NullString
+		if sErr := rows.Scan(&e.ID, &e.Name, &e.CustodianUserID, &collectionID, &createdAt,
+			&updatedAt, &e.CustodianEmail, &e.CollectionName, &e.RecordedOwnerUserID,
+			&e.RecordedOwnerEmail); sErr != nil {
+			return nil, fmt.Errorf("scan entry with a recorded owner: %w", sErr)
+		}
+		e.CollectionID = collectionID.String
+		e.CreatedAt = createdAt.String
+		e.UpdatedAt = updatedAt.String
+
+		live, lErr := h.recordedOwnerMayDirect(ctx, e.ID)
+		if lErr != nil {
+			// A read error is not "this row is fine". Skipping it would hide a
+			// stranded entry behind a transient database problem, and the operator
+			// would see a shorter list rather than an error.
+			return nil, fmt.Errorf("read the recorded owner of %s: %w", e.ID, lErr)
+		}
+		if live {
+			continue
+		}
+		e.Why = "this entry records a secret owner who can no longer reach it, so it contributes no " +
+			"delivery destinations at all. Nothing was written on the entry: the recorded owner was " +
+			"removed from the collection it lives in, which any manager of that collection can do"
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // whyNoRecordedOwner says, per row, which branch of the backfill withheld it.

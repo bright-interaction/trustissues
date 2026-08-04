@@ -261,6 +261,11 @@ export interface UnownedEntry {
   created_at: string;
   updated_at: string;
   why: string;
+  // Set only for the second class on this page: an entry that HAS a recorded
+  // owner who may no longer direct it, because they were removed from the
+  // collection it lives in. Empty for the rows the upgrade itself withheld.
+  recorded_owner_user_id: string;
+  recorded_owner_email: string;
 }
 
 export interface OwnershipReport {
