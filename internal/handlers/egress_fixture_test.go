@@ -79,8 +79,18 @@ func setRotationTargetsFixture(t *testing.T, q *db.Queries, p vaultegress.Rotati
 // createVaultEntryFixture is the fixture form of "a user creates an entry". The
 // row carries the caller's own user_id, so the principal the oracle would name
 // is the caller, exactly as in VaultHandler.Create.
+//
+// SecretOwnerUserID defaults to UserID here for the same reason Create sets them
+// equal: at creation the custodian and the owner ARE the same principal, and
+// they diverge only when a collection manager later adopts the entry. A fixture
+// that left the owner empty would be modelling a row no creating statement in
+// the product can produce (TestEveryRowCreatingStatementNamesTheSecretOwner
+// proves that), so tests built on it would be testing a state that cannot exist.
 func createVaultEntryFixture(t *testing.T, q *db.Queries, p vaultegress.CreateEntryParams) error {
 	t.Helper()
+	if p.SecretOwnerUserID == "" {
+		p.SecretOwnerUserID = p.UserID
+	}
 	return vaultegress.CreateEntry(context.Background(), q,
 		fixtureEgressTicket(t, p.ID, vaultegress.FieldProvider), p)
 }

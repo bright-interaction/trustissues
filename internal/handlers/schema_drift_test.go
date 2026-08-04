@@ -35,8 +35,8 @@ var tableDecl = "CREATE TABLE " + "vault_entries"
 // like newCollectionAuthzEnv does; until then this keeps them honest.
 func TestHandRolledFixturesMatchTheRealSchema(t *testing.T) {
 	required := []string{
-		"id", "user_id", "name", "encrypted_value", "nonce", "encryption_version",
-		"collection_id", "custom_fields", "destination_patterns",
+		"id", "user_id", "secret_owner_user_id", "name", "encrypted_value", "nonce",
+		"encryption_version", "collection_id", "custom_fields", "destination_patterns",
 		"provider", "provider_meta", "rotation_targets", "rotation_log",
 		"last_rotated_at", "last_rotation_error", "updated_at", "created_at",
 	}

@@ -305,18 +305,26 @@ type entrySecretSource interface {
 		o secretexit.Origin) (secretexit.Plaintext, error)
 }
 
-// SCOPE BOUNDARY, STATED RATHER THAN ASSUMED.
+// SCOPE BOUNDARY, DERIVED RATHER THAN LISTED.
 //
-// The exit governs the plaintext of vault_entries.encrypted_value: the client
-// credential this product exists to hold. Two other encrypted things in the tree
-// are deliberately NOT vault entry secrets and do not pass through it:
+// This used to be a prose paragraph naming the two encrypted things that are
+// deliberately outside the exit, introduced with the words "so the boundary is a
+// decision rather than an oversight". It had already rotted when it shipped: it
+// named alert_channels.config and the smtp_password setting and missed
+// vault_entries.custom_fields, which is AES-encrypted at rest exactly like the
+// value, can hold operator-designated secret material, and was written into a
+// response body with no destination, no chooser, no receipt and no entry in
+// theExitList.
 //
-//   - alert_channels.config (VaultHandler.DecryptInstanceConfig). Written only
-//     through the AdminOnly notification-channel routes, belongs to the instance,
-//     and never carries an entry's value: Dispatch sends the entry NAME and a
-//     redacted detail string, never the secret.
-//   - the smtp_password setting (resolveSMTPPassword, internal/columncrypto).
-//     Same shape: an AdminOnly settings row holding the relay credential.
+// A list of what is out of scope is exactly the kind of claim that rots, and a
+// rotted one reads as coverage. So the list is theEncryptedFieldLedger in
+// encrypted_field_ledger.go, and TestEveryEncryptedFieldIsClassified derives the
+// REAL set from the module's AST (every decryptColumnOrLog field literal, every
+// columncrypto decrypt site, every OpenEntrySecret, every DecryptInstanceConfig)
+// and fails in both directions. A NEW encrypted field has to be CLASSIFIED
+// rather than forgotten, and a classification of something that no longer exists
+// fails too.
 //
-// Both are named here so the boundary is a decision rather than an oversight,
-// and both have structural guards on their caller sets.
+// Two fields are classified as going through the exit: encrypted_value, which is
+// what this whole construction is about, and custom_fields, which is now routed
+// through VaultHandler.customFieldsForCaller.

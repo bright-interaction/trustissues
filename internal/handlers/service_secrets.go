@@ -154,19 +154,17 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 	// so operators can see "service asked for X but vault has no X".
 	secrets := make(map[string]string, len(allowed))
 	missing := make([]string, 0)
-	// Defense-in-depth: the decrypted values are copied into `secrets` as
-	// strings for the JSON response, but the []byte plaintext slices returned
-	// by DecryptValue linger on the heap until GC. Zero their backing arrays
-	// once the response has been written (deferred, so it runs after writeJSON
-	// below). Best-effort: the string copies cannot be wiped, only the slices.
-	var plaintexts [][]byte
-	defer func() {
-		for _, p := range plaintexts {
-			for i := range p {
-				p[i] = 0
-			}
-		}
-	}()
+	// The deferred wipe that used to live here is gone, and this note is what
+	// replaces it. It walked a `plaintexts [][]byte` slice that round 7 stopped
+	// appending to when the decrypt started returning an opaque type, so it was a
+	// loop over an always-empty slice under a comment describing a protection
+	// that no longer happened there. Dead code claiming a security property is
+	// worse than no code: the next reader takes the claim at face value.
+	//
+	// The wipe is now pt.Wipe() at the point of use below, which is strictly
+	// better (immediately after the value is taken, not after the response is
+	// written). What still cannot be wiped is the string copies in `secrets`, and
+	// that was true before too.
 	for _, name := range allowed {
 		row, qerr := h.queries.GetVaultEntryForServiceFetch(r.Context(), db.GetVaultEntryForServiceFetchParams{
 			Name:   name,

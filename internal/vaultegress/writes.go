@@ -129,8 +129,13 @@ type RotationTargetsParams struct {
 // CreateEntryParams inserts a vault entry, which carries provider and
 // provider_meta on the INSERT.
 type CreateEntryParams struct {
-	ID                   string
-	UserID               string
+	ID     string
+	UserID string
+	// SecretOwnerUserID is the principal whose authority governs this entry's
+	// plaintext at the exit. On creation it is the creator, i.e. UserID; the two
+	// diverge only when a collection manager later ADOPTS the entry, which moves
+	// the custodian and deliberately does not move this.
+	SecretOwnerUserID    string
 	Name                 string
 	EncryptedValue       []byte
 	Nonce                []byte
@@ -247,6 +252,7 @@ func CreateEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Cre
 	return writer(q).CreateVaultEntry(ctx, egressq.CreateVaultEntryParams{
 		ID:                   p.ID,
 		UserID:               p.UserID,
+		SecretOwnerUserID:    p.SecretOwnerUserID,
 		Name:                 p.Name,
 		EncryptedValue:       p.EncryptedValue,
 		Nonce:                p.Nonce,

@@ -207,23 +207,38 @@ func (q *Queries) GetCollectionMembership(ctx context.Context, arg GetCollection
 
 const getVaultEntryAccess = `-- name: GetVaultEntryAccess :one
 
-SELECT user_id, collection_id FROM vault_entries WHERE id = ?
+SELECT user_id, secret_owner_user_id, collection_id FROM vault_entries WHERE id = ?
 `
 
 type GetVaultEntryAccessRow struct {
-	UserID       string         `json:"user_id"`
-	CollectionID sql.NullString `json:"collection_id"`
+	UserID            string         `json:"user_id"`
+	SecretOwnerUserID string         `json:"secret_owner_user_id"`
+	CollectionID      sql.NullString `json:"collection_id"`
 }
 
 // ============================================================================
 // Collection-aware vault-entry access
 // ============================================================================
-// Returns the owner and collection of an entry so the handler can authorize a
-// single-entry operation (personal: owner-or-admin; collection: member role).
+// Returns the custodian, the SECRET OWNER and the collection of an entry so the
+// handler can authorize a single-entry operation (personal: owner-or-admin;
+// collection: member role).
+//
+// Two owner columns, because they answer two questions and conflating them is
+// what made round 7's gate decorative on one path:
+//
+//	user_id               the CUSTODIAN. grantFor's isCreator, the
+//	                      UNIQUE(user_id, name) namespace, the listing scope. A
+//	                      collection MANAGER moves it to themselves by adopting
+//	                      an orphaned entry, which is legitimate and is what
+//	                      keeps a rename from being an oracle over a colleague's
+//	                      private vault.
+//	secret_owner_user_id  the OWNER the EXIT asks about (mayDirectSecretEgress).
+//	                      Adoption does not move it, and nothing else in the
+//	                      module can: see internal/vaultegress.
 func (q *Queries) GetVaultEntryAccess(ctx context.Context, id string) (GetVaultEntryAccessRow, error) {
 	row := q.db.QueryRowContext(ctx, getVaultEntryAccess, id)
 	var i GetVaultEntryAccessRow
-	err := row.Scan(&i.UserID, &i.CollectionID)
+	err := row.Scan(&i.UserID, &i.SecretOwnerUserID, &i.CollectionID)
 	return i, err
 }
 

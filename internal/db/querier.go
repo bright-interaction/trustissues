@@ -257,8 +257,22 @@ type Querier interface {
 	// ============================================================================
 	// Collection-aware vault-entry access
 	// ============================================================================
-	// Returns the owner and collection of an entry so the handler can authorize a
-	// single-entry operation (personal: owner-or-admin; collection: member role).
+	// Returns the custodian, the SECRET OWNER and the collection of an entry so the
+	// handler can authorize a single-entry operation (personal: owner-or-admin;
+	// collection: member role).
+	//
+	// Two owner columns, because they answer two questions and conflating them is
+	// what made round 7's gate decorative on one path:
+	//
+	//   user_id               the CUSTODIAN. grantFor's isCreator, the
+	//                         UNIQUE(user_id, name) namespace, the listing scope. A
+	//                         collection MANAGER moves it to themselves by adopting
+	//                         an orphaned entry, which is legitimate and is what
+	//                         keeps a rename from being an oracle over a colleague's
+	//                         private vault.
+	//   secret_owner_user_id  the OWNER the EXIT asks about (mayDirectSecretEgress).
+	//                         Adoption does not move it, and nothing else in the
+	//                         module can: see internal/vaultegress.
 	GetVaultEntryAccess(ctx context.Context, id string) (GetVaultEntryAccessRow, error)
 	// On-demand path: fetch a single entry (with its secret + rotation fields) by
 	// id, with NO auto_rotate filter. This backs the manual Rotate and ValidateKey
@@ -303,6 +317,14 @@ type Querier interface {
 	// ============================================================================
 	// Import - bulk insert (used inside transaction)
 	// ============================================================================
+	// secret_owner_user_id is written HERE, on the INSERT, alongside user_id.
+	//
+	// Every statement that creates a vault entry has to name both, and
+	// TestEveryRowCreatingStatementNamesTheSecretOwner proves it against SQLite
+	// rather than against a reviewer: a row inserted with the column left at its ''
+	// default has no owner at all, so mayDirectSecretEgress refuses everyone and the
+	// importer silently loses the ability to configure delivery for what they just
+	// imported. Forgetting must be a red test, not a feature that quietly stops.
 	ImportVaultEntry(ctx context.Context, arg ImportVaultEntryParams) error
 	InsertActivity(ctx context.Context, arg InsertActivityParams) error
 	// ============================================================================
@@ -443,9 +465,12 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
-	// Re-own ONE entry, so a single name collision cannot block the rest.
-	ReassignCollectionVaultEntryOwner(ctx context.Context, arg ReassignCollectionVaultEntryOwnerParams) (sql.Result, error)
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
+	// Re-owning ONE entry (so a single name collision cannot block the rest) is
+	// vaultegress.TransferSecretOwnership now. The statement moved to
+	// internal/vaultegress/queries because it writes secret_owner_user_id, the
+	// column the exit resolves "whose secret is this" from, and that column has
+	// exactly one post-creation writer by construction rather than by convention.
 	// Used only to de-duplicate on re-ownership when the new owner already has an
 	// entry by that name.
 	RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error)

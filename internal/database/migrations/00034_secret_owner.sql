@@ -1,0 +1,43 @@
+-- +goose Up
+-- +goose StatementBegin
+-- WHOSE SECRET THIS IS, for the purposes of the exit, in a column no member can
+-- move.
+--
+-- Round 7 put every decrypted secret through one gate and asked one question:
+-- did the OWNER of the secret being sent authorise this destination. It
+-- resolved "owner" from vault_entries.user_id, and user_id is a column an
+-- ordinary product route lets a collection MANAGER write to their own id:
+-- AdoptAndRenameVaultEntry, reached by PUT /api/vault/{id} with a new name once
+-- the entry's creator is no longer an accepted member of the collection. A
+-- manager can bring that precondition about themselves with
+-- DELETE /api/collections/{id}/members/{creator}, which is manager-gated too. So
+-- two ordinary calls made the attacker the owner, and the exit then authorised
+-- the exact round-6 delivery it exists to refuse.
+--
+-- An authority derived from data the attacker can write is not an authority.
+--
+-- The fix is not to take adoption away: adoption is what moves the
+-- UNIQUE(user_id, name) question into the renamer's own namespace, which is what
+-- keeps a rename from being an existence oracle over a colleague's private
+-- vault. The fix is that user_id was carrying TWO meanings at once, the
+-- namespace this row occupies and the principal whose authority governs its
+-- plaintext, and the attack is exactly that conflation. They are two columns now.
+--
+--   user_id               the CUSTODIAN. Uniqueness scope, listing, ownership
+--                         for grantFor. Adoption moves it, deliberately.
+--   secret_owner_user_id  the OWNER, and only the exit asks about it. Written
+--                         when the row is created, and afterwards only by the
+--                         one statement in internal/vaultegress/internal/egressq
+--                         that exists to transfer it.
+--
+-- Backfilled from user_id, which records the state this instance is already in:
+-- every existing row keeps exactly the owner it has today, so nothing an
+-- operator has configured stops working at the deploy.
+ALTER TABLE vault_entries ADD COLUMN secret_owner_user_id TEXT NOT NULL DEFAULT '';
+UPDATE vault_entries SET secret_owner_user_id = user_id WHERE secret_owner_user_id = '';
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+ALTER TABLE vault_entries DROP COLUMN secret_owner_user_id;
+-- +goose StatementEnd

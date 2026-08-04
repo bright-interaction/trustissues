@@ -107,6 +107,16 @@ var theExitList = map[string]exitSite{
 		why: "password-re-verified above; the exit asks the second half, whether each entry's owner " +
 			"admits this caller. A list query that widened by accident is refused row by row.",
 	},
+	"vault.go:VaultHandler.customFieldsForCaller": {
+		secret:  "every secret:true custom field of the entry being rendered",
+		chooser: "the caller (a read question, not a destination question)",
+		why: "THE SECOND CREDENTIAL AN ENTRY CAN HOLD, and the one the round-7 SCOPE BOUNDARY missed. " +
+			"custom_fields is AES-encrypted at rest exactly like the value, a field marked secret:true " +
+			"is operator-designated secret material (the UI masks it for that reason), and it left in " +
+			"the same response body as the entry's own value with no destination, no chooser and no " +
+			"receipt. Every response path that emits custom fields goes through here: GET, POST /unlock, " +
+			"the create and update echoes, and the rotate response.",
+	},
 	"vault.go:VaultHandler.Rotate": {
 		secret:  "the entry being rotated (its NEW value, returned so the operator can copy it)",
 		chooser: "the caller",

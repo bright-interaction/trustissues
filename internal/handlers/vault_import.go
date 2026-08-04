@@ -567,15 +567,20 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		}
 
 		err = qtx.ImportVaultEntry(r.Context(), db.ImportVaultEntryParams{
-			ID:             entryID,
-			UserID:         userID,
-			Name:           entry.Name,
-			EncryptedValue: encrypted,
-			Nonce:          nonce,
-			Url:            toNullString(encURL),
-			Username:       toNullString(encUser),
-			Category:       toNullString(encCat),
-			Notes:          toNullString(encNotes),
+			ID:     entryID,
+			UserID: userID,
+			// The importer is the entry's owner for exit purposes, the same way
+			// the creator of a hand-entered secret is. Left at the '' default the
+			// row would have no owner at all and nobody could configure delivery
+			// for anything they imported.
+			SecretOwnerUserID: userID,
+			Name:              entry.Name,
+			EncryptedValue:    encrypted,
+			Nonce:             nonce,
+			Url:               toNullString(encURL),
+			Username:          toNullString(encUser),
+			Category:          toNullString(encCat),
+			Notes:             toNullString(encNotes),
 			// Imported entries land in the user's PERSONAL vault, so the blind
 			// index is keyed to that scope.
 			UrlBidx: h.handler.urlBlindIndex(bidxScope(userID, sql.NullString{}), entry.URL),

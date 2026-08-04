@@ -90,12 +90,22 @@ var vaultEntryEgressClass = map[string]struct {
 	// ── neutral ─────────────────────────────────────────────────────────
 	"id": {egressNeutral, "primary key"},
 	"user_id": {egressNeutral,
-		"never reaches a URL. It IS the input to mayDirectSecretEgress, so writing it transfers the " +
-			"right to choose a destination, and there is exactly one writer: AdoptAndRenameVaultEntry, " +
-			"reachable only by a collection MANAGER and only once the creator has left that collection " +
-			"(managerMayAdoptOrphanedEntry). That is a deliberate, documented ownership transfer for a " +
-			"stranded secret, not a redirect. Any second writer of this column has to be read as an " +
-			"egress-authority change, not as bookkeeping"},
+		"the CUSTODIAN: the UNIQUE(user_id, name) namespace, the listing scope, and grantFor's " +
+			"isCreator. It never reaches a URL. This row used to say it was the input to " +
+			"mayDirectSecretEgress and that its one writer, AdoptAndRenameVaultEntry, was a " +
+			"deliberate ownership transfer. Both halves were true and the conclusion was wrong: a " +
+			"collection MANAGER reaches that writer with two ordinary calls (remove the creator from " +
+			"the collection, then rename the entry), so the exit was resolving its owner from a " +
+			"column the attacker could write. The egress authority now lives in " +
+			"secret_owner_user_id, which adoption does not touch"},
+	"secret_owner_user_id": {egressNeutral,
+		"never reaches a URL, and it is now THE input to mayDirectSecretEgress: whose authority " +
+			"governs this entry's plaintext at the exit. Written when the row is created; moved " +
+			"afterwards by exactly one statement, in internal/vaultegress/internal/egressq, behind a " +
+			"vaultegress.TransferProof that only an instance admin taking ownership for THEMSELVES " +
+			"can obtain. TestOnlyTheSanctionedStatementMovesTheSecretOwner proves the single-writer " +
+			"claim against SQLite rather than against a reviewer. A second writer of this column is " +
+			"a second way to become the owner, which is the whole finding"},
 	"collection_id": {egressNeutral,
 		"sharing scope, so it decides who holds manage. It cannot name a host, and manage alone no " +
 			"longer carries the right to add one"},

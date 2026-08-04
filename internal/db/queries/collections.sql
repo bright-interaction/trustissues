@@ -144,9 +144,23 @@ WHERE collection_id = ? AND role = 'manager' AND accepted_at IS NOT NULL;
 -- ============================================================================
 
 -- name: GetVaultEntryAccess :one
--- Returns the owner and collection of an entry so the handler can authorize a
--- single-entry operation (personal: owner-or-admin; collection: member role).
-SELECT user_id, collection_id FROM vault_entries WHERE id = ?;
+-- Returns the custodian, the SECRET OWNER and the collection of an entry so the
+-- handler can authorize a single-entry operation (personal: owner-or-admin;
+-- collection: member role).
+--
+-- Two owner columns, because they answer two questions and conflating them is
+-- what made round 7's gate decorative on one path:
+--
+--   user_id               the CUSTODIAN. grantFor's isCreator, the
+--                         UNIQUE(user_id, name) namespace, the listing scope. A
+--                         collection MANAGER moves it to themselves by adopting
+--                         an orphaned entry, which is legitimate and is what
+--                         keeps a rename from being an oracle over a colleague's
+--                         private vault.
+--   secret_owner_user_id  the OWNER the EXIT asks about (mayDirectSecretEgress).
+--                         Adoption does not move it, and nothing else in the
+--                         module can: see internal/vaultegress.
+SELECT user_id, secret_owner_user_id, collection_id FROM vault_entries WHERE id = ?;
 
 -- name: SetVaultEntryCollection :exec
 UPDATE vault_entries SET collection_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;

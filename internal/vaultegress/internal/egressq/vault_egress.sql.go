@@ -12,13 +12,14 @@ import (
 
 const createVaultEntry = `-- name: CreateVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
 `
 
 type CreateVaultEntryParams struct {
 	ID                   string         `json:"id"`
 	UserID               string         `json:"user_id"`
+	SecretOwnerUserID    string         `json:"secret_owner_user_id"`
 	Name                 string         `json:"name"`
 	EncryptedValue       []byte         `json:"encrypted_value"`
 	Nonce                []byte         `json:"nonce"`
@@ -62,6 +63,7 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 	_, err := q.db.ExecContext(ctx, createVaultEntry,
 		arg.ID,
 		arg.UserID,
+		arg.SecretOwnerUserID,
 		arg.Name,
 		arg.EncryptedValue,
 		arg.Nonce,
@@ -100,6 +102,35 @@ type SeedVaultEntryCapabilityDefaultsParams struct {
 func (q *Queries) SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error {
 	_, err := q.db.ExecContext(ctx, seedVaultEntryCapabilityDefaults, arg.DestinationPatterns, arg.InjectionSpec, arg.ID)
 	return err
+}
+
+const transferVaultEntrySecretOwner = `-- name: TransferVaultEntrySecretOwner :execresult
+UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+`
+
+type TransferVaultEntrySecretOwnerParams struct {
+	UserID            string `json:"user_id"`
+	SecretOwnerUserID string `json:"secret_owner_user_id"`
+	ID                string `json:"id"`
+}
+
+// THE ONLY STATEMENT IN THE MODULE THAT MOVES secret_owner_user_id AFTER
+// CREATION, and it lives here for the same reason the host-choosing writes do:
+// so that "change whose authority governs this plaintext" is not something a
+// handler can express.
+//
+// It writes BOTH columns, deliberately. A transfer that moved the exit's owner
+// and left the custodian behind would put UNIQUE(user_id, name) in one person's
+// namespace and the widening right in another's, which is the split this column
+// exists to make impossible to create by accident.
+//
+// Its one caller is the hard-delete offboarding path: an instance admin deleting
+// a user re-owns the entries that person created inside shared collections, so
+// the team keeps them. An instance admin already holds the widening right on
+// every entry (grantFor row 3), so this hands them nothing they did not have,
+// and the activity log names the transfer.
+func (q *Queries) TransferVaultEntrySecretOwner(ctx context.Context, arg TransferVaultEntrySecretOwnerParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, transferVaultEntrySecretOwner, arg.UserID, arg.SecretOwnerUserID, arg.ID)
 }
 
 const updateVaultEntryDestinationPatterns = `-- name: UpdateVaultEntryDestinationPatterns :exec

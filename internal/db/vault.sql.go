@@ -396,30 +396,40 @@ func (q *Queries) GetVaultEntryTargets(ctx context.Context, id string) (sql.Null
 
 const importVaultEntry = `-- name: ImportVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
 `
 
 type ImportVaultEntryParams struct {
-	ID             string         `json:"id"`
-	UserID         string         `json:"user_id"`
-	Name           string         `json:"name"`
-	EncryptedValue []byte         `json:"encrypted_value"`
-	Nonce          []byte         `json:"nonce"`
-	Url            sql.NullString `json:"url"`
-	Username       sql.NullString `json:"username"`
-	Category       sql.NullString `json:"category"`
-	Notes          sql.NullString `json:"notes"`
-	UrlBidx        string         `json:"url_bidx"`
+	ID                string         `json:"id"`
+	UserID            string         `json:"user_id"`
+	SecretOwnerUserID string         `json:"secret_owner_user_id"`
+	Name              string         `json:"name"`
+	EncryptedValue    []byte         `json:"encrypted_value"`
+	Nonce             []byte         `json:"nonce"`
+	Url               sql.NullString `json:"url"`
+	Username          sql.NullString `json:"username"`
+	Category          sql.NullString `json:"category"`
+	Notes             sql.NullString `json:"notes"`
+	UrlBidx           string         `json:"url_bidx"`
 }
 
 // ============================================================================
 // Import - bulk insert (used inside transaction)
 // ============================================================================
+// secret_owner_user_id is written HERE, on the INSERT, alongside user_id.
+//
+// Every statement that creates a vault entry has to name both, and
+// TestEveryRowCreatingStatementNamesTheSecretOwner proves it against SQLite
+// rather than against a reviewer: a row inserted with the column left at its ”
+// default has no owner at all, so mayDirectSecretEgress refuses everyone and the
+// importer silently loses the ability to configure delivery for what they just
+// imported. Forgetting must be a red test, not a feature that quietly stops.
 func (q *Queries) ImportVaultEntry(ctx context.Context, arg ImportVaultEntryParams) error {
 	_, err := q.db.ExecContext(ctx, importVaultEntry,
 		arg.ID,
 		arg.UserID,
+		arg.SecretOwnerUserID,
 		arg.Name,
 		arg.EncryptedValue,
 		arg.Nonce,
@@ -1180,21 +1190,8 @@ func (q *Queries) MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVa
 	return err
 }
 
-const reassignCollectionVaultEntryOwner = `-- name: ReassignCollectionVaultEntryOwner :execresult
-UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type ReassignCollectionVaultEntryOwnerParams struct {
-	UserID string `json:"user_id"`
-	ID     string `json:"id"`
-}
-
-// Re-own ONE entry, so a single name collision cannot block the rest.
-func (q *Queries) ReassignCollectionVaultEntryOwner(ctx context.Context, arg ReassignCollectionVaultEntryOwnerParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, reassignCollectionVaultEntryOwner, arg.UserID, arg.ID)
-}
-
 const renameVaultEntry = `-- name: RenameVaultEntry :execresult
+
 UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
@@ -1203,6 +1200,11 @@ type RenameVaultEntryParams struct {
 	ID   string `json:"id"`
 }
 
+// Re-owning ONE entry (so a single name collision cannot block the rest) is
+// vaultegress.TransferSecretOwnership now. The statement moved to
+// internal/vaultegress/queries because it writes secret_owner_user_id, the
+// column the exit resolves "whose secret is this" from, and that column has
+// exactly one post-creation writer by construction rather than by convention.
 // Used only to de-duplicate on re-ownership when the new owner already has an
 // entry by that name.
 func (q *Queries) RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error) {

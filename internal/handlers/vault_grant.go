@@ -125,6 +125,30 @@ func (h *VaultHandler) grantFor(ctx context.Context, userID string, isAdmin bool
 //
 // Narrowing is not gated here: anyone with manage may shrink or clear the list,
 // because clearing it is the only per-secret agent revocation the product has.
+//
+// # secret_owner_user_id, NOT user_id
+//
+// This is the line the whole exit hangs from, so the column it reads has to be
+// one no principal below the owner can write. user_id is not that column: a
+// collection MANAGER moves it to their own id with two ordinary calls,
+//
+//	DELETE /api/collections/{id}/members/{creator}  (manager-gated)
+//	PUT    /api/vault/{entry}  {"name":"..."}       (managerMayAdoptOrphanedEntry
+//	                                                -> AdoptAndRenameVaultEntry)
+//
+// and once they had, this function said yes and the exit authorised the exact
+// round-6 cross-entry delivery it was built to refuse. An authority derived from
+// data the attacker can write is not an authority.
+//
+// secret_owner_user_id is written when the row is created and moved afterwards
+// by exactly one statement, in a package the compiler keeps out of reach of the
+// handlers (internal/vaultegress). Adoption does not move it, on purpose:
+// adoption exists so the uniqueness question lands in the renamer's namespace,
+// which is a namespace concern and not an authority one.
+//
+// An EMPTY owner is refused rather than falling back to user_id. A row with no
+// recorded owner is one no creating statement stamped, and the safe reading of
+// that is "nobody may redirect this", not "whoever holds it now may".
 func (h *VaultHandler) mayDirectSecretEgress(ctx context.Context, userID string, isAdmin bool, entryID string) bool {
 	if entryID == "" {
 		return false
@@ -140,7 +164,7 @@ func (h *VaultHandler) mayDirectSecretEgress(ctx context.Context, userID string,
 	if err != nil {
 		return false
 	}
-	return userID != "" && info.UserID == userID
+	return userID != "" && info.SecretOwnerUserID != "" && info.SecretOwnerUserID == userID
 }
 
 // instanceAdminByRecord reports whether userID is an instance admin RIGHT NOW,

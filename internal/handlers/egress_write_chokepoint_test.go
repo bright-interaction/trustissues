@@ -675,17 +675,26 @@ func TestEveryExportedEgressWriteDemandsATicket(t *testing.T) {
 				continue
 			}
 			checked++
-			hasTicket := false
+			// Two proof types, because there are two questions. An
+			// egressgate.Ticket says "this write may move where the secret goes".
+			// A vaultegress.TransferProof says "this write may move WHOSE the
+			// secret is". Neither can be spent as the other: a Ticket is field-
+			// scoped and a TransferProof is entry-and-recipient-scoped, and both
+			// have unexported fields and one constructor.
+			hasProof := false
 			for _, p := range fn.Type.Params.List {
 				if sel, isSel := p.Type.(*ast.SelectorExpr); isSel && sel.Sel.Name == "Ticket" {
-					hasTicket = true
+					hasProof = true
+				}
+				if id, isID := p.Type.(*ast.Ident); isID && id.Name == "TransferProof" {
+					hasProof = true
 				}
 			}
-			if !hasTicket {
-				t.Errorf("%s: exported func %s reaches the generated egress querier but takes no "+
-					"egressgate.Ticket.\nA wrapper that performs the write without a ticket is a "+
-					"chokepoint with no lock on it: every caller looks correctly routed and none of "+
-					"them is gated.", filepath.Base(path), fn.Name.Name)
+			if !hasProof {
+				t.Errorf("%s: exported func %s reaches the generated egress querier but takes neither "+
+					"an egressgate.Ticket nor a vaultegress.TransferProof.\nA wrapper that performs the "+
+					"write without a proof is a chokepoint with no lock on it: every caller looks "+
+					"correctly routed and none of them is gated.", filepath.Base(path), fn.Name.Name)
 			}
 		}
 	}

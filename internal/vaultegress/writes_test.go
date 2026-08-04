@@ -153,10 +153,14 @@ func newTestQueries(t *testing.T) (*db.Queries, *sql.DB) {
 	if err := database.RunMigrations(conn); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	// secret_owner_user_id is seeded alongside user_id because that is what every
+	// row-creating statement in the product does
+	// (TestEveryRowCreatingStatementNamesTheSecretOwner). A fixture that left it
+	// empty would model a row the product cannot produce.
 	if _, err := conn.Exec(
-		`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, provider, provider_meta,
-		   rotation_targets, destination_patterns, injection_spec)
-		 VALUES (?, 'u1', 'seed', x'00', x'00', 'openai', '{}', '[]', '[]', '{}')`, testEntryID); err != nil {
+		`INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce,
+		   provider, provider_meta, rotation_targets, destination_patterns, injection_spec)
+		 VALUES (?, 'u1', 'u1', 'seed', x'00', x'00', 'openai', '{}', '[]', '[]', '{}')`, testEntryID); err != nil {
 		t.Fatalf("seed entry: %v", err)
 	}
 	return db.New(conn), conn
@@ -296,6 +300,36 @@ func TestEveryExportedWriteIsCoveredHere(t *testing.T) {
 	var covered []string
 	for _, tc := range writeCases() {
 		covered = append(covered, tc.funcName)
+	}
+	// The writes that take a TransferProof rather than an egressgate.Ticket
+	// cannot be driven by writeCases, whose fn signature is ticket-shaped. They
+	// are covered by their own named tests, and the name is checked below
+	// against the AST so a claim of coverage cannot outlive the test making it.
+	proofWrites := map[string]string{
+		"TransferSecretOwnership": "TestTransferSecretOwnershipRefusesAProofThatDoesNotAuthorise",
+	}
+	testFuncs := map[string]bool{}
+	testPkgs, terr := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if terr != nil {
+		t.Fatalf("parse tests: %v", terr)
+	}
+	for _, p := range testPkgs {
+		for _, f := range p.Files {
+			for _, decl := range f.Decls {
+				if fn, isFn := decl.(*ast.FuncDecl); isFn {
+					testFuncs[fn.Name.Name] = true
+				}
+			}
+		}
+	}
+	for write, byTest := range proofWrites {
+		if !testFuncs[byTest] {
+			t.Fatalf("%s is claimed to be covered by %s, and no such test exists in this package. A "+
+				"coverage claim that outlives its test reads as coverage and is not.", write, byTest)
+		}
+		covered = append(covered, write)
 	}
 	sort.Strings(covered)
 
