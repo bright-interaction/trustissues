@@ -39,7 +39,7 @@
   "id": "repair-adopts-the-previous-holders-ceiling",
   "mech": "repair",
   "file": "internal/handlers/vault_ownership_repair.go",
-  "old": "\twithdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID)\n\tif wErr != nil {",
+  "old": "\twithdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID, actor)\n\tif wErr != nil {",
   "new": "\twithdrawn, wErr := withdrawnEvidence{Why: \"ablated\"}, error(nil)\n\tif wErr != nil {",
   "test": "TestTheRepairDoesNotReArmThePlantedEvidence",
   "why": "the half read-time withholding cannot cover. Claiming ownership answers the question the attacker's records were waiting on, so without the withdrawal the admin's repair re-arms their collector under admin authority"

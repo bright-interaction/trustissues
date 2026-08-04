@@ -19,7 +19,7 @@
   "test": "TestDoor2ValidateRefusesAPlantedProviderMetaOnAWithheldRow",
   "why": "step 3, the round-4 class. A meta-derived host (forgejo's whole base URL) is authorised straight off the column the attacker rewrote, which is doors 2 and 3",
   "result": "CAUGHT",
-  "detail": "secret_exit_owner_liveness_test.go:175: THE WITHHELD OWNER WAS LAUNDERED THROUGH THE CUSTODIAN. The secret reached the planted host."
+  "detail": "repair_surface_bypass_test.go:221: ABORT: the control delivered too ([POST 127.0.0.1:49656/api/v1/users/tokens]), so the test above proves nothing about ownership"
  },
  {
   "id": "exit-empty-owner-is-treated-as-answered",
@@ -51,8 +51,8 @@
   "new": "\twithdrawn, wErr := withdrawnEvidence{Why: \"ablated\"}, error(nil)\n\tif wErr != nil {",
   "test": "TestTheRepairDoesNotReArmThePlantedEvidence",
   "why": "the half read-time withholding cannot cover. Claiming ownership answers the question the attacker's records were waiting on, so without the withdrawal the admin's repair re-arms their collector under admin authority",
-  "result": "CAUGHT",
-  "detail": "secret_exit_recorded_evidence_test.go:594: the claim withdrew the ceiling without reporting it; an admin whose legitimate patterns were cleared has nothing to re-enter from"
+  "result": "INVALID",
+  "detail": "anchor text not found in source"
  },
  {
   "id": "an-undeclared-file-holds-the-vault-key",
@@ -112,6 +112,6 @@
   "pkg": "./internal/database/",
   "why": "the same blindness in the re-derivation. It was first pointed at the fresh-database backfill test and MISSED, because on a fresh database the corrected 00034 has already withheld and 00036 repairs nothing. 00036 is load-bearing on exactly one database: the one that ALREADY RAN the broken 00034, which goose will never re-read. That is the database its test now builds, and it is the one every existing instance is in",
   "result": "CAUGHT",
-  "detail": "secret_owner_backfill_test.go:651: THE PAREN-ERA LAUNDERING SURVIVED THE REPAIR."
+  "detail": "repair_migration_bypass_test.go:129: ABORT: 00036 left the control entry owned by \"u-manager\". This test cannot tell an injection from a migration that does nothing"
  }
 ]
