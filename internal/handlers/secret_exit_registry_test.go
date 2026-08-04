@@ -361,3 +361,67 @@ func TestOnlyTheAlertsPathDecryptsInstanceConfig(t *testing.T) {
 			"  of vault_entries.", callers)
 	}
 }
+
+// TestRawAESIsReachedFromExactlyOnePlace is the last hole in "one way to open an
+// entry secret".
+//
+// decryptWithKey is raw AES-GCM returning a bare []byte. It exists because the
+// instance-config door needs it, and that door is justified by what it opens.
+// VaultHandler.MigrateEncryption used to call it too, for a v1 -> v2 re-key: a
+// purely in-process operation that transmits nothing, and therefore a second way
+// to open an entry's value sitting in the tree for the next person to copy. It
+// goes through the opaque type now.
+func TestRawAESIsReachedFromExactlyOnePlace(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var callers []string
+	scanned := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		scanned++
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			enclosing := fn.Name.Name
+			if fn.Recv != nil && len(fn.Recv.List) > 0 {
+				enclosing = receiverTypeName(fn.Recv.List[0].Type) + "." + enclosing
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				id, ok := call.Fun.(*ast.Ident)
+				if !ok || id.Name != "decryptWithKey" {
+					return true
+				}
+				callers = append(callers, name+":"+enclosing)
+				return true
+			})
+		}
+	}
+	if scanned < 20 {
+		t.Fatalf("ABORT: only scanned %d files", scanned)
+	}
+	want := []string{"vault.go:VaultHandler.DecryptInstanceConfig"}
+	sort.Strings(callers)
+	if len(callers) != 1 || callers[0] != want[0] {
+		t.Errorf("decryptWithKey is called from %v, want exactly %v.\n"+
+			"  It is raw AES returning a bare []byte. The ONE place entitled to it is the\n"+
+			"  instance-config door, which is justified by what it opens: a row belonging to no\n"+
+			"  vault entry. Anything that opens vault_entries.encrypted_value goes through\n"+
+			"  VaultHandler.OpenEntrySecret and comes back opaque.", callers, want)
+	}
+}

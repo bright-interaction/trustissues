@@ -287,18 +287,20 @@ func (h *VaultHandler) MigrateEncryption() error {
 
 	migrated := 0
 	for _, e := range entries {
-		// Decrypt with legacy SHA-256 key
-		plaintext, err := decryptWithKey(h.legacyKey, e.EncryptedValue, e.Nonce)
+		// Open with the legacy SHA-256 key and re-seal with the PBKDF2 one.
+		//
+		// Through the OPAQUE type, even though this is a purely in-process re-key
+		// that transmits nothing. It used to call decryptWithKey and hold the
+		// value as a bare []byte, which is a second way to open an entry secret
+		// sitting in the tree for the next person to copy. Re-keying is not an
+		// exit and does not appear in theExitList: nothing leaves, and the value
+		// is ciphertext again on the other side.
+		plaintext, err := h.OpenEntrySecret(e.EncryptedValue, e.Nonce, 1, entryOrigin(e.ID, ""))
 		if err != nil {
 			return fmt.Errorf("decrypting entry %s with legacy key: %w", e.ID, err)
 		}
-
-		// Re-encrypt with PBKDF2 key
-		newCiphertext, newNonce, err := h.encrypt(plaintext)
-		// Zero plaintext immediately
-		for i := range plaintext {
-			plaintext[i] = 0
-		}
+		newCiphertext, newNonce, err := h.encryptEntrySecret(plaintext)
+		plaintext.Wipe()
 		if err != nil {
 			return fmt.Errorf("re-encrypting entry %s: %w", e.ID, err)
 		}
