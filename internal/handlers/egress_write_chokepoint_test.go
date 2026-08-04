@@ -140,12 +140,16 @@ func moduleGoFiles(t *testing.T) map[string]string {
 	return out
 }
 
-// foldConstantString folds a compile-time-constant string expression.
+// foldConstantString folds a compile-time-constant string expression, resolving
+// named constants through consts.
 //
-// go/ast, not a grep. A raw string literal, an interpreted one, and two of
-// either joined with + are all the same thing to the compiler and are all the
-// same thing here.
-func foldConstantString(e ast.Expr) (string, bool) {
+// go/ast, not a grep. A raw string literal, an interpreted one, two of either
+// joined with +, and a named constant holding any of those are all the same
+// thing to the compiler and are all the same thing here. Resolving the names
+// matters: `"SELECT 1 FROM vault_entries WHERE id = ? AND " +
+// accessibleEntriesPredicate` is a whole statement to SQLite and half a
+// statement to anything that only folds literals.
+func foldConstantString(e ast.Expr, consts map[string]string) (string, bool) {
 	switch v := e.(type) {
 	case *ast.BasicLit:
 		if v.Kind != token.STRING {
@@ -156,24 +160,73 @@ func foldConstantString(e ast.Expr) (string, bool) {
 			return "", false
 		}
 		return s, true
+	case *ast.Ident:
+		s, ok := consts[v.Name]
+		return s, ok
 	case *ast.BinaryExpr:
 		if v.Op != token.ADD {
 			return "", false
 		}
-		l, okL := foldConstantString(v.X)
-		r, okR := foldConstantString(v.Y)
+		l, okL := foldConstantString(v.X, consts)
+		r, okR := foldConstantString(v.Y, consts)
 		if !okL || !okR {
 			return "", false
 		}
 		return l + r, true
 	case *ast.ParenExpr:
-		return foldConstantString(v.X)
+		return foldConstantString(v.X, consts)
 	}
 	return "", false
 }
 
+// packageStringConstants maps directory -> const name -> value, for every
+// package-level string constant in the module.
+//
+// Iterated to a fixed point so a constant defined in terms of another one
+// resolves too.
+func packageStringConstants(parsed map[string]*ast.File) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	for path := range parsed {
+		out[filepath.ToSlash(filepath.Dir(path))] = map[string]string{}
+	}
+	for round := 0; round < 5; round++ {
+		added := 0
+		for path, f := range parsed {
+			dir := filepath.ToSlash(filepath.Dir(path))
+			for _, decl := range f.Decls {
+				gd, isGen := decl.(*ast.GenDecl)
+				if !isGen || gd.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs, isVal := spec.(*ast.ValueSpec)
+					if !isVal {
+						continue
+					}
+					for i, name := range vs.Names {
+						if i >= len(vs.Values) {
+							continue
+						}
+						if _, known := out[dir][name.Name]; known {
+							continue
+						}
+						if s, ok := foldConstantString(vs.Values[i], out[dir]); ok {
+							out[dir][name.Name] = s
+							added++
+						}
+					}
+				}
+			}
+		}
+		if added == 0 {
+			break
+		}
+	}
+	return out
+}
+
 // constantStrings returns every compile-time-constant string in a file.
-func constantStrings(fset *token.FileSet, f *ast.File, path string) []sqlCandidate {
+func constantStrings(fset *token.FileSet, f *ast.File, path string, consts map[string]string) []sqlCandidate {
 	var out []sqlCandidate
 	ast.Inspect(f, func(n ast.Node) bool {
 		e, isExpr := n.(ast.Expr)
@@ -185,7 +238,7 @@ func constantStrings(fset *token.FileSet, f *ast.File, path string) []sqlCandida
 		default:
 			return true
 		}
-		s, ok := foldConstantString(e)
+		s, ok := foldConstantString(e, consts)
 		if !ok || strings.TrimSpace(s) == "" {
 			return true
 		}
@@ -199,6 +252,20 @@ func constantStrings(fset *token.FileSet, f *ast.File, path string) []sqlCandida
 		return false // the whole folded expression, not its pieces as well
 	})
 	return out
+}
+
+// parseModule parses every non-test source file once.
+func parseModule(t *testing.T, fset *token.FileSet) map[string]*ast.File {
+	t.Helper()
+	parsed := map[string]*ast.File{}
+	for path := range moduleGoFiles(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		parsed[path] = f
+	}
+	return parsed
 }
 
 // sqlExecMethods are the database/sql entry points that take a statement.
@@ -220,48 +287,50 @@ var sqlExecMethods = map[string]bool{
 // "every constant string in the module" are the same set, by construction.
 func TestEverySQLStatementInTheModuleIsACompileTimeConstant(t *testing.T) {
 	fset := token.NewFileSet()
+	parsed := parseModule(t, fset)
+	// Package-level string constants, per directory. An identifier handed to
+	// ExecContext is only acceptable if it names one of these: `stmt := build();
+	// db.Exec(stmt)` is exactly as invisible to SQLite as an inline Sprintf.
+	consts := packageStringConstants(parsed)
+
 	checked, flagged := 0, 0
-	for path := range moduleGoFiles(t) {
-		f, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
+	for path, f := range parsed {
+		dir := filepath.ToSlash(filepath.Dir(path))
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !sqlExecMethods[sel.Sel.Name] || len(call.Args) == 0 {
+			if !ok || !sqlExecMethods[sel.Sel.Name] {
+				return true
+			}
+			// The statement position is fixed by database/sql's own API: the
+			// Context variants take ctx first. Accepting "a constant anywhere in
+			// the first two arguments" is what an earlier version of this guard
+			// did, and an ablation walked straight through it, because the ctx
+			// in position 0 is an identifier and satisfied the check while the
+			// Sprintf in position 1 was never looked at.
+			idx := 0
+			if strings.HasSuffix(sel.Sel.Name, "Context") {
+				idx = 1
+			}
+			if len(call.Args) <= idx {
 				return true
 			}
 			checked++
-			// The statement is argument 0 (Exec) or argument 1 (ExecContext).
-			// Accepting either keeps this free of type information: a constant
-			// in one of the first two positions is the statement, and nothing
-			// else in those positions is.
-			limit := 2
-			if len(call.Args) < limit {
-				limit = len(call.Args)
-			}
-			for i := 0; i < limit; i++ {
-				switch call.Args[i].(type) {
-				case *ast.BasicLit, *ast.Ident, *ast.SelectorExpr:
-					return true
-				case *ast.BinaryExpr:
-					if _, ok := foldConstantString(call.Args[i]); ok {
-						return true
-					}
-				}
+			if _, ok := foldConstantString(call.Args[idx], consts[dir]); ok {
+				return true
 			}
 			flagged++
 			pos := fset.Position(call.Pos())
-			t.Errorf("%s:%d builds a SQL statement dynamically (%s).\n"+
-				"Every statement in this module has to be a compile-time constant, because the guard "+
-				"that proves no statement writes a host-choosing column works by handing statements to "+
-				"SQLite, and it can only hand over what exists at compile time. A statement assembled at "+
-				"runtime is invisible to it, which is how a text-matching guard fails one level up.",
-				pos.Filename, pos.Line, sel.Sel.Name)
+			t.Errorf("%s:%d builds a SQL statement dynamically (%s, argument %d).\n"+
+				"Every statement in this module has to be a compile-time constant string or a named "+
+				"string constant, because the guard that proves no statement writes a host-choosing "+
+				"column works by handing statements to SQLite, and it can only hand over what exists at "+
+				"compile time. A statement assembled at runtime is invisible to it, which is how a "+
+				"text-matching guard fails one level up.",
+				pos.Filename, pos.Line, sel.Sel.Name, idx)
 			return true
 		})
 	}
@@ -448,13 +517,12 @@ func TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn(t *testing.
 	control, probe := probeSchema(t, cols)
 
 	fset := token.NewFileSet()
+	parsed := parseModule(t, fset)
+	consts := packageStringConstants(parsed)
 	var candidates []sqlCandidate
-	for path := range moduleGoFiles(t) {
-		f, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		candidates = append(candidates, constantStrings(fset, f, path)...)
+	for path, f := range parsed {
+		candidates = append(candidates,
+			constantStrings(fset, f, path, consts[filepath.ToSlash(filepath.Dir(path))])...)
 	}
 	if len(candidates) < 200 {
 		t.Fatalf("ABORT: only collected %d constant strings from the module; the AST walk is not "+
