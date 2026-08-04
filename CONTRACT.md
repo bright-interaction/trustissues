@@ -155,9 +155,15 @@ alerts.SignPayload(secret, body)      // HMAC-SHA256 over "timestamp.body"
 ```
 
 `alerts.ConfigDecrypter` interface:
-`DecryptValue(ciphertext, nonce []byte, encVersion int) ([]byte, error)`.
-The vault handler should satisfy it (dockyard pattern) and be passed in at
-integration. Events defined: `vault.rotation_partial`,
+`DecryptInstanceConfig(ciphertext, nonce []byte, encVersion int) ([]byte, error)`.
+The vault handler satisfies it and is passed in at integration.
+
+The method is deliberately NOT the one that opens a vault entry's value. Since
+round 7 an entry secret comes back as a `secretexit.Plaintext`, an opaque type
+whose bytes only `secretexit.Exit` releases, and this door returns bytes because
+an `alert_channels.config` row belongs to the INSTANCE rather than to any entry:
+only an instance admin can write one, so there is no entry owner to ask. Two
+doors with two names is what keeps that distinction visible. Events defined: `vault.rotation_partial`,
 `vault.rotation_failed`, `vault.secret_expiring`, `test.notification`.
 Channel types: `webhook` (HMAC-signed generic POST, signature headers
 `X-Trustissues-Signature` / `X-Trustissues-Timestamp`) and `slog`.
