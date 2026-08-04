@@ -188,8 +188,8 @@
   "new": "\tif t.Type != \"forgejo_secret\" {\n\t\treturn authTokenRefusal{}\n\t}\n\tif strings.TrimSpace(t.AuthToken) == \"\" {\n\t\treturn authTokenRefusal{TargetLabel: t.Label, AuthToken: t.AuthToken, Reason: \"no auth_token\"}\n\t}",
   "test": "TestExistingCrossOwnerTargetsAreNamedAtBootNotAtTheNextRotation",
   "why": "the noise direction. A boot warning that fires on healthy configuration is what makes the real one get ignored, and this is the version an operator would actually meet",
-  "result": "MISSED",
-  "detail": "guard passed clean with the bug present"
+  "result": "CAUGHT",
+  "detail": "rotation_auth_token_shipping_test.go:218: boot report: entry entry-app-boot: delivery target \"ci\" references the vault entry \"forgejo-pat-boot\", which its configurer may not spend, so this delivery wi"
  },
  {
   "id": "rotate-withholds-in-silence",
