@@ -223,10 +223,12 @@ func TestEveryVaultEntryColumnIsClassified(t *testing.T) {
 // handler's one named condition, so it can only see the doors it was told
 // about, and rotation_targets has its own route. The guard that answers the
 // general question, for every host-choosing column and every write path
-// including ones nobody has written yet, is
-// TestEveryHostChoosingWriteGoesThroughTheChokepoint in
-// egress_write_chokepoint_test.go. This one stays because it pins the SHAPE of
-// the condition inside Update, which the chokepoint cannot see.
+// including ones nobody has written yet, is the pair in
+// egress_write_chokepoint_test.go: the compiler (the write methods are gone from
+// every type a handler can name) and
+// TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn (SQLite is
+// asked what each statement writes). This one stays because it pins the SHAPE of
+// the condition inside Update, which neither of those can see.
 //
 // A classification is a claim. This checks the claim against the handler: every
 // column classified egressChoosesHost and writable through PUT /api/vault/{id}
