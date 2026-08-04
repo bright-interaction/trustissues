@@ -2,8 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,6 +26,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -220,7 +219,7 @@ func (h *VaultHandler) encryptCustomFields(fields []CustomField) (string, error)
 // this process in a response body exactly like the entry's own value does, so it
 // goes through the exit: see customFieldsForCaller.
 func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
-	dec := h.decryptColumnOrLog(stored, "[]", "custom_fields")
+	dec := h.decryptColumnOrLog(stored, "[]", vaultFieldCustomFields)
 	if dec == "" {
 		return nil
 	}
@@ -429,12 +428,12 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 		// Recover the cleartext host to (re)compute the blind index. decryptColumn
 		// is idempotent on cleartext, so this works whether the column is still
 		// plaintext or already encrypted.
-		urlPlain, derr := h.decryptColumn(row.Url.String)
+		urlPlain, derr := h.decryptColumn(row.Url.String, vaultFieldURL)
 		if derr != nil {
 			slog.Error("vault: metadata backfill url decrypt failed", "id", row.ID, "error", derr)
 			continue
 		}
-		aliasPlain, derr := h.decryptColumn(row.AliasUrl.String)
+		aliasPlain, derr := h.decryptColumn(row.AliasUrl.String, vaultFieldAliasURL)
 		if derr != nil {
 			slog.Error("vault: metadata backfill alias_url decrypt failed", "id", row.ID, "error", derr)
 			continue
@@ -479,24 +478,15 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 	return updated, nil
 }
 
-// decryptWithKey decrypts data using a specific AES-256-GCM key.
-func decryptWithKey(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	// Guard the nonce length ourselves: gcm.Open PANICS on a wrong-length
-	// (e.g. nil/empty) nonce rather than returning an error, which would
-	// otherwise surface as a bare HTTP 500 via chi's Recoverer. A malformed
-	// stored nonce must degrade to a handled decrypt error, never a panic.
-	if len(nonce) != gcm.NonceSize() {
-		return nil, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
-	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+// decryptWithKey decrypts data using a specific AES-256-GCM key, for one
+// DECLARED field.
+//
+// TestRawAESIsReachedFromExactlyOnePlace pins its caller set to the
+// instance-config door. The field argument is the second half of the same
+// discipline: the caller set says who may call it, and the field says what they
+// are allowed to be opening.
+func decryptWithKey(key [32]byte, ciphertext, nonce []byte, field vaultfield.Field) ([]byte, error) {
+	return vaultfield.Open(key, ciphertext, nonce, field)
 }
 
 // vaultEntryMeta is the JSON response for vault entries (metadata only, no secret value).
@@ -568,17 +558,17 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 	e := vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),
@@ -596,17 +586,17 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 		ID:                   row.ID,
 		UserID:               row.UserID,
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -620,17 +610,17 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 		ID:                   row.ID,
 		UserID:               row.UserID,
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -643,17 +633,17 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -670,17 +660,17 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		UserID:               row.UserID,
 		CollectionID:         nullStringPtr(row.CollectionID),
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -705,17 +695,17 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 		ID:                   row.ID,
 		CollectionID:         nullStringPtr(row.CollectionID),
 		Name:                 row.Name,
-		URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-		Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-		Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-		Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+		Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+		Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 		AutoLogin:            row.AutoLogin != 0,
 		RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -723,25 +713,10 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 	}
 }
 
-// encrypt encrypts data using AES-256-GCM.
+// encrypt encrypts data using AES-256-GCM. Sealing names no field: the ledger
+// records what can become PLAINTEXT, and this produces none.
 func (h *VaultHandler) encrypt(plaintext []byte) (ciphertext, nonce []byte, err error) {
-	block, err := aes.NewCipher(h.encryptionKey[:])
-	if err != nil {
-		return nil, nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	nonce = make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, nil, err
-	}
-
-	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
-	return ciphertext, nonce, nil
+	return vaultfield.Seal(h.encryptionKey, plaintext, rand.Reader)
 }
 
 // OpenEntrySecret is the ONE WAY to decrypt a vault entry's value, and what it
@@ -834,8 +809,19 @@ func (h *VaultHandler) DecryptInstanceConfig(ciphertext, nonce []byte, encVersio
 	if encVersion == 1 {
 		key = h.legacyKey
 	}
-	return decryptWithKey(key, ciphertext, nonce)
+	return decryptWithKey(key, ciphertext, nonce, vaultFieldAlertChannelConfig)
 }
+
+// vaultFieldAlertChannelConfig is declared HERE, beside the door that opens it,
+// which is the rule internal/vaultfield enforces without exception: a
+// declaration belongs where the plaintext is produced, because that is the only
+// place that cannot be forgotten.
+var vaultFieldAlertChannelConfig = vaultfield.Declare(
+	"alert_channels.config", vaultfield.InstanceOwned, "",
+	"notification-channel configuration (a Slack webhook URL, relay credentials), written only through "+
+		"the admin-only notification-channel routes. It carries no entry's value: Dispatch sends the "+
+		"entry NAME and a redacted detail string. TestOnlyTheAlertsPathDecryptsInstanceConfig pins its "+
+		"caller set so this door cannot quietly become a second way to open an entry secret.")
 
 // computeRotationStatus determines the rotation status of a vault entry based
 // on its rotation interval, expiration date, and last rotation time.
@@ -1352,8 +1338,8 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		logError(r, "vault.move: reindex lookup failed", "error", mErr)
 	} else {
 		newScope := bidxScope(info.UserID, target)
-		urlPlain := h.decryptColumnOrLog(meta.Url.String, "", "url")
-		aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", "alias_url")
+		urlPlain := h.decryptColumnOrLog(meta.Url.String, "", vaultFieldURL)
+		aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", vaultFieldAliasURL)
 		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
 			Url:          meta.Url,
 			AliasUrl:     meta.AliasUrl,
@@ -1425,7 +1411,7 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries
 	// while granting reach over a domain space anyone can register into.
 	var meta map[string]string
 	if row, err := q.GetVaultEntryMeta(ctx, entryID); err == nil {
-		meta = ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"))
+		meta = ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	}
 	dests, inj := MarshalCapabilityDefaults(provider, meta)
 	if dests == "" && inj == "" {
@@ -1542,13 +1528,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		if field, broken := h.anyMetaColumnUndecryptable(map[string]string{
-			"url":           damaged.Url.String,
-			"alias_url":     damaged.AliasUrl.String,
-			"username":      damaged.Username.String,
-			"category":      damaged.Category.String,
-			"notes":         damaged.Notes.String,
-			"custom_fields": damaged.CustomFields,
+		if field, broken := h.anyMetaColumnUndecryptable(map[vaultfield.Field]string{
+			vaultFieldURL:          damaged.Url.String,
+			vaultFieldAliasURL:     damaged.AliasUrl.String,
+			vaultFieldUsername:     damaged.Username.String,
+			vaultFieldCategory:     damaged.Category.String,
+			vaultFieldNotes:        damaged.Notes.String,
+			vaultFieldCustomFields: damaged.CustomFields,
 		}); broken {
 			logError(r, "vault.update: refusing to overwrite an undecryptable column", "entry", id, "field", field)
 			writeError(w, r, http.StatusConflict, "decrypt_failed",
@@ -2049,7 +2035,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			// says what the pair resolves to and this asks whether the resolution
 			// grew. That is what makes a provider added next year covered on the day
 			// it is added rather than after it is exploited.
-			beforeMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", "provider_meta"))
+			beforeMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 			afterMeta := beforeMeta
 			if req.ProviderMeta != nil {
 				afterMeta = ParseProviderMeta(*req.ProviderMeta)
@@ -2325,17 +2311,17 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				ID:                   row.ID,
 				CollectionID:         nullStringPtr(row.CollectionID),
 				Name:                 row.Name,
-				URL:                  h.decryptColumnOrLog(row.Url.String, "", "url"),
-				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", "alias_url"),
-				Username:             h.decryptColumnOrLog(row.Username.String, "", "username"),
-				Category:             h.decryptColumnOrLog(row.Category.String, "", "category"),
-				Notes:                h.decryptColumnOrLog(row.Notes.String, "", "notes"),
+				URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
+				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
+				Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
+				Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
+				Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
 				AutoLogin:            row.AutoLogin != 0,
 				RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
 				ExpiresAt:            nullTimePtr(row.ExpiresAt),
 				LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 				Provider:             row.Provider.String,
-				ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
+				ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
 				// Through the exit, like the entry's own value below. A
@@ -2491,7 +2477,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	{
 		if providerRoleFor == providerAuto {
 			provider := resolvedProvider
-			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
+			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 			// THE ONE EXIT, network form. The old value is released only if the
 			// entry's OWN record authorises the provider hosts it is about to
 			// authenticate against, and the returned context carries the receipt
@@ -2794,7 +2780,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	targetsUndecryptable := false
 	rawTargets := "[]"
 	if stored := entryRow.RotationTargets.String; stored != "" {
-		if plain, tErr := h.decryptColumn(stored); tErr != nil {
+		if plain, tErr := h.decryptColumn(stored, vaultFieldRotationTargets); tErr != nil {
 			targetsUndecryptable = true
 			logError(r, "vault.rotate: rotation_targets did not decrypt; the new key cannot be delivered",
 				"entry", id, "error", tErr)
@@ -3008,7 +2994,7 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	defer plaintext.Wipe()
 
-	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", "provider_meta"))
+	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	// Validate AUTHENTICATES with the decrypted key against the provider, so it
 	// is a live spend of the credential and the fastest of the three paths that
 	// carry it off the box: no scheduler wait, no rotation, just the caller's own
@@ -3060,7 +3046,7 @@ func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
-	targets := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+	targets := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
 	// The version pins the view the client is editing. UpdateTargets is a full
 	// replace, so a panel held open across an offboarding would otherwise
 	// resubmit the departed member's purged webhook, and since that target is no
@@ -3121,7 +3107,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// secrets included. Same class as the guard Update has on its metadata
 	// columns; this surface never got the equivalent.
 	if strings.TrimSpace(existingTargets) != "" {
-		if _, decErr := h.decryptColumn(existingTargets); decErr != nil {
+		if _, decErr := h.decryptColumn(existingTargets, vaultFieldRotationTargets); decErr != nil {
 			logError(r, "vault.targets: refusing to overwrite an undecryptable targets column", "entry", id, "error", decErr)
 			writeError(w, r, http.StatusConflict, "decrypt_failed",
 				"the existing delivery targets could not be decrypted, so nothing was changed; saving would have overwritten data that is still recoverable with the correct key")
@@ -3136,7 +3122,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// target on top of that empty view replaced the real ones, with a success
 	// toast and no undo. Clearing must be deliberate.
 	if len(targets) == 0 && strings.TrimSpace(existingTargets) != "" {
-		if prior := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets")); len(prior) > 0 &&
+		if prior := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", vaultFieldRotationTargets)); len(prior) > 0 &&
 			r.URL.Query().Get("clear") != "1" {
 			writeError(w, r, http.StatusConflict, "targets_not_cleared",
 				fmt.Sprintf("this would delete all %d delivery target(s); if that is intended, resend with ?clear=1", len(prior)))
@@ -3168,7 +3154,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stored := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", "rotation_targets"))
+	stored := ParseRotationTargets(h.decryptColumnOrLog(existingTargets, "[]", vaultFieldRotationTargets))
 	priorBy := make(map[string]string, len(stored))
 	for _, t := range stored {
 		if t.ConfiguredBy != "" {
@@ -3378,7 +3364,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	// a caller-supplied provider into this request body, the two sides stop
 	// matching and the ticket is refused instead of silently reopening round 4
 	// through a door nobody is watching.
-	scheduleMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", "provider_meta"))
+	scheduleMeta := ParseProviderMeta(h.decryptColumnOrLog(current.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	scheduleTicket, schedTkErr := egressgate.Decide(egressgate.Request{
 		EntryID: id,
 		What:    egressFieldProvider,

@@ -186,7 +186,7 @@ func TestPurgeDropsOnlyTheDepartingMembersTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reread: %v", err)
 	}
-	after := ParseRotationTargets(h.decryptColumnOrLog(row.RotationTargets.String, "[]", "rotation_targets"))
+	after := ParseRotationTargets(h.decryptColumnOrLog(row.RotationTargets.String, "[]", vaultFieldRotationTargets))
 	if len(after) != 1 {
 		t.Fatalf("expected 1 surviving target, got %d: %+v", len(after), after)
 	}

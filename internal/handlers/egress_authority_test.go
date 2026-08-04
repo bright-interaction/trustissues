@@ -211,8 +211,8 @@ func TestEditorCannotRedirectTheGatewayKeyThroughTheProviderConfiguration(t *tes
 		if p != "openai" {
 			t.Fatalf("the provider was changed anyway: %q", p)
 		}
-		if strings.Contains(h.decryptColumnOrLog(m, "{}", "provider_meta"), "attacker") {
-			t.Fatalf("provider_meta was written anyway: %s", h.decryptColumnOrLog(m, "{}", "provider_meta"))
+		if strings.Contains(h.decryptColumnOrLog(m, "{}", vaultFieldProviderMeta), "attacker") {
+			t.Fatalf("provider_meta was written anyway: %s", h.decryptColumnOrLog(m, "{}", vaultFieldProviderMeta))
 		}
 	})
 
@@ -241,7 +241,7 @@ func TestEditorCannotRedirectTheGatewayKeyThroughTheProviderConfiguration(t *tes
 			"provider_meta": `{"site":"attacker-controlled.example"}`,
 		})
 		p, m := storedProvider(t, queries, entryID)
-		after := declaredProviderEgress(p, ParseProviderMeta(h.decryptColumnOrLog(m, "{}", "provider_meta")))
+		after := declaredProviderEgress(p, ParseProviderMeta(h.decryptColumnOrLog(m, "{}", vaultFieldProviderMeta)))
 		if after.Describe() != before.Describe() {
 			t.Fatalf("the reachable host set moved from %s to %s on a write by an editor",
 				before.Describe(), after.Describe())
@@ -389,8 +389,8 @@ func TestEditorCannotRedirectAnOrdinarySharedSecretThroughProviderMeta(t *testin
 			t.Fatalf("moving the grafana instance returned %d, want 403 (body: %s)", rec.Code, rec.Body.String())
 		}
 		_, m := storedProvider(t, queries, entryID)
-		if strings.Contains(h.decryptColumnOrLog(m, "{}", "provider_meta"), "attacker") {
-			t.Fatalf("stored anyway: %s", h.decryptColumnOrLog(m, "{}", "provider_meta"))
+		if strings.Contains(h.decryptColumnOrLog(m, "{}", vaultFieldProviderMeta), "attacker") {
+			t.Fatalf("stored anyway: %s", h.decryptColumnOrLog(m, "{}", vaultFieldProviderMeta))
 		}
 	})
 

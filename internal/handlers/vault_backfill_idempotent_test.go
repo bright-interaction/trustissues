@@ -53,7 +53,7 @@ func TestMetaColumnsBackfillIsIdempotent(t *testing.T) {
 
 	// And the data still decrypts to the original, not to an inner marker.
 	for want, stored := range map[string]string{url: encURL2, username: encUser2, notes: encNotes2} {
-		got, derr := vh.decryptColumn(stored)
+		got, derr := vh.decryptColumn(stored, vaultFieldNotes)
 		if derr != nil {
 			t.Fatalf("decrypt %q: %v", want, derr)
 		}

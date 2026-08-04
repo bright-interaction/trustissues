@@ -699,7 +699,7 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 		// No version, at any point, may have carried the pending-revoke markers.
 		// vault_providers.go documents them as never reaching the database.
 		for i, v := range versions {
-			plain := e.h.decryptColumnOrLog(v, "{}", "provider_meta")
+			plain := e.h.decryptColumnOrLog(v, "{}", vaultFieldProviderMeta)
 			for _, marker := range []string{pendingRevokeMethod, pendingRevokeURL} {
 				if strings.Contains(plain, marker) {
 					t.Errorf("%s: provider_meta write #%d persisted the transient marker %q\n"+

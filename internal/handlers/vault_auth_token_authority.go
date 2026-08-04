@@ -151,7 +151,7 @@ func (h *VaultHandler) AuditCrossOwnerAuthTokenTargets(ctx context.Context) []st
 		if raw == "" {
 			continue
 		}
-		for _, t := range ParseRotationTargets(h.decryptColumnOrLog(raw, "[]", "rotation_targets")) {
+		for _, t := range ParseRotationTargets(h.decryptColumnOrLog(raw, "[]", vaultFieldRotationTargets)) {
 			refusal := h.checkAuthTokenAuthority(ctx, t)
 			if refusal.empty() {
 				continue

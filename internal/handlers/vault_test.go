@@ -161,7 +161,7 @@ func TestDecryptRejectsMalformedNonce(t *testing.T) {
 
 	// decryptWithKey (the legacy-key path) shares the same guard.
 	var key [32]byte
-	if _, err := decryptWithKey(key, ct, nil); err == nil {
+	if _, err := decryptWithKey(key, ct, nil, vaultFieldAlertChannelConfig); err == nil {
 		t.Fatal("decryptWithKey accepted nil nonce, want error")
 	}
 

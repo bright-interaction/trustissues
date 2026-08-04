@@ -45,7 +45,7 @@ func TestRenameConflictIsReportedNotSwallowed(t *testing.T) {
 	// The other field in the same request must NOT have landed: a refused
 	// request has to be all-or-nothing, or the operator is left guessing which
 	// half applied.
-	if notes := h.decryptColumnOrLog(meta.Notes.String, "", "notes"); notes == "changed-notes" {
+	if notes := h.decryptColumnOrLog(meta.Notes.String, "", vaultFieldNotes); notes == "changed-notes" {
 		t.Error("the request was half-applied: the rename was refused but notes were written")
 	}
 }
@@ -103,7 +103,7 @@ func TestUndecryptableMetadataIsNotOverwritten(t *testing.T) {
 	}
 
 	// Guard the fixture: it must genuinely fail to decrypt, or this proves nothing.
-	if _, decErr := h.decryptColumn(string(body)); decErr == nil {
+	if _, decErr := h.decryptColumn(string(body), vaultFieldNotes); decErr == nil {
 		t.Fatal("ABORT: the corrupted column still decrypts; the test would be vacuous")
 	}
 
@@ -194,7 +194,7 @@ func TestGuardRunsBeforeEveryWrite(t *testing.T) {
 		}
 		b := []byte(sealed)
 		b[len(b)-3] ^= 0x01
-		if _, decErr := h.decryptColumn(string(b)); decErr == nil {
+		if _, decErr := h.decryptColumn(string(b), vaultFieldRotationTargets); decErr == nil {
 			t.Fatal("ABORT: the corrupted blob still decrypts; the test would be vacuous")
 		}
 		return string(b)

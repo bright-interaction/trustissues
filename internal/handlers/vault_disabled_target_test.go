@@ -149,7 +149,7 @@ func TestPurgeTargetsConfiguredByUserSpansPersonalEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload entry: %v", err)
 	}
-	left := ParseRotationTargets(h.decryptColumnOrLog(stored.String, "[]", "rotation_targets"))
+	left := ParseRotationTargets(h.decryptColumnOrLog(stored.String, "[]", vaultFieldRotationTargets))
 	if len(left) != 1 {
 		t.Fatalf("expected exactly the other user's target to survive, got %d: %+v", len(left), left)
 	}

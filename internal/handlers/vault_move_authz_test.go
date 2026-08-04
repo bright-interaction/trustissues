@@ -357,7 +357,7 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read back targets: %v", err)
 		}
-		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
 	}
 
 	// The owner configures delivery, and lies about who configured it. The

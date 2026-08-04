@@ -67,7 +67,7 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read targets: %v", err)
 		}
-		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
 	}
 
 	// Guard the setup: the target must exist and be authorized right now.

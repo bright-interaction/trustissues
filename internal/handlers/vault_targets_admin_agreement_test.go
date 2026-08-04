@@ -85,7 +85,7 @@ func TestInstanceAdminDeliveryTargetIsAcceptedAndDelivered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read back targets: %v", err)
 	}
-	targets := ParseRotationTargets(h.decryptColumnOrLog(stored.String, "[]", "rotation_targets"))
+	targets := ParseRotationTargets(h.decryptColumnOrLog(stored.String, "[]", vaultFieldRotationTargets))
 	if len(targets) != 1 || targets[0].ConfiguredBy != admin {
 		t.Fatalf("stored targets = %+v, want one attributed to the admin %q", targets, admin)
 	}

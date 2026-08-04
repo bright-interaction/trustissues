@@ -108,7 +108,7 @@ func TestEditorCannotPointARotationWebhookAtAHostTheyChose(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read targets: %v", err)
 		}
-		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+		return ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
 	}
 
 	// ── STEP 1. The attack, on the real route. ──────────────────────────────
@@ -257,7 +257,7 @@ func TestPlantedEditorTargetIsRefusedAtDeliveryToo(t *testing.T) {
 	results := DeliverRotatedKey(ctx, queries, h, entryID, "team-grafana-x",
 		h.MintedEntrySecret([]byte("old"), entryID, "team-grafana-x"),
 		h.MintedEntrySecret([]byte("sk_live_ROTATED_NEW"), entryID, "team-grafana-x"),
-		ParseRotationTargets(h.decryptColumnOrLog(enc, "[]", "rotation_targets")), operator)
+		ParseRotationTargets(h.decryptColumnOrLog(enc, "[]", vaultFieldRotationTargets)), operator)
 
 	if hosts, bodies := collector.got(); len(hosts) != 0 {
 		t.Fatalf("a planted editor-configured webhook received the rotated plaintext: %v %v", hosts, bodies)

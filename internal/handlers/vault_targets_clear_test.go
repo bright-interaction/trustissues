@@ -56,7 +56,7 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		return len(ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets")))
+		return len(ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets)))
 	}
 
 	seed()
@@ -125,7 +125,7 @@ func TestDamagedTargetsColumnIsNotOverwritten(t *testing.T) {
 	}
 	bad := []byte(sealed)
 	bad[len(bad)-3] ^= 0x01
-	if _, decErr := h.decryptColumn(string(bad)); decErr == nil {
+	if _, decErr := h.decryptColumn(string(bad), vaultFieldRotationTargets); decErr == nil {
 		t.Fatal("ABORT: the corrupted column still decrypts; the test would be vacuous")
 	}
 	if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
@@ -229,7 +229,7 @@ func TestStalePanelCannotResurrectAPurgedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	for _, tg := range ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets")) {
+	for _, tg := range ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets)) {
 		if tg.WebhookURL == "https://leaver.example.com/hook" {
 			t.Error("the offboarded member's webhook was resurrected")
 		}

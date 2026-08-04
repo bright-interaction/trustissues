@@ -38,7 +38,7 @@ func (h *CollectionHandler) purgeTargetsConfiguredBy(ctx context.Context, collec
 	dropped := 0
 	var entries []string
 	for _, row := range rows {
-		targets := ParseRotationTargets(h.vault.decryptColumnOrLog(row.RotationTargets.String, "[]", "rotation_targets"))
+		targets := ParseRotationTargets(h.vault.decryptColumnOrLog(row.RotationTargets.String, "[]", vaultFieldRotationTargets))
 		kept := make([]RotationTarget, 0, len(targets))
 		removedHere := 0
 		for _, t := range targets {

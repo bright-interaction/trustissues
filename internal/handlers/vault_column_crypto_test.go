@@ -44,7 +44,7 @@ func TestColumnCryptoRoundTrip(t *testing.T) {
 		if err != nil || encIf != enc {
 			t.Fatalf("encryptColumnIfNeeded not idempotent: %q -> %q (err %v)", enc, encIf, err)
 		}
-		dec, err := vh.decryptColumn(enc)
+		dec, err := vh.decryptColumn(enc, vaultFieldNotes)
 		if err != nil {
 			t.Fatalf("decrypt: %v", err)
 		}
@@ -54,7 +54,7 @@ func TestColumnCryptoRoundTrip(t *testing.T) {
 	}
 
 	// decryptColumn on cleartext (pre-migration row) returns it unchanged.
-	if out, err := vh.decryptColumn(`{"still":"cleartext"}`); err != nil || out != `{"still":"cleartext"}` {
+	if out, err := vh.decryptColumn(`{"still":"cleartext"}`, vaultFieldNotes); err != nil || out != `{"still":"cleartext"}` {
 		t.Fatalf("decrypt cleartext passthrough failed: %q (err %v)", out, err)
 	}
 	// Empty input has nothing to protect and passes through; the empty-JSON
@@ -99,7 +99,7 @@ func TestEncryptColumnIsNotADecryptionOracle(t *testing.T) {
 	}
 
 	// Reading it back must yield the attacker's own input, not the victim secret.
-	out, err := vh.decryptColumn(stored)
+	out, err := vh.decryptColumn(stored, vaultFieldNotes)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
@@ -164,10 +164,10 @@ func TestBackfillMetadataEncryption(t *testing.T) {
 		t.Fatal("cleartext secret still present at rest after backfill")
 	}
 	// Decrypt round-trips to the originals.
-	if got := vh.decryptColumnOrLog(pmRaw, "{}", "provider_meta"); got != meta {
+	if got := vh.decryptColumnOrLog(pmRaw, "{}", vaultFieldProviderMeta); got != meta {
 		t.Fatalf("provider_meta round-trip: %q", got)
 	}
-	if got := vh.decryptColumnOrLog(rtRaw, "[]", "rotation_targets"); got != secretTargets {
+	if got := vh.decryptColumnOrLog(rtRaw, "[]", vaultFieldRotationTargets); got != secretTargets {
 		t.Fatalf("rotation_targets round-trip: %q", got)
 	}
 
