@@ -1,0 +1,189 @@
+[
+ {
+  "id": "exit-owner-reads-the-custodian-column",
+  "mech": "owner-column",
+  "file": "internal/handlers/vault_grant.go",
+  "old": "\treturn userID != \"\" && info.SecretOwnerUserID != \"\" && info.SecretOwnerUserID == userID",
+  "new": "\treturn userID != \"\" && info.UserID == userID",
+  "test": "TestAManagerWhoRewritesOwnershipStillCannotDirectTheSecret",
+  "why": "THE FINDING, written out literally. The exit resolves its one question from user_id again, and a collection manager who adopts an entry becomes the principal it names"
+ },
+ {
+  "id": "exit-owner-falls-back-to-the-custodian-when-unset",
+  "mech": "owner-column",
+  "file": "internal/handlers/vault_grant.go",
+  "old": "\treturn userID != \"\" && info.SecretOwnerUserID != \"\" && info.SecretOwnerUserID == userID",
+  "new": "\tif info.SecretOwnerUserID == \"\" {\n\t\treturn userID != \"\" && info.UserID == userID\n\t}\n\treturn userID != \"\" && info.SecretOwnerUserID == userID",
+  "test": "TestAManagerWhoRewritesOwnershipStillCannotDirectTheSecret",
+  "why": "the friendly-looking version of the same bug: 'be lenient for rows the migration missed'. An empty owner must deny, or a row inserted without one is owned by whoever holds it",
+  "expect_miss": true,
+  "note": "reached by hand: the migration backfills every row and TestEveryRowCreatingStatementNamesTheSecretOwner makes an empty owner unreachable from any create path, so no state in the suite distinguishes this. It is defence in depth over a state the schema guards, exactly like the round-7 unlock miss"
+ },
+ {
+  "id": "adoption-moves-the-owner-too",
+  "mech": "owner-column",
+  "file": "internal/db/queries/vault.sql",
+  "old": "UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+  "new": "UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+  "test": "TestOnlyTheSanctionedStatementMovesTheSecretOwner",
+  "why": "a second post-creation writer of the owner column, in the exact query the attack used. SQLite decides, not a pattern"
+ },
+ {
+  "id": "transfer-proof-is-not-checked",
+  "mech": "owner-column",
+  "file": "internal/vaultegress/ownership.go",
+  "old": "\tif err := p.authorizes(params.ID, params.NewOwnerUserID); err != nil {\n\t\treturn nil, err\n\t}",
+  "new": "\tif false {\n\t\treturn nil, nil\n\t}",
+  "test": "TestTransferSecretOwnershipRefusesAProofThatDoesNotAuthorise",
+  "pkg": "./internal/vaultegress/",
+  "why": "the wrapper takes a proof and ignores it, which is a chokepoint with no lock on it and a two-line edit"
+ },
+ {
+  "id": "transfer-allows-a-third-party-recipient",
+  "mech": "owner-column",
+  "file": "internal/vaultegress/ownership.go",
+  "old": "\tcase to != actor:",
+  "new": "\tcase false:",
+  "test": "TestAuthorizeTransferIsTheOnlyWayToGetAProof",
+  "pkg": "./internal/vaultegress/",
+  "why": "an admin may hand ownership to anybody. Then a route that names a recipient can make a collection manager the owner, and the attack is back one indirection away, looking like an administrative convenience"
+ },
+ {
+  "id": "transfer-does-not-need-an-admin",
+  "mech": "owner-column",
+  "file": "internal/vaultegress/ownership.go",
+  "old": "\tcase !req.ActorIsInstanceAdmin:",
+  "new": "\tcase false:",
+  "test": "TestAuthorizeTransferIsTheOnlyWayToGetAProof",
+  "pkg": "./internal/vaultegress/",
+  "why": "every principal below the owner can now acquire ownership by acting, which is the class of defect this whole file exists to close"
+ },
+ {
+  "id": "create-leaves-the-owner-empty",
+  "mech": "owner-column",
+  "file": "internal/vaultegress/queries/vault_egress.sql",
+  "old": "INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)\nVALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);",
+  "new": "INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)\nVALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);",
+  "test": "TestEveryRowCreatingStatementNamesTheSecretOwner",
+  "why": "the silent-product-failure direction: rows land with no owner, mayDirectSecretEgress refuses everybody, and whoever created the entry cannot configure delivery for it with no error anywhere"
+ },
+ {
+  "id": "custom-fields-skip-the-exit",
+  "mech": "custom-fields",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\tCustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),",
+  "new": "\t\tCustomFields:         h.decryptCustomFields(row.CustomFields),",
+  "test": "TestOnlyTheCustomFieldExitDecryptsCustomFields",
+  "why": "the second exit re-opened on the response path it was found on. The behavioural tests miss this (the owner is allowed the value either way and the defensive test calls the gated function directly), which is why the caller-set guard exists"
+ },
+ {
+  "id": "custom-field-exit-releases-on-refusal",
+  "mech": "custom-fields",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\t\tfields[i].Value = \"\"\n\t\t\tfields[i].Withheld = true\n\t\t\tcontinue",
+  "new": "\t\t\tfields[i].Withheld = true\n\t\t\tcontinue",
+  "test": "TestSecretCustomFieldsGoThroughTheExit",
+  "why": "the exit refuses and the value goes out anyway, which is the shape of a gate that logs instead of gating"
+ },
+ {
+  "id": "a-withheld-field-can-be-saved-back",
+  "mech": "custom-fields",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\tif f.Withheld {",
+  "new": "\t\tif false {",
+  "test": "TestASaveCannotWriteBackAWithheldCustomField",
+  "why": "the blank this server rendered is written over the real secret on the next save, permanently, with a 200 and a success toast"
+ },
+ {
+  "id": "the-ledger-stops-deriving-columns",
+  "mech": "scope-boundary",
+  "file": "internal/handlers/encrypted_field_ledger_test.go",
+  "old": "\t\t\t\t\t\trecord(\"vault_entries.\"+name, pos)",
+  "new": "\t\t\t\t\t\t_ = name",
+  "test": "TestEveryEncryptedFieldIsClassified",
+  "why": "the derivation stops seeing the column fields, so the ledger would read as complete over a boundary it no longer checks. Both directions have to fail, and the stale half is what catches this"
+ },
+ {
+  "id": "an-exit-classification-needs-no-exit",
+  "mech": "scope-boundary",
+  "file": "internal/handlers/encrypted_field_ledger.go",
+  "old": "\t\tclass: classThroughTheExit, exitKey: \"vault.go:VaultHandler.customFieldsForCaller\",",
+  "new": "\t\tclass: classThroughTheExit, exitKey: \"vault.go:VaultHandler.NoSuchExit\",",
+  "test": "TestEveryFieldThatGoesThroughTheExitHasOne",
+  "why": "a field claimed to be gated names an exit that does not exist. A classification with nothing behind it is the rubber stamp the prose boundary already was"
+ },
+ {
+  "id": "the-write-gate-stops-asking-about-auth-token",
+  "mech": "shippability",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\tif refusal := h.checkAuthTokenAuthority(r.Context(), t); !refusal.empty() {",
+  "new": "\t\tif refusal := h.checkAuthTokenAuthority(r.Context(), t); false && !refusal.empty() {",
+  "test": "TestAForgejoTargetNamingSomebodyElsesTokenIsRefusedAtTheWrite",
+  "why": "THE ROTATION DEFECT restored: the panel accepts a target it cannot deliver, reports it saved, and drops it weeks later against a credential that has just been rolled"
+ },
+ {
+  "id": "the-write-gate-asks-the-wrong-entry",
+  "mech": "shippability",
+  "file": "internal/handlers/vault_auth_token_authority.go",
+  "old": "\tif !h.mayConfigureDelivery(ctx, t.ConfiguredBy, referenced) {",
+  "new": "\tif !h.mayConfigureDelivery(ctx, t.ConfiguredBy, t.ConfiguredBy) {",
+  "test": "TestAForgejoTargetNamingSomebodyElsesTokenIsRefusedAtTheWrite",
+  "why": "the round-6 defect in one argument, transplanted into the write gate: ask about anything other than the entry the secret COMES FROM and the answer is about the wrong row"
+ },
+ {
+  "id": "the-write-gate-asks-can-you-use-it",
+  "mech": "shippability",
+  "file": "internal/handlers/vault_auth_token_authority.go",
+  "old": "\tif !h.mayConfigureDelivery(ctx, t.ConfiguredBy, referenced) {",
+  "new": "\tif !h.entryCurrentlyUsableBy(ctx, t.ConfiguredBy, referenced) {",
+  "test": "TestAForgejoTargetNamingSomebodyElsesTokenIsRefusedAtTheWrite",
+  "why": "the question every earlier round kept asking. A member of the collection HAS use on the shared token, so the write gate and the delivery gate disagree again and the target is accepted and never delivered"
+ },
+ {
+  "id": "the-boot-audit-reports-nothing",
+  "mech": "shippability",
+  "file": "internal/handlers/vault_auth_token_authority.go",
+  "old": "\t\t\trefusal := h.checkAuthTokenAuthority(ctx, t)\n\t\t\tif refusal.empty() {\n\t\t\t\tcontinue\n\t\t\t}",
+  "new": "\t\t\trefusal := h.checkAuthTokenAuthority(ctx, t)\n\t\t\tif true {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\t_ = refusal",
+  "test": "TestExistingCrossOwnerTargetsAreNamedAtBootNotAtTheNextRotation",
+  "why": "the migration half disappears. New writes are refused and every row an existing instance already has still fails at its next unattended rotation, which is the whole reason this defect was the priority"
+ },
+ {
+  "id": "the-boot-audit-reports-everything",
+  "mech": "shippability",
+  "file": "internal/handlers/vault_auth_token_authority.go",
+  "old": "\tif t.Type != \"forgejo_secret\" || strings.TrimSpace(t.AuthToken) == \"\" {\n\t\treturn authTokenRefusal{}\n\t}",
+  "new": "\tif t.Type != \"forgejo_secret\" {\n\t\treturn authTokenRefusal{}\n\t}\n\tif strings.TrimSpace(t.AuthToken) == \"\" {\n\t\treturn authTokenRefusal{TargetLabel: t.Label, AuthToken: t.AuthToken, Reason: \"no auth_token\"}\n\t}",
+  "test": "TestExistingCrossOwnerTargetsAreNamedAtBootNotAtTheNextRotation",
+  "why": "the noise direction. A boot warning that fires on healthy configuration is what makes the real one get ignored, and this is the version an operator would actually meet"
+ },
+ {
+  "id": "rotate-withholds-in-silence",
+  "mech": "shippability",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\tvalueWithheld = \"the secret was rotated and stored, but its value was not released to you: \" +\n\t\t\tcallerErr.Error()",
+  "new": "\t\tvalueWithheld = \"\"",
+  "test": "TestRotateSaysSoWhenItWithholdsTheValue",
+  "why": "the defect as shipped: 200 with an empty value on a credential that has just been rolled, and the operator cannot tell that from 'the new value is empty'"
+ },
+ {
+  "id": "rotate-returns-the-value-the-exit-refused",
+  "mech": "shippability",
+  "file": "internal/handlers/vault.go",
+  "old": "\t\trotatedForCaller = \"\"\n\t\tvalueWithheld =",
+  "new": "\t\tvalueWithheld =",
+  "test": "TestRotateSaysSoWhenItWithholdsTheValue",
+  "why": "ExitString returns \"\" on refusal today, so this is only safe by accident. If it ever returned a partial value the refusal would ship it, and the assertion has to be on the response rather than on that accident",
+  "expect_miss": true,
+  "note": "reached by hand: secretexit.ExitString returns the empty string on every error path (TestExitFailsClosed pins that the bytes are not returned alongside the refusal), so the explicit clear is belt to that brace and no state distinguishes them. Kept because the brace is in another package"
+ },
+ {
+  "id": "the-genuine-transfer-stops-moving-the-owner",
+  "mech": "owner-column",
+  "file": "internal/vaultegress/ownership.go",
+  "old": "\t\tSecretOwnerUserID: params.NewOwnerUserID,",
+  "new": "\t\tSecretOwnerUserID: \"\",",
+  "test": "TestTheGenuineOwnershipTransferStillWorksAndIsAttributable",
+  "why": "the positive-control direction: a transfer that moves the custodian and not the owner leaves the re-owned entry with no principal who can direct it, which is 'the fix works by giving nobody the right'"
+ }
+]
