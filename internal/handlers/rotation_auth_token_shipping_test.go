@@ -217,19 +217,42 @@ func TestExistingCrossOwnerTargetsAreNamedAtBootNotAtTheNextRotation(t *testing.
 	}
 	t.Logf("boot report: %s", joined)
 
-	// NEGATIVE CONTROL. A target naming a token its configurer DOES own is not
-	// reported: a boot warning that fires on healthy configuration is noise, and
-	// noise is what makes the real one get ignored.
+	// NEGATIVE CONTROLS. A boot warning that fires on healthy configuration is
+	// noise, and noise is what makes the real one get ignored, so every shape
+	// this audit must stay quiet about is driven here rather than assumed.
+	//
+	// The third case is the one an ablation caught: a forgejo target with NO
+	// auth_token at all is storable (UpdateTargets requires instance, repo and
+	// secret_name, not auth_token) and has nothing to do with cross-owner
+	// references. Reporting it would name the wrong problem on a row that has a
+	// different one.
 	mustEntry(t, env.h, queries, "entry-alice-own", env.alice, "alice-own-pat", "gitea_ALICE")
-	ok := `[{"type":"forgejo_secret","label":"ci","instance":"https://git.example",` +
-		`"repo":"team/app","secret_name":"APP_KEY","auth_token":"alice-own-pat",` +
-		`"configured_by":"` + env.alice + `"}]`
-	encOK, err := env.h.encryptColumn(ok)
-	if err != nil {
-		t.Fatalf("encrypt: %v", err)
-	}
-	mustStoreRotationTargetsForTest(t, queries, env.appEntry, encOK)
-	if again := env.h.AuditCrossOwnerAuthTokenTargets(context.Background()); len(again) != 0 {
-		t.Fatalf("a healthy target was reported as broken: %v", again)
+	for _, tc := range []struct {
+		name    string
+		targets string
+	}{
+		{"a forgejo target naming a token its configurer owns",
+			`[{"type":"forgejo_secret","label":"ci","instance":"https://git.example",` +
+				`"repo":"team/app","secret_name":"APP_KEY","auth_token":"alice-own-pat",` +
+				`"configured_by":"` + env.alice + `"}]`},
+		{"a forgejo target with no auth_token at all",
+			`[{"type":"forgejo_secret","label":"ci","instance":"https://git.example",` +
+				`"repo":"team/app","secret_name":"APP_KEY","configured_by":"` + env.alice + `"}]`},
+		{"a webhook target, which references no other entry",
+			`[{"type":"webhook","label":"deploy","webhook_url":"https://hooks.example/deploy",` +
+				`"configured_by":"` + env.alice + `"}]`},
+		{"a notify target",
+			`[{"type":"notify","label":"tell the team","configured_by":"` + env.alice + `"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encOK, encErr := env.h.encryptColumn(tc.targets)
+			if encErr != nil {
+				t.Fatalf("encrypt: %v", encErr)
+			}
+			mustStoreRotationTargetsForTest(t, queries, env.appEntry, encOK)
+			if again := env.h.AuditCrossOwnerAuthTokenTargets(context.Background()); len(again) != 0 {
+				t.Fatalf("a healthy target was reported as broken: %v", again)
+			}
+		})
 	}
 }
