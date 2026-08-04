@@ -33,7 +33,8 @@ type SettingsTab =
   | 'email'
   | 'channels'
   | 'apikeys'
-  | 'ai';
+  | 'ai'
+  | 'ownership';
 
 function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.message;
@@ -1162,6 +1163,141 @@ function ChannelsTab() {
   );
 }
 
+// OwnershipTab is the operator surface for migration 00034's fail-closed
+// backfill.
+//
+// The migration split vault_entries.user_id into a custodian and an owner, and
+// refused to copy user_id into the owner column wherever the database could not
+// prove the custodian is the principal who deposited the secret. An empty owner
+// denies, which is the safe direction and is not free: those entries refuse NEW
+// delivery destinations, and existing targets a non-admin configured stop
+// contributing hosts at delivery time.
+//
+// Without this page an operator would reach for sqlite3 and set the column by
+// hand, which is the laundering step the migration exists to avoid, with a human
+// running it.
+function OwnershipTab() {
+  const queryClient = useQueryClient();
+  const [claiming, setClaiming] = useState<string | null>(null);
+
+  const reportQuery = useQuery({
+    queryKey: queryKeys.admin.unownedEntries(),
+    queryFn: () => api.admin.listUnownedEntries(),
+  });
+
+  const claimMutation = useMutation({
+    mutationFn: (id: string) => api.admin.claimSecretOwnership(id),
+    onSuccess: () => {
+      toast.success('Ownership claimed');
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.unownedEntries(),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+    onSettled: () => setClaiming(null),
+  });
+
+  const entries = reportQuery.data?.entries ?? [];
+
+  return (
+    <div className="max-w-3xl space-y-6">
+      <div className={cardClass}>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Secrets with no recorded owner
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Every secret records the principal whose authority decides where its
+          plaintext may be sent. That is deliberately not the same column as the
+          one a collection manager can take over by adopting an entry, so the
+          upgrade would not guess an owner where it could not prove one. The
+          entries below still open, reveal and rotate. They refuse{' '}
+          <span className="font-medium text-slate-700">new</span> delivery
+          destinations, and existing webhook or Forgejo targets that a non-admin
+          configured stay unauthorised, until an admin takes ownership here.
+        </p>
+        <p className="mt-3 text-sm text-slate-500">
+          Claiming makes you the owner and the custodian of that one entry. It
+          grants you nothing you did not already have as an instance admin; what
+          it does is record the decision.
+        </p>
+      </div>
+
+      {reportQuery.isLoading && (
+        <div className={cardClass}>
+          <div className="flex items-center gap-2 text-sm text-slate-500">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading
+          </div>
+        </div>
+      )}
+
+      {reportQuery.isError && (
+        <div className={cardClass}>
+          <p className="text-sm text-red-600">
+            {errorMessage(reportQuery.error)}
+          </p>
+        </div>
+      )}
+
+      {!reportQuery.isLoading && !reportQuery.isError && entries.length === 0 && (
+        <div className={cardClass}>
+          <div className="flex items-center gap-2 text-sm text-slate-600">
+            <ShieldCheck className="h-4 w-4 text-emerald-600" />
+            Every secret on this instance records an owner. Nothing to repair.
+          </div>
+        </div>
+      )}
+
+      {entries.length > 0 && (
+        <div className={cardClass} data-testid="unowned-entries">
+          <ul className="divide-y divide-slate-100">
+            {entries.map((entry) => (
+              <li key={entry.id} className="flex gap-4 py-4 first:pt-0 last:pb-0">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-slate-900">
+                      {entry.name}
+                    </span>
+                    {entry.collection_name && (
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+                        {entry.collection_name}
+                      </span>
+                    )}
+                    {entry.adoption_recorded && (
+                      <span className="flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">
+                        <AlertTriangle className="h-3 w-3" />
+                        adoption recorded
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Held by {entry.custodian_email || entry.custodian_user_id}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">{entry.why}</p>
+                </div>
+                <button
+                  type="button"
+                  disabled={claimMutation.isPending && claiming === entry.id}
+                  onClick={() => {
+                    setClaiming(entry.id);
+                    claimMutation.mutate(entry.id);
+                  }}
+                  className="h-8 shrink-0 self-center rounded-lg bg-slate-900 px-3 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {claimMutation.isPending && claiming === entry.id
+                    ? 'Claiming'
+                    : 'Take ownership'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ApiKeysTab() {
   const queryClient = useQueryClient();
   const [name, setName] = useState('');
@@ -1597,6 +1733,7 @@ export default function Settings() {
           { id: 'session', label: 'Sessions', icon: Clock },
           { id: 'email', label: 'Email', icon: Mail },
           { id: 'channels', label: 'Alerts', icon: Bell },
+          { id: 'ownership', label: 'Ownership', icon: KeyRound },
         ] as const)
       : []),
   ];
@@ -1643,6 +1780,7 @@ export default function Settings() {
       {activeTab === 'session' && isAdmin && <SessionTab />}
       {activeTab === 'email' && isAdmin && <EmailTab />}
       {activeTab === 'channels' && isAdmin && <ChannelsTab />}
+      {activeTab === 'ownership' && isAdmin && <OwnershipTab />}
     </Layout>
   );
 }

@@ -12,6 +12,7 @@ export const queryKeys = {
     users: () => ['admin', 'users'] as const,
     invitations: () => ['admin', 'invitations'] as const,
     notificationChannels: () => ['admin', 'notification-channels'] as const,
+    unownedEntries: () => ['admin', 'vault-ownership'] as const,
   },
   settings: {
     all: ['settings'] as const,

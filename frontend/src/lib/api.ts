@@ -23,6 +23,7 @@ import type {
   CollectionRole,
   CollectionInviteResult,
   PendingInvite,
+  OwnershipReport,
 } from './types';
 
 export class ApiError extends Error {
@@ -255,6 +256,17 @@ export const api = {
       request<void>(`/admin/notification-channels/${id}/test`, {
         method: 'POST',
       }),
+
+    // Migration 00034 split vault_entries.user_id into a custodian and an
+    // owner, and refused to guess an owner wherever the database could not
+    // prove the custodian deposited the secret. An empty owner denies, so
+    // those entries cannot take a NEW delivery destination until an admin
+    // claims them. This is the surface that shows what was withheld and the
+    // one action that repairs it.
+    listUnownedEntries: () =>
+      request<OwnershipReport>('/admin/vault/ownership'),
+    claimSecretOwnership: (id: string) =>
+      request<void>(`/admin/vault/${id}/ownership/claim`, { method: 'POST' }),
   },
 
   settings: {

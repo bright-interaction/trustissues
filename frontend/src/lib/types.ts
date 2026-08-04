@@ -238,3 +238,32 @@ export interface NotificationChannel {
   events: string;
   created_at: string;
 }
+
+// One vault entry that migration 00034 refused to stamp with a secret owner.
+//
+// The migration split vault_entries.user_id into a CUSTODIAN (namespace,
+// listing, adoption) and an OWNER (the only principal the secret exit asks
+// about), and it would not copy user_id into the owner column wherever the
+// database could not prove the custodian is the principal who deposited the
+// plaintext. An empty owner denies, so these entries still open, reveal and
+// rotate, and refuse NEW delivery destinations until an admin claims them.
+export interface UnownedEntry {
+  id: string;
+  name: string;
+  custodian_user_id: string;
+  custodian_email: string;
+  collection_id: string;
+  collection_name: string;
+  // True when the append-only audit trail actually records this entry being
+  // renamed and adopted by a collection manager. False proves nothing: the
+  // audit row only exists for adoptions performed from 2026-08-02 onward.
+  adoption_recorded: boolean;
+  created_at: string;
+  updated_at: string;
+  why: string;
+}
+
+export interface OwnershipReport {
+  entries: UnownedEntry[];
+  total: number;
+}
