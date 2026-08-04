@@ -1,0 +1,191 @@
+[
+ {
+  "id": "the-sixth-door",
+  "mech": "decryption-door",
+  "file": "internal/handlers/ablation_sixth_door.go (new)",
+  "change": "a new wrapper with a new name, UserHandler.unsealRecoveryBlob, opening a new vault-key-encrypted column with its own aes.NewCipher / cipher.NewGCM / gcm.Open, touching no ledger",
+  "test": "TestAESGCMIsOpenedInExactlyOneFile",
+  "why": "THE REQUIRED ABLATION. It is the exact shape that beat round 18: a door is not a name, and a guard that derives its set from four call shapes cannot see a fifth wrapper",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A SIXTH DECRYPTION DOOR: internal/handlers/ablation_sixth_door.go imports crypto/aes and crypto/cipher",
+  "control": "the SAME file on base 61cb33d3: go build succeeded and the ENTIRE round-18 suite stayed green, TestEveryEncryptedFieldIsClassified logging '15 encrypted fields, all classified'"
+ },
+ {
+  "id": "the-fifth-door-again",
+  "mech": "decryption-door",
+  "file": "internal/handlers/ablation_invite_raw.go (new)",
+  "change": "UserHandler.openInviteCodeForDisplay, a raw AES door on invitations.code, i.e. the original finding re-introduced under a new name",
+  "test": "TestAESGCMIsOpenedInExactlyOneFile",
+  "why": "the permanent regression for the finding this round exists to close",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A SIXTH DECRYPTION DOOR: internal/handlers/ablation_invite_raw.go imports crypto/aes and crypto/cipher"
+ },
+ {
+  "id": "a-second-opener-of-the-invite-code",
+  "mech": "declared-door",
+  "file": "internal/handlers/ablation_second_opener.go (new)",
+  "change": "UserHandler.peekInviteCode opens invitations.code through the DECLARED entry point, so the import guard has nothing to say",
+  "test": "TestTheInvitationCodeGoesThroughTheDeclaredDoor",
+  "why": "a second opener is a second answer to 'may this caller be handed a credential that redeems into an account'",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "vaultFieldInvitationCode is used in [ablation_second_opener.go:UserHandler.peekInviteCode invitation_code.go:UserHandler.openInviteCode], want exactly one"
+ },
+ {
+  "id": "mislabel-the-invite-code",
+  "mech": "field-identity",
+  "file": "internal/handlers/invitation_code.go",
+  "change": "openInviteCode passes vaultFieldNotes instead of vaultFieldInvitationCode",
+  "test": "TestNoFieldIsDeclaredAndNeverOpened, TestTheInvitationCodeGoesThroughTheDeclaredDoor",
+  "why": "the ledger would then carry an entry for invitations.code that nothing opens, and the real decrypt would be filed under notes",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A STALE DECLARATION: vaultFieldInvitationCode declares invitations.code and nothing in the module ever passes it to a decrypt"
+ },
+ {
+  "id": "borrow-a-still-used-field-for-a-new-column",
+  "mech": "field-identity",
+  "file": "internal/handlers/ablation_borrowed_field.go (new)",
+  "change": "a new door on a NEW column, through the declared entry point, naming vaultFieldNotes, which stays in use elsewhere",
+  "test": "the whole handlers suite",
+  "why": "the residual this construction does not close",
+  "build": "SUCCEEDED",
+  "expect_miss": true,
+  "result": "MISS",
+  "detail": "ok github.com/bright-interaction/trustissues/internal/handlers 26.7s. THE LEDGER STILL HAS NO HOLE: it records that a decryption happens at that site and carries a classification. What it gets wrong is the COLUMN NAME. Closing it takes AES-GCM additional authenticated data binding the field name into the ciphertext, which is a storage-format change; see AUDIT-ROUND-19.md for why it was deferred rather than half-done"
+ },
+ {
+  "id": "stale-crypto-exemption",
+  "mech": "guard-integrity",
+  "file": "internal/handlers/encrypted_field_ledger_test.go",
+  "change": "theCryptoFiles gains an exemption for a file that imports neither package",
+  "test": "TestAESGCMIsOpenedInExactlyOneFile",
+  "why": "an exemption for code that no longer does the thing reads as a boundary and is not one",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A STALE CRYPTO EXEMPTION"
+ },
+ {
+  "id": "declared-and-never-opened",
+  "mech": "guard-integrity",
+  "file": "internal/handlers/ablation_unused_field.go (new)",
+  "change": "vaultfield.Declare for vault_entries.ghost_column, passed to nothing",
+  "test": "TestNoFieldIsDeclaredAndNeverOpened",
+  "why": "the round-18 guard failed in BOTH directions and that half is still worth keeping",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A STALE DECLARATION: vaultFieldGhostColumn declares vault_entries.ghost_column and nothing opens it"
+ },
+ {
+  "id": "invitation-routes-leave-admin-only",
+  "mech": "classification-premise",
+  "file": "cmd/server/main.go",
+  "change": "GET /admin/invitations and POST /admin/invitations/{id}/resend moved out of the AdminOnly group onto the public /api group",
+  "test": "TestInstanceOwnedFieldsAreOnlyReachableByAdmins",
+  "why": "invitations.code is classified instance-owned BECAUSE its two destinations are admin-only. A classification whose premise is not checked is a claim, and two rounds were lost to claims",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "three failures naming the route, ListInvitations and ResendInvitation"
+ },
+ {
+  "id": "ledger-entry-declared-from-a-test",
+  "mech": "guard-integrity",
+  "file": "internal/handlers/ablation_testdecl_test.go (new)",
+  "change": "a vaultfield.Declare in a _test.go file inside the handlers package",
+  "test": "TestTheLedgerIsDeclaredByProductionCode",
+  "why": "a test-only declaration satisfies the ledger in the test binary and ships nothing",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "vault_entries.test_only_column is declared from a TEST file"
+ },
+ {
+  "id": "zero-field-decrypts",
+  "mech": "fail-closed",
+  "file": "internal/vaultfield/vaultfield.go",
+  "change": "the f.IsZero() check removed from OpenColumn",
+  "test": "TestTheZeroFieldDecryptsNothing",
+  "why": "vaultfield.Field{} is a composite literal any package can write, so the type alone does not stop a door being written without a declaration",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "vaultfield.OpenColumn decrypted for the ZERO Field"
+ },
+ {
+  "id": "shield-reaches-for-the-vault-key",
+  "mech": "exemption-premise",
+  "file": "internal/shield/crypto.go",
+  "change": "a helper taking a parameter named VaultKey",
+  "test": "TestShieldDoesNotTouchTheVaultKey",
+  "why": "internal/shield is exempt from the ledger because it is a different key family. The moment it reaches for the vault key that exemption is false",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "internal/shield/crypto.go mentions \"VaultKey\""
+ },
+ {
+  "id": "two-declarations-of-one-column",
+  "mech": "fail-closed",
+  "file": "internal/handlers/ablation_dup.go (new)",
+  "change": "a second, contradictory declaration of vault_entries.notes",
+  "test": "any test in the package",
+  "why": "two declarations of one column will disagree and a reader believes whichever they find first",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "panic at init: vault_entries.notes is already declared at internal/handlers/ablation_dup.go:7"
+ },
+ {
+  "id": "unclassified-declaration",
+  "mech": "fail-closed",
+  "file": "internal/handlers/ablation_unclassified.go (new)",
+  "change": "vaultfield.Declare with vaultfield.Unclassified and an empty reason",
+  "test": "any test in the package",
+  "why": "an unset class is not a decision",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "panic at init: vault_entries.mystery must be classified"
+ },
+ {
+  "id": "exit-key-that-does-not-exist",
+  "mech": "guard-integrity",
+  "file": "internal/handlers/encrypted_field_ledger.go",
+  "change": "custom_fields names a theExitList key that was renamed away",
+  "test": "TestEveryDeclaredFieldIsARuling",
+  "why": "either the exit was renamed and the declaration rotted, or the field is classified as gated and is not",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "vault_entries.custom_fields says it leaves through a key theExitList does not have"
+ },
+ {
+  "id": "second-caller-of-the-raw-bytes-door",
+  "mech": "pre-existing-guard",
+  "file": "internal/handlers/ablation_rawaes_caller.go (new)",
+  "change": "a second caller of decryptWithKey",
+  "test": "TestRawAESIsReachedFromExactlyOnePlace",
+  "why": "the round-7 guard must survive this round's refactor, which changed decryptWithKey's signature",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "decryptWithKey is called from two places, want exactly [vault.go:VaultHandler.DecryptInstanceConfig]"
+ },
+ {
+  "id": "ledger-names-a-column-the-schema-does-not-have",
+  "mech": "guard-integrity",
+  "file": "internal/handlers/encrypted_field_ledger.go",
+  "change": "vault_entries.rotation_targets renamed to vault_entries.delivery_targets in its declaration",
+  "test": "TestEveryLedgerColumnExistsInTheSchema",
+  "why": "this guard caught a REAL one on its first run: the ledger had carried alert_channels.config since round 17 and the table is notification_channels",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "A LEDGER ENTRY FOR A COLUMN THAT DOES NOT EXIST: vault_entries.delivery_targets"
+ },
+ {
+  "id": "empty-owner-falls-back-to-the-custodian",
+  "mech": "owner-column",
+  "file": "internal/handlers/vault_grant.go",
+  "change": "if info.SecretOwnerUserID == \"\" { return userID != \"\" && info.UserID == userID }",
+  "test": "TestAnEmptyOwnerDeniesEvenTheCustodian",
+  "why": "THIS IS THE ROUND-8 DOCUMENTED MISS, run verbatim. Round 8 recorded it SUPERSEDED because 'no state in the suite distinguishes this'. The skeptic that was supposed to supply that state died on an API connection error, so the claim shipped unverified. This round supplies it: a planted legacy row, the strongest non-admin position on it, and a real rotation",
+  "build": "SUCCEEDED",
+  "result": "CAUGHT",
+  "detail": "the custodian's host received [POST 127.0.0.1/collect] carrying the rotated secret; the round-8 miss is closed"
+ }
+]
