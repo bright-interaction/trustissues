@@ -30,7 +30,7 @@
   "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
   "why": "the one implementation of the rule stops deciding. Everything else in the construction survives, so this is what the wire assertions are actually for",
   "result": "CAUGHT",
-  "detail": "secret_exit_failclosed_test.go:47: a destination with no recorded chooser was authorised. There was nobody whose authority could be checked, and that has to mean no"
+  "detail": "access_revocation_test.go:167: after \"remove from collection\", probe \"rotation-delivery\" still grants: the credential can still be spent by someone whose access was revoked"
  },
  {
   "id": "no-chooser-is-treated-as-allowed",
@@ -88,13 +88,13 @@
   "detail": "secret_exit_principals_test.go:119: the team secret delivered=true, want false (THE ROUND-6 BREAK)"
  },
  {
-  "id": "webhook-skips-the-exit-chooser",
+  "id": "forgejo-body-exit-misstates-the-chooser",
   "mech": "chokepoint",
   "file": "internal/handlers/vault_targets.go",
-  "old": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), hostFromRawURL(target.WebhookURL)))",
-  "new": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), hostFromRawURL(target.WebhookURL)))",
-  "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
-  "why": "the round-5 attack again, through the round-7 exit, with the chooser misstated",
+  "old": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), host))",
+  "new": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), host))",
+  "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
+  "why": "the SECOND of the two exits in the forgejo path, with the chooser misstated. ChosenByTheInstance is the one kind the authority answers yes to unconditionally, so a call site reaching for it is the sharpest misuse available",
   "result": "MISSED",
   "detail": "guard passed clean with the bug present"
  },
@@ -201,23 +201,23 @@
   "id": "a-new-exit-nobody-wrote-down",
   "mech": "guard",
   "file": "internal/handlers/vault_keycheck.go",
-  "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
-  "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+  "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n\n",
+  "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n\n// A brand-new exit, added without touching theExitList.\nfunc undocumentedNewExit(ctx context.Context, pt secretexit.Plaintext, host string) (string, error) {\n\t_, s, err := secretexit.ExitString(ctx, pt,\n\t\tsecretexit.ToHost(\"an undocumented exit\", secretexit.ChosenByTheInstance(\"nothing\"), host))\n\treturn s, err\n}\n\n",
   "test": "TestEveryExitIsRegistered",
   "why": "the list is as much the deliverable as the code. A new exit has to fail loudly on the day it is written, naming the file, the way the providerHTTP.Do guard does",
-  "result": "INVALID",
-  "detail": "does not compile: internal/handlers/vault_keycheck.go:20:2: \"github.com/bright-interaction/trustissues/internal/secretexit\" imported and not used"
+  "result": "CAUGHT",
+  "detail": "secret_exit_registry_test.go:160: A NEW EXIT: vault_keycheck.go:undocumentedNewExit (at vault_keycheck.go:25) calls secretexit.Exit and is not in theExitList."
  },
  {
   "id": "a-second-implementation-of-the-rule",
   "mech": "guard",
   "file": "internal/handlers/vault_keycheck.go",
-  "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
-  "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+  "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n\n",
+  "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n\n// A second production Authority, which is a second copy of one rule.\ntype secondAuthority struct{}\n\nfunc (secondAuthority) AuthorizeSecretExit(context.Context, secretexit.Origin, secretexit.Destination) error {\n\treturn nil\n}\n\n",
   "test": "TestVaultHandlerIsTheOnlyProductionAuthority",
   "why": "round 5 is what a second copy of one rule costs: the write gate and the delivery gate both implemented it, disagreed about instance admins, and an admin's target was accepted and then silently never delivered",
-  "result": "INVALID",
-  "detail": "does not compile: internal/handlers/vault_keycheck.go:20:2: \"github.com/bright-interaction/trustissues/internal/secretexit\" imported and not used"
+  "result": "CAUGHT",
+  "detail": "secret_exit_registry_test.go:302: the owner rule has 2 production implementations: [VaultHandler (secret_exit_authority.go) secondAuthority (vault_keycheck.go)]."
  },
  {
   "id": "instance-config-door-opens-an-entry-secret",
@@ -239,7 +239,7 @@
   "test": "TestUnlockOnlyReleasesEntriesTheCallerMayRead",
   "why": "the caller half of the exit stops asking, so a list query that widened by accident hands over rows the caller may not read",
   "result": "CAUGHT",
-  "detail": "secret_exit_failclosed_test.go:308: the exit released an entry to a caller its owner never admitted. The list query is then the only thing standing between a widened SELECT and every secret on the ins"
+  "detail": "secret_exit_failclosed_test.go:323: the exit released an entry to a caller its owner never admitted. The list query is then the only thing standing between a widened SELECT and every secret on the ins"
  },
  {
   "id": "unlock-does-not-go-through-the-exit",
@@ -248,7 +248,8 @@
   "old": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", userID))",
   "new": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", row.UserID))",
   "test": "TestUnlockOnlyReleasesEntriesTheCallerMayRead",
-  "why": "asking about the ENTRY OWNER instead of the caller. The owner always passes their own read check, so the question becomes a tautology and answers yes for every row the query returned",
+  "why": "KNOWN MISS, recorded rather than removed. Swapping the caller id for the entry owner's is not independently observable: ListAccessibleVaultEntriesWithSecrets already filters on a disabled account and on ACCEPTED membership, and the schema pins collection_members.role to the three roles grantFor grants read to, so no reachable state has the query return a row the exit would refuse. The caller half is defence in depth over a query that is currently correct, and this line is what says so",
+  "expect": "MISS",
   "result": "MISSED",
   "detail": "guard passed clean with the bug present"
  },
@@ -261,7 +262,7 @@
   "test": "TestViewerCannotExfiltrateATeamSecretThroughTheirOwnEntrysAuthToken",
   "why": "THE PRE-FIX STATE. Nothing asked the origin-owner question for the auth_token secret, which is the round-6 break exactly",
   "result": "CAUGHT",
-  "detail": "secret_exit_principals_test.go:119: the team secret delivered=true, want false (THE ROUND-6 BREAK)"
+  "detail": "access_revocation_test.go:167: after \"remove from collection\", probe \"rotation-delivery\" still grants: the credential can still be spent by someone whose access was revoked"
  },
  {
   "id": "chooser-branch-stops-asking-scheduler",
@@ -272,7 +273,7 @@
   "test": "TestTheSchedulerIsHeldToTheSameRule",
   "why": "the same defect on the path that runs with nobody watching",
   "result": "CAUGHT",
-  "detail": "secret_exit_principals_test.go:119: the team secret delivered=true, want false (THE ROUND-6 BREAK)"
+  "detail": "access_revocation_test.go:167: after \"remove from collection\", probe \"rotation-delivery\" still grants: the credential can still be spent by someone whose access was revoked"
  },
  {
   "id": "chooser-branch-stops-asking-matrix",
@@ -283,6 +284,6 @@
   "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
   "why": "the same defect read across every principal class at once",
   "result": "CAUGHT",
-  "detail": "secret_exit_principals_test.go:119: the team secret delivered=true, want false (THE ROUND-6 BREAK)"
+  "detail": "access_revocation_test.go:167: after \"remove from collection\", probe \"rotation-delivery\" still grants: the credential can still be spent by someone whose access was revoked"
  }
 ]

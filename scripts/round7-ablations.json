@@ -77,7 +77,7 @@
     "file": "internal/handlers/vault_targets.go",
     "old": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), host))",
     "new": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), host))",
-    "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
+    "test": "TestBothForgejoExitsAreAskedSeparately",
     "why": "the SECOND of the two exits in the forgejo path, with the chooser misstated. ChosenByTheInstance is the one kind the authority answers yes to unconditionally, so a call site reaching for it is the sharpest misuse available"
   },
   {

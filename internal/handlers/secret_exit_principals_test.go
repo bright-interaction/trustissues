@@ -289,3 +289,86 @@ func TestAnUnauthorisedExitReleasesNoBytes(t *testing.T) {
 		t.Fatalf("the authorised exit returned %q", b)
 	}
 }
+
+// TestBothForgejoExitsAreAskedSeparately is the case an ablation found.
+//
+// deliverToForgejoSecret carries TWO secrets to one host: the rotated value of
+// the entry being delivered, in the body, and another entry's token, in the
+// Authorization header. The round-6 fix is about the SECOND one, so every test
+// written for it drives a principal who fails on the bearer and never reaches
+// the body. Misstating the chooser on the body exit therefore changed nothing
+// anybody was looking at.
+//
+// This is the configuration that separates them: the configurer owns the entry
+// the BEARER comes from and does not own the entry being ROTATED. The bearer
+// exit says yes, correctly, and the body exit has to say no on its own.
+func TestBothForgejoExitsAreAskedSeparately(t *testing.T) {
+	swapProviderHTTP(t)
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	alice := mustUser(t, queries, "split-alice@example.com", "user", "")
+	bob := mustUser(t, queries, "split-bob@example.com", "vault_only", "")
+	mustCollection(t, queries, "coll-split", alice, map[string]string{
+		alice: collRoleManager,
+		bob:   collRoleEditor,
+	})
+
+	// Alice's shared entry: the one being rotated, whose value goes in the BODY.
+	const aliceSecret = "sk_live_ALICES_ROTATED_VALUE"
+	mustEntry(t, h, queries, "entry-split-alice", alice, "alice-app", "seed")
+	placeInCollection(t, queries, "entry-split-alice", "coll-split")
+
+	// Bob's OWN personal token: the one that goes in the Authorization header.
+	// He is its creator, so he genuinely may choose where it goes.
+	mustEntry(t, h, queries, "entry-split-bob-pat", bob, "bobs-pat", "bob_PAT_VALUE")
+
+	sink := newHeaderSink(t)
+	target := RotationTarget{
+		Type: "forgejo_secret", Instance: sink.URL, Repo: "o/r", SecretName: "S",
+		AuthToken: "bobs-pat", ConfiguredBy: bob,
+	}
+
+	// Guard the setup, both halves, or the assertion below proves nothing about
+	// WHICH exit refused.
+	if !h.mayConfigureDelivery(ctx, bob, "entry-split-bob-pat") {
+		t.Fatal("ABORT: Bob cannot choose where his OWN token goes, so the bearer exit would refuse " +
+			"and this test would not reach the body exit at all")
+	}
+	if h.mayConfigureDelivery(ctx, bob, "entry-split-alice") {
+		t.Fatal("ABORT: Bob may choose where Alice's secret goes, so there is nothing for the body " +
+			"exit to refuse")
+	}
+
+	err := deliverToForgejoSecret(ctx, h, target,
+		h.MintedEntrySecret([]byte(aliceSecret), "entry-split-alice", "alice-app"), alice)
+	if err == nil {
+		t.Fatal("the delivery succeeded. Bob owns the bearer token but not the entry being rotated, " +
+			"so the BODY exit had to refuse on its own")
+	}
+	if sink.sawSecret(aliceSecret) {
+		auths, lines, bodies := sink.received()
+		t.Fatalf("Alice's rotated value reached a host Bob chose: auths=%q lines=%q bodies=%q",
+			auths, lines, bodies)
+	}
+	// And Bob's own token must not have gone either: the request is not sent at all.
+	if sink.sawSecret("bob_PAT_VALUE") {
+		t.Fatal("the bearer left even though the delivery was refused")
+	}
+
+	// THE POSITIVE CONTROL, in the same shape. Alice configures the same target
+	// with her OWN token, and both exits say yes.
+	mustEntry(t, h, queries, "entry-split-alice-pat", alice, "alices-pat", "alice_PAT_VALUE")
+	ok := RotationTarget{
+		Type: "forgejo_secret", Instance: sink.URL, Repo: "o/r", SecretName: "S",
+		AuthToken: "alices-pat", ConfiguredBy: alice,
+	}
+	if err := deliverToForgejoSecret(ctx, h, ok,
+		h.MintedEntrySecret([]byte(aliceSecret), "entry-split-alice", "alice-app"), alice); err != nil {
+		t.Fatalf("THE FEATURE IS BROKEN: the owner's own two-secret delivery was refused: %v", err)
+	}
+	if !sink.sawSecret(aliceSecret) || !sink.sawSecret("alice_PAT_VALUE") {
+		auths, _, bodies := sink.received()
+		t.Fatalf("the owner's delivery did not carry both secrets: auths=%q bodies=%q", auths, bodies)
+	}
+}
