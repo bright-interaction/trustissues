@@ -502,12 +502,20 @@ func TestTheRepairMigrationUndoesTheLaunderedOwnership(t *testing.T) {
 				mustExec(t, conn,
 					`UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ? WHERE id = ?`,
 					"u-admin", "u-admin", id)
+				// THE CLAIM IS A ROW. ClaimSecretOwnership writes this inside the
+				// same transaction as the ownership transfer. It used to write only
+				// the activity_log sentence below, and the migrations parsed that
+				// sentence with an unanchored instr() while it carried the previous
+				// holder's own bytes.
+				mustExec(t, conn,
+					`INSERT INTO secret_ownership_claims (entry_id, claimed_by) VALUES (?, ?)`,
+					id, "u-admin")
 				logRow(t, conn, "u-admin", "vault.ownership_claimed",
 					"Entry "+id+": secret ownership claimed by admin u-admin (it had none)")
 			},
 			wantOwner: "u-admin",
 			why: "clearing an owner an admin deliberately took would undo a decision rather than an " +
-				"accident, and the claim writes an audit row naming the entry",
+				"accident, and the claim is recorded as its own row",
 		},
 	}
 

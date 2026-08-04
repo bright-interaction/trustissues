@@ -62,31 +62,59 @@ func openAtVersion(t *testing.T, version int64) *sql.DB {
 // again, and the laundered ownership of an entry whose move rows are in the
 // paren-era wording survived. 00036 is the upgrade.
 func TestTheInjectedClaimDetailSparesALaunderedOwner(t *testing.T) {
-	conn := openAtVersion(t, 35)
+	// The rows must exist BEFORE 00034 runs, because that is where they are on a
+	// real instance and because a repair may now only undo the backfill's own
+	// work. Creating them at v35 would put them outside every repair by design,
+	// and the control below would abort rather than measure the injection.
+	conn := openBefore(t)
 	seedPeople(t, conn)
 
 	// Three entries in identical states: personal now, custodian is the manager
-	// who adopted them, laundered owner still in place, paren-era move rows that
-	// 00036 CAN read and the earlier predicate could not. 00036 must clear all
-	// three except the one an admin genuinely claimed.
+	// who adopted them, paren-era move rows that 00036 CAN read and the earlier
+	// predicate could not. 00036 must clear all three except the one an admin
+	// genuinely claimed.
 	for _, id := range []string{launderedEntryID, controlEntryID, repairedEntryID} {
 		mustExec(t, conn,
-			`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, collection_id,
-			   secret_owner_user_id)
-			 VALUES (?, 'u-manager', ?, X'00', X'00', NULL, 'u-manager')`, id, "e-"+id)
+			`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, collection_id)
+			 VALUES (?, 'u-manager', ?, X'00', X'00', NULL)`, id, "e-"+id)
 		logRow(t, conn, "u-manager", "vault.entry_moved",
 			"Vault entry moved to collection (id: "+id+")")
 	}
 
-	// THE ROW THE PRODUCT WROTE. Byte-for-byte the shape
-	// ClaimSecretOwnership produces, with the tail being the attacker's own
-	// provider_meta value echoed by withdrawnEvidence.auditSuffix.
+	goose.SetBaseFS(embeddedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("goose dialect: %v", err)
+	}
+	if err := goose.UpTo(conn, "migrations", 35); err != nil {
+		t.Fatalf("migrate to 35: %v", err)
+	}
+	// THE FIRST CUT OF 00034, whose outcome is what 00036 exists to repair: it
+	// copied user_id into the owner column for rows whose move evidence it could
+	// not read. Written as the outcome because the broken file was corrected in
+	// place.
+	mustExec(t, conn,
+		`UPDATE vault_entries SET secret_owner_user_id = user_id WHERE secret_owner_user_id = ''`)
+
+	// THE ROW THE PRODUCT WROTE, byte for byte the shape ClaimSecretOwnership
+	// used to produce, with the tail being the attacker's own provider_meta value
+	// echoed by withdrawnEvidence.auditSuffix. The sentence is still written and
+	// the poisoned bytes are still in it on any instance that ran that build.
+	// Nothing reads it for authority any more, and this test is what says so.
 	logRow(t, conn, "u-admin", "vault.ownership_claimed",
 		"Entry "+repairedEntryID+": secret ownership claimed by admin u-admin (it had none; ownership "+
 			"repair after migration 00034: the backfill could not prove the custodian deposited this "+
 			"secret, so an instance admin took it deliberately). Recorded destinations chosen by the "+
 			"previous holder were WITHDRAWN and must be re-entered deliberately: "+
 			"provider_meta.instance = Entry "+launderedEntryID+":")
+	// And the claim itself, as ClaimSecretOwnership performs it: the transfer
+	// moves the owner AND the custodian, and the claim's own record is written in
+	// the same transaction. That record is the only thing 00036 consults.
+	mustExec(t, conn,
+		`UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ? WHERE id = ?`,
+		"u-admin", "u-admin", repairedEntryID)
+	mustExec(t, conn,
+		`INSERT INTO secret_ownership_claims (entry_id, claimed_by) VALUES (?, ?)`,
+		repairedEntryID, "u-admin")
 
 	if err := goose.Up(conn, "migrations"); err != nil {
 		t.Fatalf("goose up: %v", err)
@@ -100,6 +128,14 @@ func TestTheInjectedClaimDetailSparesALaunderedOwner(t *testing.T) {
 	if got := ownerOf(t, conn, controlEntryID); got != "" {
 		t.Fatalf("ABORT: 00036 left the control entry owned by %q. This test cannot tell an injection "+
 			"from a migration that does nothing", got)
+	}
+	// THE OTHER CONTROL. A migration that clears every owner also passes the
+	// injection assertion, and it would have destroyed the admin's decision.
+	// The claim row is the only thing standing between those two outcomes.
+	if got := ownerOf(t, conn, repairedEntryID); got != "u-admin" {
+		t.Fatalf("ABORT: 00036 withdrew the ownership an admin deliberately claimed (%q, want "+
+			"%q). A repair that clears everything passes the assertion below while destroying the "+
+			"one decision it was told to respect", got, "u-admin")
 	}
 
 	if got := ownerOf(t, conn, launderedEntryID); got != "" {

@@ -270,7 +270,7 @@ func TestTheRepairIsImpossibleForADatadogEntryWithARegionalSite(t *testing.T) {
 //	 destinations... Settings -> Ownership is where an admin takes such a row
 //	 back"
 //
-// It does not. ListUnownedEntries selects on secret_owner_user_id = '' so the
+// It does not. ListUnownedEntries selects on secret_owner_user_id = ” so the
 // row never appears on the page, and ClaimSecretOwnership refuses any entry that
 // already records an owner. A collection manager therefore turns off a
 // colleague's rotation delivery permanently with one manager-gated call, writing

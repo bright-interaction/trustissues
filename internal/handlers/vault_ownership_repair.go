@@ -229,6 +229,32 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// THE CLAIM IS RECORDED AS A ROW, in the same transaction as the ownership it
+	// grants.
+	//
+	// Migrations 00035 and 00036 have to know which ownerships an admin took
+	// deliberately, so they can spare those while withdrawing the ones nothing can
+	// prove. They used to ask the activity log with an unanchored instr() over the
+	// prose detail below, and that detail carried the withdrawn destination_patterns
+	// and provider_meta VALUES, all written by the previous holder of this row. The
+	// previous holder of entry A could therefore put "Entry <B>:" in a field of A
+	// and spare a laundered ownership on entry B.
+	//
+	// The withdrawn values live here too, as JSON, because they are worth keeping
+	// and the audit sentence is no longer allowed to carry them.
+	if _, iErr := tx.ExecContext(ctx,
+		`INSERT INTO secret_ownership_claims (entry_id, claimed_by, withdrawn_json)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(entry_id) DO UPDATE SET
+		   claimed_by = excluded.claimed_by,
+		   claimed_at = CURRENT_TIMESTAMP,
+		   withdrawn_json = excluded.withdrawn_json`,
+		entryID, actor, withdrawn.json()); iErr != nil {
+		logError(r, "vault.ownership: could not record the claim", "entry", entryID, "error", iErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
 	if cErr := tx.Commit(); cErr != nil {
 		logError(r, "vault.ownership: commit failed", "entry", entryID, "error", cErr)
 		writeInternalError(w, r, "internal server error")
@@ -275,19 +301,47 @@ func (wd withdrawnEvidence) anything() bool {
 
 // auditSuffix renders the withdrawal for the activity row. Empty when there was
 // nothing to withdraw, so an ordinary claim keeps its ordinary line.
+// json is the withdrawal as stored on the claim row, which is where the VALUES
+// live now.
+func (wd withdrawnEvidence) json() string {
+	b, err := json.Marshal(struct {
+		DestinationPatterns []string          `json:"destination_patterns"`
+		ProviderMetaKeys    map[string]string `json:"provider_meta"`
+	}{wd.DestinationPatterns, wd.ProviderMetaKeys})
+	if err != nil {
+		// Never fail a repair over its own bookkeeping. The claim row is what the
+		// migrations read; the values are a convenience on top of it.
+		return "{}"
+	}
+	return string(b)
+}
+
+// auditSuffix renders the withdrawal for the activity row. Empty when there was
+// nothing to withdraw, so an ordinary claim keeps its ordinary line.
+//
+// IT NAMES WHAT WAS WITHDRAWN AND NEVER THE VALUES. Those were written by the
+// previous holder of this row, and this sentence used to interpolate them
+// verbatim into an append-only log that two migrations then parsed with an
+// unanchored instr() to decide who owns a secret. The values are on the claim
+// row and in the response body; a caller's bytes do not belong in a sentence
+// anything reads for authority, and the safe way to keep that true is for them
+// never to be in it at all.
+//
+// The key NAMES are safe: egressInfluencingMetaKeys is a compile-time set.
 func (wd withdrawnEvidence) auditSuffix() string {
 	if !wd.anything() {
 		return ""
 	}
 	var parts []string
-	if len(wd.DestinationPatterns) > 0 {
-		parts = append(parts, "destination_patterns "+strings.Join(wd.DestinationPatterns, " "))
+	if n := len(wd.DestinationPatterns); n > 0 {
+		parts = append(parts, fmt.Sprintf("destination_patterns (%d withdrawn)", n))
 	}
 	for _, k := range sortedMetaKeys(wd.ProviderMetaKeys) {
-		parts = append(parts, "provider_meta."+k+" = "+wd.ProviderMetaKeys[k])
+		parts = append(parts, "provider_meta."+k)
 	}
 	return ". Recorded destinations chosen by the previous holder were WITHDRAWN and must be " +
-		"re-entered deliberately: " + strings.Join(parts, "; ")
+		"re-entered deliberately: " + strings.Join(parts, "; ") +
+		". The withdrawn values are on the claim record and in this request's response"
 }
 
 // disarmRecordedDestinations clears the two columns an attacker who held this
