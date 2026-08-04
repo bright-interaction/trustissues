@@ -3,6 +3,7 @@ package handlers
 import (
 	"go/ast"
 	"go/token"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -500,6 +501,95 @@ func TestInstanceOwnedFieldsAreOnlyReachableByAdmins(t *testing.T) {
 				route)
 		}
 	}
+}
+
+// TestEveryLedgerColumnExistsInTheSchema is the stale check at the DATA level.
+//
+// The guards above keep the ledger honest about the CODE. This one keeps it
+// honest about the database: a ledger naming table.column pairs that the schema
+// does not have is describing something nobody can point at, and a rename that
+// leaves the declaration behind is exactly how the round-18 boundary would have
+// rotted next.
+//
+// Two entries are deliberately not columns: the boot probes, which open whatever
+// blob AnyEncryptedColumnSample happened to return. They are spelled with a
+// parenthesis and are required to be in-process-only, because a ruling that
+// cannot name its column must not be one that lets anything leave.
+func TestEveryLedgerColumnExistsInTheSchema(t *testing.T) {
+	files := moduleGoFiles(t)
+	// The migrations are .sql, so read them off disk rather than through the Go
+	// walk.
+	schema, err := readMigrations()
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	if len(schema) < 5000 {
+		t.Fatalf("ABORT: read only %d bytes of migrations; this guard is checking nothing", len(schema))
+	}
+	_ = files
+
+	checked := 0
+	for _, e := range vaultfield.Ledger() {
+		if strings.Contains(e.Name, "(") {
+			if e.Class != vaultfield.InProcessOnly {
+				t.Errorf("%s does not name a real column and is classified %s. A ruling that cannot say "+
+					"WHICH column it is about must be in-process-only: it cannot argue about where a value "+
+					"may go when it does not know what the value is.", e.Name, e.Class)
+			}
+			continue
+		}
+		table, column, ok := strings.Cut(e.Name, ".")
+		if !ok {
+			t.Errorf("%s is not spelled table.column, so it cannot be checked against the schema", e.Name)
+			continue
+		}
+		checked++
+		// settings rows are key/value, not columns: settings.smtp_password is a
+		// ROW key. Check the table and the value column instead.
+		if table == "settings" {
+			if !strings.Contains(schema, "CREATE TABLE settings") &&
+				!strings.Contains(schema, "CREATE TABLE IF NOT EXISTS settings") {
+				t.Errorf("%s names the settings table and the schema has none", e.Name)
+			}
+			continue
+		}
+		if !strings.Contains(schema, table) {
+			t.Errorf("%s names table %q and no migration mentions it", e.Name, table)
+			continue
+		}
+		if !strings.Contains(schema, column) {
+			t.Errorf("A LEDGER ENTRY FOR A COLUMN THAT DOES NOT EXIST: %s.\n"+
+				"  No migration mentions %q. Either the column was renamed and the declaration was left\n"+
+				"  behind, or the declaration was written for something that never shipped. Both read as\n"+
+				"  coverage.", e.Name, column)
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("ABORT: only %d ledger entries name a table.column; at least ten do", checked)
+	}
+}
+
+// readMigrations concatenates the migration SQL so a guard can ask what the
+// schema actually contains.
+func readMigrations() (string, error) {
+	dir := filepath.Join("..", "database", "migrations")
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, n := range names {
+		if n.IsDir() || !strings.HasSuffix(n.Name(), ".sql") {
+			continue
+		}
+		raw, rErr := os.ReadFile(filepath.Join(dir, n.Name()))
+		if rErr != nil {
+			return "", rErr
+		}
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	return b.String(), nil
 }
 
 // TestOnlyTheCustomFieldExitDecryptsCustomFields is the half the behavioural
