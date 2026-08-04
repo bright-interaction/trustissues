@@ -232,40 +232,29 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	if u.Disabled != 0 {
 		return fmt.Errorf("delivery target skipped: the user who configured it (%s) is disabled", u.Email)
 	}
-	// mayConfigureDelivery, not mayDirectSecretEgress with a hand-supplied
-	// isAdmin. Round 5 wrote `mayDirectSecretEgress(ctx, target.ConfiguredBy,
-	// false, entryID)` here, with the comment "isAdmin false on purpose: this
-	// asks whether THIS user still has access, not whether the process is
-	// privileged". The reasoning was right and the code did not implement it:
-	// "does THIS user still have access" for an instance admin IS yes, because
-	// the write gate had just said so out of middleware.IsAdmin. So an admin
-	// configured a target, the panel said saved, and every rotation afterwards
-	// dropped it in silence.
+	// THE EGRESS QUESTION USED TO BE ASKED HERE TOO, AND IS NOT ANY MORE.
 	//
-	// mayConfigureDelivery resolves the admin question from the users row, which
-	// is the only source available here AND therefore the source the write half
-	// uses too. Asking a demoted admin's stale session is no longer possible on
-	// either side.
+	// Round 5 put `mayConfigureDelivery(ctx, target.ConfiguredBy, entryID)` at
+	// this line. Round 7 deleted it, and this comment is the record of why.
 	//
-	// mayDirectSecretEgress, not entryAccessFor. The doc comment above this
-	// function has always said this asks "whether they would still be allowed to
-	// set it up today", and from round 5 that answer is the widening right rather
-	// than plain write access. Asking the weaker question would leave the fix
-	// half-applied in exactly the cases that matter most on a shared instance:
-	// UpdateTargets now refuses an editor at the write, but every row already
-	// stored by an editor on a running deployment, and every row that arrives
-	// through a restored backup, an import, or an older binary, would keep
-	// delivering. Refused at the write AND at delivery is the same discipline the
-	// provider pin already follows, and for the same reason: the write gate can
-	// only guard writes it sees.
+	// It was the same call the exit now makes, about the same entry, with one
+	// difference that only ever made it weaker: it asked about entryID, the entry
+	// being ROTATED, while the exit asks about the entry the SECRET CAME FROM.
+	// For a webhook those are the same row. For a forgejo_secret target they are
+	// not, and the gap between them is the whole round-6 break: the auth_token
+	// secret belongs to another entry entirely, and this check never looked at it.
 	//
-	// mayDirectSecretEgress subsumes the old check. It calls grantFor and requires
-	// manage before it looks at anything else, so every case the write check
-	// caught is still caught, with the account-status rows ahead of it.
-	if !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {
-		return fmt.Errorf("delivery target skipped: the user who configured it may no longer choose " +
-			"where this secret is delivered (that takes the secret's owner or an instance admin)")
-	}
+	// Two copies of one rule is also what round 5 cost. Leaving a duplicate here
+	// would put the identical question in two places again, and the only thing
+	// that can come of that is the two disagreeing.
+	//
+	// What stays is what is NOT the egress question: the account-status rows
+	// above, which give the operator an accurate reason ("the user who configured
+	// it is disabled") instead of sending them to look at collection membership.
+	// grantFor row 2 refuses a disabled account everything, so the exit would
+	// refuse these too; it would just say something less useful.
+	//
+	// See secret_exit_authority.go and secretexit.Exit.
 	return nil
 }
 

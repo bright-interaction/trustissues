@@ -81,3 +81,30 @@ func testPlaintext(v string) secretexit.Plaintext {
 	return secretexit.Minted([]byte(v),
 		secretexit.Origin{EntryID: "test-entry", Name: "test-entry"}, allowAllExitAuthority{})
 }
+
+// deliveryStillAuthorized is the DELIVERY-half probe the drift and revocation
+// matrices use.
+//
+// It used to be targetStillAuthorized. Round 7 moved the egress question out of
+// that function and into the exit, so a probe that still called it would be
+// asking the account-status half only, and every matrix built on it would agree
+// with the write gate by accident rather than by construction.
+//
+// This asks the question the delivery path now actually asks: would
+// secretexit.Exit release THIS entry's secret to a destination chosen by this
+// principal? Same rule, same call, one place.
+func deliveryStillAuthorized(ctx context.Context, h *VaultHandler, entryID string,
+	target RotationTarget) error {
+
+	if err := targetStillAuthorized(ctx, h, entryID, target); err != nil {
+		return err
+	}
+	host := hostFromRawURL(target.WebhookURL)
+	if target.Type == "forgejo_secret" {
+		host = hostFromRawURL(target.Instance)
+	}
+	_, _, err := secretexit.ExitString(ctx,
+		h.MintedEntrySecret([]byte("probe"), entryID, "probe"),
+		secretexit.ToHost("a delivery target", secretexit.ChosenBy(target.ConfiguredBy), host))
+	return err
+}

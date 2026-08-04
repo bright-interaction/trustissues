@@ -161,7 +161,7 @@ func TestDemotedAdminStopsDeliveringAndCannotConfigure(t *testing.T) {
 		t.Fatalf("ABORT: the admin could not configure the target: %d %s", rec.Code, rec.Body.String())
 	}
 	target := RotationTarget{Type: "webhook", Label: "ops", WebhookURL: sink.URL + "/deploy", ConfiguredBy: admin}
-	if err := targetStillAuthorized(ctx, h, entryID, target); err != nil {
+	if err := deliveryStillAuthorized(ctx, h, entryID, target); err != nil {
 		t.Fatalf("ABORT: the admin's own target is refused at delivery before any demotion: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestDemotedAdminStopsDeliveringAndCannotConfigure(t *testing.T) {
 		t.Fatalf("demote: %v", err)
 	}
 
-	if err := targetStillAuthorized(ctx, h, entryID, target); err == nil {
+	if err := deliveryStillAuthorized(ctx, h, entryID, target); err == nil {
 		t.Error("a demoted admin's delivery target is still authorized; the delivery gate is reading a " +
 			"stale role")
 	}
@@ -258,7 +258,7 @@ func TestDeliveryGateAgreesWithWriteGate(t *testing.T) {
 			writeAllowed := rec.Code == http.StatusOK
 
 			// The DELIVERY half, on a row attributed to the same principal.
-			deliveryErr := targetStillAuthorized(ctx, h, entryID, RotationTarget{
+			deliveryErr := deliveryStillAuthorized(ctx, h, entryID, RotationTarget{
 				Type: "webhook", Label: "x", WebhookURL: sink.URL + "/deploy", ConfiguredBy: tc.userID,
 			})
 			deliveryAllowed := deliveryErr == nil
@@ -266,7 +266,7 @@ func TestDeliveryGateAgreesWithWriteGate(t *testing.T) {
 			if writeAllowed != deliveryAllowed {
 				t.Fatalf("THE HALVES DISAGREE about %s (%q).\n"+
 					"  write gate  (PUT /api/vault/{id}/targets): allowed=%v (HTTP %d: %s)\n"+
-					"  delivery gate (targetStillAuthorized):     allowed=%v (%v)\n"+
+					"  delivery gate (secretexit.Exit):           allowed=%v (%v)\n"+
 					"Accepting a configuration that will never deliver is the worst of the three "+
 					"options: the operator is told it worked and the consumer never gets the key. "+
 					"Both halves must call VaultHandler.mayConfigureDelivery.",

@@ -75,7 +75,7 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 	if len(stored) != 1 || stored[0].ConfiguredBy != leaver {
 		t.Fatalf("ABORT: unexpected stored target %+v", stored)
 	}
-	if err := targetStillAuthorized(ctx, h, entryID, stored[0]); err != nil {
+	if err := deliveryStillAuthorized(ctx, h, entryID, stored[0]); err != nil {
 		t.Fatalf("ABORT: target not authorized while the editor is a member: %v", err)
 	}
 
@@ -133,7 +133,7 @@ func TestLeavingACollectionPurgesTheLeaversTargets(t *testing.T) {
 		t.Error("an unrelated save re-attributed the departed member's webhook to the owner; " +
 			"the next rotation would deliver the fresh plaintext secret to someone who left")
 	}
-	if err := targetStillAuthorized(ctx, h, entryID, after[0]); err == nil {
+	if err := deliveryStillAuthorized(ctx, h, entryID, after[0]); err == nil {
 		t.Error("the departed member's target is authorized again after an unrelated save")
 	}
 }
