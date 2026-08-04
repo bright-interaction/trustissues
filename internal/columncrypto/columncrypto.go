@@ -6,16 +6,15 @@
 package columncrypto
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
 	"strings"
 	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
+
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 // marker is a short self-describing prefix stamped on every ciphertext this
@@ -48,7 +47,7 @@ const marker = "tienc:v1:"
 // so this adds no new exposure. It is bounded because deriveCacheMax caps it.
 var (
 	deriveCacheMu sync.RWMutex
-	deriveCache   = make(map[[32]byte][]byte)
+	deriveCache   = make(map[[32]byte][32]byte)
 )
 
 // deriveCacheMax bounds the cache. Real deployments use one vault key; the cap
@@ -59,7 +58,7 @@ const deriveCacheMax = 16
 // deriveKey derives a 32-byte key using PBKDF2-SHA256 with 600k iterations,
 // memoized per secret. The KDF cost is unchanged for the first call with a
 // given secret; later calls reuse it.
-func deriveKey(secret string) []byte {
+func deriveKey(secret string) [32]byte {
 	id := sha256.Sum256([]byte(secret))
 
 	deriveCacheMu.RLock()
@@ -70,7 +69,8 @@ func deriveKey(secret string) []byte {
 	}
 
 	salt := []byte("trustissues:column:v1")
-	derived := pbkdf2.Key([]byte(secret), salt, 600_000, 32, sha256.New)
+	var derived [32]byte
+	copy(derived[:], pbkdf2.Key([]byte(secret), salt, 600_000, 32, sha256.New))
 
 	deriveCacheMu.Lock()
 	if len(deriveCache) < deriveCacheMax {
@@ -91,56 +91,40 @@ func IsEncrypted(s string) bool {
 
 // EncryptString encrypts a string value using AES-256-GCM with a
 // PBKDF2-derived key. Output is marker + base64(nonce || ciphertext).
+//
+// The AES itself is internal/vaultfield's, which is the one file in the module
+// that imports crypto/aes and crypto/cipher. Sealing takes no Field: the ledger
+// is about what becomes PLAINTEXT.
 func EncryptString(plaintext, key string) (string, error) {
-	derivedKey := deriveKey(key)
-	block, err := aes.NewCipher(derivedKey)
+	packed, err := vaultfield.SealPacked(deriveKey(key), []byte(plaintext), rand.Reader)
 	if err != nil {
 		return "", err
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return marker + base64.StdEncoding.EncodeToString(ciphertext), nil
+	return marker + base64.StdEncoding.EncodeToString(packed), nil
 }
 
 // DecryptString decrypts a value produced by EncryptString. It accepts both the
 // current marked form (marker + base64) and legacy bare-base64 ciphertext
 // written before the marker was introduced, so existing rows keep decrypting.
-func DecryptString(encrypted, key string) (string, error) {
-	derivedKey := deriveKey(key)
+//
+// It takes a vaultfield.Field because this is a DECRYPTION: it turns a stored
+// column into plaintext, and every such door in this product names the column it
+// opens so the ledger is a by-product of the decryption rather than a list kept
+// beside it. Passing the zero Field is refused (vaultfield.ErrUndeclared).
+//
+// This function used to be generic over "some encrypted string", which is
+// precisely how a family of four different columns (TOTP seeds, the boot
+// sentinel, the SMTP relay password, the sampled probe blob) shared one entry
+// keyed by CALL SITE in the old ledger. The call site is a property of the
+// caller; the column is a property of the data.
+func DecryptString(encrypted, key string, f vaultfield.Field) (string, error) {
 	data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(encrypted, marker))
 	if err != nil {
 		return "", err
 	}
-
-	block, err := aes.NewCipher(derivedKey)
+	plaintext, err := vaultfield.OpenPacked(deriveKey(key), data, f)
 	if err != nil {
 		return "", err
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	if len(data) < gcm.NonceSize() {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertext := data[:gcm.NonceSize()], data[gcm.NonceSize():]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", err
-	}
-
 	return string(plaintext), nil
 }

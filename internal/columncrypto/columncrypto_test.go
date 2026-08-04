@@ -6,9 +6,23 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 const testKey = "test-vault-key-with-enough-entropy-0123456789"
+
+// testField is a declared field for this package's own round-trip tests.
+//
+// DecryptString demands one because it is a decryption, and a declaration is
+// what puts a column in the ledger. Declaring one from a _test.go file is
+// allowed and cannot be used to satisfy the production ledger:
+// TestTheLedgerIsDeclaredByProductionCode fails on any entry whose declaration
+// site ends in _test.go.
+var testField = vaultfield.Declare(
+	"columncrypto_test.roundtrip", vaultfield.InProcessOnly, "",
+	"a declaration used only by this package's own round-trip tests. It opens no real column and exists "+
+		"because the decrypt entry point refuses the zero Field.")
 
 // TestRoundTripPreservesEveryInputShape covers the values this package actually
 // holds: TOTP seeds, SMTP passwords, notification channel configs (JSON), and
@@ -41,7 +55,7 @@ func TestRoundTripPreservesEveryInputShape(t *testing.T) {
 		if plaintext != "" && strings.Contains(enc, plaintext) {
 			t.Fatalf("%s: plaintext survives inside the ciphertext", name)
 		}
-		got, err := DecryptString(enc, testKey)
+		got, err := DecryptString(enc, testKey, testField)
 		if err != nil {
 			t.Fatalf("%s: decrypt: %v", name, err)
 		}
@@ -93,7 +107,7 @@ func TestWrongKeyAndTamperingAreRejected(t *testing.T) {
 		t.Fatalf("encrypt: %v", err)
 	}
 
-	if got, err := DecryptString(enc, "a-completely-different-key"); err == nil {
+	if got, err := DecryptString(enc, "a-completely-different-key", testField); err == nil {
 		t.Fatalf("wrong key decrypted successfully, returning %q", got)
 	}
 
@@ -106,7 +120,7 @@ func TestWrongKeyAndTamperingAreRejected(t *testing.T) {
 		tampered := append([]byte(nil), raw...)
 		tampered[pos] ^= 0x01
 		bad := marker + base64.StdEncoding.EncodeToString(tampered)
-		if got, err := DecryptString(bad, testKey); err == nil {
+		if got, err := DecryptString(bad, testKey, testField); err == nil {
 			t.Fatalf("tampering at byte %d was NOT detected, returned %q", pos, got)
 		}
 	}
@@ -131,7 +145,7 @@ func TestMalformedInputErrorsRatherThanPanics(t *testing.T) {
 					t.Fatalf("PANIC on malformed input %q: %v", in[:min(len(in), 30)], r)
 				}
 			}()
-			if _, err := DecryptString(in, testKey); err == nil {
+			if _, err := DecryptString(in, testKey, testField); err == nil {
 				t.Logf("note: %q decrypted without error", in[:min(len(in), 30)])
 			}
 		}()
@@ -176,7 +190,7 @@ func TestLegacyBareBase64StillDecrypts(t *testing.T) {
 	if IsEncrypted(legacy) {
 		t.Fatal("legacy form should NOT carry the marker, the test is not exercising the legacy path")
 	}
-	got, err := DecryptString(legacy, testKey)
+	got, err := DecryptString(legacy, testKey, testField)
 	if err != nil {
 		t.Fatalf("legacy bare-base64 no longer decrypts: %v", err)
 	}
@@ -190,19 +204,19 @@ func TestLegacyBareBase64StillDecrypts(t *testing.T) {
 // different vault key must derive a different one.
 func TestKeyDerivationIsDeterministic(t *testing.T) {
 	a1, a2 := deriveKey(testKey), deriveKey(testKey)
-	if string(a1) != string(a2) {
+	if a1 != a2 {
 		t.Fatal("deriveKey is not deterministic: nothing would decrypt after a restart")
 	}
 	if len(a1) != 32 {
 		t.Fatalf("derived key is %d bytes, want 32 for AES-256", len(a1))
 	}
-	if string(deriveKey("another-key")) == string(a1) {
+	if deriveKey("another-key") == a1 {
 		t.Fatal("two different vault keys derive the same AES key")
 	}
 	// A value encrypted before a restart decrypts after one (same key in, same
 	// key out).
 	enc, _ := EncryptString("survives-restart", testKey)
-	if got, err := DecryptString(enc, testKey); err != nil || got != "survives-restart" {
+	if got, err := DecryptString(enc, testKey, testField); err != nil || got != "survives-restart" {
 		t.Fatalf("cross-instance decrypt failed: %q (err %v)", got, err)
 	}
 }
@@ -229,7 +243,7 @@ func TestDerivedKeyIsMemoizedPerSecret(t *testing.T) {
 	ka2 := deriveKey(a)
 	warmA := time.Since(second)
 
-	if string(ka1) != string(ka2) {
+	if ka1 != ka2 {
 		t.Fatal("memoized derivation returned a different key on the second call")
 	}
 	// The cold path runs the real KDF; the warm path must not. Compare against
@@ -241,7 +255,7 @@ func TestDerivedKeyIsMemoizedPerSecret(t *testing.T) {
 
 	// A different secret must still derive its own key, not reuse the cached one.
 	kb := deriveKey(b)
-	if string(kb) == string(ka1) {
+	if kb == ka1 {
 		t.Fatal("KEY COLLISION: a second secret received the first secret's derived key")
 	}
 
@@ -250,10 +264,10 @@ func TestDerivedKeyIsMemoizedPerSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt a: %v", err)
 	}
-	if got, err := DecryptString(encA, a); err != nil || got != "alpha-secret" {
+	if got, err := DecryptString(encA, a, testField); err != nil || got != "alpha-secret" {
 		t.Fatalf("same-key round-trip broke under caching: %q (err %v)", got, err)
 	}
-	if got, err := DecryptString(encA, b); err == nil {
+	if got, err := DecryptString(encA, b, testField); err == nil {
 		t.Fatalf("CROSS-KEY DECRYPT: key b opened key a's ciphertext, returning %q", got)
 	}
 }
@@ -263,7 +277,7 @@ func TestDerivedKeyIsMemoizedPerSecret(t *testing.T) {
 // cap (uncached secrets simply recompute).
 func TestDeriveCacheIsBounded(t *testing.T) {
 	deriveCacheMu.Lock()
-	deriveCache = make(map[[32]byte][]byte)
+	deriveCache = make(map[[32]byte][32]byte)
 	deriveCacheMu.Unlock()
 
 	for i := 0; i < deriveCacheMax+5; i++ {
@@ -287,7 +301,7 @@ func TestDeriveCacheIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt beyond cap: %v", err)
 	}
-	if got, err := DecryptString(enc, beyond); err != nil || got != "still-works" {
+	if got, err := DecryptString(enc, beyond, testField); err != nil || got != "still-works" {
 		t.Fatalf("uncached secret broke: %q (err %v)", got, err)
 	}
 }

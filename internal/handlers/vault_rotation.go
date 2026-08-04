@@ -166,7 +166,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 
-		meta := ParseProviderMeta(vaultHandler.decryptColumnOrLog(entry.ProviderMeta.String, "{}", "provider_meta"))
+		meta := ParseProviderMeta(vaultHandler.decryptColumnOrLog(entry.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 		// The egress authority for this entry's rotation. This is the path the
 		// round-4 report walked: an editor sets provider + provider_meta +
 		// auto_rotate through PUT /api/vault/{id} with no password, and the
@@ -261,7 +261,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		targetsRaw := "[]"
 		targetsUnreadable := false
 		if stored := entry.RotationTargets.String; stored != "" {
-			if plain, tErr := vaultHandler.decryptColumn(stored); tErr != nil {
+			if plain, tErr := vaultHandler.decryptColumn(stored, vaultFieldRotationTargets); tErr != nil {
 				targetsUnreadable = true
 				slog.Error("vault rotation: rotation_targets did not decrypt; the new key cannot be delivered",
 					"entry", entry.Name, "error", tErr)

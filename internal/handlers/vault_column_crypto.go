@@ -2,10 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,6 +9,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 // vaultColumnEncPrefix marks a vault metadata column (provider_meta,
@@ -35,7 +32,13 @@ import (
 // is now ALWAYS encrypted (encryptColumn); only the backfill, which reads values
 // out of the database, may skip already-encrypted values
 // (encryptColumnIfNeeded).
-const vaultColumnEncPrefix = "enc:v1:"
+//
+// The constant is an alias of vaultfield.ColumnPrefix so the format has one
+// definition. The crypto moved to that package because it is the only file in
+// the module allowed to import crypto/aes and crypto/cipher, which is what makes
+// "every way a value becomes plaintext" a set the compiler and one import guard
+// maintain rather than a list of wrapper names.
+const vaultColumnEncPrefix = vaultfield.ColumnPrefix
 
 // encryptColumn encrypts a cleartext column into a single self-describing
 // string: prefix + base64(nonce || ciphertext) using the vault's AES-256-GCM key.
@@ -46,68 +49,38 @@ const vaultColumnEncPrefix = "enc:v1:"
 // oracle (see the note on vaultColumnEncPrefix). A caller that legitimately
 // holds an already-encrypted value from the database must not call this at all,
 // or must call encryptColumnIfNeeded.
+//
+// Sealing takes no vaultfield.Field on purpose. The ledger records what can
+// become PLAINTEXT; putting a value back under the key produces none. Only the
+// decrypt half names a field.
 func (h *VaultHandler) encryptColumn(plaintext string) (string, error) {
-	if plaintext == "" {
-		return "", nil
-	}
-	block, err := aes.NewCipher(h.encryptionKey[:])
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-	ciphertext := gcm.Seal(nil, nonce, []byte(plaintext), nil)
-	packed := make([]byte, 0, len(nonce)+len(ciphertext))
-	packed = append(packed, nonce...)
-	packed = append(packed, ciphertext...)
-	return vaultColumnEncPrefix + base64.StdEncoding.EncodeToString(packed), nil
+	return vaultfield.SealColumn(h.encryptionKey, plaintext)
 }
 
-// decryptColumn reverses encryptColumn. An unprefixed value (pre-migration
-// cleartext, empty, or a passthrough) is returned as-is, so it is safe to apply
-// at every read choke unconditionally.
-func (h *VaultHandler) decryptColumn(stored string) (string, error) {
-	if !strings.HasPrefix(stored, vaultColumnEncPrefix) {
-		return stored, nil
-	}
-	packed, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, vaultColumnEncPrefix))
-	if err != nil {
-		return "", fmt.Errorf("decode encrypted column: %w", err)
-	}
-	block, err := aes.NewCipher(h.encryptionKey[:])
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	ns := gcm.NonceSize()
-	if len(packed) < ns {
-		return "", fmt.Errorf("encrypted column too short")
-	}
-	nonce, ciphertext := packed[:ns], packed[ns:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", fmt.Errorf("decrypt column: %w", err)
-	}
-	return string(plaintext), nil
+// decryptColumn reverses encryptColumn for one DECLARED field. An unprefixed
+// value (pre-migration cleartext, empty, or a passthrough) is returned as-is, so
+// it is safe to apply at every read choke unconditionally.
+//
+// The field argument is not decoration and it is not a log label. It is the
+// handle vaultfield demands before it will decrypt anything, and the only way to
+// obtain one is vaultfield.Declare, which is what writes the ledger. This
+// function used to take no field at all: it was the RAW door, decryptColumnOrLog
+// was its logging wrapper, and the round-18 ledger derived its coverage by
+// matching the wrapper's name. UserHandler.openInviteCode called this one, so
+// invitations.code, a bearer credential that redeems into an account, was
+// decrypted by a door the ledger could not see.
+func (h *VaultHandler) decryptColumn(stored string, field vaultfield.Field) (string, error) {
+	return vaultfield.OpenColumn(h.encryptionKey, stored, field)
 }
 
 // decryptColumnOrLog decrypts a stored column, returning fallback (and logging)
 // on a decrypt error so a single corrupted row never emits ciphertext to a
 // client, breaks JSON parsing, or blocks a list. Cleartext/empty inputs pass
 // through unchanged (decryptColumn is idempotent-safe on them).
-func (h *VaultHandler) decryptColumnOrLog(stored, fallback, field string) string {
-	out, err := h.decryptColumn(stored)
+func (h *VaultHandler) decryptColumnOrLog(stored, fallback string, field vaultfield.Field) string {
+	out, err := h.decryptColumn(stored, field)
 	if err != nil {
-		slog.Error("vault: metadata column decrypt failed", "field", field, "error", err)
+		slog.Error("vault: metadata column decrypt failed", "field", field.Name(), "error", err)
 		return fallback
 	}
 	return out
@@ -138,7 +111,7 @@ func metaColumnNeedsEncrypt(v string) bool {
 	case "", "{}", "[]":
 		return false
 	}
-	return !strings.HasPrefix(v, vaultColumnEncPrefix)
+	return !vaultfield.IsSealedColumn(v)
 }
 
 // BackfillMetadataEncryption encrypts any vault provider_meta / rotation_targets
@@ -236,14 +209,26 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 // write, or a row still sealed under an older key after an operator used the
 // documented TRUSTISSUES_ALLOW_KEY_MISMATCH escape hatch, which re-seals the
 // sentinel and therefore makes every later boot look healthy.
-func (h *VaultHandler) anyMetaColumnUndecryptable(cols map[string]string) (string, bool) {
+// The map is keyed by the DECLARED field rather than by a display string, so a
+// column can only be checked here if it has a ledger entry.
+func (h *VaultHandler) anyMetaColumnUndecryptable(cols map[vaultfield.Field]string) (string, bool) {
 	for field, stored := range cols {
 		if stored == "" {
 			continue
 		}
-		if _, err := h.decryptColumn(stored); err != nil {
-			return field, true
+		if _, err := h.decryptColumn(stored, field); err != nil {
+			return shortColumnName(field), true
 		}
 	}
 	return "", false
+}
+
+// shortColumnName renders "vault_entries.notes" as "notes" for a message aimed
+// at an operator looking at an edit form.
+func shortColumnName(f vaultfield.Field) string {
+	name := f.Name()
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }

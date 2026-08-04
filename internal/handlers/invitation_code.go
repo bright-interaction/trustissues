@@ -67,7 +67,7 @@ func (h *UserHandler) openInviteCode(stored string) string {
 	if stored == "" || h.vault == nil {
 		return ""
 	}
-	plain, err := h.vault.decryptColumn(stored)
+	plain, err := h.vault.decryptColumn(stored, vaultFieldInvitationCode)
 	if err != nil {
 		slog.Error("invitations: opening invite code failed", "error", err)
 		return ""

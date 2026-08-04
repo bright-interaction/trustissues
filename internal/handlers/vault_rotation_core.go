@@ -98,7 +98,7 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 			"entry", entryName, "error", rErr)
 		return revokeWarn
 	} else {
-		beforeMeta = ParseProviderMeta(deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"))
+		beforeMeta = ParseProviderMeta(deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	}
 	tk, tkErr := egressgate.Decide(egressgate.Request{
 		EntryID: entryID,

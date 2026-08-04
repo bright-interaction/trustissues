@@ -243,7 +243,7 @@ func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID st
 	// 3. provider + provider_meta, through the same declaration table the
 	// derivation gate uses, so "site: datadoghq.eu" is read as api.datadoghq.eu
 	// rather than as an opaque string.
-	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", "provider_meta"))
+	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	declared := declaredProviderEgress(meta.Provider.String, providerMeta)
 	for _, host := range declared.Hosts {
 		add(host)
@@ -259,7 +259,7 @@ func (h *VaultHandler) ownerRecordedDestinations(ctx context.Context, entryID st
 	// is supposed to be judging.
 	targets, tErr := h.queries.GetVaultEntryTargets(ctx, entryID)
 	if tErr == nil && strings.TrimSpace(targets.String) != "" {
-		for _, t := range ParseRotationTargets(h.decryptColumnOrLog(targets.String, "[]", "rotation_targets")) {
+		for _, t := range ParseRotationTargets(h.decryptColumnOrLog(targets.String, "[]", vaultFieldRotationTargets)) {
 			if !targetTransmitsSecret(t) {
 				continue
 			}

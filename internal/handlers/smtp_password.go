@@ -33,7 +33,7 @@ func resolveSMTPPassword(stored, vaultKey string) (string, error) {
 		// Legacy row written before at-rest encryption. Still a usable password.
 		return stored, nil
 	}
-	plain, err := columncrypto.DecryptString(stored, vaultKey)
+	plain, err := columncrypto.DecryptString(stored, vaultKey, vaultFieldSMTPPassword)
 	if err != nil {
 		return "", fmt.Errorf("decrypt smtp password: %w", err)
 	}

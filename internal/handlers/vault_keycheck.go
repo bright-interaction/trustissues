@@ -2,11 +2,8 @@ package handlers
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +14,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/columncrypto"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 // vaultKeyCheckSetting is the settings row holding the key sentinel.
@@ -106,7 +104,7 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 		return nil
 	}
 
-	plain, decErr := columncrypto.DecryptString(stored, vaultKey)
+	plain, decErr := columncrypto.DecryptString(stored, vaultKey, vaultFieldKeySentinel)
 	if decErr != nil || plain != vaultKeyCheckPlaintext {
 		return ErrVaultKeyMismatch
 	}
@@ -173,7 +171,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 			continue
 		}
 		hasCiphertext = true
-		if _, decErr := columncrypto.DecryptString(v, vaultKey); decErr == nil {
+		if _, decErr := columncrypto.DecryptString(v, vaultKey, vaultFieldTOTPSecret); decErr == nil {
 			return true, true, nil
 		}
 	}
@@ -220,7 +218,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 				continue
 			}
 			hasCiphertext = true
-			if _, decErr := columncrypto.DecryptString(b.Blob, vaultKey); decErr == nil {
+			if _, decErr := columncrypto.DecryptString(b.Blob, vaultKey, vaultFieldBootProbe); decErr == nil {
 				return true, true, nil
 			}
 		case "vaultcolumn":
@@ -244,28 +242,28 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 	return hasCiphertext, false, nil
 }
 
+// vaultV2Key is the PBKDF2 derivation NewVaultHandler builds as encryptionKey,
+// repeated here because the key check runs before a handler exists.
+func vaultV2Key(vaultKey string) [32]byte {
+	var out [32]byte
+	copy(out[:], pbkdf2.Key([]byte(vaultKey), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New))
+	return out
+}
+
 // vaultSecretOpens mirrors VaultHandler.decrypt for a v2 row without needing a
 // constructed handler (the key check runs before one exists).
+//
+// The crypto is vaultfield's, and the probe entry point returns a BOOL: it wipes
+// the plaintext rather than handing it back, so this cannot become a second way
+// to read an entry's value when somebody edits the caller. It names
+// vault_entries.encrypted_value because that is the column it opens.
 func vaultSecretOpens(ciphertext, nonce []byte, vaultKey string) bool {
 	if len(ciphertext) == 0 || len(nonce) == 0 {
 		return false
 	}
-	derived := pbkdf2.Key([]byte(vaultKey), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New)
-	defer func() {
-		for i := range derived {
-			derived[i] = 0
-		}
-	}()
-	block, err := aes.NewCipher(derived)
-	if err != nil {
-		return false
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil || len(nonce) != gcm.NonceSize() {
-		return false
-	}
-	_, err = gcm.Open(nil, nonce, ciphertext, nil)
-	return err == nil
+	key := vaultV2Key(vaultKey)
+	defer wipeKey(&key)
+	return vaultfield.Opens(key, ciphertext, nonce, vaultFieldEntryValueProbe)
 }
 
 // vaultSecretOpensLegacy is the v1 counterpart of vaultSecretOpens.
@@ -278,17 +276,15 @@ func vaultSecretOpensLegacy(ciphertext, nonce []byte, vaultKey string) bool {
 	if len(ciphertext) == 0 || len(nonce) == 0 {
 		return false
 	}
-	derived := sha256.Sum256([]byte(vaultKey + ":secrets-vault"))
-	block, err := aes.NewCipher(derived[:])
-	if err != nil {
-		return false
+	key := sha256.Sum256([]byte(vaultKey + ":secrets-vault"))
+	defer wipeKey(&key)
+	return vaultfield.Opens(key, ciphertext, nonce, vaultFieldEntryValueProbe)
+}
+
+func wipeKey(k *[32]byte) {
+	for i := range k {
+		k[i] = 0
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil || len(nonce) != gcm.NonceSize() {
-		return false
-	}
-	_, err = gcm.Open(nil, nonce, ciphertext, nil)
-	return err == nil
 }
 
 // EnforceVaultKey runs VerifyVaultKey and stops the process on a mismatch,
@@ -352,31 +348,13 @@ What to do:
 // vaultKey, without needing a constructed VaultHandler (the key check runs before
 // one exists). It mirrors VaultHandler.decryptColumn, and the v2 derivation is the
 // same one vaultSecretOpens uses.
+//
+// It used to do its own AES-GCM, which made it a decryption door the round-18
+// ledger could not see (it matched none of the four call shapes that guard
+// derived from). It goes through vaultfield now, with the probe field, and
+// returns a bool.
 func vaultColumnOpens(stored, vaultKey string) bool {
-	if !strings.HasPrefix(stored, vaultColumnEncPrefix) {
-		return false
-	}
-	packed, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, vaultColumnEncPrefix))
-	if err != nil {
-		return false
-	}
-	derived := pbkdf2.Key([]byte(vaultKey), []byte("trustissues:vault:v2"), 600_000, 32, sha256.New)
-	defer func() {
-		for i := range derived {
-			derived[i] = 0
-		}
-	}()
-	block, err := aes.NewCipher(derived)
-	if err != nil {
-		return false
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return false
-	}
-	if len(packed) < gcm.NonceSize() {
-		return false
-	}
-	_, err = gcm.Open(nil, packed[:gcm.NonceSize()], packed[gcm.NonceSize():], nil)
-	return err == nil
+	key := vaultV2Key(vaultKey)
+	defer wipeKey(&key)
+	return vaultfield.ColumnOpens(key, stored, vaultFieldBootProbe)
 }

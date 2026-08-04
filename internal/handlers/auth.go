@@ -80,7 +80,7 @@ func decryptTOTPSecret(stored, key string) string {
 	if stored == "" {
 		return ""
 	}
-	if dec, err := columncrypto.DecryptString(stored, key); err == nil {
+	if dec, err := columncrypto.DecryptString(stored, key, vaultFieldTOTPSecret); err == nil {
 		return dec
 	}
 	return stored
@@ -105,7 +105,7 @@ func (h *AuthHandler) MigrateTOTPSecrets() error {
 		// here is a key mismatch or corruption, not plaintext; re-encrypting would
 		// make a recoverable mismatch permanent. Log and leave untouched.
 		if columncrypto.IsEncrypted(stored) {
-			if _, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey); derr != nil {
+			if _, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey, vaultFieldTOTPSecret); derr != nil {
 				slog.Error("totp.migrate: marked secret failed to decrypt under current key, leaving untouched", "user_id", row.ID, "error", derr)
 			}
 			continue
@@ -115,7 +115,7 @@ func (h *AuthHandler) MigrateTOTPSecrets() error {
 		// missing the marker) and we recover the seed, otherwise it is genuine
 		// plaintext to be encrypted now.
 		seed := stored
-		if dec, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey); derr == nil {
+		if dec, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey, vaultFieldTOTPSecret); derr == nil {
 			seed = dec
 		}
 		enc, eerr := columncrypto.EncryptString(seed, h.cfg.VaultKey)

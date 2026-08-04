@@ -76,8 +76,6 @@ package secretexit
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -85,7 +83,23 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
+
+// entryValue is the ledger declaration for vault_entries.encrypted_value.
+//
+// It lives HERE, next to [Open], because that is the rule internal/vaultfield
+// enforces: the declaration belongs where the plaintext is produced, not in a
+// list somebody keeps beside the code. The old ledger kept this entry in the
+// handlers package and derived it by matching the name "OpenEntrySecret", which
+// is a wrapper name and therefore exactly the kind of handle that missed the
+// invitations.code door.
+var entryValue = vaultfield.Declare(
+	"vault_entries.encrypted_value", vaultfield.ThroughTheExit, "any",
+	"THE client credential this product exists to hold. secretexit.Open is the only door and what it "+
+		"returns is opaque, so every path it leaves by is one of the registered exits. The exit key is "+
+		"\"any\" because every entry in theExitList governs this one column; naming one would be arbitrary.")
 
 // ── what a secret is, and whose it is ───────────────────────────────────────
 
@@ -412,21 +426,7 @@ type Plaintext struct {
 // handler assembled by hand (a test fixture, a future refactor) fails closed and
 // loudly instead of silently disabling the rule.
 func Open(key [32]byte, ciphertext, nonce []byte, o Origin, a Authority) (Plaintext, error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return Plaintext{}, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return Plaintext{}, err
-	}
-	// gcm.Open PANICS on a wrong-length nonce rather than returning an error,
-	// which would otherwise surface as a bare HTTP 500 via chi's Recoverer. A
-	// malformed stored nonce must degrade to a handled decrypt error.
-	if len(nonce) != gcm.NonceSize() {
-		return Plaintext{}, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
-	}
-	pt, err := gcm.Open(nil, nonce, ciphertext, nil)
+	pt, err := vaultfield.Open(key, ciphertext, nonce, entryValue)
 	if err != nil {
 		return Plaintext{}, err
 	}
@@ -435,20 +435,13 @@ func Open(key [32]byte, ciphertext, nonce []byte, o Origin, a Authority) (Plaint
 
 // Seal encrypts a plaintext with AES-256-GCM using rand for the nonce. It is
 // here rather than in the handlers so encrypt and decrypt stay one pair.
+//
+// The crypto itself is vaultfield's, because that package is the ONE file in the
+// module allowed to import crypto/aes and crypto/cipher. Sealing needs no Field:
+// the ledger is about what becomes PLAINTEXT, and putting a value back under the
+// key produces none.
 func Seal(key [32]byte, plaintext []byte, rand io.Reader) (ciphertext, nonce []byte, err error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-	nonce = make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand, nonce); err != nil {
-		return nil, nil, err
-	}
-	return gcm.Seal(nil, nonce, plaintext, nil), nonce, nil
+	return vaultfield.Seal(key, plaintext, rand)
 }
 
 // Reseal re-encrypts a Plaintext for storage WITHOUT releasing its bytes.

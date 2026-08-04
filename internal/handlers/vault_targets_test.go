@@ -325,7 +325,7 @@ func TestUpdateTargetsValidationSetMatchesDelivery(t *testing.T) {
 	if strings.Contains(raw.String, "webhook_url") {
 		t.Fatal("rotation_targets stored in cleartext; expected encrypted column")
 	}
-	stored := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", "rotation_targets"))
+	stored := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
 	if len(stored) != 3 {
 		t.Fatalf("expected 3 stored targets, got %d", len(stored))
 	}
