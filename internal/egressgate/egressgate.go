@@ -20,12 +20,23 @@
 //     Decide. Package handlers can write egressgate.Ticket{}, but the zero value
 //     authorizes nothing, so "I forgot to ask" and "I asked and was allowed"
 //     cannot look the same to the code that performs the write.
-//   - Every generated query that writes a host-choosing column is called from
-//     exactly one file, through a wrapper that demands a Ticket for that entry
-//     and that field. A new route, or a new field, that writes one of those
-//     columns without a Ticket does not compile past its own wrapper, and if it
-//     goes around the wrapper the chokepoint guard fails
-//     (TestEveryHostChoosingWriteGoesThroughTheChokepoint).
+//
+//   - Every generated query that writes a host-choosing column lives in
+//     internal/vaultegress/internal/egressq, which Go's own `internal` rule puts
+//     out of reach of every package except internal/vaultegress, and the only
+//     exported way in demands a Ticket for that entry and that field. Round 5
+//     held that rule up with a test that read the source and matched it against
+//     regular expressions, and four planted write paths walked through the gaps
+//     while building clean. Now a handler that calls a host-choosing write does
+//     not fail a test, it fails to compile:
+//
+//     h.queries.UpdateVaultEntryRotationTargets undefined
+//     (type *db.Queries has no field or method UpdateVaultEntryRotationTargets)
+//
+//     What the compiler cannot see, a NEW query in internal/db or a hand-written
+//     statement, is covered by
+//     TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn, which
+//     asks SQLite rather than a pattern.
 //
 // Decide also decides WHEN to ask. Narrowing, clearing and re-saving an
 // unchanged destination never consult the authority oracle, because clearing is

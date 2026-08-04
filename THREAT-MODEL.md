@@ -312,12 +312,33 @@ an unenforced write path reads as coverage. So the enforcement point is now a
 value a handler cannot fabricate. `internal/egressgate` issues a `Ticket` only
 from `Decide`, which consults the authority oracle exactly when a write ADDS a
 destination; every generated query that writes `destination_patterns`,
-`provider`, `provider_meta` or `rotation_targets` is called from
-`vault_egress_writes.go` and nowhere else, through a wrapper that demands a
-Ticket for that entry and that field.
-`TestEveryHostChoosingWriteGoesThroughTheChokepoint` derives the guarded queries
-from the generated SQL and the columns from the classification table, so a new
-column or a new route is covered on the day it is written.
+`provider`, `provider_meta` or `rotation_targets` is generated into
+`internal/vaultegress/internal/egressq`, which Go's own `internal` rule puts out
+of reach of every package except `internal/vaultegress`, whose six exported
+functions each demand a Ticket for that entry and that field.
+
+Round 5 stated that rule as "one file, checked by a test that reads the source",
+and four planted write paths walked through the gaps in its regular expressions
+while building clean. Round 6 removed the methods from every type a handler can
+name, so a host-choosing write without a ticket does not fail a test, it fails
+to compile. `TestPlantedEgressBypassesDoNotCompile` runs the real toolchain on
+five planted bypasses and reads its refusals.
+
+The residual the compiler cannot see (a NEW query in `internal/db`, or a
+hand-written statement) is covered by
+`TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn`, which builds a
+probe database in which those columns are `GENERATED` and hands every
+compile-time constant in the module to SQLite. Which columns a statement writes
+is the engine's answer, not a pattern's, so a table alias or doubled whitespace
+changes nothing.
+
+Adding a delivery destination takes the entry's creator or an instance admin,
+and both halves of that rule (the write gate and the delivery gate) call one
+function, `VaultHandler.mayConfigureDelivery`, which resolves admin status from
+the users row. Round 5 implemented the rule twice and the copies disagreed about
+admins, so an admin's target was accepted and then silently never delivered.
+`TestDeliveryGateAgreesWithWriteGate` runs both halves over nine principals and
+fails if they ever differ.
 
 **What this does not cover.** `auto_rotate` still takes only `manage` and is
 classified `egressTriggersDelivery`: it decides WHETHER the secret moves, never
