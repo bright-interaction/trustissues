@@ -170,10 +170,39 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	// A RECORDED OWNER IS NOT THE SAME AS A LIVE ONE.
+	//
+	// This used to refuse every row whose owner column was non-empty, which is
+	// right for an owner who can still direct the secret and wrong for one who
+	// cannot. ownerRecordedDestinations counts a recorded owner's destinations
+	// only while that owner still holds manage on the entry, so a collection
+	// MANAGER removes a colleague from the collection with one ordinary call,
+	//
+	//	DELETE /api/collections/{id}/members/{owner}
+	//
+	// writes nothing on the entry at all, and the entry stops contributing every
+	// destination it has. The owner column still names somebody, so the only
+	// repair route in the product refused it and the row was stranded for good.
+	// The migration's own operator notice sends people to this page.
+	//
+	// So the question is the one the exit asks: may the recorded owner still
+	// direct this secret? If yes, this route stays closed, because moving a live
+	// ownership would be a second transfer path with a friendlier name and the
+	// whole point of the column is that there is one.
 	if access.SecretOwnerUserID != "" {
-		writeConflict(w, r, "this entry already records a secret owner; ownership moves only when a "+
-			"user is deleted or when a migration could not prove one")
-		return
+		live, lErr := h.recordedOwnerMayDirect(ctx, entryID)
+		if lErr != nil {
+			logError(r, "vault.ownership: could not read the recorded owner", "entry", entryID,
+				"error", lErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if live {
+			writeConflict(w, r, "this entry already records a secret owner who may still direct it; "+
+				"ownership moves only when a user is deleted, when a migration could not prove one, or "+
+				"when the recorded owner can no longer reach the entry")
+			return
+		}
 	}
 
 	// From the users ROW, never from the session claim that got us here. The

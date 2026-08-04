@@ -116,47 +116,75 @@ func TestTheRepairAuditDetailCarriesBytesThePreviousHolderChose(t *testing.T) {
 // internal/database TestTheInjectedClaimDetailSparesALaunderedOwner leaves
 // behind: personal now, custodian is the manager who adopted it, and
 // secret_owner_user_id is still the attacker.
-func TestALaunderedOwnerThatSurvivesTheRepairMigrationDelivers(t *testing.T) {
-	swapProviderHTTP(t)
-	h, queries := newCollectionAuthzEnv(t)
-	sink := newHeaderSink(t)
-	ctx := context.Background()
+// TestTheClaimRecordNamesOnlyTheEntryItRepaired replaces a test that could not
+// be made honest.
+//
+// Its predecessor hand-wrote secret_owner_user_id = attacker on a personal entry
+// and then asserted that the rotation sweep must not deliver. That state is an
+// attacker who IS the recorded owner of an entry they hold personally, and
+// delivering to a destination such an owner recorded is not a bug, it is the
+// feature. The test only looked like an attack because a migration was supposed
+// to have produced the state, and a refutation established it cannot: the audit
+// suffix carrying caller bytes and migration 00036 ship in the same commit, and
+// migrations finish before the server listens, so a poisoned claim row cannot
+// exist on a database at the moment 00036 runs.
+//
+// What IS worth guarding is the fix. Authority now comes from
+// secret_ownership_claims, written in the same transaction as the transfer, and
+// the property that matters is that a repair speaks for exactly one entry: the
+// one it repaired. This drives the real attacker write and the real admin claim
+// and checks the row, not a sentence.
+func TestTheClaimRecordNamesOnlyTheEntryItRepaired(t *testing.T) {
+	env := newAttackedEnv(t, "claimrecord")
+	payload := "Entry " + theInjectedVictimID + ":"
 
-	const secret = "sk_live_TEAM_SECRET_LAUNDERED"
-	victim := mustUser(t, queries, "laundered-victim@example.com", "user", "victim-login-password")
-	attacker := mustUser(t, queries, "laundered-attacker@example.com", "user", "attacker-login-password")
-	const entryID = "entry-laundered"
-	mustEntry(t, h, queries, entryID, victim, "team-key", secret)
-
-	if _, err := h.db.Exec(
-		`UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, collection_id = NULL WHERE id = ?`,
-		attacker, attacker, entryID); err != nil {
-		t.Fatalf("plant the post-00036 state: %v", err)
+	body, _ := json.Marshal(map[string]any{
+		"provider":      "forgejo",
+		"provider_meta": `{"instance":"` + payload + `"}`,
+	})
+	put := httptest.NewRecorder()
+	env.h.Update(put, vaultAuthzRequest(http.MethodPut, "/api/vault/"+env.entryID,
+		env.attacker, "user", env.entryID, string(body)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("ABORT: the attacker's provider_meta write was refused (%d: %s); nothing below is "+
+			"measuring the injection", put.Code, put.Body.String())
 	}
-	if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
-		DestinationPatterns: `["` + attackedHost + `/*"]`, ID: entryID,
-	}); err != nil {
-		t.Fatalf("plant the ceiling: %v", err)
-	}
-	forceProviderConfig(t, h, entryID, "forgejo", `{"instance":"`+sink.URL+`"}`)
 
-	acc, err := queries.GetVaultEntryAccess(ctx, entryID)
+	admin := mustUser(t, env.queries, "claimrecord-admin@example.com", "admin", "admin-login-password")
+	claim := httptest.NewRecorder()
+	env.h.ClaimSecretOwnership(claim, vaultAuthzRequest(http.MethodPost,
+		"/api/admin/vault/"+env.entryID+"/ownership/claim", admin, "admin", env.entryID, ""))
+	if claim.Code != http.StatusOK {
+		t.Fatalf("ABORT: the admin could not claim the entry (%d: %s)", claim.Code, claim.Body.String())
+	}
+
+	rows, err := env.h.db.Query(`SELECT entry_id, claimed_by FROM secret_ownership_claims`)
 	if err != nil {
-		t.Fatalf("read entry access: %v", err)
+		t.Fatalf("read the claim records: %v", err)
 	}
-	if acc.SecretOwnerUserID != attacker {
-		t.Fatalf("ABORT: the fixture does not carry the laundered owner (%q)", acc.SecretOwnerUserID)
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var id, by string
+		if sErr := rows.Scan(&id, &by); sErr != nil {
+			t.Fatalf("scan claim record: %v", sErr)
+		}
+		got[id] = by
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate claim records: %v", err)
 	}
 
-	RotateVaultKeys(h.db, queries, h)
-	if !h.WaitForDelivery(30 * time.Second) {
-		t.Fatal("the sweep did not drain; the wire assertions would be racing it")
+	if len(got) != 1 {
+		t.Fatalf("THE REPAIR SPOKE FOR MORE THAN THE ENTRY IT REPAIRED.\n  claim records: %v", got)
 	}
-	auths, lines, payloads := sink.received()
-	if sink.sawSecret(secret) {
-		t.Fatalf("THE ATTACK SUCCEEDED. An ownership migration 00036 was written to withdraw delivered "+
-			"a colleague's plaintext to the attacker's host.\n  auth headers:  %q\n  request lines: %q"+
-			"\n  bodies:        %q", auths, lines, payloads)
+	if by, ok := got[env.entryID]; !ok || by != admin {
+		t.Fatalf("the claim record does not name the repaired entry and its admin.\n"+
+			"  repaired: %s by %s\n  records:  %v", env.entryID, admin, got)
+	}
+	if _, ok := got[theInjectedVictimID]; ok {
+		t.Fatalf("THE INJECTED ENTRY ID BECAME A CLAIM RECORD. The previous holder of one entry wrote "+
+			"an authority row for another.\n  records: %v", got)
 	}
 }
 
