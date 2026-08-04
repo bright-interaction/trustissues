@@ -1363,9 +1363,20 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 	if nameErr != nil {
 		name = "(unknown)"
 	}
+	// THE NAME IS SCRUBBED OF ANYTHING SHAPED LIKE AN ENTRY ID.
+	//
+	// The ownership backfill decides whether an entry has ever been in a
+	// collection by asking whether any vault.entry_moved detail CONTAINS its id.
+	// The name is caller-chosen and lands in that detail verbatim, so one move of
+	// an entry named with seven 32-hex tokens tells the backfill that seven other
+	// entries were shared, and it withholds all seven owners. The move route can
+	// be driven as often as the caller likes and activity_log is append-only.
+	//
+	// 00036 recorded this as a residual and called it "a self-inflicted denial of
+	// service on one row". It is neither self-inflicted nor one row.
 	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf(
 		"Vault entry moved: %s (id: %s, from: %s, to: %s)",
-		name, id, collectionLabel(source), collectionLabel(destination)))
+		scrubEntryIDLookalikes(name), id, collectionLabel(source), collectionLabel(destination)))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -3612,4 +3623,21 @@ func generateToken(byteLen int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// entryIDLookalike matches the shape vault_entries.id is generated in:
+// lower(hex(randomblob(16))), so exactly 32 lowercase hex characters.
+var entryIDLookalike = regexp.MustCompile(`[0-9a-f]{32}`)
+
+// scrubEntryIDLookalikes removes entry-id-shaped tokens from caller-supplied
+// text before it is written into an activity detail that a migration reads by
+// containment.
+//
+// It is deliberately blunt. A name that legitimately contains 32 hex characters
+// loses them from ONE audit line and keeps them everywhere else; a name that
+// contains them on purpose loses its ability to speak for another entry. The
+// asymmetry is the point, and it is the same reason the ownership claim stopped
+// rendering the previous holder's bytes at all.
+func scrubEntryIDLookalikes(s string) string {
+	return entryIDLookalike.ReplaceAllString(s, "[redacted-id-shaped]")
 }
