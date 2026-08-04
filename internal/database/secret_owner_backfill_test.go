@@ -571,3 +571,92 @@ func TestTheRepairMigrationUndoesTheLaunderedOwnership(t *testing.T) {
 			"the column outright passes every attack case", kept)
 	}
 }
+
+// THE UPGRADE PATH 00036 EXISTS FOR, AND THE ONE NOTHING WAS TESTING.
+//
+// The round-20 ablation sweep reverted both wording predicates and the suite
+// stayed green twice:
+//
+//	00034 back to instr(detail, '(id: ' || id || ',')   MISSED
+//	00036 back to the same                              MISSED
+//
+// Neither miss was a bug in the fix. It was redundancy that no single-file
+// ablation can see: every migration test above starts from a FRESH database and
+// runs goose up, where 00034 is already corrected, so 00036 repairs nothing and
+// reverting it changes nothing. Redundancy is not the same as coverage. Nothing
+// in the suite established that 00036 does anything at all.
+//
+// It has exactly one job, stated in its own header: a corrected file is worth
+// nothing to a database that already ran the broken one, because goose records
+// the version and never reads the file again. So the database this test builds
+// is the only one where 00036 is load-bearing, and it is the one every existing
+// instance is actually in.
+//
+// THE ROW is the laundering path the paren wording made invisible: created
+// personal, moved INTO a collection and back OUT by a binary from the 2026-07-24
+// to 2026-07-26 window that wrote "(id: X)" with a closing paren, adopted by a
+// manager while vault.entry_adopted did not exist yet. To a comma-shaped
+// predicate it looks like an entry that has never been anywhere, so the broken
+// backfill stamped its custodian: the manager.
+func TestTheLogFormatMigrationRepairsAParenEraLaundering(t *testing.T) {
+	const parenEra = "p01"
+
+	conn := openBefore(t)
+	seedPeople(t, conn)
+
+	// Personal NOW. That is what makes the entry invisible to a predicate that
+	// cannot read its move rows: collection_id is empty and the only evidence it
+	// was ever shared is the wording those rows are written in.
+	insertEntry(t, conn, parenEra, "u-victim", "moved-and-returned", "")
+	// THE PAREN WORDING, verbatim from 4e9bd5ec.
+	logRow(t, conn, "u-manager", "vault.entry_moved",
+		"Vault entry moved to collection (id: "+parenEra+")")
+	logRow(t, conn, "u-manager", "vault.entry_moved",
+		"Vault entry moved to collection (id: "+parenEra+")")
+	// The adoption, which left no vault.entry_adopted row because that action was
+	// not added until 2026-08-02.
+	mustExec(t, conn, `UPDATE vault_entries SET user_id = ? WHERE id = ?`, "u-manager", parenEra)
+
+	// A control row an honest backfill must KEEP, so a repair that simply clears
+	// the column cannot pass this test.
+	const honest = "p02"
+	insertEntry(t, conn, honest, "u-victim", "never-shared", "")
+
+	// Up to the relaunder, then the outcome the paren-era binary actually
+	// produced. Written as the outcome rather than by re-running the broken SQL
+	// because the broken file no longer exists: 00034 and 00035 were corrected in
+	// place, which is precisely why 00036 had to be written.
+	goose.SetBaseFS(embeddedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("goose dialect: %v", err)
+	}
+	if err := goose.UpTo(conn, "migrations", relaunderVersion); err != nil {
+		t.Fatalf("migrate to %d: %v", relaunderVersion, err)
+	}
+	mustExec(t, conn,
+		`UPDATE vault_entries SET secret_owner_user_id = user_id WHERE secret_owner_user_id = ''`)
+
+	// THE CONTROL ON THE FIXTURE. If the laundering did not take, 00036 has
+	// nothing to undo and this test passes over anything at all.
+	if got := ownerOf(t, conn, parenEra); got != "u-manager" {
+		t.Fatalf("ABORT: the simulated paren-era backfill left owner %q, want %q. This database is not "+
+			"in the state 00036 exists to repair", got, "u-manager")
+	}
+
+	if err := goose.Up(conn, "migrations"); err != nil {
+		t.Fatalf("goose up: %v", err)
+	}
+
+	if got := ownerOf(t, conn, parenEra); got != "" {
+		t.Errorf("THE PAREN-ERA LAUNDERING SURVIVED THE REPAIR.\n"+
+			"  secret_owner_user_id = %q, want empty\n"+
+			"  The entry has two vault.entry_moved rows naming it in the paren wording, so 00036 must "+
+			"see them and withdraw the owner it cannot prove. A predicate that matches a prose format "+
+			"instead of the entry id cannot, and this is the database where that is the only thing "+
+			"standing between an attacker and a permanent ownership record.", got)
+	}
+	if got := ownerOf(t, conn, honest); got != "u-victim" {
+		t.Errorf("the repair also cleared an entry that was never shared (owner %q, want %q). A "+
+			"migration that clears everything is safe and useless", got, "u-victim")
+	}
+}
