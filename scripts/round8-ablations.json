@@ -16,8 +16,8 @@
   "new": "\tif info.SecretOwnerUserID == \"\" {\n\t\treturn userID != \"\" && info.UserID == userID\n\t}\n\treturn userID != \"\" && info.SecretOwnerUserID == userID",
   "test": "TestAManagerWhoRewritesOwnershipStillCannotDirectTheSecret",
   "why": "the friendly-looking version of the same bug: 'be lenient for rows the migration missed'. An empty owner must deny, or a row inserted without one is owned by whoever holds it",
-  "expect_miss": true,
-  "note": "reached by hand: the migration backfills every row and TestEveryRowCreatingStatementNamesTheSecretOwner makes an empty owner unreachable from any create path, so no state in the suite distinguishes this. It is defence in depth over a state the schema guards, exactly like the round-7 unlock miss"
+  "expect_miss": false,
+  "note": "SUPERSEDED 2026-08-04, and by BOTH halves at once. The premise was that no state distinguishes this, because the migration backfilled every row and no create path leaves an owner empty. The migration does not backfill every row any more: 00034 stamps only entries it can prove were never in a collection, so an empty owner is now an ordinary state on a live database rather than an unreachable one. And the suite does distinguish it: TestAnEmptyOwnerDeniesEvenTheCustodian reddens on this exact edit, and scripts/live-crossversion-skeptic.sh reddens twice on the wire (the attacker widens the ceiling again and their planted webhook is no longer refused at the exit). expect_miss is false now."
  },
  {
   "id": "adoption-moves-the-owner-too",
