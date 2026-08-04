@@ -385,7 +385,8 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	// falling back to the entry owner.
 	legacy := stored[0]
 	legacy.ConfiguredBy = ""
-	if err := deliverToForgejoSecret(ctx, queries, h, legacy, "new-value", owner); err == nil ||
+	if err := deliverToForgejoSecret(ctx, h, legacy,
+		h.MintedEntrySecret([]byte("new-value"), entryID, "entry"), owner); err == nil ||
 		!strings.Contains(err.Error(), "re-save") {
 		t.Fatalf("legacy target should fail closed with a re-save hint, got %v", err)
 	}
@@ -423,7 +424,8 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 			"picked which of the owner's credentials is spent as the delivery bearer token and the "+
 			"lookup would run as the owner", stored[0].ConfiguredBy)
 	}
-	err := deliverToForgejoSecret(ctx, queries, h, stored[0], "new-value", owner)
+	err := deliverToForgejoSecret(ctx, h, stored[0],
+		h.MintedEntrySecret([]byte("new-value"), entryID, "entry"), owner)
 	if err == nil {
 		t.Fatal("an editor-chosen auth_token resolved the owner's personal secret")
 	}
@@ -516,12 +518,12 @@ func TestManualRotateProviderFailureLeavesSecretIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read entry after: %v", err)
 	}
-	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	plain, err := h.openForTest(after.EncryptedValue, after.Nonce)
 	if err != nil {
 		t.Fatalf("decrypt after: %v", err)
 	}
-	if string(plain) != "live-upstream-value" {
-		t.Fatalf("stored secret was overwritten with %q; the live credential would be destroyed", plain)
+	if !plain.EqualsString("live-upstream-value") {
+		t.Fatalf("stored secret was overwritten (len %d); the live credential would be destroyed", plain.Len())
 	}
 	if string(after.EncryptedValue) != string(before.EncryptedValue) {
 		t.Fatal("stored ciphertext changed on a failed provider rotation")

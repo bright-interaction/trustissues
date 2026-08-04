@@ -99,8 +99,8 @@ func ceilingDestinations(patterns []string) []string {
 // string edit.
 func providerDestinations(provider string, meta map[string]string) []string {
 	allow := declaredProviderEgress(provider, meta)
-	out := append([]string{}, allow.hosts...)
-	for _, s := range allow.suffixes {
+	out := append([]string{}, allow.Hosts...)
+	for _, s := range allow.Suffixes {
 		out = append(out, "*"+strings.ToLower(s))
 	}
 	return out

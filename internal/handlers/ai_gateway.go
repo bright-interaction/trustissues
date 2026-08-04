@@ -10,12 +10,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/shield"
 	"github.com/go-chi/chi/v5"
 )
@@ -144,9 +146,31 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("no %s key configured; an admin must set it in Settings > AI gateway", providerName))
 		return
 	}
-	key, err := h.vault.DecryptedValueByID(ctx, entryID)
-	if err != nil || key == "" {
+	pt, err := h.vault.EntrySecretByID(ctx, entryID)
+	if err != nil {
 		logError(r, "ai_gateway: provider key resolve failed", "provider", providerName, "error", err)
+		writeInternalError(w, r, "provider key is not available")
+		return
+	}
+	defer pt.Wipe()
+	// THE ONE EXIT. The destination is fixed by the DEPLOYMENT and by nothing
+	// else: p.baseURL is a compile-time constant in the aiProviders table and the
+	// entry is named by an AdminOnly settings row, so no caller and nobody who
+	// can edit the entry moves it. That is what ChosenByTheInstance means, and it
+	// is the only chooser kind this route can legitimately use.
+	//
+	// The host comes from the URL that is ACTUALLY about to be built, not from a
+	// second constant that could drift from it. p.apiHost is the other half of
+	// the same pair and TestAIProviderBaseURLMatchesItsAllowlistHost pins them
+	// together for the production table; deriving the receipt from baseURL is
+	// what lets a test point baseURL at a loopback upstream without the receipt
+	// silently describing somewhere the request is not going.
+	upCtx, key, err := secretexit.ExitString(ctx, pt,
+		secretexit.ToHost("the AI gateway's "+providerName+" key",
+			secretexit.ChosenByTheInstance("settings "+p.settingKey+" is an AdminOnly write, and the host "+
+				"is the compile-time aiProviders baseURL"), baseURLHost(p.baseURL)))
+	if err != nil || key == "" {
+		logError(r, "ai_gateway: provider key not released", "provider", providerName, "error", err)
 		writeInternalError(w, r, "provider key is not available")
 		return
 	}
@@ -196,7 +220,7 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 			upstreamURL += "?" + raw
 		}
 	}
-	upReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(body))
+	upReq, err := http.NewRequestWithContext(upCtx, r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		writeInternalError(w, r, "internal server error")
 		return
@@ -213,6 +237,16 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	p.inject(upReq.Header, key)
 
+	// CheckHost, not a bare client.Do. The gateway has its own client (redirects
+	// refused, long timeout), so it cannot reuse providerDo, but the RECEIPT
+	// question is the same one and asking it here is what keeps this door and the
+	// capability bridge's door from diverging the way they did in round 2.
+	if err := secretexit.CheckHost(upReq.Context(), upReq.URL.Hostname()); err != nil {
+		logError(r, "ai_gateway: refused an upstream host outside the exit receipt",
+			"provider", providerName, "error", err)
+		writeError(w, r, http.StatusForbidden, "destination_pinned", err.Error())
+		return
+	}
 	resp, err := h.client.Do(upReq)
 	if err != nil {
 		logError(r, "ai_gateway: upstream request failed", "provider", providerName, "error", err)
@@ -288,6 +322,17 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // requestsStreaming reports whether the JSON body sets "stream": true.
+// baseURLHost is the host half of a provider baseURL. An unparseable value
+// yields "", which secretexit.Exit refuses, so a malformed table entry stops the
+// key rather than releasing it to nowhere in particular.
+func baseURLHost(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
 func requestsStreaming(body []byte) bool {
 	var probe struct {
 		Stream bool `json:"stream"`

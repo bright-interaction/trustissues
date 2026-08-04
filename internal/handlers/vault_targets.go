@@ -17,6 +17,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // RotationTarget defines where a rotated key should be delivered.
@@ -94,7 +95,7 @@ func ParseRotationTargets(raw string) []RotationTarget {
 // userID is the ENTRY OWNER and is used for logging context only. Vault
 // references inside a target (forgejo_secret's auth_token) resolve as
 // target.ConfiguredBy instead; see the RotationTarget doc comment for why.
-func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryID string, entryName string, oldValue string, newValue string, targets []RotationTarget, userID string) []DeliveryResult {
+func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHandler, entryID string, entryName string, oldValue secretexit.Plaintext, newValue secretexit.Plaintext, targets []RotationTarget, userID string) []DeliveryResult {
 	results := make([]DeliveryResult, 0, len(targets))
 
 	// The provider pin, at delivery. An entry an admin wired into the AI gateway
@@ -159,7 +160,7 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 				continue
 			}
 			if target.Type == "forgejo_secret" {
-				err = deliverToForgejoSecret(ctx, queries, vault, target, newValue, userID)
+				err = deliverToForgejoSecret(ctx, vault, target, newValue, userID)
 			} else {
 				err = deliverToWebhook(ctx, target, entryName, newValue)
 			}
@@ -314,7 +315,20 @@ func dispatchRotationAlertReal(ctx context.Context, queries *db.Queries, decrypt
 }
 
 // deliverToForgejoSecret updates an Actions secret on a Forgejo/Gitea repository.
-func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *VaultHandler, target RotationTarget, newValue string, userID string) error {
+//
+// THIS IS THE ROUND-6 PATH. It carries TWO secrets to the same host: the rotated
+// value of the entry being delivered, in the body, and ANOTHER entry's personal
+// access token, in the Authorization header. The second one is the break:
+// auth_token names an entry by NAME, and an accepted vault_only VIEWER of a
+// shared collection may USE the team's secret, so a viewer put this target on
+// their OWN entry, named the team's secret, rotated their own entry, and the
+// team secret left as a bearer token to a host they chose.
+//
+// Both secrets now leave through secretexit.Exit, each asked about ITS OWN
+// owner. For the body that is the entry being rotated, whose delivery targets
+// this configurer was entitled to set. For the header it is the REFERENCED
+// entry, and the configurer has to hold the widening right on that one.
+func deliverToForgejoSecret(ctx context.Context, vault *VaultHandler, target RotationTarget, newValue secretexit.Plaintext, userID string) error {
 	if target.Instance == "" || target.Repo == "" || target.SecretName == "" {
 		return fmt.Errorf("instance, repo, and secret_name are required for forgejo_secret target")
 	}
@@ -332,6 +346,10 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 	// name a shared secret here and have its post-rotation plaintext delivered to
 	// a host they control. Targets written before ConfiguredBy existed carry no
 	// identity and are refused rather than falling back to the owner.
+	//
+	// That gate answers "may they REACH this secret". It never answered "may
+	// they send it HERE", and a viewer can reach a team secret by design. The
+	// exit below is the second question.
 	if target.ConfiguredBy == "" {
 		return fmt.Errorf("target has no recorded configuring user; re-save this entry's rotation targets to authorize the auth_token lookup")
 	}
@@ -346,27 +364,41 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 			"error", err)
 		return fmt.Errorf("resolve Forgejo auth token %q from the configuring user's vault: %w", authToken, err)
 	}
-	defer func() {
-		for i := range tokenPlaintext {
-			tokenPlaintext[i] = 0
-		}
-	}()
+	defer tokenPlaintext.Wipe()
 
-	// PUT /api/v1/repos/{owner}/{repo}/actions/secrets/{secretname}
-	payload, _ := json.Marshal(map[string]string{"data": newValue})
-	url := strings.TrimRight(target.Instance, "/") + "/api/v1/repos/" + target.Repo + "/actions/secrets/" + target.SecretName
+	host := hostFromRawURL(target.Instance)
 
-	// The authority for this one delivery is the target row that was authorized
-	// above (its configurer still has write, and the provider pin allowed it).
-	// Naming it here rather than letting providerDo default to something is the
-	// whole discipline: there is no default. See egress_authority.go.
-	req, err := http.NewRequestWithContext(
-		withDeliveryEgress(ctx, target.Instance, "this forgejo_secret delivery target"),
-		"PUT", url, bytes.NewReader(payload))
+	// EXIT 1: the REFERENCED entry's token, as the bearer. Its owner is asked
+	// whether the principal who configured this target may choose where THAT
+	// entry's secret goes. The round-6 viewer could not.
+	ctx, bearer, err := secretexit.ExitString(ctx, tokenPlaintext,
+		secretexit.ToHost("this forgejo_secret delivery target's auth_token",
+			secretexit.ChosenBy(target.ConfiguredBy), host))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "token "+string(tokenPlaintext))
+
+	// EXIT 2: the rotated value itself, in the body, asked about its own entry.
+	ctx, pushed, err := secretexit.ExitString(ctx, newValue,
+		secretexit.ToHost("this forgejo_secret delivery target",
+			secretexit.ChosenBy(target.ConfiguredBy), host))
+	if err != nil {
+		return err
+	}
+
+	// PUT /api/v1/repos/{owner}/{repo}/actions/secrets/{secretname}
+	payload, _ := json.Marshal(map[string]string{"data": pushed})
+	url := strings.TrimRight(target.Instance, "/") + "/api/v1/repos/" + target.Repo + "/actions/secrets/" + target.SecretName
+
+	// ctx carries BOTH receipts, so providerDo refuses unless the host it is
+	// actually sending to is the one both owners authorised. There is no
+	// default and no way to state a destination without an owner having said
+	// yes to it. See internal/secretexit.
+	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "token "+bearer)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := providerDo(req)
@@ -384,21 +416,29 @@ func deliverToForgejoSecret(ctx context.Context, queries *db.Queries, vault *Vau
 }
 
 // deliverToWebhook POSTs the new key to a webhook URL with HMAC-SHA256 signing.
-func deliverToWebhook(ctx context.Context, target RotationTarget, entryName string, newValue string) error {
+func deliverToWebhook(ctx context.Context, target RotationTarget, entryName string, newValue secretexit.Plaintext) error {
 	if target.WebhookURL == "" {
 		return fmt.Errorf("webhook_url is required")
+	}
+
+	// THE ONE EXIT. The destination was chosen by whoever configured this
+	// target, so the OWNER of the secret is asked whether that principal may
+	// choose where it goes.
+	ctx, value, err := secretexit.ExitString(ctx, newValue,
+		secretexit.ToHost("this webhook delivery target",
+			secretexit.ChosenBy(target.ConfiguredBy), hostFromRawURL(target.WebhookURL)))
+	if err != nil {
+		return err
 	}
 
 	payload, _ := json.Marshal(map[string]string{
 		"event":      "vault.key_rotated",
 		"entry_name": entryName,
-		"new_value":  newValue,
+		"new_value":  value,
 		"rotated_at": time.Now().UTC().Format(time.RFC3339),
 	})
 
-	req, err := http.NewRequestWithContext(
-		withDeliveryEgress(ctx, target.WebhookURL, "this webhook delivery target"),
-		"POST", target.WebhookURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", target.WebhookURL, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

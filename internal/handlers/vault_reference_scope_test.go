@@ -45,7 +45,7 @@ func TestRemovedMemberCannotResolveSharedSecretByName(t *testing.T) {
 
 	// Guard the setup: while she is a member the reference must resolve, or the
 	// post-removal assertion proves nothing.
-	if v, err := h.resolveVaultReferenceFor(ctx, "prod-db", mallory); err != nil || string(v) != "ORIGINAL-VALUE" {
+	if v, err := h.resolveVaultReferenceFor(ctx, "prod-db", mallory); err != nil || !v.EqualsString("ORIGINAL-VALUE") {
 		t.Fatalf("ABORT: an active member cannot resolve the shared secret (err=%v)", err)
 	}
 
@@ -62,8 +62,8 @@ func TestRemovedMemberCannotResolveSharedSecretByName(t *testing.T) {
 	}
 
 	if v, err := h.resolveVaultReferenceFor(ctx, "prod-db", mallory); err == nil {
-		t.Errorf("a REMOVED member resolved the shared secret's plaintext: %q\n"+
-			"a forgejo_secret auth_token on her own personal entry would deliver this to a host she controls", string(v))
+		t.Errorf("a REMOVED member resolved the shared secret's plaintext (len %d)\n"+
+			"a forgejo_secret auth_token on her own personal entry would deliver this to a host she controls", v.Len())
 	}
 
 	// The manager, who is still a member, must be unaffected. This is not the
@@ -101,7 +101,7 @@ func TestAmbiguousVaultReferenceIsRefused(t *testing.T) {
 
 	v, err := h.resolveVaultReferenceFor(ctx, "shared-name", user)
 	if err == nil {
-		t.Fatalf("an ambiguous reference silently resolved to %q; the operator cannot tell which credential was spent", string(v))
+		t.Fatalf("an ambiguous reference silently resolved (len %d); the operator cannot tell which credential was spent", v.Len())
 	}
 	if !errors.Is(err, errAmbiguousVaultReference) {
 		t.Errorf("ambiguity was reported as %v, which does not tell the operator what to fix", err)
@@ -113,8 +113,8 @@ func TestAmbiguousVaultReferenceIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an unambiguous reference stopped resolving: %v", err)
 	}
-	if string(got) != "COLLECTION" {
-		t.Errorf("resolved the wrong entry: %q", string(got))
+	if !got.EqualsString("COLLECTION") {
+		t.Errorf("resolved the wrong entry (len %d)", got.Len())
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/capability"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // ──────────────────────────────────────────────────────────────────────
@@ -418,17 +419,22 @@ func TestCapability_E2E_AutoRouteByDestination(t *testing.T) {
 
 const testCapVaultKey = "test-vault-key-32-bytes-long-aaaaaa"
 
-// stubDecrypter satisfies alerts.ConfigDecrypter without pulling in the
-// vault handler (owned by the vault feature). It returns the stored
-// bytes verbatim, so tests seed vault_entries with plaintext in
-// encrypted_value. The real crypto is covered by the vault's own tests;
-// these tests cover the bridge.
+// stubDecrypter satisfies entrySecretSource without pulling in the vault handler
+// (owned by the vault feature). It returns the stored bytes verbatim, so tests
+// seed vault_entries with plaintext in encrypted_value. The real crypto is
+// covered by the vault's own tests; these tests cover the bridge.
+//
+// It hands back a real secretexit.Plaintext under allowAllExitAuthority, so the
+// bridge's own machinery (token, nonce, method, allow-list, pin, inference
+// routes) is what these tests exercise, and the OWNER question is exercised
+// against a real VaultHandler in capability_egress_pin_test.go instead. A stub
+// that could produce bare bytes would be a second door; this one still has to
+// call secretexit.Exit to get any.
 type stubDecrypter struct{}
 
-func (stubDecrypter) DecryptValue(ciphertext, nonce []byte, encVersion int) ([]byte, error) {
-	out := make([]byte, len(ciphertext))
-	copy(out, ciphertext)
-	return out, nil
+func (stubDecrypter) OpenEntrySecret(ciphertext, nonce []byte, encVersion int,
+	o secretexit.Origin) (secretexit.Plaintext, error) {
+	return secretexit.Minted(ciphertext, o, allowAllExitAuthority{}), nil
 }
 
 // newTestDB returns an in-memory sqlite DB with the schema needed for

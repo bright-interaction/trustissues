@@ -154,8 +154,11 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 
-		// Decrypt current value
-		plaintext, err := vaultHandler.DecryptValue(entry.EncryptedValue, entry.Nonce, int(entry.EncryptionVersion.Int64))
+		// Decrypt current value. It comes back opaque: the sweep runs with nobody
+		// watching, so it is the path where a value held as a bare string is
+		// hardest to notice going somewhere it should not.
+		plaintext, err := vaultHandler.OpenEntrySecret(entry.EncryptedValue, entry.Nonce,
+			int(entry.EncryptionVersion.Int64), entryOrigin(entry.ID, entry.Name))
 		if err != nil {
 			slog.Error("vault rotation: decrypt failed", "entry", entry.Name, "error", err)
 			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
@@ -171,11 +174,10 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// decrypted key to the host they named. The write is refused now (see
 		// VaultHandler.Update), and this refuses to deliver a row that got
 		// written some other way. See egress_authority.go.
-		rotateCtx, egressErr := providerEgressContextFor(ctx, queries, entry.ID, providerName, meta)
+		rotateCtx, oldPlain, egressErr := spendProviderSecret(ctx, queries, plaintext,
+			entry.ID, providerName, meta)
 		if egressErr != nil {
-			for i := range plaintext {
-				plaintext[i] = 0
-			}
+			plaintext.Wipe()
 			slog.Error("vault rotation: refusing to rotate through this provider configuration; "+
 				"the secret was not sent anywhere",
 				"entry", entry.Name, "provider", providerName, "error", egressErr)
@@ -183,13 +185,9 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 				entry.RotationLog.String, rotFailProvider, "auto", nil)
 			return
 		}
-		oldValueCopy := string(plaintext) // captured for delivery, zeroed in plaintext below
-		newValue, err := provider.Rotate(rotateCtx, string(plaintext), meta)
-
-		// Zero plaintext immediately
-		for i := range plaintext {
-			plaintext[i] = 0
-		}
+		oldValueCopy := plaintext // carried to delivery still opaque
+		rotated, err := provider.Rotate(rotateCtx, oldPlain, meta)
+		newValue := vaultHandler.MintedEntrySecret([]byte(rotated), entry.ID, entry.Name)
 
 		if err != nil {
 			// Do NOT persist err.Error() here: a provider Rotate error can embed the
@@ -209,7 +207,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// either. See deferRevokeOldProviderKey.
 
 		// Encrypt the new value
-		encrypted, nonce, err := vaultHandler.EncryptValue([]byte(newValue))
+		encrypted, nonce, err := vaultHandler.encryptEntrySecret(newValue)
 		if err != nil {
 			// The provider has ALREADY issued a replacement key upstream and we
 			// are about to throw it away. The old value stays in the vault, so

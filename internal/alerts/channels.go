@@ -52,10 +52,18 @@ const (
 	EventTest              = "test.notification"
 )
 
-// ConfigDecrypter decrypts encrypted channel configs. The vault handler
-// satisfies this with its AES-256-GCM column crypto.
+// ConfigDecrypter decrypts encrypted NOTIFICATION CHANNEL configs. The vault
+// handler satisfies this with its AES-256-GCM column crypto.
+//
+// The method is deliberately not the one that opens a vault entry's value.
+// Since round 7 an entry secret comes back as a secretexit.Plaintext, an opaque
+// type whose bytes only secretexit.Exit can release, and this door returns bytes
+// because a channel config belongs to the INSTANCE rather than to any entry:
+// only an instance admin can write those rows, so there is no entry owner to
+// ask. Two doors with two names is what keeps that distinction visible; one door
+// with two meanings is how the rounds before this one went wrong.
 type ConfigDecrypter interface {
-	DecryptValue(ciphertext, nonce []byte, encVersion int) ([]byte, error)
+	DecryptInstanceConfig(ciphertext, nonce []byte, encVersion int) ([]byte, error)
 }
 
 // NotificationChannel represents a configured notification channel.
@@ -152,7 +160,7 @@ func (d *ChannelDispatcher) decryptConfig(config string, nonce []byte, encVersio
 		return "", fmt.Errorf("decoding config: %w", err)
 	}
 
-	plaintext, err := d.decrypter.DecryptValue(ciphertext, nonce, int(version))
+	plaintext, err := d.decrypter.DecryptInstanceConfig(ciphertext, nonce, int(version))
 	if err != nil {
 		return "", fmt.Errorf("decrypting config: %w", err)
 	}

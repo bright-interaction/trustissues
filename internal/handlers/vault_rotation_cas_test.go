@@ -68,11 +68,11 @@ func TestSweepActuallyPersistsTheRotatedValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	plain, err := h.openForTest(after.EncryptedValue, after.Nonce)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if string(plain) == "old-value" {
+	if plain.EqualsString("old-value") {
 		t.Error("the sweep did not persist the rotated value: the CAS is rejecting its own snapshot, " +
 			"so scheduled auto-rotation silently does nothing")
 	}
@@ -178,11 +178,11 @@ func TestManualRotateActuallyRotates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after: %v", err)
 	}
-	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	plain, err := h.openForTest(after.EncryptedValue, after.Nonce)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if string(plain) == "OLD-VALUE" {
+	if plain.EqualsString("OLD-VALUE") {
 		t.Error("manual rotate returned success but the stored value is unchanged")
 	}
 }
@@ -237,11 +237,11 @@ func TestManualRotateWorksForProviderBackedEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	plain, err := h.DecryptValue(after.EncryptedValue, after.Nonce, 2)
+	plain, err := h.openForTest(after.EncryptedValue, after.Nonce)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if string(plain) == "OLD-VALUE" {
+	if plain.EqualsString("OLD-VALUE") {
 		t.Error("rotate reported success but the stored value is unchanged")
 	}
 	meta, err := queries.GetVaultEntryMeta(ctx, entryID)

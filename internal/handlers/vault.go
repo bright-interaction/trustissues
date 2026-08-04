@@ -25,6 +25,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/pbkdf2"
@@ -653,43 +654,56 @@ func (h *VaultHandler) encrypt(plaintext []byte) (ciphertext, nonce []byte, err 
 	return ciphertext, nonce, nil
 }
 
-// decrypt decrypts data using AES-256-GCM.
-func (h *VaultHandler) decrypt(ciphertext, nonce []byte) ([]byte, error) {
-	block, err := aes.NewCipher(h.encryptionKey[:])
-	if err != nil {
-		return nil, err
-	}
+// OpenEntrySecret is the ONE WAY to decrypt a vault entry's value, and what it
+// hands back is a secretexit.Plaintext: an opaque type whose bytes can only be
+// obtained by calling secretexit.Exit with a destination and having the entry's
+// OWNER authorise it.
+//
+// That is the whole shape of round 7. There is no method on the result that
+// returns the value, so "every path by which a decrypted secret leaves this
+// process" is not a list somebody maintains, it is a set the compiler maintains:
+// a new exit that does not call secretexit.Exit does not compile.
+//
+// It handles both v1 (legacy SHA-256) and v2 (PBKDF2) encryption versions.
+func (h *VaultHandler) OpenEntrySecret(ciphertext, nonce []byte, encVersion int,
+	o secretexit.Origin) (secretexit.Plaintext, error) {
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
+	key := h.encryptionKey
+	if encVersion == 1 {
+		key = h.legacyKey
 	}
-
-	// Guard the nonce length ourselves: gcm.Open PANICS on a wrong-length
-	// (e.g. nil/empty) nonce rather than returning an error, which would
-	// otherwise surface as a bare HTTP 500 via chi's Recoverer. A malformed
-	// stored nonce must degrade to a handled decrypt error, never a panic.
-	if len(nonce) != gcm.NonceSize() {
-		return nil, fmt.Errorf("decrypt: invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
-	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	return secretexit.Open(key, ciphertext, nonce, o, h)
 }
 
-// DecryptedValueByID returns the decrypted secret value of an entry by id. It
-// exists for server-side consumers that inject a stored credential into an
-// outbound request without exposing it (the AI gateway). It does NOT do access
-// control: the caller must have already authorized (the AI gateway resolves the
-// provider-key entry from an admin-set setting, not from user input).
-func (h *VaultHandler) DecryptedValueByID(ctx context.Context, id string) (string, error) {
+// entryOrigin names an entry for the exit gate. Every openEntrySecret call site
+// passes one, and passing the WRONG one is the round-6 defect in a single
+// argument: the delivery path used to authorise against the entry being rotated
+// rather than against the entry the secret came from.
+func entryOrigin(entryID, name string) secretexit.Origin {
+	return secretexit.Origin{EntryID: entryID, Name: name}
+}
+
+// EntrySecretByID opens an entry's value by id. It does NOT do access control:
+// the caller must have already authorized, and the exit gate asks the owner
+// question at the moment the value is actually spent.
+func (h *VaultHandler) EntrySecretByID(ctx context.Context, id string) (secretexit.Plaintext, error) {
 	row, err := h.queries.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
-		return "", err
+		return secretexit.Plaintext{}, err
 	}
-	pt, err := h.decrypt(row.EncryptedValue, row.Nonce)
-	if err != nil {
-		return "", err
-	}
-	return string(pt), nil
+	return h.OpenEntrySecret(row.EncryptedValue, row.Nonce, int(row.EncryptionVersion.Int64),
+		entryOrigin(id, row.Name))
+}
+
+// MintedEntrySecret wraps a value this server CREATED for an entry (a locally
+// generated rotation value, or the successor a provider handed back) as the same
+// opaque type a decrypted one gets.
+//
+// It is exactly as dangerous as a decrypted value, so it goes through the same
+// exit. Nothing in this package may hold a rotation's new value as a bare
+// string: TestNoSecretValueEscapesTheExitType is what fails when it tries.
+func (h *VaultHandler) MintedEntrySecret(value []byte, entryID, name string) secretexit.Plaintext {
+	return secretexit.Minted(value, entryOrigin(entryID, name), h)
 }
 
 // EncryptValue encrypts a plaintext value using the current PBKDF2 key.
@@ -698,15 +712,39 @@ func (h *VaultHandler) EncryptValue(plaintext []byte) (ciphertext, nonce []byte,
 	return h.encrypt(plaintext)
 }
 
-// DecryptValue decrypts a vault-encrypted value. It handles both v1 (legacy SHA-256)
-// and v2 (PBKDF2) encryption versions. This method satisfies the
-// alerts.ConfigDecrypter interface so the vault handler can be passed to
-// alerts.NewChannelDispatcher at integration.
-func (h *VaultHandler) DecryptValue(ciphertext, nonce []byte, encVersion int) ([]byte, error) {
+// encryptEntrySecret re-seals an opaque entry secret for storage.
+//
+// Storing a value is not an exit, so it does not go through secretexit.Exit and
+// deliberately does not appear in the exit list: nothing leaves the process and
+// the value is ciphertext again on the other side.
+func (h *VaultHandler) encryptEntrySecret(pt secretexit.Plaintext) (ciphertext, nonce []byte, err error) {
+	return secretexit.Reseal(h.encryptionKey, pt, rand.Reader)
+}
+
+// DecryptInstanceConfig decrypts INSTANCE-OWNED encrypted configuration: the
+// notification-channel config rows, which hold an operator's Slack webhook URL
+// or SMTP credentials.
+//
+// It is deliberately a different door from openEntrySecret, and deliberately
+// still returns bytes. Those rows belong to no vault entry, so there is no entry
+// owner to ask, and only an instance admin can write them. Every value the exit
+// gate governs is a vault_entries.encrypted_value, and this is not one.
+//
+// It returns bytes rather than a Plaintext because the value never leaves the
+// process AS a value: alerts parses it to find the channel's URL or relay, and
+// what goes on the wire is the operator's own alert text. Wrapping it in an
+// origin nobody can authorise would be ceremony, and ceremony is what this round
+// is removing.
+//
+// TestOnlyTheAlertsPathDecryptsInstanceConfig pins the caller set from the AST,
+// so this cannot quietly become a second way to open an entry's secret. See the
+// SCOPE BOUNDARY note in secret_exit_authority.go.
+func (h *VaultHandler) DecryptInstanceConfig(ciphertext, nonce []byte, encVersion int) ([]byte, error) {
+	key := h.encryptionKey
 	if encVersion == 1 {
-		return decryptWithKey(h.legacyKey, ciphertext, nonce)
+		key = h.legacyKey
 	}
-	return h.decrypt(ciphertext, nonce)
+	return decryptWithKey(key, ciphertext, nonce)
 }
 
 // computeRotationStatus determines the rotation status of a vault entry based
@@ -1619,17 +1657,20 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		currentPlain, decErr := h.decrypt(current.EncryptedValue, current.Nonce)
+		currentPlain, decErr := h.OpenEntrySecret(current.EncryptedValue, current.Nonce,
+			int(current.EncryptionVersion.Int64), entryOrigin(id, current.Name))
 		if decErr != nil {
 			logError(r, "vault.update: refusing to overwrite an undecryptable secret", "entry", id, "error", decErr)
 			writeError(w, r, http.StatusConflict, "decrypt_failed",
 				"this secret could not be decrypted, so it was not changed; saving would have overwritten a value that is still recoverable")
 			return
 		}
-		unchanged := string(currentPlain) == *req.Value
-		for i := range currentPlain {
-			currentPlain[i] = 0
-		}
+		// NOT an exit. EqualsString is constant-time and emits one bit the caller
+		// already knew how to obtain, because they supplied the candidate. It is
+		// the only in-process use of a secret that does not go through
+		// secretexit.Exit, and it cannot be turned into a read of the value.
+		unchanged := currentPlain.EqualsString(*req.Value)
+		currentPlain.Wipe()
 
 		if !unchanged {
 			encrypted, nonce, err := h.encrypt([]byte(*req.Value))
@@ -2199,16 +2240,25 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 
-		decrypted, err := h.decrypt(row.EncryptedValue, row.Nonce)
+		// THE ONE EXIT, caller form. Unlock is password-re-verified above, and
+		// this asks the second half: does the OWNER of each entry admit this
+		// caller to it? A list query that widened by accident would otherwise
+		// hand over rows the caller may not read, and the exit is the one place
+		// that cannot be widened by accident.
+		// Version 2: this query only ever returns rows this build wrote, which
+		// matches the h.decrypt call it replaces.
+		decrypted, err := h.OpenEntrySecret(row.EncryptedValue, row.Nonce, 2,
+			entryOrigin(row.ID, row.Name))
+		if err == nil {
+			var value string
+			_, value, err = secretexit.ExitString(ctx, decrypted,
+				secretexit.ToCaller("POST /api/vault/unlock", userID))
+			decrypted.Wipe()
+			e.Value = value
+		}
 		if err != nil {
-			logError(r, "vault.unlock: decrypt failed", "name", e.Name, "error", err)
+			logError(r, "vault.unlock: value not released", "name", e.Name, "error", err)
 			e.Value = "[decryption error]"
-		} else {
-			e.Value = string(decrypted)
-			// Zero out decrypted bytes after copying to string
-			for i := range decrypted {
-				decrypted[i] = 0
-			}
 		}
 
 		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
@@ -2277,8 +2327,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var newValue string
-	var oldValue string // current plaintext, needed by provider.Rotate()
+	// newValue and oldValue are OPAQUE. They are the entry's secret, so they are
+	// the same type a decrypted one is, and neither can be read, logged or sent
+	// anywhere except through secretexit.Exit. Holding them as strings is what
+	// used to make the delivery path's destination question invisible.
+	var newValue secretexit.Plaintext
+	var oldValue secretexit.Plaintext // current plaintext, needed by provider.Rotate()
 	// Deferred until after the CAS: writing either of these before it would move
 	// updated_at and make the compare-and-swap reject the handler's own write.
 	var pendingRevokeWarn string
@@ -2309,7 +2363,8 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// recoverable (a row an older migration missed, bit rot, a partial write).
 	// Refuse instead, and leave the stored value untouched so it can be
 	// recovered once the underlying cause is fixed.
-	currentValue, decErr := h.decrypt(entryRow.EncryptedValue, entryRow.Nonce)
+	oldValue, decErr := h.OpenEntrySecret(entryRow.EncryptedValue, entryRow.Nonce,
+		int(entryRow.EncryptionVersion.Int64), entryOrigin(id, meta.Name))
 	if decErr != nil {
 		logError(r, "vault.rotate: decrypt failed, refusing to rotate", "entry", id, "error", decErr)
 		recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
@@ -2318,31 +2373,31 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			"this secret could not be decrypted, so it was not rotated; rotating would have overwritten a value that is still recoverable")
 		return
 	}
-	oldValue = string(currentValue)
-	// Best-effort zero of the plaintext slice. oldValue copy outlives this.
-	for i := range currentValue {
-		currentValue[i] = 0
-	}
 
 	// Declared out here so the deferred revoke after the value is persisted can
 	// still reach it; the revoke must not run until the new value is stored.
 	var providerMeta map[string]string
+	// rotateCtx carries the exit receipt for the provider spend, so the deferred
+	// revoke after the CAS runs under the same authorisation the Rotate call did.
+	rotateCtx := ctx
 	{
 		if providerRoleFor == providerAuto {
 			provider := resolvedProvider
 			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", "provider_meta"))
-			// The egress authority for this whole rotation, resolved here because
-			// here is where the stored (provider, provider_meta) pair becomes a
-			// destination. Rotate, and the deferred revoke that follows the CAS,
-			// both run under it. See egress_authority.go.
-			rotateCtx, egressErr := providerEgressContextFor(ctx, h.queries, id, providerName, providerMeta)
+			// THE ONE EXIT, network form. The old value is released only if the
+			// entry's OWN record authorises the provider hosts it is about to
+			// authenticate against, and the returned context carries the receipt
+			// providerDo checks when the request actually leaves.
+			spendCtx, oldPlain, egressErr := spendProviderSecret(ctx, h.queries, oldValue,
+				id, providerName, providerMeta)
 			if egressErr != nil {
 				logError(r, "vault.rotate: refusing to rotate through this provider configuration",
 					"entry", id, "user", userID, "error", egressErr)
 				writeError(w, r, http.StatusForbidden, "destination_pinned", egressErr.Error())
 				return
 			}
-			rotatedValue, rotErr := provider.Rotate(rotateCtx, oldValue, providerMeta)
+			rotateCtx = spendCtx
+			rotatedValue, rotErr := provider.Rotate(rotateCtx, oldPlain, providerMeta)
 			if rotErr != nil {
 				// Do NOT fall through to a locally generated value. The upstream
 				// credential is untouched, so storing a random string here would
@@ -2374,7 +2429,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 					"the provider rejected the rotation; the stored secret was left unchanged")
 				return
 			}
-			newValue = rotatedValue
+			// The successor the provider handed back is as dangerous as a
+			// decrypted one, so it re-enters the type immediately and leaves
+			// again only through the exit.
+			newValue = h.MintedEntrySecret([]byte(rotatedValue), id, meta.Name)
 			// rotationMethod stays "manual".
 			//
 			// It used to be reassigned to "auto" here, so every user-clicked rotation
@@ -2421,7 +2479,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// This guard used to read `if p, ok := Registry[name]; ok && !p.CanAutoRotate()`,
 	// so it caught providerReminder and let providerUnknown walk straight past it
 	// into the generator below. The sweep refused the same entry. Ask the role.
-	if newValue == "" {
+	if newValue.IsZero() {
 		switch providerRoleFor {
 		case providerReminder:
 			updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
@@ -2464,7 +2522,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// value and generating a fresh one IS the rotation. A FAILED auto-rotating
 	// provider never reaches here, it returned 502 above, and a reminder-only
 	// provider was refused just above.
-	if newValue == "" {
+	if newValue.IsZero() {
 		// Belt, to the switch above's braces. Every role except providerNone has
 		// already returned by now, so arriving here as anything else means a new
 		// role was added and this chain was not updated. Refuse rather than
@@ -2478,16 +2536,18 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 					"and paste the new value. Nothing was changed.")
 			return
 		}
-		newValue, err = generateToken(32)
-		if err != nil {
-			logError(r, "vault.rotate: failed to generate token", "error", err)
+		generated, gErr := generateToken(32)
+		if gErr != nil {
+			logError(r, "vault.rotate: failed to generate token", "error", gErr)
 			writeInternalError(w, r, "failed to generate new secret")
 			return
 		}
+		newValue = h.MintedEntrySecret([]byte(generated), id, meta.Name)
 	}
 
-	// Encrypt the new value
-	encrypted, nonce, err := h.encrypt([]byte(newValue))
+	// Encrypt the new value. encryptEntrySecret is inside the type, so a
+	// rotation never converts the value to bytes just to store it.
+	encrypted, nonce, err := h.encryptEntrySecret(newValue)
 	if err != nil {
 		logError(r, "vault.rotate: encryption failed", "error", err)
 		writeInternalError(w, r, "failed to encrypt new secret")
@@ -2556,6 +2616,20 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	defer cancelPost()
 	ctx = postCtx
 
+	// THE ONE EXIT, caller form, for the value this response carries.
+	//
+	// Rotate returns the new plaintext so the operator can copy it, which is a
+	// release of a secret to a principal and is therefore asked the same way
+	// unlock is. A failure here does NOT unwind the rotation (the value is
+	// already durably stored and the predecessor may already be revoked
+	// upstream); it withholds the value from the body and says so.
+	_, rotatedForCaller, callerErr := secretexit.ExitString(ctx, newValue,
+		secretexit.ToCaller("POST /api/vault/{id}/rotate", userID))
+	if callerErr != nil {
+		logError(r, "vault.rotate: the rotated value was not released to the caller",
+			"entry", id, "user", userID, "error", callerErr)
+	}
+
 	// One fact, collected from both places a revoke can fail, folded into the
 	// final status exactly once at the end.
 	//
@@ -2576,8 +2650,8 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// and URL taken out of provider_meta, so it is the same question as every
 	// other outbound call and it gets the same answer.
 	deps := rotationDeps{queries: h.queries, vault: h}
-	if warn := revokeOldKeyAndPersistMeta(withProviderEgress(ctx, providerName, providerMeta),
-		deps, id, meta.Name, providerName, providerMeta, newValue); warn != "" {
+	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerName,
+		providerMeta, newValue); warn != "" {
 		revokeWarn = warn
 	}
 
@@ -2641,10 +2715,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// silently undid the whole point of recording a partial outcome. A fix that
 		// writes the truth to the database and hands the caller a stale copy of it is
 		// only half a fix.
-		out := vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: newValue}
+		out := vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: rotatedForCaller}
 		if fresh, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {
 			out.vaultEntryMeta = h.vaultMetaFromGetRow(fresh)
-			out.Value = newValue
+			out.Value = rotatedForCaller
 		}
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -2702,7 +2776,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			"pre-rotation metadata", "entry", id, "error", fErr)
 		entry.vaultEntryMeta = h.vaultMetaFromGetRow(meta)
 	}
-	entry.Value = newValue
+	entry.Value = rotatedForCaller
 
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
@@ -2800,34 +2874,29 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plaintext, err := h.decrypt(entryRow.EncryptedValue, entryRow.Nonce)
+	plaintext, err := h.OpenEntrySecret(entryRow.EncryptedValue, entryRow.Nonce,
+		int(entryRow.EncryptionVersion.Int64), entryOrigin(id, meta.Name))
 	if err != nil {
 		writeInternalError(w, r, "failed to decrypt secret")
 		return
 	}
+	defer plaintext.Wipe()
 
 	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", "provider_meta"))
 	// Validate AUTHENTICATES with the decrypted key against the provider, so it
 	// is a live spend of the credential and the fastest of the three paths that
 	// carry it off the box: no scheduler wait, no rotation, just the caller's own
 	// password. Whoever holds this key may only ever send it to the hosts the
-	// entry's provider declares. See egress_authority.go.
-	egressCtx, egressErr := providerEgressContextFor(ctx, h.queries, id, meta.Provider.String, providerMeta)
+	// entry's OWN record authorises. THE ONE EXIT, network form.
+	egressCtx, secret, egressErr := spendProviderSecret(ctx, h.queries, plaintext,
+		id, meta.Provider.String, providerMeta)
 	if egressErr != nil {
-		for i := range plaintext {
-			plaintext[i] = 0
-		}
 		logError(r, "vault.validate: refusing to spend the secret against this provider configuration",
 			"entry", id, "user", userID, "error", egressErr)
 		writeError(w, r, http.StatusForbidden, "destination_pinned", egressErr.Error())
 		return
 	}
-	valid, validErr := provider.Validate(egressCtx, string(plaintext), providerMeta)
-
-	// Zero plaintext
-	for i := range plaintext {
-		plaintext[i] = 0
-	}
+	valid, validErr := provider.Validate(egressCtx, secret, providerMeta)
 
 	result := map[string]any{
 		"valid":    valid,
@@ -3278,9 +3347,20 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 var vaultRefPattern = regexp.MustCompile(`\{\{vault:([^}]+)\}\}`)
 
 // ResolveReferences takes a string and replaces all {{vault:NAME}} references
-// with their decrypted values from the specified user's vault. If a secret is not found,
-// the reference is left as-is and a warning is logged.
-func (h *VaultHandler) ResolveReferences(content string, userID string) string {
+// with their decrypted values from the specified user's vault. If a secret is not
+// found, or the destination is not authorised by the secret's owner, the
+// reference is left as-is and a warning is logged.
+//
+// THE dest ARGUMENT IS NOT DECORATION. This function renders a secret into
+// arbitrary text, which is the most dangerous shape in this codebase: the string
+// it returns can be a URL, a request body, a log line or an email. Before round 7
+// it took no destination at all, and it has no production caller, so it was a
+// fully-formed exfiltration primitive sitting in the tree waiting for its first
+// one. Requiring a destination means the first caller has to answer the owner
+// question in the same commit that adds it.
+func (h *VaultHandler) ResolveReferences(ctx context.Context, content, userID string,
+	dest secretexit.Destination) string {
+
 	if userID == "" {
 		slog.Warn("vault.resolveReferences: called with empty userID, skipping resolution")
 		return content
@@ -3295,17 +3375,19 @@ func (h *VaultHandler) ResolveReferences(content string, userID string) string {
 		// Scoped to what this user can CURRENTLY reach, not to who created the
 		// entry. See resolveVaultReferenceFor: the raw (name, user_id) match kept
 		// resolving for a member removed from the collection holding the secret.
-		decrypted, err := h.resolveVaultReferenceFor(context.Background(), name, userID)
+		decrypted, err := h.resolveVaultReferenceFor(ctx, name, userID)
 		if err != nil {
 			slog.Warn("vault.resolveReferences: secret not resolvable for this user",
 				"name", name, "user_id", userID, "error", err)
 			return match
 		}
+		defer decrypted.Wipe()
 
-		value := string(decrypted)
-		// Zero out decrypted bytes
-		for i := range decrypted {
-			decrypted[i] = 0
+		_, value, exitErr := secretexit.ExitString(ctx, decrypted, dest)
+		if exitErr != nil {
+			slog.Warn("vault.resolveReferences: the secret's owner did not authorise this destination",
+				"name", name, "user_id", userID, "error", exitErr)
+			return match
 		}
 		return value
 	})

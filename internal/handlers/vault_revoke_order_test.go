@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"os"
 	"strings"
 	"testing"
@@ -47,7 +48,9 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 	}
 
 	// The new secret must NEVER be written into meta: provider_meta is persisted.
-	performPendingRevoke(context.Background(), meta, "NEW-SECRET-VALUE")
+	performPendingRevoke(testExitCtx(context.Background(), "revoke fixture",
+		secretexit.HostSet{Hosts: []string{"api.example.com"}}), meta, "manual",
+		testPlaintext("NEW-SECRET-VALUE"))
 	for k, v := range meta {
 		if strings.Contains(v, "NEW-SECRET-VALUE") {
 			t.Fatalf("meta[%q] carries the new secret and would be persisted to the database", k)
@@ -75,7 +78,9 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 func TestDeferredRevokeFailureIsNeverSilent(t *testing.T) {
 	meta := map[string]string{"key_id": "old"}
 	deferRevokeOldProviderKey(meta, "DELETE", "http://10.0.0.1/keys/old")
-	performPendingRevoke(context.Background(), meta, "NEW-SECRET-VALUE")
+	performPendingRevoke(testExitCtx(context.Background(), "revoke fixture",
+		secretexit.HostSet{Hosts: []string{"api.example.com"}}), meta, "manual",
+		testPlaintext("NEW-SECRET-VALUE"))
 
 	if meta["last_revoke_error"] == "" {
 		t.Fatal("a failed revoke was silent: the old key is still live and nothing reports it")
@@ -95,7 +100,9 @@ func TestDeferredRevokeFailureIsNeverSilent(t *testing.T) {
 // must not error or mutate anything.
 func TestPerformPendingRevokeIsANoOpWithoutAPendingRevoke(t *testing.T) {
 	meta := map[string]string{"key_id": "abc"}
-	performPendingRevoke(context.Background(), meta, "NEW")
+	performPendingRevoke(testExitCtx(context.Background(), "revoke fixture",
+		secretexit.HostSet{Hosts: []string{"api.example.com"}}), meta, "manual",
+		testPlaintext("NEW"))
 	if meta["last_revoke_error"] != "" {
 		t.Fatalf("no-op revoke recorded an error: %q", meta["last_revoke_error"])
 	}

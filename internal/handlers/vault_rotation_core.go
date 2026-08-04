@@ -9,6 +9,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
@@ -59,11 +60,11 @@ type rotationDeps struct {
 // Call only after the value is durably stored: revoking earlier means a failure in
 // the encrypt/persist window leaves the old credential dead upstream and the new
 // one discarded, with no copy of either anywhere.
-func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string, newValue string) string {
+func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string, newValue secretexit.Plaintext) string {
 	if providerMeta == nil {
 		return ""
 	}
-	performPendingRevoke(ctx, providerMeta, newValue)
+	performPendingRevoke(ctx, providerMeta, provider, newValue)
 	revokeWarn := providerMeta["last_revoke_error"]
 	delete(providerMeta, "last_revoke_error")
 	if revokeWarn != "" {
@@ -137,8 +138,10 @@ type rotationRecord struct {
 	// this, so a caller passing a stale copy loses entries.
 	RotationLog string
 	Targets     []RotationTarget
-	OldValue    string
-	NewValue    string
+	// OldValue and NewValue are the entry's secret, so they are opaque: neither
+	// can be read, logged or transmitted except through secretexit.Exit.
+	OldValue secretexit.Plaintext
+	NewValue secretexit.Plaintext
 	// RevokeWarn is what revokeOldKeyAndPersistMeta returned.
 	RevokeWarn string
 }

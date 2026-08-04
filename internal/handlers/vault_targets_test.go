@@ -18,6 +18,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/database"
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
@@ -97,7 +98,10 @@ func TestDeliverRotatedKeyRejectsRetiredTypes(t *testing.T) {
 		{Type: "bogus"},
 	}
 	// nil queries/vault are safe: unknown types never reach the DB or crypto.
-	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry", "old", "new", targets, "user1")
+	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry",
+		secretexit.Minted([]byte("old"), secretexit.Origin{EntryID: "entry-id", Name: "entry"}, allowAllExitAuthority{}),
+		secretexit.Minted([]byte("new"), secretexit.Origin{EntryID: "entry-id", Name: "entry"}, allowAllExitAuthority{}),
+		targets, "user1")
 	if len(results) != 4 {
 		t.Fatalf("expected 4 results, got %d", len(results))
 	}
@@ -120,7 +124,10 @@ func TestDeliverRotatedKeyRejectsRetiredTypes(t *testing.T) {
 // result (the caller dispatches notifications separately) and never fail a
 // rotation.
 func TestDeliverRotatedKeyNotifySkipped(t *testing.T) {
-	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry", "", "new", []RotationTarget{{Type: "notify"}}, "user1")
+	results := DeliverRotatedKey(context.Background(), nil, nil, "entry-id", "entry",
+		secretexit.Plaintext{},
+		secretexit.Minted([]byte("new"), secretexit.Origin{EntryID: "entry-id", Name: "entry"}, allowAllExitAuthority{}),
+		[]RotationTarget{{Type: "notify"}}, "user1")
 	if len(results) != 0 {
 		t.Fatalf("notify target should be skipped, got %d results", len(results))
 	}
@@ -147,7 +154,9 @@ func TestDeliverToWebhook(t *testing.T) {
 	defer srv.Close()
 
 	target := RotationTarget{Type: "webhook", WebhookURL: srv.URL, WebhookSecret: secret}
-	if err := deliverToWebhook(context.Background(), target, "my-entry", newValue); err != nil {
+	if err := deliverToWebhook(testExitCtx(context.Background(), "webhook fixture",
+		secretexit.HostSet{Hosts: []string{hostOf(t, srv.URL)}}),
+		target, "my-entry", testPlaintext(newValue)); err != nil {
 		t.Fatalf("deliverToWebhook failed: %v", err)
 	}
 
@@ -184,7 +193,9 @@ func TestDeliverToWebhookNoSecretNoSignature(t *testing.T) {
 	defer srv.Close()
 
 	target := RotationTarget{Type: "webhook", WebhookURL: srv.URL}
-	if err := deliverToWebhook(context.Background(), target, "e", "v"); err != nil {
+	if err := deliverToWebhook(testExitCtx(context.Background(), "webhook fixture",
+		secretexit.HostSet{Hosts: []string{hostOf(t, srv.URL)}}),
+		target, "e", testPlaintext("v")); err != nil {
 		t.Fatalf("deliverToWebhook failed: %v", err)
 	}
 	if sigPresent {
@@ -196,7 +207,8 @@ func TestDeliverToWebhookErrors(t *testing.T) {
 	swapProviderHTTP(t)
 
 	// Missing URL fails without any HTTP call.
-	if err := deliverToWebhook(context.Background(), RotationTarget{Type: "webhook"}, "e", "v"); err == nil {
+	if err := deliverToWebhook(context.Background(), RotationTarget{Type: "webhook"}, "e",
+		testPlaintext("v")); err == nil {
 		t.Fatal("missing webhook_url should fail")
 	}
 
@@ -205,7 +217,9 @@ func TestDeliverToWebhookErrors(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	err := deliverToWebhook(context.Background(), RotationTarget{Type: "webhook", WebhookURL: srv.URL}, "e", "v")
+	err := deliverToWebhook(testExitCtx(context.Background(), "webhook fixture",
+		secretexit.HostSet{Hosts: []string{hostOf(t, srv.URL)}}),
+		RotationTarget{Type: "webhook", WebhookURL: srv.URL}, "e", testPlaintext("v"))
 	if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
 		t.Fatalf("expected HTTP 500 error, got %v", err)
 	}
@@ -366,7 +380,7 @@ func TestDeliverToForgejoSecretValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := deliverToForgejoSecret(context.Background(), nil, nil, c.target, "v", "user1")
+			err := deliverToForgejoSecret(context.Background(), nil, c.target, testPlaintext("v"), "user1")
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("error = %v, want mention of %q", err, c.want)
 			}

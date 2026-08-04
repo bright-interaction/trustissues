@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // KeyProvider defines the interface for services that support programmatic API key rotation.
@@ -275,7 +276,13 @@ func deferRevokeOldProviderKey(meta map[string]string, method, url string) {
 // Call it only after the new value is durably stored. A failure sets
 // meta["last_revoke_error"], which downgrades the rotation to partial and
 // alarms, exactly as an inline failure used to.
-func performPendingRevoke(ctx context.Context, meta map[string]string, newKey string) {
+// newKey is opaque. The revoke sends "Authorization: Bearer <the new secret>" to
+// a method and URL taken out of provider_meta, so it is an EXIT and it takes the
+// entry's own recorded destinations to authorise it, exactly like the Rotate call
+// that minted the value.
+func performPendingRevoke(ctx context.Context, meta map[string]string, provider string,
+	newKey secretexit.Plaintext) {
+
 	method, url := meta[pendingRevokeMethod], meta[pendingRevokeURL]
 	delete(meta, pendingRevokeMethod)
 	delete(meta, pendingRevokeURL)
@@ -283,8 +290,16 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, newKey st
 		return
 	}
 	auth := ""
-	if newKey != "" {
-		auth = "Bearer " + newKey
+	if !newKey.IsZero() && !newKey.Empty() {
+		exitCtx, plain, err := secretexit.ExitString(ctx, newKey,
+			secretexit.ToHosts("the deferred revoke for provider "+provider,
+				secretexit.ChosenByTheEntrysOwnRecord(), declaredProviderEgress(provider, meta)))
+		if err != nil {
+			meta["last_revoke_error"] = "revoke old key: " + err.Error()
+			return
+		}
+		ctx = exitCtx
+		auth = "Bearer " + plain
 	}
 	revokeOldProviderKey(ctx, meta, method, url, auth)
 }

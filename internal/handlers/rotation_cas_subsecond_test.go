@@ -84,9 +84,9 @@ func TestRotationCASRefusesAStaleTokenWithinOneSecond(t *testing.T) {
 
 	// And the winner's value is what survived.
 	_, finalValue := read()
-	plain, err := h.decrypt(finalValue, nonceB)
-	if err == nil && string(plain) != "SOMEONE ELSE'S ROTATION" {
-		t.Errorf("the surviving value is %q, want the competing write's", plain)
+	plain, err := h.openForTest(finalValue, nonceB)
+	if err == nil && !plain.EqualsString("SOMEONE ELSE'S ROTATION") {
+		t.Errorf("the surviving value is not the competing write's (len %d)", plain.Len())
 	}
 }
 

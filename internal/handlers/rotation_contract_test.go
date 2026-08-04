@@ -649,13 +649,13 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 		t.Fatalf("%s: the row was expected to be gone by assert time but is still present, "+
 			"so this case is not exercising the post-commit-window deletion it claims to", path)
 	}
-	plain, err := e.h.DecryptValue(row.EncryptedValue, row.Nonce, 2)
+	plain, err := e.h.openForTest(row.EncryptedValue, row.Nonce)
 	if err != nil {
 		t.Fatalf("%s: decrypt: %v", path, err)
 	}
-	changed := string(plain) != e.before
+	changed := !plain.EqualsString(e.before)
 	if changed != want.valueChanged {
-		t.Errorf("%s: stored value changed=%v, want %v (still %q)", path, changed, want.valueChanged, string(plain))
+		t.Errorf("%s: stored value changed=%v, want %v", path, changed, want.valueChanged)
 	}
 
 	meta, err := e.queries.GetVaultEntryMeta(ctx, e.entryID)
