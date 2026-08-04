@@ -52,7 +52,7 @@ func accessProbes() []accessProbe {
 			return err == nil
 		}},
 		{name: "rotation-delivery", spend: true, run: func(t *testing.T, e *revocationEnv, u string) bool {
-			return targetStillAuthorized(context.Background(), e.h, e.entryID, RotationTarget{
+			return deliveryStillAuthorized(context.Background(), e.h, e.entryID, RotationTarget{
 				Type: "webhook", WebhookURL: "https://sink.example.com/h", ConfiguredBy: u,
 			}) == nil
 		}},

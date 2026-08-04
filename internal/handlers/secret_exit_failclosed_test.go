@@ -290,12 +290,27 @@ func TestUnlockOnlyReleasesEntriesTheCallerMayRead(t *testing.T) {
 	}
 
 	// A stranger's unlock must not carry it. They cannot reach the entry at all,
-	// so the list should not contain it; the exit is what makes that true even
-	// if the list query is wrong.
+	// so the list query should not return it.
 	got = unlock(stranger)
 	if strings.Contains(got, mine) {
 		t.Fatalf("a stranger's unlock carried somebody else's plaintext: %s", got)
 	}
+
+	// AND THE HONEST LIMIT OF THIS ONE, recorded rather than papered over.
+	//
+	// The caller half of the exit is DEFENCE IN DEPTH here, not the only thing
+	// standing between a caller and a value. ListAccessibleVaultEntriesWithSecrets
+	// already filters on a disabled account and on ACCEPTED membership, and the
+	// schema pins collection_members.role with
+	// CHECK (role IN ('viewer','editor','manager')), all three of which grantFor
+	// grants read to. So there is no reachable database state in which the query
+	// returns a row the exit then refuses, and an ablation that swaps the caller
+	// id for the entry owner's is NOT independently observable through this
+	// route. scripts/round7-ablations.json records that as a known miss with the
+	// reason rather than pretending otherwise.
+	//
+	// What IS observable is the rule itself, asked directly, which is the next
+	// assertion: the day that query widens, the exit is already there.
 
 	// And the row-level property, asked directly: the exit refuses the stranger
 	// for this entry even when handed the value.

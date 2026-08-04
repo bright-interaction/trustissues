@@ -72,13 +72,13 @@
     "why": "the exit is called, with the wrong chooser. ChosenByTheInstance is the one kind the authority answers yes to unconditionally, so a call site that reaches for it is the sharpest misuse available"
   },
   {
-    "id": "webhook-skips-the-exit-chooser",
+    "id": "forgejo-body-exit-misstates-the-chooser",
     "mech": "chokepoint",
     "file": "internal/handlers/vault_targets.go",
-    "old": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), hostFromRawURL(target.WebhookURL)))",
-    "new": "\t\tsecretexit.ToHost(\"this webhook delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), hostFromRawURL(target.WebhookURL)))",
-    "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
-    "why": "the round-5 attack again, through the round-7 exit, with the chooser misstated"
+    "old": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenBy(target.ConfiguredBy), host))",
+    "new": "\t\tsecretexit.ToHost(\"this forgejo_secret delivery target\",\n\t\t\tsecretexit.ChosenByTheInstance(\"ablation\"), host))",
+    "test": "TestTheOwnerRuleAnswersEveryPrincipalClassTheSameWay",
+    "why": "the SECOND of the two exits in the forgejo path, with the chooser misstated. ChosenByTheInstance is the one kind the authority answers yes to unconditionally, so a call site reaching for it is the sharpest misuse available"
   },
   {
     "id": "receipt-check-is-a-no-op",
@@ -165,8 +165,8 @@
     "id": "a-new-exit-nobody-wrote-down",
     "mech": "guard",
     "file": "internal/handlers/vault_keycheck.go",
-    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
-    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n\n",
+    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n\n// A brand-new exit, added without touching theExitList.\nfunc undocumentedNewExit(ctx context.Context, pt secretexit.Plaintext, host string) (string, error) {\n\t_, s, err := secretexit.ExitString(ctx, pt,\n\t\tsecretexit.ToHost(\"an undocumented exit\", secretexit.ChosenByTheInstance(\"nothing\"), host))\n\treturn s, err\n}\n\n",
     "test": "TestEveryExitIsRegistered",
     "why": "the list is as much the deliverable as the code. A new exit has to fail loudly on the day it is written, naming the file, the way the providerHTTP.Do guard does"
   },
@@ -174,8 +174,8 @@
     "id": "a-second-implementation-of-the-rule",
     "mech": "guard",
     "file": "internal/handlers/vault_keycheck.go",
-    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n",
-    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n",
+    "old": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n)\n\n",
+    "new": "\t\"github.com/bright-interaction/trustissues/internal/db\"\n\t\"github.com/bright-interaction/trustissues/internal/secretexit\"\n)\n\n// A second production Authority, which is a second copy of one rule.\ntype secondAuthority struct{}\n\nfunc (secondAuthority) AuthorizeSecretExit(context.Context, secretexit.Origin, secretexit.Destination) error {\n\treturn nil\n}\n\n",
     "test": "TestVaultHandlerIsTheOnlyProductionAuthority",
     "why": "round 5 is what a second copy of one rule costs: the write gate and the delivery gate both implemented it, disagreed about instance admins, and an admin's target was accepted and then silently never delivered"
   },
@@ -204,7 +204,8 @@
     "old": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", userID))",
     "new": "\t\t\t_, value, err = secretexit.ExitString(ctx, decrypted,\n\t\t\t\tsecretexit.ToCaller(\"POST /api/vault/unlock\", row.UserID))",
     "test": "TestUnlockOnlyReleasesEntriesTheCallerMayRead",
-    "why": "asking about the ENTRY OWNER instead of the caller. The owner always passes their own read check, so the question becomes a tautology and answers yes for every row the query returned"
+    "why": "KNOWN MISS, recorded rather than removed. Swapping the caller id for the entry owner's is not independently observable: ListAccessibleVaultEntriesWithSecrets already filters on a disabled account and on ACCEPTED membership, and the schema pins collection_members.role to the three roles grantFor grants read to, so no reachable state has the query return a row the exit would refuse. The caller half is defence in depth over a query that is currently correct, and this line is what says so",
+    "expect": "MISS"
   },
   {
     "id": "chooser-branch-stops-asking",
