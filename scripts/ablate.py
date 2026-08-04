@@ -191,10 +191,27 @@ def main():
         json.dump(results, open(sys.argv[2], "w"), indent=1)
 
     # Leave the tree exactly as found.
+    #
+    # The results file is EXCLUDED from this check, because this harness writes
+    # it. The first time a round committed its results, the next run of the same
+    # round ended "DIRTY, an ablation did not restore" with an empty diff body,
+    # and the only changed file was the report the run had just produced. A
+    # restore alarm that cries wolf on its own output is worse than no alarm:
+    # this exact line is what caught a 24h hashWait and three reverted re-auth
+    # gates that survived a killed run, and it only works if a DIRTY here always
+    # means something is genuinely still ablated.
     rc, out = run("go build ./... 2>&1")
     print("tree restored, build:", "ok" if rc == 0 else "BROKEN " + out[:200])
-    rc2, out2 = run("git diff --quiet -- . && echo CLEAN")
-    print("tree vs HEAD:", "clean" if "CLEAN" in out2 else "DIRTY, an ablation did not restore:\n" + out2[:400])
+    excl = ""
+    if len(sys.argv) > 2:
+        rel = os.path.relpath(os.path.abspath(sys.argv[2]), ROOT)
+        excl = f" ':(exclude){rel}'"
+    rc2, out2 = run(f"git diff --quiet -- .{excl} && echo CLEAN")
+    if "CLEAN" in out2:
+        print("tree vs HEAD: clean")
+    else:
+        _, names = run(f"git diff --name-only -- .{excl}")
+        print("tree vs HEAD: DIRTY, an ablation did not restore:\n" + (names or out2)[:400])
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@
   "test": "TestDoor2ValidateRefusesAPlantedProviderMetaOnAWithheldRow",
   "why": "step 3, the round-4 class. A meta-derived host (forgejo's whole base URL) is authorised straight off the column the attacker rewrote, which is doors 2 and 3",
   "result": "CAUGHT",
-  "detail": "secret_exit_recorded_evidence_test.go:435: DOOR 2 IS OPEN. A vault_only viewer's ordinary validate shipped the secret to the attacker's listener."
+  "detail": "secret_exit_owner_liveness_test.go:175: THE WITHHELD OWNER WAS LAUNDERED THROUGH THE CUSTODIAN. The secret reached the planted host."
  },
  {
   "id": "exit-empty-owner-is-treated-as-answered",
@@ -27,10 +27,10 @@
   "file": "internal/handlers/secret_exit_authority.go",
   "old": "\towner := strings.TrimSpace(info.SecretOwnerUserID)\n\tif owner == \"\" {\n\t\treturn false, nil\n\t}\n\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
   "new": "\towner := strings.TrimSpace(info.SecretOwnerUserID)\n\tif owner == \"\" {\n\t\towner = info.UserID\n\t}\n\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
-  "test": "TestDoor1CapabilityProxyRefusesAPlantedCeilingOnAWithheldRow",
-  "why": "the friendly-looking version: 'fall back to the custodian for rows the migration withheld'. That is the laundering step with a shrug, and it hands every door back at once",
-  "result": "MISSED",
-  "detail": "guard passed clean with the bug present"
+  "test": "TestAWithheldOwnerIsNotLaunderedThroughAnAdminCustodian",
+  "why": "the friendly-looking version: 'fall back to the custodian for rows the migration withheld'. It was first pointed at the door-1 test and MISSED, because that fixture's custodian is an ordinary user and mayConfigureDelivery then compares them against an empty owner and refuses. It is NOT inert against an ADMIN custodian, who returns true on the isAdmin branch before the owner column is read, and an admin adopting an attacked row is what an operator does to clean one up",
+  "result": "CAUGHT",
+  "detail": "secret_exit_owner_liveness_test.go:175: THE WITHHELD OWNER WAS LAUNDERED THROUGH THE CUSTODIAN. The secret reached the planted host."
  },
  {
   "id": "exit-asks-about-the-caller-not-the-owner",
@@ -38,10 +38,10 @@
   "file": "internal/handlers/secret_exit_authority.go",
   "old": "\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
   "new": "\treturn owner != \"\", nil",
-  "test": "TestDoor1CapabilityProxyRefusesAPlantedCeilingOnAWithheldRow",
-  "why": "asking whether an owner is RECORDED instead of whether they may still direct the secret. It is the same shape as the six rounds that asked 'who wrote the row' rather than 'whose is it'",
-  "result": "MISSED",
-  "detail": "guard passed clean with the bug present"
+  "test": "TestARecordedOwnerWhoLostManageStopsAuthorisingDestinations",
+  "why": "asking whether an owner is RECORDED instead of whether they may still direct the secret. It is the same shape as the six rounds that asked 'who wrote the row' rather than 'whose is it'. It was first pointed at the door-1 test and MISSED, because that fixture's owner is EMPTY so 'is one recorded' still answers no. It needs a row whose owner is recorded and has since been removed from the collection, which is every instance new enough for the creating statement to have stamped one",
+  "result": "CAUGHT",
+  "detail": "secret_exit_owner_liveness_test.go:272: A RECORDED-BUT-EXPIRED OWNER STILL AUTHORISED THE PLANT. The secret reached the planted host."
  },
  {
   "id": "repair-adopts-the-previous-holders-ceiling",
@@ -74,8 +74,8 @@
   "test": "TestAESGCMIsOpenedInExactlyOneFile",
   "why": "the sixth-door shape the import net exists for, kept as a net rather than sold as a proof",
   "extra_import": "crypto/aes",
-  "result": "INVALID",
-  "detail": "does not compile: internal/handlers/mcp.go:46:9: undefined: aes"
+  "result": "CAUGHT",
+  "detail": "encrypted_field_ledger_test.go:266: A SIXTH DECRYPTION DOOR: internal/handlers/mcp.go imports crypto/aes."
  },
  {
   "id": "the-vault-key-is-handed-to-shield",
@@ -96,9 +96,11 @@
   "new": "    WHERE al.action = 'vault.entry_moved'\n      AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0",
   "test": "TestTheBackfillNeverStampsAnAttackerAsOwner",
   "pkg": "./internal/database/",
-  "why": "the shipped predicate, restored. It reads the CURRENT phrasing of the detail and is blind to the one 4e9bd5ec actually wrote, which is how a non-creator got stamped as owner. Expected to be MASKED by migration 00036 on its own: see round20-ablations.notes",
-  "result": "MISSED",
-  "detail": "guard passed clean with the bug present"
+  "expect_miss": true,
+  "note": "MASKED BY DESIGN, verified by running it. 00034 is corrected in place, so it only ever runs on a fresh database, and on a fresh database 00035 and 00036 re-derive the same withholding afterwards. Reverting 00034 alone therefore changes no outcome the suite can observe, and that is defence in depth working rather than a blind guard. The layer that is NOT redundant is 00036 on an already-migrated instance, which is its own ablation below.",
+  "why": "the shipped predicate, restored. It reads the CURRENT phrasing of the detail and is blind to the one 4e9bd5ec actually wrote, which is how a non-creator got stamped as owner",
+  "result": "SUPERSEDED",
+  "detail": "expected miss: MASKED BY DESIGN, verified by running it. 00034 is corrected in place, so it only ever runs on a fresh database, and on a fresh database 00035 and 00036 re-deri"
  },
  {
   "id": "the-relaunder-reads-a-wording-again",
@@ -106,10 +108,10 @@
   "file": "internal/database/migrations/00036_secret_owner_log_format.sql",
   "old": "      WHERE al.action = 'vault.entry_moved'\n        AND instr(al.detail, vault_entries.id) > 0\n    )\n    AND NOT EXISTS (\n      SELECT 1 FROM activity_log al\n      WHERE al.action = 'vault.entry_adopted'\n        AND instr(al.detail, vault_entries.id) > 0\n    )\n  )",
   "new": "      WHERE al.action = 'vault.entry_moved'\n        AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0\n    )\n    AND NOT EXISTS (\n      SELECT 1 FROM activity_log al\n      WHERE al.action = 'vault.entry_adopted'\n        AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0\n    )\n  )",
-  "test": "TestTheBackfillNeverStampsAnAttackerAsOwner",
+  "test": "TestTheLogFormatMigrationRepairsAParenEraLaundering",
   "pkg": "./internal/database/",
-  "why": "the same blindness in the re-derivation, which is the layer that masks the 00034 ablation. Also expected MASKED alone, because 00034 is correct: the two together are the real ablation and it is run by hand",
-  "result": "MISSED",
-  "detail": "guard passed clean with the bug present"
+  "why": "the same blindness in the re-derivation. It was first pointed at the fresh-database backfill test and MISSED, because on a fresh database the corrected 00034 has already withheld and 00036 repairs nothing. 00036 is load-bearing on exactly one database: the one that ALREADY RAN the broken 00034, which goose will never re-read. That is the database its test now builds, and it is the one every existing instance is in",
+  "result": "CAUGHT",
+  "detail": "secret_owner_backfill_test.go:651: THE PAREN-ERA LAUNDERING SURVIVED THE REPAIR."
  }
 ]
