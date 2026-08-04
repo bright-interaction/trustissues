@@ -600,6 +600,18 @@ func main() {
 					r.Post("/{id}/resend", userHandler.ResendInvitation)
 				})
 
+				// The repair surface for migration 00034's fail-closed
+				// backfill. It refused to stamp secret_owner_user_id wherever
+				// the database could not prove the custodian deposited the
+				// secret, and an empty owner denies, so an operator needs to
+				// see what was withheld and take it deliberately. Admin-only
+				// because it enumerates entries across every user's vault and
+				// because AuthorizeTransfer grants a proof to nobody else.
+				r.Route("/vault/ownership", func(r chi.Router) {
+					r.Get("/", vaultHandler.ListUnownedEntries)
+				})
+				r.Post("/vault/{id}/ownership/claim", vaultHandler.ClaimSecretOwnership)
+
 				r.Route("/notification-channels", func(r chi.Router) {
 					r.Get("/", notificationChannelsHandler.List)
 					r.Post("/", notificationChannelsHandler.Create)

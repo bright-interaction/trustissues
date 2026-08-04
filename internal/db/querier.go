@@ -32,6 +32,19 @@ type Querier interface {
 	// owner and the new name together moves the uniqueness question into the
 	// renamer's OWN namespace, where a conflict is with an entry they can see and
 	// saying so leaks nothing. See the rule in vault.go's Update.
+	//
+	// IT DOES NOT TOUCH secret_owner_user_id, AND THAT IS THE POINT.
+	//
+	// This statement is how a collection MANAGER used to make themselves the owner
+	// for the purposes of the exit: remove the creator from the collection (also
+	// manager-gated), then rename the entry. Two ordinary calls and the exit
+	// authorised the cross-entry delivery it exists to refuse, because it resolved
+	// "owner" from the column this statement writes.
+	//
+	// Adoption is still right and still happens: it moves the UNIQUE(user_id, name)
+	// question into the renamer's namespace, which is a NAMESPACE concern. Whose
+	// authority governs the plaintext is a different question and lives in a
+	// different column, which only internal/vaultegress can write.
 	AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error
 	// Boot key-gate probe 3: every OTHER columncrypto surface.
 	//
@@ -125,6 +138,15 @@ type Querier interface {
 	CountCollectionManagers(ctx context.Context, collectionID string) (int64, error)
 	CountRecentFailedLoginAttemptsByEmail(ctx context.Context, email string) (int64, error)
 	CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddress string) (int64, error)
+	// Whether the append-only audit trail records this entry being ADOPTED by a
+	// collection manager, i.e. its custodian moving without its owner moving.
+	//
+	// It is shown next to each unowned entry so an admin repairing ownership can
+	// tell "this one is merely ambiguous" from "this one was demonstrably taken
+	// over". It is not a security decision: the vault.entry_adopted row only exists
+	// for adoptions performed by a binary from 2026-08-02 onward, so an empty
+	// answer proves nothing and the migration never treats it as proof on its own.
+	CountRecordedAdoptionsForEntry(ctx context.Context, entryID sql.NullString) (int64, error)
 	CountUsers(ctx context.Context) (int64, error)
 	CountVaultEntriesForUser(ctx context.Context, userID string) (int64, error)
 	// vault.sql: Secrets vault queries - CRUD, encryption migration, unlock,
@@ -435,6 +457,24 @@ type Querier interface {
 	ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVaultEntriesForMetaBackfillRow, error)
 	ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVaultEntriesNeedingRotationRow, error)
 	ListVaultEntriesV1(ctx context.Context) ([]ListVaultEntriesV1Row, error)
+	// ============================================================================
+	// THE OPERATOR SURFACE FOR THE FAIL-CLOSED BACKFILL (migration 00034)
+	// ============================================================================
+	// Every entry whose secret_owner_user_id is empty, which is every entry the
+	// 00034 backfill refused to stamp because the database could not prove the
+	// current custodian is the principal who deposited the plaintext.
+	//
+	// An empty owner DENIES at mayDirectSecretEgress, so this list is exactly the
+	// set of secrets that cannot accept a new delivery destination. A fail-closed
+	// migration with no way to see what it closed is its own outage, which is why
+	// this exists and why it is joined to something an admin can act on: the
+	// custodian's address and the collection name.
+	//
+	// Admin-only at the route. It names entries across every user's vault, which is
+	// a thing only an instance admin may enumerate, and it deliberately returns NO
+	// ciphertext and no encrypted metadata: repairing ownership does not require
+	// seeing the secret.
+	ListVaultEntriesWithNoRecordedOwner(ctx context.Context) ([]ListVaultEntriesWithNoRecordedOwnerRow, error)
 	ListVaultEntriesWithSecrets(ctx context.Context, userID string) ([]ListVaultEntriesWithSecretsRow, error)
 	// ============================================================================
 	// Import - conflict detection

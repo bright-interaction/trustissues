@@ -28,6 +28,19 @@ type AdoptAndRenameVaultEntryParams struct {
 // owner and the new name together moves the uniqueness question into the
 // renamer's OWN namespace, where a conflict is with an entry they can see and
 // saying so leaks nothing. See the rule in vault.go's Update.
+//
+// IT DOES NOT TOUCH secret_owner_user_id, AND THAT IS THE POINT.
+//
+// This statement is how a collection MANAGER used to make themselves the owner
+// for the purposes of the exit: remove the creator from the collection (also
+// manager-gated), then rename the entry. Two ordinary calls and the exit
+// authorised the cross-entry delivery it exists to refuse, because it resolved
+// "owner" from the column this statement writes.
+//
+// Adoption is still right and still happens: it moves the UNIQUE(user_id, name)
+// question into the renamer's namespace, which is a NAMESPACE concern. Whose
+// authority governs the plaintext is a different question and lives in a
+// different column, which only internal/vaultegress can write.
 func (q *Queries) AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error {
 	_, err := q.db.ExecContext(ctx, adoptAndRenameVaultEntry, arg.UserID, arg.Name, arg.ID)
 	return err
@@ -172,6 +185,26 @@ type CASVaultEntryRotationLogParams struct {
 // literal text which has already caused three rounds of CAS bugs on this table.
 func (q *Queries) CASVaultEntryRotationLog(ctx context.Context, arg CASVaultEntryRotationLogParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, cASVaultEntryRotationLog, arg.RotationLog, arg.ID, arg.RotationLog_2)
+}
+
+const countRecordedAdoptionsForEntry = `-- name: CountRecordedAdoptionsForEntry :one
+SELECT COUNT(*) FROM activity_log
+WHERE action = 'vault.entry_adopted' AND instr(detail, 'Entry ' || ?1 || ' ') > 0
+`
+
+// Whether the append-only audit trail records this entry being ADOPTED by a
+// collection manager, i.e. its custodian moving without its owner moving.
+//
+// It is shown next to each unowned entry so an admin repairing ownership can
+// tell "this one is merely ambiguous" from "this one was demonstrably taken
+// over". It is not a security decision: the vault.entry_adopted row only exists
+// for adoptions performed by a binary from 2026-08-02 onward, so an empty
+// answer proves nothing and the migration never treats it as proof on its own.
+func (q *Queries) CountRecordedAdoptionsForEntry(ctx context.Context, entryID sql.NullString) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRecordedAdoptionsForEntry, entryID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const countVaultEntriesV1 = `-- name: CountVaultEntriesV1 :one
@@ -941,6 +974,78 @@ func (q *Queries) ListVaultEntriesV1(ctx context.Context) ([]ListVaultEntriesV1R
 	for rows.Next() {
 		var i ListVaultEntriesV1Row
 		if err := rows.Scan(&i.ID, &i.EncryptedValue, &i.Nonce); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listVaultEntriesWithNoRecordedOwner = `-- name: ListVaultEntriesWithNoRecordedOwner :many
+
+SELECT e.id, e.name, e.user_id, e.collection_id, e.created_at, e.updated_at,
+       u.email AS custodian_email,
+       c.name AS collection_name
+FROM vault_entries e
+LEFT JOIN users u ON u.id = e.user_id
+LEFT JOIN collections c ON c.id = e.collection_id
+WHERE e.secret_owner_user_id = ''
+ORDER BY e.created_at ASC, e.id ASC
+`
+
+type ListVaultEntriesWithNoRecordedOwnerRow struct {
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	UserID         string         `json:"user_id"`
+	CollectionID   sql.NullString `json:"collection_id"`
+	CreatedAt      sql.NullTime   `json:"created_at"`
+	UpdatedAt      sql.NullTime   `json:"updated_at"`
+	CustodianEmail sql.NullString `json:"custodian_email"`
+	CollectionName sql.NullString `json:"collection_name"`
+}
+
+// ============================================================================
+// THE OPERATOR SURFACE FOR THE FAIL-CLOSED BACKFILL (migration 00034)
+// ============================================================================
+// Every entry whose secret_owner_user_id is empty, which is every entry the
+// 00034 backfill refused to stamp because the database could not prove the
+// current custodian is the principal who deposited the plaintext.
+//
+// An empty owner DENIES at mayDirectSecretEgress, so this list is exactly the
+// set of secrets that cannot accept a new delivery destination. A fail-closed
+// migration with no way to see what it closed is its own outage, which is why
+// this exists and why it is joined to something an admin can act on: the
+// custodian's address and the collection name.
+//
+// Admin-only at the route. It names entries across every user's vault, which is
+// a thing only an instance admin may enumerate, and it deliberately returns NO
+// ciphertext and no encrypted metadata: repairing ownership does not require
+// seeing the secret.
+func (q *Queries) ListVaultEntriesWithNoRecordedOwner(ctx context.Context) ([]ListVaultEntriesWithNoRecordedOwnerRow, error) {
+	rows, err := q.db.QueryContext(ctx, listVaultEntriesWithNoRecordedOwner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListVaultEntriesWithNoRecordedOwnerRow{}
+	for rows.Next() {
+		var i ListVaultEntriesWithNoRecordedOwnerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.UserID,
+			&i.CollectionID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.CustodianEmail,
+			&i.CollectionName,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

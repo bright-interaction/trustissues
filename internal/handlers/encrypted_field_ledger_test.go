@@ -11,7 +11,79 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/vaultfield"
+	"github.com/bright-interaction/trustissues/internal/vaultfield/declscan"
 )
+
+// ── the ledger these guards read ────────────────────────────────────────────
+//
+// NOT vaultfield.Ledger(). That map is filled by init-time Declare calls in
+// whichever packages THIS TEST BINARY LINKS, which is internal/handlers plus its
+// import graph and nothing else. A guard reading it describes an import graph
+// and claims to describe the module, and the difference is decided by whoever
+// last edited an import somewhere unrelated. Put a Declare in cmd/server and
+// every guard below used to stay green over a column it had never seen.
+//
+// declscan walks the module's FILES, exactly the way the crypto-import pin
+// does, which is what made that pin complete. The declaration set is now the
+// module's set.
+//
+// vaultfield.Ledger() is still checked, in one place
+// (TestTheStaticLedgerContainsEverythingTheBinaryLinked), as a CONTROL: a
+// runtime entry missing from the source scan means the scan is blind, and a
+// blind scan passes over anything.
+
+// staticLedger is every vaultfield.Declare call in the module source.
+func staticLedger(t *testing.T) []declscan.Declaration {
+	t.Helper()
+	decls, err := declscan.Scan(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("scan the module for vaultfield declarations: %v", err)
+	}
+	if len(decls) < 12 {
+		t.Fatalf("ABORT: the module scan found only %d declarations (%v). At least twelve exist, so "+
+			"this is not reading the source and every guard below is vacuous",
+			len(decls), declaredColumns(decls))
+	}
+	for _, d := range decls {
+		if d.Unparsed != "" {
+			t.Fatalf("ABORT: %s declares a field this scan cannot read (%s). A declaration a guard "+
+				"cannot parse is one it cannot check", d.At(), d.Unparsed)
+		}
+	}
+	return decls
+}
+
+// productionLedger is the static set minus declarations made from _test.go
+// files. Those satisfy a ledger inside a test binary and ship nothing.
+func productionLedger(t *testing.T) []declscan.Declaration {
+	t.Helper()
+	var out []declscan.Declaration
+	for _, d := range staticLedger(t) {
+		if !d.IsTest {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func declaredColumns(decls []declscan.Declaration) []string {
+	out := make([]string, 0, len(decls))
+	for _, d := range decls {
+		out = append(out, d.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// lookupDeclared finds one column in the static ledger.
+func lookupDeclared(decls []declscan.Declaration, column string) (declscan.Declaration, bool) {
+	for _, d := range decls {
+		if d.Name == column {
+			return d, true
+		}
+	}
+	return declscan.Declaration{}, false
+}
 
 // THE GUARD THAT STOPPED ENUMERATING DOORS.
 //
@@ -256,26 +328,28 @@ func (zeroReader) Read(p []byte) (int, error) {
 // outside so the bar is visible where the ledger is read, and adds the one cross
 // check Declare cannot do because it does not know about theExitList.
 func TestEveryDeclaredFieldIsARuling(t *testing.T) {
-	entries := vaultfield.Ledger()
-	// Ten was the round-18 floor and the set has grown since. A ledger that
-	// suddenly holds two entries means the declarations stopped being linked
-	// into this binary, and a guard over an empty set passes over anything.
-	if len(entries) < 12 {
-		t.Fatalf("ABORT: the ledger holds only %d fields (%v). At least twelve are known to be declared, "+
-			"so the declarations are not reaching this binary and every check below is vacuous",
-			len(entries), ledgerNames(entries))
+	entries := productionLedger(t)
+
+	// knownClasses is the vocabulary, read textually because the ledger is now
+	// derived from source. A class name that is not one of these is either a
+	// typo the compiler would catch or a new class nobody told the guards about.
+	knownClasses := map[string]bool{
+		"ThroughTheExit": true, "InProcessOnly": true,
+		"NotACredential": true, "InstanceOwned": true,
 	}
 
 	throughTheExit := 0
 	for _, e := range entries {
-		if e.Class == vaultfield.Unclassified {
-			t.Errorf("%s is declared without a classification (declared at %s)", e.Name, e.DeclaredAt)
+		if e.Class == "Unclassified" || !knownClasses[e.Class] {
+			t.Errorf("%s is declared with class %q, which is not a ruling (declared at %s).\n"+
+				"  Unclassified is the zero value and vaultfield.Declare refuses it; anything else here "+
+				"is a class the guards have never been told about.", e.Name, e.Class, e.At())
 		}
 		if len(strings.TrimSpace(e.Why)) < 60 {
 			t.Errorf("%s is declared without a reason worth reading. Say what the plaintext IS and why "+
-				"that classification is the right one (declared at %s)", e.Name, e.DeclaredAt)
+				"that classification is the right one (declared at %s)", e.Name, e.At())
 		}
-		if e.Class != vaultfield.ThroughTheExit {
+		if e.Class != "ThroughTheExit" {
 			if e.ExitKey != "" {
 				t.Errorf("%s is not classified through-the-exit but names one (%q). One of the two is wrong",
 					e.Name, e.ExitKey)
@@ -302,7 +376,64 @@ func TestEveryDeclaredFieldIsARuling(t *testing.T) {
 		t.Fatalf("ABORT: only %d fields are classified through-the-exit; two are known to be "+
 			"(encrypted_value and custom_fields), so this guard is checking almost nothing", throughTheExit)
 	}
-	t.Logf("%d declared fields, all ruled: %v", len(entries), ledgerNames(entries))
+	t.Logf("%d declared fields, all ruled: %v", len(entries), declaredColumns(entries))
+}
+
+// TestTheStaticLedgerContainsEverythingTheBinaryLinked is the CONTROL on the
+// change that made this file read the source instead of the map.
+//
+// A source scan is only better than a runtime map if it is a SUPERSET of it. A
+// scanner that silently stopped recognising Declare calls would return an empty
+// set, every guard above would pass over nothing, and the failure would look
+// exactly like a clean module. So the runtime ledger, which is complete for the
+// packages this binary links, is required to be inside the static one.
+//
+// The direction it does NOT assert is the point: the static set is allowed to
+// be bigger, because a declaration in a package internal/handlers does not
+// import is still in the module, and being blind to it is the defect.
+func TestTheStaticLedgerContainsEverythingTheBinaryLinked(t *testing.T) {
+	static := staticLedger(t)
+	byName := map[string]declscan.Declaration{}
+	for _, d := range static {
+		byName[d.Name] = d
+	}
+
+	linked := vaultfield.Ledger()
+	if len(linked) < 12 {
+		t.Fatalf("ABORT: the runtime ledger holds only %d fields (%v); at least twelve are linked into "+
+			"this binary, so this control is comparing against nothing",
+			len(linked), ledgerNames(linked))
+	}
+	for _, e := range linked {
+		d, ok := byName[e.Name]
+		if !ok {
+			t.Errorf("%s is in vaultfield.Ledger() at runtime and the SOURCE SCAN did not find it.\n"+
+				"  The scan is what every other guard in this file reads, so a column it cannot see is a\n"+
+				"  column nothing checks. Either the declaration is spelled in a way declscan cannot fold,\n"+
+				"  or it lives in a directory the walk skips.", e.Name)
+			continue
+		}
+		if d.Class != e.Class.String() && !classMatches(d.Class, e.Class) {
+			t.Errorf("%s is classified %s in the source and %s at runtime", e.Name, d.Class, e.Class)
+		}
+	}
+	t.Logf("source scan: %d declarations; this binary links %d of them", len(static), len(linked))
+}
+
+// classMatches compares the identifier the source uses against the runtime
+// Class, whose String() is the hyphenated operator-facing spelling.
+func classMatches(sourceIdent string, c vaultfield.Class) bool {
+	switch sourceIdent {
+	case "ThroughTheExit":
+		return c == vaultfield.ThroughTheExit
+	case "InProcessOnly":
+		return c == vaultfield.InProcessOnly
+	case "NotACredential":
+		return c == vaultfield.NotACredential
+	case "InstanceOwned":
+		return c == vaultfield.InstanceOwned
+	}
+	return false
 }
 
 // TestTheLedgerIsDeclaredByProductionCode closes the way to satisfy the ledger
@@ -312,19 +443,46 @@ func TestEveryDeclaredFieldIsARuling(t *testing.T) {
 // binary decrypts through a Field nobody shipped. Declaring from a test is
 // allowed (internal/columncrypto does it for its own round trips), it just
 // cannot appear in the ledger this package's guards read.
+// It is a STRICTER question than it used to be, and only because the ledger is
+// static now. The runtime map could not see a test declaration from another
+// package at all, so the old version of this guard was checking a set that
+// excluded the thing it was worried about by construction. The source scan sees
+// every declaration in the module, so the rule can be stated properly: a test
+// may declare a FIXTURE column, and it may not be the only declaration of a
+// column the product actually stores.
 func TestTheLedgerIsDeclaredByProductionCode(t *testing.T) {
-	for _, e := range vaultfield.Ledger() {
-		site := e.DeclaredAt
-		if i := strings.LastIndex(site, ":"); i >= 0 {
-			site = site[:i]
+	all := staticLedger(t)
+	production := productionLedger(t)
+
+	schema, err := readMigrations()
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	if len(schema) < 5000 {
+		t.Fatalf("ABORT: read only %d bytes of migrations; this guard is checking nothing", len(schema))
+	}
+
+	tests := 0
+	for _, d := range all {
+		if !d.IsTest {
+			continue
 		}
-		if strings.HasSuffix(site, "_test.go") {
-			t.Errorf("%s is declared from a TEST file (%s).\n"+
-				"  A declaration in a test satisfies the ledger in the test binary and ships nothing. The\n"+
-				"  field the production code decrypts with would then be unclassified in production, which\n"+
-				"  is the exact hole this package removes.", e.Name, e.DeclaredAt)
+		tests++
+		if _, shipped := lookupDeclared(production, d.Name); shipped {
+			continue // the product declares it too; the test one is a duplicate handle at worst
+		}
+		table, _, ok := strings.Cut(d.Name, ".")
+		if ok && strings.Contains(schema, "TABLE "+table) {
+			t.Errorf("%s is declared ONLY from a TEST file (%s), and %q is a real table in the schema.\n"+
+				"  A declaration in a test satisfies the ledger inside the test binary and ships nothing,\n"+
+				"  so the production decrypt of that column would run through a Field nobody shipped.\n"+
+				"  Move the declaration next to the door that opens it.", d.Name, d.At(), table)
 		}
 	}
+	if len(production) < 12 {
+		t.Fatalf("ABORT: only %d production declarations; at least twelve exist", len(production))
+	}
+	t.Logf("%d production declarations, %d test fixtures", len(production), tests)
 }
 
 // TestNoFieldIsDeclaredAndNeverOpened keeps the ledger from drifting into
@@ -337,56 +495,26 @@ func TestNoFieldIsDeclaredAndNeverOpened(t *testing.T) {
 	fset := token.NewFileSet()
 	parsed := parseModule(t, fset)
 
-	// Every identifier used anywhere in the module, by name. A field is "opened"
-	// if its declaring identifier is mentioned somewhere other than its own
-	// declaration, which is the same handle theExitList uses.
-	uses := map[string]int{}
+	// The declaration set comes from the SOURCE SCAN, so a declaration in a
+	// package this test binary never links is checked like any other. Under the
+	// runtime map it was invisible, which meant a stale declaration could sit in
+	// cmd/server forever and this guard would call the module clean.
 	declNames := map[string]string{} // identifier -> declared column name
-	for path, f := range parsed {
-		rel := moduleRelative(path)
-		for _, decl := range f.Decls {
-			gd, ok := decl.(*ast.GenDecl)
-			if !ok || gd.Tok != token.VAR {
-				continue
-			}
-			for _, spec := range gd.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for i, name := range vs.Names {
-					if i >= len(vs.Values) {
-						continue
-					}
-					call, ok := vs.Values[i].(*ast.CallExpr)
-					if !ok {
-						continue
-					}
-					sel, ok := call.Fun.(*ast.SelectorExpr)
-					if !ok || sel.Sel.Name != "Declare" {
-						continue
-					}
-					pkg, ok := sel.X.(*ast.Ident)
-					if !ok || pkg.Name != "vaultfield" {
-						continue
-					}
-					if len(call.Args) == 0 {
-						continue
-					}
-					lit, ok := call.Args[0].(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						t.Errorf("%s declares a field with a non-literal name, so it cannot be checked. "+
-							"Pass the column name literally.", rel)
-						continue
-					}
-					column, uErr := strconv.Unquote(lit.Value)
-					if uErr != nil {
-						t.Fatalf("%s: unquote %s: %v", rel, lit.Value, uErr)
-					}
-					declNames[name.Name] = column
-				}
-			}
+	for _, d := range productionLedger(t) {
+		if d.Ident == "" {
+			t.Errorf("%s declares %s without binding it to a package-level variable.\n"+
+				"  A Field nothing holds cannot be passed to a decrypt, so the declaration is a ledger\n"+
+				"  entry for a door that does not exist.", d.At(), d.Name)
+			continue
 		}
+		declNames[d.Ident] = d.Name
+	}
+
+	// Every identifier used anywhere in the module's non-test source, by name. A
+	// field is "opened" if its declaring identifier is mentioned somewhere other
+	// than its own declaration, which is the same handle theExitList uses.
+	uses := map[string]int{}
+	for _, f := range parsed {
 		ast.Inspect(f, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok {
 				uses[id.Name]++
@@ -422,14 +550,15 @@ func TestNoFieldIsDeclaredAndNeverOpened(t *testing.T) {
 //  2. exactly one function in the module opens it;
 //  3. that function is openInviteCode, in the file that argues about it.
 func TestTheInvitationCodeGoesThroughTheDeclaredDoor(t *testing.T) {
-	entry, ok := vaultfield.Lookup("invitations.code")
+	production := productionLedger(t)
+	entry, ok := lookupDeclared(production, "invitations.code")
 	if !ok {
 		t.Fatalf("invitations.code is not in the ledger. It is a vault-key-encrypted bearer credential "+
 			"that redeems into an account (an admin one, at target_role admin), and this is the exact "+
-			"omission round 19 exists to close. Ledger: %v", ledgerNames(vaultfield.Ledger()))
+			"omission round 19 exists to close. Ledger: %v", declaredColumns(production))
 	}
-	if entry.Class != vaultfield.InstanceOwned {
-		t.Errorf("invitations.code is classified %s, want instance-owned. It belongs to no vault entry, "+
+	if entry.Class != "InstanceOwned" {
+		t.Errorf("invitations.code is classified %s, want InstanceOwned. It belongs to no vault entry, "+
 			"so the exit's question (did the OWNER of this secret authorise this destination) has no "+
 			"owner to ask; what carries the ruling instead is that both of its destinations are "+
 			"admin-only, which TestInstanceOwnedFieldsAreOnlyReachableByAdmins checks", entry.Class)
@@ -529,9 +658,9 @@ func TestEveryLedgerColumnExistsInTheSchema(t *testing.T) {
 	_ = files
 
 	checked := 0
-	for _, e := range vaultfield.Ledger() {
+	for _, e := range productionLedger(t) {
 		if strings.Contains(e.Name, "(") {
-			if e.Class != vaultfield.InProcessOnly {
+			if e.Class != "InProcessOnly" {
 				t.Errorf("%s does not name a real column and is classified %s. A ruling that cannot say "+
 					"WHICH column it is about must be in-process-only: it cannot argue about where a value "+
 					"may go when it does not know what the value is.", e.Name, e.Class)

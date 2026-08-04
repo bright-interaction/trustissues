@@ -30,11 +30,132 @@
 --                         one statement in internal/vaultegress/internal/egressq
 --                         that exists to transfer it.
 --
--- Backfilled from user_id, which records the state this instance is already in:
--- every existing row keeps exactly the owner it has today, so nothing an
--- operator has configured stops working at the deploy.
+-- ===========================================================================
+-- THE BACKFILL DOES NOT TRUST user_id, BECAUSE user_id IS WHAT IT DISTRUSTS
+-- ===========================================================================
+--
+-- The first version of this migration ended with
+--
+--   UPDATE vault_entries SET secret_owner_user_id = user_id;
+--
+-- and that one statement handed the whole round back. On an instance where a
+-- manager had ALREADY run the two calls above, user_id was the attacker. The
+-- migration would have promoted them from custodian to OWNER, durably, into the
+-- one column nothing below an instance admin can move afterwards, and the exit
+-- would then have authorised their deliveries CORRECTLY, forever. A fix whose
+-- backfill bootstraps its authority from the column it exists to distrust is
+-- not a fix, it is a laundering step with a comment on it.
+--
+-- So the backfill stamps an owner only where the custodian is PROVABLY still
+-- the creator, and leaves the column EMPTY everywhere else. An empty owner
+-- denies (VaultHandler.mayDirectSecretEgress refuses rather than falling back
+-- to user_id), which is the safe direction. An entry that denies until an admin
+-- repairs it is a bad afternoon; an entry silently owned by an attacker is the
+-- round.
+--
+-- WHAT ACTUALLY DISTINGUISHES THE TWO ON A LIVE DATABASE
+--
+-- After creation, exactly two statements in the module write
+-- vault_entries.user_id:
+--
+--   AdoptAndRenameVaultEntry        the attack. It can only fire on an entry
+--                                   whose collection_id is NOT NULL, because
+--                                   managerMayAdoptOrphanedEntry returns false
+--                                   for a personal entry before it reads
+--                                   anything else.
+--   TransferVaultEntrySecretOwner   internal/vaultegress, which did not exist
+--                                   before this migration and which moves BOTH
+--                                   columns together.
+--
+-- collection_id itself is written in exactly two places: at creation
+-- (VaultHandler.Create places a new shared entry immediately, logging only
+-- vault.entry_created), and by SetVaultEntryCollection behind
+-- PUT /api/vault/{id}/collection, which logs
+--
+--   vault.entry_moved   "Vault entry moved: NAME (id: ID, from: X, to: Y)"
+--
+-- with the ENTRY ID in it, and has done since the commit that introduced
+-- collections at all (4e9bd5ec). activity_log is append-only at the DATABASE
+-- level: migrations 00003 and 00027 put triggers on it that abort every UPDATE
+-- except the foreign key's actor anonymization, and every DELETE without
+-- exception, and no query in the module deletes from it.
+--
+-- Therefore an entry that is PERSONAL NOW and has NO vault.entry_moved row
+-- naming it has never been in a collection, so adoption was never reachable for
+-- it, so its user_id is still the principal who deposited the plaintext. That
+-- is the class this migration is willing to stamp.
+--
+-- WHAT DOES NOT DISTINGUISH THEM, SAID PLAINLY
+--
+-- For an entry that is in a collection NOW, nothing in the database separates
+-- "the creator still holds it" from "a manager adopted it". Both states are one
+-- row whose user_id is an accepted member of the collection. The
+-- vault.entry_adopted audit row checked below is real, but it was only added on
+-- 2026-08-02, so an adoption performed by an older binary left no record naming
+-- the entry: vault.entry_updated carries the NEW name and the ADOPTER's id,
+-- which is indistinguishable from an owner renaming their own entry. Membership
+-- history does not close it either, because an admin can move a non-member's
+-- personal entry into a collection, which satisfies "the creator is not a
+-- member" with no removal ever recorded.
+--
+-- So every collection entry lands in the ambiguous class and is left EMPTY.
+-- That is deliberately the expensive answer: on a team instance it means every
+-- shared entry stops accepting NEW delivery destinations, and existing webhook
+-- and forgejo targets configured by a non-admin stop contributing hosts at
+-- delivery time, until an admin claims the entry. Reading, revealing, rotating
+-- in place, narrowing and CLEARING targets all stay open, and clearing is the
+-- lever that matters for a secret nobody is left to own. The repair surface is
+-- GET /api/admin/vault/ownership and POST /api/admin/vault/{id}/ownership/claim,
+-- reachable in the UI at Settings -> Ownership, and it goes through
+-- vaultegress.AuthorizeTransfer like every other ownership move.
+--
+-- RESIDUAL, stated rather than hidden: the evidence is an activity_log row, and
+-- LogActivityFromRequest is best effort. A vault.entry_moved insert that failed
+-- at the time (a write error the handler logged and carried on from) leaves an
+-- entry that WAS in a collection looking as though it never was. That is one
+-- failed insert on a route that had to succeed first, and it is why the
+-- vault.entry_adopted clause is kept even though the collection_id clause
+-- already implies it: two independent rows have to be missing, not one.
 ALTER TABLE vault_entries ADD COLUMN secret_owner_user_id TEXT NOT NULL DEFAULT '';
-UPDATE vault_entries SET secret_owner_user_id = user_id WHERE secret_owner_user_id = '';
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+UPDATE vault_entries
+SET secret_owner_user_id = user_id
+WHERE user_id != ''
+  -- Adoption cannot reach a personal entry: managerMayAdoptOrphanedEntry
+  -- returns false when collection_id is NULL or empty.
+  AND (collection_id IS NULL OR collection_id = '')
+  -- ... and this one has never been in a collection either, because the only
+  -- post-creation writer of collection_id logs the entry id when it runs.
+  -- instr() rather than LIKE, so an id can carry no wildcard.
+  AND NOT EXISTS (
+    SELECT 1 FROM activity_log al
+    WHERE al.action = 'vault.entry_moved'
+      AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0
+  )
+  -- The direct record, for the era that has one.
+  AND NOT EXISTS (
+    SELECT 1 FROM activity_log al
+    WHERE al.action = 'vault.entry_adopted'
+      AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0
+  );
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+-- Tell the operator, durably, in the surface they already read. A fail-closed
+-- migration that strands secrets silently is its own outage; this row is what
+-- makes the Activity page say so on the first login after the deploy, and it
+-- names the page that repairs it.
+INSERT INTO activity_log (user_id, action, detail)
+SELECT NULL, 'vault.owner_backfill_withheld',
+       'Migration 00034 left ' || COUNT(*) || ' vault entry/entries with no recorded secret owner, ' ||
+       'because the database cannot prove their current custodian is the principal who deposited the ' ||
+       'secret. They still open, reveal and rotate; they refuse NEW delivery destinations until an ' ||
+       'instance admin claims them at Settings -> Ownership.'
+FROM vault_entries
+WHERE secret_owner_user_id = ''
+HAVING COUNT(*) > 0;
 -- +goose StatementEnd
 
 -- +goose Down

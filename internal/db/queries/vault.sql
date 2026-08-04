@@ -436,3 +436,43 @@ UNION ALL
 SELECT family, blob FROM (SELECT 'vaultcolumn' AS family, code AS blob FROM invitations WHERE code != '' LIMIT 1)
 UNION ALL
 SELECT family, blob FROM (SELECT 'rawgcm' AS family, config AS blob FROM notification_channels WHERE config != '' AND encryption_version > 0 LIMIT 1);
+
+-- ============================================================================
+-- THE OPERATOR SURFACE FOR THE FAIL-CLOSED BACKFILL (migration 00034)
+-- ============================================================================
+
+-- name: ListVaultEntriesWithNoRecordedOwner :many
+-- Every entry whose secret_owner_user_id is empty, which is every entry the
+-- 00034 backfill refused to stamp because the database could not prove the
+-- current custodian is the principal who deposited the plaintext.
+--
+-- An empty owner DENIES at mayDirectSecretEgress, so this list is exactly the
+-- set of secrets that cannot accept a new delivery destination. A fail-closed
+-- migration with no way to see what it closed is its own outage, which is why
+-- this exists and why it is joined to something an admin can act on: the
+-- custodian's address and the collection name.
+--
+-- Admin-only at the route. It names entries across every user's vault, which is
+-- a thing only an instance admin may enumerate, and it deliberately returns NO
+-- ciphertext and no encrypted metadata: repairing ownership does not require
+-- seeing the secret.
+SELECT e.id, e.name, e.user_id, e.collection_id, e.created_at, e.updated_at,
+       u.email AS custodian_email,
+       c.name AS collection_name
+FROM vault_entries e
+LEFT JOIN users u ON u.id = e.user_id
+LEFT JOIN collections c ON c.id = e.collection_id
+WHERE e.secret_owner_user_id = ''
+ORDER BY e.created_at ASC, e.id ASC;
+
+-- name: CountRecordedAdoptionsForEntry :one
+-- Whether the append-only audit trail records this entry being ADOPTED by a
+-- collection manager, i.e. its custodian moving without its owner moving.
+--
+-- It is shown next to each unowned entry so an admin repairing ownership can
+-- tell "this one is merely ambiguous" from "this one was demonstrably taken
+-- over". It is not a security decision: the vault.entry_adopted row only exists
+-- for adoptions performed by a binary from 2026-08-02 onward, so an empty
+-- answer proves nothing and the migration never treats it as proof on its own.
+SELECT COUNT(*) FROM activity_log
+WHERE action = 'vault.entry_adopted' AND instr(detail, 'Entry ' || sqlc.arg(entry_id) || ' ') > 0;
