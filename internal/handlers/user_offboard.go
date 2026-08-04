@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // offboardUser runs every revocation step that must happen when a person loses
@@ -115,6 +117,20 @@ func (h *UserHandler) disposeVaultEntriesOnDelete(r *http.Request, targetID, ema
 // skipping, so the team keeps the secret either way and the rename says where it
 // came from. Anything that still fails is NAMED on the activity log instead of
 // being swallowed.
+// THE PRODUCT'S ONE GENUINE OWNERSHIP TRANSFER, and the only post-creation
+// writer of secret_owner_user_id.
+//
+// It is not a plain UPDATE any more. secret_owner_user_id is what the exit
+// resolves "whose secret is this" from, and a column any route can write is not
+// an authority, so the statement lives in internal/vaultegress and demands a
+// vaultegress.TransferProof. AuthorizeTransfer grants one only to an instance
+// admin taking ownership FOR THEMSELVES, resolved from the users row rather than
+// from the session that got them into this handler.
+//
+// An instance admin already holds the widening right on every entry (grantFor
+// row 3), so the transfer hands them nothing they did not have; what it does is
+// make the new state attributable, which is the half the old blanket UPDATE was
+// missing.
 func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email, newOwnerID string) {
 	rows, err := h.queries.ListCollectionVaultEntriesForUser(r.Context(), targetID)
 	if err != nil {
@@ -125,12 +141,32 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		return
 	}
 
+	// Resolved from the users ROW. The route is AdminOnly, but "safe because of
+	// an authorization rule somewhere else" is how a control survives until the
+	// next refactor and not past it, and round 5 is what asking a session claim
+	// on one side and the row on the other costs.
+	actorIsAdmin := false
+	if u, uErr := h.queries.GetUserByID(r.Context(), newOwnerID); uErr == nil {
+		actorIsAdmin = u.Disabled == 0 && u.Role == middleware.RoleAdmin
+	}
+
 	moved := 0
 	var renamed, failed []string
 	for _, row := range rows {
-		_, uErr := h.queries.ReassignCollectionVaultEntryOwner(r.Context(), db.ReassignCollectionVaultEntryOwnerParams{
-			UserID: newOwnerID, ID: row.ID,
+		proof, pErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
+			EntryID:              row.ID,
+			Actor:                newOwnerID,
+			ActorIsInstanceAdmin: actorIsAdmin,
+			To:                   newOwnerID,
+			Why:                  "hard delete of " + email + ": the team keeps the shared entries they created",
 		})
+		if pErr != nil {
+			slog.Error("offboard: ownership transfer refused", "entry", row.ID, "error", pErr)
+			failed = append(failed, row.Name)
+			continue
+		}
+		_, uErr := vaultegress.TransferSecretOwnership(r.Context(), h.queries, proof,
+			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID})
 		if uErr == nil {
 			moved++
 			continue
@@ -149,9 +185,20 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			failed = append(failed, row.Name)
 			continue
 		}
-		if _, uErr2 := h.queries.ReassignCollectionVaultEntryOwner(r.Context(), db.ReassignCollectionVaultEntryOwnerParams{
-			UserID: newOwnerID, ID: row.ID,
-		}); uErr2 != nil {
+		retry, retryErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
+			EntryID:              row.ID,
+			Actor:                newOwnerID,
+			ActorIsInstanceAdmin: actorIsAdmin,
+			To:                   newOwnerID,
+			Why:                  "hard delete of " + email + ": re-own after a name de-duplication",
+		})
+		if retryErr != nil {
+			slog.Error("offboard: ownership transfer refused after rename", "entry", row.ID, "error", retryErr)
+			failed = append(failed, row.Name)
+			continue
+		}
+		if _, uErr2 := vaultegress.TransferSecretOwnership(r.Context(), h.queries, retry,
+			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID}); uErr2 != nil {
 			slog.Error("offboard: re-own failed after rename", "entry", row.ID, "error", uErr2)
 			failed = append(failed, row.Name)
 			continue

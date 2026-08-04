@@ -42,6 +42,7 @@ func aiGatewayTestDB(t *testing.T) *sql.DB {
 	schema := `
 	CREATE TABLE vault_entries (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL,
+		secret_owner_user_id TEXT NOT NULL DEFAULT '',
 		encrypted_value BLOB NOT NULL, nonce BLOB NOT NULL, encryption_version INTEGER DEFAULT 2,
 		provider TEXT DEFAULT '', provider_meta TEXT DEFAULT '{}',
 		rotation_interval_days INTEGER, last_rotated_at DATETIME,

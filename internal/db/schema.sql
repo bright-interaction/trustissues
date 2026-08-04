@@ -161,6 +161,12 @@ CREATE TABLE vault_entries (
   alias_url_bidx TEXT NOT NULL DEFAULT '',
   collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
   custom_fields TEXT NOT NULL DEFAULT '[]',
+  -- 00034_secret_owner.sql. user_id is the CUSTODIAN (uniqueness scope, listing,
+  -- grantFor); this is the OWNER the exit asks about. They are two columns
+  -- because a collection manager can move user_id to their own id through
+  -- AdoptAndRenameVaultEntry, and an authority derived from a column the
+  -- attacker can write is not an authority. See the migration.
+  secret_owner_user_id TEXT NOT NULL DEFAULT '',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, name)

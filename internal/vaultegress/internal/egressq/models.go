@@ -205,6 +205,7 @@ type VaultEntry struct {
 	AliasUrlBidx         string         `json:"alias_url_bidx"`
 	CollectionID         sql.NullString `json:"collection_id"`
 	CustomFields         string         `json:"custom_fields"`
+	SecretOwnerUserID    string         `json:"secret_owner_user_id"`
 	CreatedAt            sql.NullTime   `json:"created_at"`
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }

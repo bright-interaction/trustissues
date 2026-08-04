@@ -467,6 +467,7 @@ func newTestDB(t *testing.T) *sql.DB {
 		CREATE TABLE vault_entries (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
+			secret_owner_user_id TEXT NOT NULL DEFAULT '',
 			collection_id TEXT,
 			name TEXT NOT NULL,
 			encrypted_value BLOB NOT NULL,

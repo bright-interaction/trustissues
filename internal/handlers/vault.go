@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,17 @@ func validateCustomFields(fields []CustomField) error {
 		if len(f.Value) > 10000 {
 			return fmt.Errorf("custom field value too long (max 10000)")
 		}
+		// A withheld field is a value the exit did NOT release to this caller,
+		// rendered blank so the UI can say so. The edit form resubmits every
+		// field it was shown, so writing one back would replace the real secret
+		// with an empty string, permanently, with a 200 and a success toast.
+		// Same class as the refuse-to-overwrite guards on the metadata columns
+		// and on rotation_targets; this surface needs its own because the blank
+		// is one this server produced.
+		if f.Withheld {
+			return fmt.Errorf("custom field %q was not released to you, so this save would blank it; "+
+				"reload the entry and try again", f.Label)
+		}
 	}
 	return nil
 }
@@ -202,6 +214,11 @@ func (h *VaultHandler) encryptCustomFields(fields []CustomField) (string, error)
 
 // decryptCustomFields decrypts and parses the stored blob, returning an empty
 // slice on any error (a corrupt field must never break loading an entry).
+//
+// It is deliberately NOT the function a response path calls. A field the
+// operator marked secret:true is a credential they deposited here, and it leaves
+// this process in a response body exactly like the entry's own value does, so it
+// goes through the exit: see customFieldsForCaller.
 func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
 	dec := h.decryptColumnOrLog(stored, "[]", "custom_fields")
 	if dec == "" {
@@ -210,6 +227,60 @@ func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
 	var fields []CustomField
 	if err := json.Unmarshal([]byte(dec), &fields); err != nil {
 		return nil
+	}
+	return fields
+}
+
+// customFieldsForCaller is THE ONE EXIT for the second credential an entry can
+// hold.
+//
+// # Why this exists
+//
+// Round 7 made "every path by which a decrypted secret leaves this process" a
+// set the compiler maintains, and then stated a SCOPE BOUNDARY naming the two
+// encrypted things deliberately outside it. custom_fields was in neither list
+// and is not metadata: a field with secret:true is operator-designated secret
+// material, the UI masks it for exactly that reason, and it was decrypted and
+// written into the same response body as the entry's own value with no
+// Destination, no Chooser, no Authority, no receipt and no entry in
+// theExitList. A boundary comment that misses a case reads as coverage.
+//
+// # What the exit adds here
+//
+// The chooser is the caller, because handing a value back to a principal is not
+// choosing a network destination; the Authority asks grantFor(...).read about
+// the entry the field belongs to. On the paths this serves the caller already
+// holds read, which is how they obtained the row, so nothing legitimate changes.
+// What changes is that a list query that widened by accident is refused field by
+// field, the value can no longer be logged or interpolated on its way out
+// (Plaintext redacts under every verb), and a NEW response path that wants these
+// values has to answer the owner question in the same commit that adds it.
+//
+// A refusal BLANKS the value and marks it withheld rather than dropping the
+// field: the edit form resubmits every field it was shown, so a silently blanked
+// secret would be written back as empty on the next save. VaultHandler.Update
+// refuses an array carrying a withheld marker for the same reason it refuses to
+// overwrite an undecryptable column.
+func (h *VaultHandler) customFieldsForCaller(ctx context.Context, entryID, entryName, stored,
+	callerID string) []CustomField {
+
+	fields := h.decryptCustomFields(stored)
+	for i := range fields {
+		if !fields[i].Secret || fields[i].Value == "" {
+			continue
+		}
+		_, released, err := secretexit.ExitString(ctx,
+			h.MintedEntrySecret([]byte(fields[i].Value), entryID, entryName),
+			secretexit.ToCaller("the custom field "+strconv.Quote(fields[i].Label)+" of this entry",
+				callerID))
+		if err != nil {
+			slog.Error("vault: a secret custom field was not released",
+				"entry", entryID, "label", fields[i].Label, "caller", callerID, "error", err)
+			fields[i].Value = ""
+			fields[i].Withheld = true
+			continue
+		}
+		fields[i].Value = released
 	}
 	return fields
 }
@@ -465,18 +536,35 @@ type CustomField struct {
 	Label  string `json:"label"`
 	Value  string `json:"value"`
 	Secret bool   `json:"secret"`
+	// Withheld marks a secret field whose value the exit did not release to this
+	// caller. Response-only: it is never stored, and Update REFUSES a save that
+	// carries one, because the edit form resubmits every field it was shown and a
+	// blanked value would otherwise be written back over the real one.
+	Withheld bool `json:"withheld,omitempty"`
 }
 
 // vaultEntryFull includes the decrypted secret value (only returned on explicit unlock).
 type vaultEntryFull struct {
 	vaultEntryMeta
 	Value string `json:"value"`
+	// ValueWithheld is set when the rotation SUCCEEDED and the exit did not
+	// release the new value to this caller. Without it the response is
+	// `{"value": ""}` with a 200, which an operator cannot tell from "the new
+	// value is empty" on a credential that has just been rolled upstream.
+	ValueWithheld string `json:"value_withheld,omitempty"`
 }
 
 // vaultMetaFromGetRow converts a db.GetVaultEntryMetaRow to a vaultEntryMeta.
 // Method (not free func) so it can decrypt the at-rest-encrypted provider_meta
 // column before it is emitted to a client.
-func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEntryMeta {
+//
+// It takes the CALLER, not because the row was not already authorized (it was:
+// every caller reached this through entryAccess) but because custom_fields can
+// carry operator-designated secret material and that leaves through the exit
+// now. A converter with no principal in scope cannot ask the exit's question,
+// which is exactly why this one used to hand those values out without asking.
+func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultEntryMetaRow,
+	callerID string) vaultEntryMeta {
 	e := vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 row.Name,
@@ -493,7 +581,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(row db.GetVaultEntryMetaRow) vaultEnt
 		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
-		CustomFields:         h.decryptCustomFields(row.CustomFields),
+		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),
 		DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
@@ -1111,8 +1199,12 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err = vaultegress.CreateEntry(ctx, h.queries, createTicket, vaultegress.CreateEntryParams{
-		ID:                   entryID,
-		UserID:               userID,
+		ID:     entryID,
+		UserID: userID,
+		// The creator is the owner the exit asks about. The two columns are the
+		// same value here and diverge only if a collection manager later adopts
+		// the entry, which moves the custodian and not the authority.
+		SecretOwnerUserID:    userID,
 		Name:                 req.Name,
 		EncryptedValue:       encrypted,
 		Nonce:                nonce,
@@ -1178,7 +1270,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry := h.vaultMetaFromGetRow(row)
+	entry := h.vaultMetaFromGetRow(ctx, row, userID)
 	entry.CollectionID = nullStringPtr(collectionID)
 
 	// Seed the capability-bridge columns from the provider's defaults so the
@@ -1770,6 +1862,17 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// (grantFor row 7), so a manager takes responsibility for a secret that
 		// was stranded in their collection. Rule 3 keeps the creator's own
 		// namespace unreadable while they are still a colleague.
+		//
+		// ADOPTION MOVES THE CUSTODIAN AND NOT THE OWNER. Rule 2 was also, until
+		// this round, a two-call route to becoming the principal the EXIT asks
+		// about: a manager removes the creator from the collection (manager-
+		// gated), renames the entry, and mayDirectSecretEgress then said yes,
+		// which authorised the exact round-6 cross-entry delivery the exit exists
+		// to refuse. secret_owner_user_id stays where it was, so a manager takes
+		// responsibility for a stranded secret without acquiring the right to
+		// choose where its plaintext goes. Narrowing and clearing its delivery
+		// targets are still open to them, which is the lever that actually
+		// matters for a secret nobody is left to own.
 		access, accessErr := qtx.GetVaultEntryAccess(ctx, id)
 		if accessErr != nil {
 			logError(r, "vault.update: owner lookup for rename failed", "entry", id, "error", accessErr)
@@ -2083,7 +2186,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry := h.vaultMetaFromGetRow(row)
+	entry := h.vaultMetaFromGetRow(ctx, row, userID)
 
 	LogActivityFromRequest(h.queries, r, "vault.entry_updated", fmt.Sprintf("Vault secret updated: %s (user: %s)", entry.Name, userID))
 
@@ -2235,10 +2338,13 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", "provider_meta"),
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
-				CustomFields:         h.decryptCustomFields(row.CustomFields),
-				DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
-				CreatedAt:            nullTimePtr(row.CreatedAt),
-				UpdatedAt:            nullTimePtr(row.UpdatedAt),
+				// Through the exit, like the entry's own value below. A
+				// secret:true custom field is a credential the operator
+				// deposited here and it rides out in this same body.
+				CustomFields:        h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, userID),
+				DestinationPatterns: parseDestinationPatterns(row.DestinationPatterns),
+				CreatedAt:           nullTimePtr(row.CreatedAt),
+				UpdatedAt:           nullTimePtr(row.UpdatedAt),
 			},
 		}
 
@@ -2622,14 +2728,26 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	//
 	// Rotate returns the new plaintext so the operator can copy it, which is a
 	// release of a secret to a principal and is therefore asked the same way
-	// unlock is. A failure here does NOT unwind the rotation (the value is
-	// already durably stored and the predecessor may already be revoked
-	// upstream); it withholds the value from the body and says so.
+	// unlock is. A failure here does NOT unwind the rotation: the value is
+	// already durably stored and the predecessor may already be revoked upstream,
+	// so refusing the whole request would report a failure that did not happen
+	// and leave the operator with a live key they were told was not minted.
+	//
+	// It withholds the value from the body AND SAYS SO IN THE BODY. The first cut
+	// of this said so only in the server log, and shipped `{"value": ""}` with a
+	// 200 and a success toast: the operator could not tell "we rotated and cannot
+	// hand you the value" from "the new value is an empty string", on a
+	// credential that has just been rolled at the provider. A response that
+	// withholds something has to say it withheld it.
 	_, rotatedForCaller, callerErr := secretexit.ExitString(ctx, newValue,
 		secretexit.ToCaller("POST /api/vault/{id}/rotate", userID))
+	valueWithheld := ""
 	if callerErr != nil {
 		logError(r, "vault.rotate: the rotated value was not released to the caller",
 			"entry", id, "user", userID, "error", callerErr)
+		rotatedForCaller = ""
+		valueWithheld = "the secret was rotated and stored, but its value was not released to you: " +
+			callerErr.Error()
 	}
 
 	// One fact, collected from both places a revoke can fail, folded into the
@@ -2717,10 +2835,15 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// silently undid the whole point of recording a partial outcome. A fix that
 		// writes the truth to the database and hands the caller a stale copy of it is
 		// only half a fix.
-		out := vaultEntryFull{vaultEntryMeta: h.vaultMetaFromGetRow(meta), Value: rotatedForCaller}
+		out := vaultEntryFull{
+			vaultEntryMeta: h.vaultMetaFromGetRow(ctx, meta, userID),
+			Value:          rotatedForCaller,
+			ValueWithheld:  valueWithheld,
+		}
 		if fresh, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {
-			out.vaultEntryMeta = h.vaultMetaFromGetRow(fresh)
+			out.vaultEntryMeta = h.vaultMetaFromGetRow(ctx, fresh, userID)
 			out.Value = rotatedForCaller
+			out.ValueWithheld = valueWithheld
 		}
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -2772,13 +2895,14 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// anywhere else.
 	entry := vaultEntryFull{}
 	if row, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr == nil {
-		entry.vaultEntryMeta = h.vaultMetaFromGetRow(row)
+		entry.vaultEntryMeta = h.vaultMetaFromGetRow(ctx, row, userID)
 	} else {
 		logError(r, "vault.rotate: post-rotation fetch failed, returning the rotated value with "+
 			"pre-rotation metadata", "entry", id, "error", fErr)
-		entry.vaultEntryMeta = h.vaultMetaFromGetRow(meta)
+		entry.vaultEntryMeta = h.vaultMetaFromGetRow(ctx, meta, userID)
 	}
 	entry.Value = rotatedForCaller
+	entry.ValueWithheld = valueWithheld
 
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
@@ -3080,6 +3204,31 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// THE AUTH_TOKEN QUESTION, ASKED AT THE WRITE BECAUSE THE EXIT ASKS IT AT
+	// DELIVERY.
+	//
+	// A forgejo_secret target names ANOTHER vault entry in auth_token and spends
+	// its secret as the bearer of this delivery. The exit asks whether the
+	// configurer may choose where THAT entry's secret goes; this validator never
+	// looked at auth_token at all. So the ordinary team configuration (Alice
+	// wires her entry's rotation to Forgejo using the collection's shared CI
+	// token, which Bob owns) was accepted, reported as saved, shown as a live
+	// target, and then dropped at the next rotation: weeks later, unattended,
+	// right after the credential was rolled at the provider.
+	//
+	// Round 5 named that shape as the worst of the three possible behaviours and
+	// fixed it once, for the admin case. This is the same defect with the
+	// argument changed. checkAuthTokenAuthority is the ONE implementation, and
+	// the boot audit calls the same function, so the two halves cannot drift.
+	for _, t := range targets {
+		if refusal := h.checkAuthTokenAuthority(r.Context(), t); !refusal.empty() {
+			logError(r, "vault.targets: refused a target whose auth_token its configurer may not spend",
+				"entry", id, "user", userID, "auth_token", refusal.AuthToken)
+			writeError(w, r, http.StatusForbidden, "auth_token_not_yours", refusal.Reason)
+			return
+		}
+	}
+
 	// The provider pin. A rotation target is a DELIVERY
 	// destination: deliverToWebhook POSTs {"new_value": <the secret>} to a URL
 	// the caller names. So an entry wired as the instance's AI provider key must
@@ -3262,7 +3411,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, h.vaultMetaFromGetRow(row))
+	writeJSON(w, http.StatusOK, h.vaultMetaFromGetRow(ctx, row, middleware.GetUserID(ctx)))
 }
 
 // Match handles GET /api/vault/match?url=... and returns vault entries whose

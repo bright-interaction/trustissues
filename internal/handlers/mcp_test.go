@@ -26,6 +26,7 @@ func mcpTestDB(t *testing.T) *sql.DB {
 	schema := `
 	CREATE TABLE vault_entries (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL,
+		secret_owner_user_id TEXT NOT NULL DEFAULT '',
 		encrypted_value BLOB NOT NULL DEFAULT x'', nonce BLOB NOT NULL DEFAULT x'',
 		collection_id TEXT,
 		custom_fields TEXT NOT NULL DEFAULT '',

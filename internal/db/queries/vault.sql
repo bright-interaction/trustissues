@@ -69,6 +69,19 @@ UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 -- owner and the new name together moves the uniqueness question into the
 -- renamer's OWN namespace, where a conflict is with an entry they can see and
 -- saying so leaks nothing. See the rule in vault.go's Update.
+--
+-- IT DOES NOT TOUCH secret_owner_user_id, AND THAT IS THE POINT.
+--
+-- This statement is how a collection MANAGER used to make themselves the owner
+-- for the purposes of the exit: remove the creator from the collection (also
+-- manager-gated), then rename the entry. Two ordinary calls and the exit
+-- authorised the cross-entry delivery it exists to refuse, because it resolved
+-- "owner" from the column this statement writes.
+--
+-- Adoption is still right and still happens: it moves the UNIQUE(user_id, name)
+-- question into the renamer's namespace, which is a NAMESPACE concern. Whose
+-- authority governs the plaintext is a different question and lives in a
+-- different column, which only internal/vaultegress can write.
 UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryCategory :exec
@@ -200,8 +213,16 @@ SELECT name FROM vault_entries WHERE user_id = ?;
 -- ============================================================================
 
 -- name: ImportVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
+-- secret_owner_user_id is written HERE, on the INSERT, alongside user_id.
+--
+-- Every statement that creates a vault entry has to name both, and
+-- TestEveryRowCreatingStatementNamesTheSecretOwner proves it against SQLite
+-- rather than against a reviewer: a row inserted with the column left at its ''
+-- default has no owner at all, so mayDirectSecretEgress refuses everyone and the
+-- importer silently loses the ability to configure delivery for what they just
+-- imported. Forgetting must be a red test, not a feature that quietly stops.
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
 
 -- ============================================================================
 -- Provider integration (API key rotation)
@@ -375,9 +396,11 @@ DELETE FROM vault_entries WHERE user_id = ? AND (collection_id IS NULL OR collec
 SELECT id, name FROM vault_entries
 WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != '';
 
--- name: ReassignCollectionVaultEntryOwner :execresult
--- Re-own ONE entry, so a single name collision cannot block the rest.
-UPDATE vault_entries SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- Re-owning ONE entry (so a single name collision cannot block the rest) is
+-- vaultegress.TransferSecretOwnership now. The statement moved to
+-- internal/vaultegress/queries because it writes secret_owner_user_id, the
+-- column the exit resolves "whose secret is this" from, and that column has
+-- exactly one post-creation writer by construction rather than by convention.
 
 -- name: RenameVaultEntry :execresult
 -- Used only to de-duplicate on re-ownership when the new owner already has an

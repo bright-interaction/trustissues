@@ -40,6 +40,7 @@ func newVaultTestDB(t *testing.T) *sql.DB {
 	CREATE TABLE vault_entries (
 		id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 		user_id TEXT NOT NULL DEFAULT '',
+		secret_owner_user_id TEXT NOT NULL DEFAULT '',
 		name TEXT NOT NULL,
 		encrypted_value BLOB NOT NULL,
 		nonce BLOB NOT NULL,

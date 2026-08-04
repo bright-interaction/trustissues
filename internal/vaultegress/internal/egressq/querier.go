@@ -6,6 +6,7 @@ package egressq
 
 import (
 	"context"
+	"database/sql"
 )
 
 type Querier interface {
@@ -35,6 +36,22 @@ type Querier interface {
 	// enrollment time. Only fills untouched rows so explicit per-entry
 	// patterns are never overwritten.
 	SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error
+	// THE ONLY STATEMENT IN THE MODULE THAT MOVES secret_owner_user_id AFTER
+	// CREATION, and it lives here for the same reason the host-choosing writes do:
+	// so that "change whose authority governs this plaintext" is not something a
+	// handler can express.
+	//
+	// It writes BOTH columns, deliberately. A transfer that moved the exit's owner
+	// and left the custodian behind would put UNIQUE(user_id, name) in one person's
+	// namespace and the widening right in another's, which is the split this column
+	// exists to make impossible to create by accident.
+	//
+	// Its one caller is the hard-delete offboarding path: an instance admin deleting
+	// a user re-owns the entries that person created inside shared collections, so
+	// the team keeps them. An instance admin already holds the widening right on
+	// every entry (grantFor row 3), so this hands them nothing they did not have,
+	// and the activity log names the transfer.
+	TransferVaultEntrySecretOwner(ctx context.Context, arg TransferVaultEntrySecretOwnerParams) (sql.Result, error)
 	// The capability ceiling: which hosts/paths an agent token minted for this
 	// secret may ever reach. Until this existed the column had exactly one writer
 	// (the provider preset seed), so a secret created without a recognised provider

@@ -44,6 +44,7 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 		`CREATE TABLE vault_entries (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
+			secret_owner_user_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL,
 			encrypted_value BLOB NOT NULL,
 			nonce BLOB NOT NULL,

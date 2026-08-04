@@ -338,6 +338,25 @@ func main() {
 	if _, err := vaultHandler.BackfillMetadataAtRest(); err != nil {
 		slog.Error("vault metadata-at-rest backfill failed", "error", err)
 	}
+	// NAME, AT THE DEPLOY, WHAT WOULD OTHERWISE BREAK AT THE NEXT ROTATION.
+	//
+	// A forgejo_secret target spends ANOTHER entry's secret as its bearer token,
+	// and the exit asks whether the person who configured the target may choose
+	// where that other entry's secret goes. UpdateTargets now asks the same
+	// question at the write, but only for writes made after this deploy. An
+	// instance that already has such a target keeps it, and it stops delivering
+	// at its next scheduled rotation: weeks later, unattended, immediately after
+	// the credential was rolled at the provider.
+	//
+	// This reads those rows and reports them, by entry and by referenced token,
+	// on the activity log and the boot log. It changes nothing: an operator
+	// decides whether to re-point the target at a token they own or to have the
+	// owner configure it. Silently rewriting somebody's delivery configuration at
+	// boot would be a worse cure than the disease.
+	if broken := vaultHandler.AuditCrossOwnerAuthTokenTargets(context.Background()); len(broken) > 0 {
+		slog.Error("vault: rotation delivery targets need reconfiguration before their next rotation",
+			"count", len(broken))
+	}
 	// Built after vaultHandler: the collection handler needs it to decrypt and
 	// re-encrypt rotation_targets when purging a departing member's endpoints.
 	collectionHandler := handlers.NewCollectionHandler(queries, vaultHandler)
