@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // purgeTargetsConfiguredBy removes every rotation target in a collection that
@@ -74,7 +74,7 @@ func (h *CollectionHandler) purgeTargetsConfiguredBy(ctx context.Context, collec
 				"entry", row.ID, "error", tkErr)
 			continue
 		}
-		if uErr := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
+		if uErr := vaultegress.SetRotationTargets(ctx, h.queries, tk, vaultegress.RotationTargetsParams{
 			RotationTargets: toNullString(enc),
 			ID:              row.ID,
 		}); uErr != nil {

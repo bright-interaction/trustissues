@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestSweepActuallyPersistsTheRotatedValue is the test the round-11 CAS needed
@@ -31,7 +32,7 @@ func TestSweepActuallyPersistsTheRotatedValue(t *testing.T) {
 	mustEntry(t, h, queries, entryID, owner, "Shared", "old-value")
 
 	// Make it due, with a provider that rotates locally.
-	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString("shared-secret"),
 		ProviderMeta: toNullString("{}"),
 		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},
@@ -94,7 +95,7 @@ func TestSweepStillDetectsARealConflict(t *testing.T) {
 	const entryID = "cas-2"
 	mustEntry(t, h, queries, entryID, owner, "Shared", "old-value")
 
-	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString("shared-secret"),
 		ProviderMeta: toNullString("{}"),
 		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},
@@ -208,7 +209,7 @@ func TestManualRotateWorksForProviderBackedEntries(t *testing.T) {
 	const entryID = "prov-rot-1"
 	mustEntry(t, h, queries, entryID, owner, "Shared", "OLD-VALUE")
 
-	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString("shared-secret"),
 		ProviderMeta: toNullString("{}"),
 		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},

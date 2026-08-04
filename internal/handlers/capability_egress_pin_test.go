@@ -16,6 +16,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/capability"
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // testEgressVaultKey is the VaultKey newCollectionAuthzEnv builds its handler
@@ -73,8 +74,7 @@ func (e *egressEnv) storedDestinations(t *testing.T, entryID string) string {
 // just a second copy of the write check.
 func (e *egressEnv) forceDestinations(t *testing.T, entryID, patternsJSON string) {
 	t.Helper()
-	if err := e.queries.UpdateVaultEntryDestinationPatterns(context.Background(),
-		db.UpdateVaultEntryDestinationPatternsParams{DestinationPatterns: patternsJSON, ID: entryID}); err != nil {
+	if err := setDestinationPatternsFixture(t, e.queries, vaultegress.DestinationPatternsParams{DestinationPatterns: patternsJSON, ID: entryID}); err != nil {
 		t.Fatalf("force destination patterns: %v", err)
 	}
 }
@@ -467,7 +467,7 @@ func TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret(t *testing.T) {
 		// turns an entry whose owner deliberately left the ceiling EMPTY (no agent
 		// may spend this secret) into one with a live destination. That is a
 		// ceiling write in everything but name, and it belongs to the owner.
-		if err := env.queries.UpdateVaultEntryProvider(context.Background(), db.UpdateVaultEntryProviderParams{
+		if err := setProviderFixture(t, env.queries, vaultegress.ProviderParams{
 			Provider: sql.NullString{String: "stripe", Valid: true},
 			ID:       entryID,
 		}); err != nil {

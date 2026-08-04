@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestDisabledUserStopsReceivingTheRotatedSecret covers the OTHER offboarding
@@ -133,7 +134,7 @@ func TestPurgeTargetsConfiguredByUserSpansPersonalEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt targets: %v", err)
 	}
-	if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+	if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(enc), ID: personalID,
 	}); err != nil {
 		t.Fatalf("seed targets: %v", err)

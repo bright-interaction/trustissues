@@ -117,10 +117,10 @@ func TestWrongKeyAndTamperingAreRejected(t *testing.T) {
 // panic in a decrypt path takes down the request or the boot sequence.
 func TestMalformedInputErrorsRatherThanPanics(t *testing.T) {
 	bad := []string{
-		marker,                                   // marker only
-		marker + "!!!not base64!!!",              // undecodable
+		marker,                      // marker only
+		marker + "!!!not base64!!!", // undecodable
 		marker + base64.StdEncoding.EncodeToString([]byte("short")), // shorter than a nonce
-		"",                                       // empty
+		"", // empty
 		"plain cleartext that was never encrypted",
 		marker + base64.StdEncoding.EncodeToString(make([]byte, 12)), // nonce, no body/tag
 	}

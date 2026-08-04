@@ -1,144 +1,102 @@
 package handlers
 
 import (
+	"database/sql"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/trustissues/internal/database"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
-// THE GUARD THAT IS SUPPOSED TO END THE SERIES.
+// THE GUARD THAT STOPPED BEING A PATTERN.
 //
-// egress_field_coverage_test.go forces every vault_entries column to be
-// CLASSIFIED as host-choosing or not. It is a good guard and it did not stop
-// round 5, and the reason is worth stating plainly, because it is the reusable
-// lesson:
+// Round 4 forced every vault_entries column to be CLASSIFIED as host-choosing or
+// not. Round 5 walked past it, because a classification is a CLAIM ABOUT THE
+// CODE: rotation_targets was correctly labelled and its write path asked nobody.
 //
-//	rotation_targets was already classified egressChoosesHost, with a paragraph
-//	of reasoning attached, sitting next to VaultHandler.UpdateTargets, which
-//	never asked anybody for permission. A vault_only account holding an accepted
-//	EDITOR seat on somebody else's shared entry PUT a webhook_url at a host it
-//	controlled, got 200, and the next scheduled rotation POSTed the freshly
-//	minted plaintext there.
+// Round 5 answered that with a chokepoint file and four guards that read the
+// source and matched it against regular expressions. A skeptic planted four
+// write paths through the gaps. The sharpest:
 //
-// A classification is a CLAIM ABOUT THE CODE. Round 4's table checked that every
-// field had a claim. It could not check that the claim was true, so a field
-// could be marked dangerous and left unenforced, and that reads as coverage,
-// which is worse than nothing.
+//	UPDATE vault_entries AS ve SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?
 //
-// So this file checks the OTHER direction. For every column classified
-// egressChoosesHost it finds, out of the GENERATED SQL, every query that writes
-// it, and requires that every call to those queries goes through
-// vault_egress_writes.go, whose wrappers demand an egressgate.Ticket. Nothing
-// here is a hand-maintained list of routes: the columns come from the
-// classification table, the queries come from internal/db, and the call sites
-// come from the tree. A NEW field, or a NEW route for an old field, is covered
-// on the day it is written rather than after a skeptic finds it.
+// which is the ordinary sqlc shape with a table alias, against a pattern of
+// `update\s+vault_entries\s+set`. It built, vetted clean and passed all four
+// guards.
 //
-// The ablations that validate this are in scripts/round5-ablations.json, plus
-// the four-file "add a whole new host-choosing column" ablation recorded in
-// AUDIT-ROUND-15.md. Both make the build succeed and this file red.
-
-// egressChokepointFile is the one file allowed to call a query that writes a
-// host-choosing column.
-const egressChokepointFile = "vault_egress_writes.go"
-
-// generatedQuery is one sqlc-generated query, as it really exists.
-type generatedQuery struct {
-	method  string // the Go method name on *db.Queries
-	file    string
-	writes  []string // vault_entries columns this statement writes
-	sqlText string
-}
-
-var (
-	// The shape sqlc emits: a const holding the annotated SQL.
-	genQueryRe = regexp.MustCompile("(?s)const \\w+ = `-- name: (\\w+) :(\\w+)\n(.*?)\n`")
-	// UPDATE vault_entries SET <assignments> [WHERE ...]
-	genUpdateRe = regexp.MustCompile(`(?is)update\s+vault_entries\s+set\s+(.*?)(?:\bwhere\b|$)`)
-	genAssignRe = regexp.MustCompile(`(?i)([a-z_0-9]+)\s*=`)
-	// INSERT INTO vault_entries (<columns>)
-	genInsertRe = regexp.MustCompile(`(?is)insert\s+into\s+vault_entries\s*\(([^)]*)\)`)
-)
-
-// generatedVaultWrites reads the REAL generated queries and reports which
-// vault_entries columns each one writes.
+// PROVING A PROPERTY BY RECOGNISING ITS TEXTUAL FORM ALWAYS LOSES.
 //
-// Reading the generated Go rather than the .sql sources is deliberate: the
-// generated file is what the handlers actually call, so a query that exists in
-// the .sql but was never regenerated cannot make this guard think a door is
-// covered when the code has no such door, and vice versa.
-func generatedVaultWrites(t *testing.T) []generatedQuery {
-	t.Helper()
-	dir := filepath.Join("..", "db")
-	files, err := filepath.Glob(filepath.Join(dir, "*.sql.go"))
-	if err != nil || len(files) == 0 {
-		t.Fatalf("ABORT: no generated query files under %s (%v); this guard would be vacuous", dir, err)
-	}
-	sort.Strings(files)
+// So there are now two enforcement mechanisms here and neither reads SQL text.
+//
+//  1. THE COMPILER. The statements that write a host-choosing column are
+//     generated into internal/vaultegress/internal/egressq. Go's `internal` rule
+//     makes that package importable only from inside internal/vaultegress, and
+//     the methods are gone from *db.Queries, so there is nothing for a handler
+//     to call. TestPlantedEgressBypassesDoNotCompile runs the real toolchain on
+//     real planted bypasses and reads its refusals.
+//
+//  2. SQLITE. TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn
+//     takes every SQL statement in the module, hands it to a real SQLite engine
+//     against a schema where the host-choosing columns are GENERATED, and lets
+//     the engine refuse to prepare anything that assigns one. Aliases, casing,
+//     comments and whitespace are the parser's problem. The statements come from
+//     the Go AST rather than from a grep, and a companion check proves that
+//     collection is COMPLETE by refusing any SQL argument in the module that is
+//     not a compile-time constant.
 
-	var out []generatedQuery
-	total := 0
-	for _, f := range files {
-		src, rErr := os.ReadFile(f)
-		if rErr != nil {
-			t.Fatalf("read %s: %v", f, rErr)
-		}
-		for _, m := range genQueryRe.FindAllStringSubmatch(string(src), -1) {
-			total++
-			method, sqlText := m[1], m[3]
-			writes := map[string]bool{}
-			for _, um := range genUpdateRe.FindAllStringSubmatch(sqlText, -1) {
-				for _, a := range genAssignRe.FindAllStringSubmatch(um[1], -1) {
-					writes[strings.ToLower(a[1])] = true
-				}
-			}
-			for _, im := range genInsertRe.FindAllStringSubmatch(sqlText, -1) {
-				for _, c := range strings.Split(im[1], ",") {
-					if c = strings.ToLower(strings.TrimSpace(c)); c != "" {
-						writes[c] = true
-					}
-				}
-			}
-			if len(writes) == 0 {
-				continue
-			}
-			cols := make([]string, 0, len(writes))
-			for c := range writes {
-				cols = append(cols, c)
-			}
-			sort.Strings(cols)
-			out = append(out, generatedQuery{method: method, file: filepath.Base(f), writes: cols, sqlText: sqlText})
-		}
-	}
-	if total < 100 {
-		t.Fatalf("ABORT: only parsed %d generated queries; the sqlc output shape has changed and this "+
-			"guard is matching almost nothing", total)
-	}
-	return out
-}
-
-// hostChoosingColumns is the classification table, read as data. It is the ONLY
-// input that says which columns matter, so reclassifying a column immediately
-// changes what this guard demands.
+// hostChoosingColumns is the classification, read as data from the package that
+// owns the writes. Reclassifying a column immediately changes what these guards
+// demand.
 func hostChoosingColumns(t *testing.T) []string {
 	t.Helper()
-	var cols []string
+	fromWriter := append([]string(nil), vaultegress.HostChoosingColumns()...)
+	sort.Strings(fromWriter)
+
+	// Cross-checked against the round-4 classification table, which is a
+	// different file maintained for a different reason. If the two ever disagree
+	// somebody has classified a column in one place and not the other, and the
+	// safe reading of that is "there is an unenforced host-choosing column".
+	var fromTable []string
 	for col, entry := range vaultEntryEgressClass {
 		if entry.class == egressChoosesHost {
-			cols = append(cols, col)
+			fromTable = append(fromTable, col)
 		}
 	}
-	sort.Strings(cols)
-	if len(cols) < 4 {
-		t.Fatalf("ABORT: only %d columns are classified egressChoosesHost (%v). Four are known to be "+
-			"(destination_patterns, provider, provider_meta, rotation_targets), so either the "+
-			"classification table shrank without an explanation or this guard is reading the wrong "+
-			"thing", len(cols), cols)
+	sort.Strings(fromTable)
+	if strings.Join(fromWriter, ",") != strings.Join(fromTable, ",") {
+		t.Fatalf("the two statements of which columns choose a host disagree.\n"+
+			"  vaultegress.HostChoosingColumns(): %v\n"+
+			"  vaultEntryEgressClass:             %v\n"+
+			"One of them has a column the other does not, which means either a column is enforced and "+
+			"not classified, or classified and not enforced. The second one is round 5.",
+			fromWriter, fromTable)
 	}
-	return cols
+	if len(fromWriter) < 4 {
+		t.Fatalf("ABORT: only %d columns are classified as choosing a host (%v). Four are known to be "+
+			"(destination_patterns, provider, provider_meta, rotation_targets)",
+			len(fromWriter), fromWriter)
+	}
+	return fromWriter
+}
+
+// ── collecting the SQL the module can actually execute ──────────────────────
+
+// sqlCandidate is one compile-time-constant string found in the module source.
+type sqlCandidate struct {
+	pkgPath string // repo-relative directory
+	file    string
+	line    int
+	text    string
 }
 
 // moduleGoFiles walks the whole module and returns every non-generated,
@@ -146,7 +104,7 @@ func hostChoosingColumns(t *testing.T) []string {
 //
 // The whole module, not just this package: a second writer of these columns in
 // cmd/ or in a future internal/scheduler would be exactly the "one more door"
-// this series keeps finding, and a guard scoped to one package would not see it.
+// this series keeps finding.
 func moduleGoFiles(t *testing.T) map[string]string {
 	t.Helper()
 	root := filepath.Join("..", "..")
@@ -157,17 +115,12 @@ func moduleGoFiles(t *testing.T) map[string]string {
 		}
 		if info.IsDir() {
 			switch info.Name() {
-			case ".git", "node_modules", "frontend", "docs", "scripts":
+			case ".git", "node_modules", "frontend", "docs", "scripts", "testdata":
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		// internal/db is the generated data-access layer. It IS the queries, so
-		// it cannot be held to "do not call the queries".
-		if strings.Contains(filepath.ToSlash(path), "/internal/db/") {
 			return nil
 		}
 		b, rErr := os.ReadFile(path)
@@ -187,193 +140,505 @@ func moduleGoFiles(t *testing.T) map[string]string {
 	return out
 }
 
-// TestEveryHostChoosingWriteGoesThroughTheChokepoint is the round-5 stopper.
+// foldConstantString folds a compile-time-constant string expression.
 //
-// It is the test that would have failed the day UpdateTargets was written, with
-// no knowledge that webhook_url is special, and it will fail the day somebody
-// adds the next column or the next route.
-func TestEveryHostChoosingWriteGoesThroughTheChokepoint(t *testing.T) {
-	cols := hostChoosingColumns(t)
-	queries := generatedVaultWrites(t)
-	files := moduleGoFiles(t)
-
-	if _, ok := files[filepath.ToSlash(filepath.Join("..", "..", "internal", "handlers", egressChokepointFile))]; !ok {
-		t.Fatalf("ABORT: the chokepoint file %s is gone. If it was renamed, rename it here too rather "+
-			"than deleting this guard", egressChokepointFile)
-	}
-
-	// Which generated queries write a host-choosing column, and which column
-	// made them interesting.
-	guarded := map[string][]string{} // method -> columns
-	for _, q := range queries {
-		for _, c := range q.writes {
-			for _, hc := range cols {
-				if c == hc {
-					guarded[q.method] = append(guarded[q.method], hc)
-				}
-			}
+// go/ast, not a grep. A raw string literal, an interpreted one, and two of
+// either joined with + are all the same thing to the compiler and are all the
+// same thing here.
+func foldConstantString(e ast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind != token.STRING {
+			return "", false
 		}
-	}
-	for _, hc := range cols {
-		found := false
-		for _, got := range guarded {
-			for _, c := range got {
-				if c == hc {
-					found = true
-				}
-			}
+		s, err := strconv.Unquote(v.Value)
+		if err != nil {
+			return "", false
 		}
-		if !found {
-			t.Errorf("no generated query writes %s, yet it is classified as choosing a host. Either the "+
-				"column is dead and the classification is stale, or the SQL parser above stopped "+
-				"recognising the statement that writes it, in which case this guard has silently "+
-				"stopped guarding that column", hc)
+		return s, true
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD {
+			return "", false
 		}
-	}
-	if len(guarded) < 5 {
-		t.Fatalf("ABORT: only %d generated queries were found to write a host-choosing column (%v). "+
-			"Six are known to (CreateVaultEntry, UpdateVaultEntryDestinationPatterns, "+
-			"UpdateVaultEntryProvider, UpdateVaultEntryProviderMeta, UpdateVaultEntryRotationTargets, "+
-			"SeedVaultEntryCapabilityDefaults), so the parser is not matching", len(guarded), guarded)
-	}
-	t.Logf("guarding %d generated queries across %d host-choosing columns", len(guarded), len(cols))
-
-	// Every call site of every one of them must be in the chokepoint file.
-	for method, columns := range guarded {
-		call := regexp.MustCompile(`\.` + regexp.QuoteMeta(method) + `\s*\(`)
-		callSites := 0
-		for path, src := range files {
-			if !call.MatchString(src) {
-				continue
-			}
-			callSites++
-			if filepath.Base(path) == egressChokepointFile {
-				continue
-			}
-			t.Errorf("%s calls %s directly.\n"+
-				"  that query writes %v, which is classified as choosing where this secret is sent\n"+
-				"  so the write has to carry an egressgate.Ticket, and the only way to get one is\n"+
-				"  egressgate.Decide, which asks mayDirectSecretEgress when the write ADDS a destination.\n"+
-				"Route it through the wrapper in %s.\n\n"+
-				"This is the round-5 defect exactly: rotation_targets was CLASSIFIED as host-choosing and "+
-				"UpdateTargets wrote it anyway, so a vault_only editor pointed a rotation webhook at a host "+
-				"they controlled and the scheduler delivered the plaintext. A table that labels a field "+
-				"without forcing its write path to ask is not coverage.",
-				path, method, columns, egressChokepointFile)
+		l, okL := foldConstantString(v.X)
+		r, okR := foldConstantString(v.Y)
+		if !okL || !okR {
+			return "", false
 		}
-		if callSites == 0 {
-			t.Errorf("nothing anywhere calls %s, which writes %v. A query with no caller is either dead "+
-				"code or a rename this guard did not follow; both make it invisible to the checks above",
-				method, columns)
-		}
+		return l + r, true
+	case *ast.ParenExpr:
+		return foldConstantString(v.X)
 	}
+	return "", false
 }
 
-// TestChokepointWrappersAllDemandATicket closes the obvious way to satisfy the
-// test above without satisfying its point: move the call into the chokepoint
-// file and do not check anything once it is there.
-func TestChokepointWrappersAllDemandATicket(t *testing.T) {
-	cols := hostChoosingColumns(t)
-	queries := generatedVaultWrites(t)
+// constantStrings returns every compile-time-constant string in a file.
+func constantStrings(fset *token.FileSet, f *ast.File, path string) []sqlCandidate {
+	var out []sqlCandidate
+	ast.Inspect(f, func(n ast.Node) bool {
+		e, isExpr := n.(ast.Expr)
+		if !isExpr {
+			return true
+		}
+		switch e.(type) {
+		case *ast.BasicLit, *ast.BinaryExpr, *ast.ParenExpr:
+		default:
+			return true
+		}
+		s, ok := foldConstantString(e)
+		if !ok || strings.TrimSpace(s) == "" {
+			return true
+		}
+		pos := fset.Position(e.Pos())
+		out = append(out, sqlCandidate{
+			pkgPath: filepath.ToSlash(filepath.Dir(path)),
+			file:    filepath.ToSlash(path),
+			line:    pos.Line,
+			text:    s,
+		})
+		return false // the whole folded expression, not its pieces as well
+	})
+	return out
+}
 
-	guardedMethods := map[string]bool{}
-	for _, q := range queries {
-		for _, c := range q.writes {
-			for _, hc := range cols {
-				if c == hc {
-					guardedMethods[q.method] = true
+// sqlExecMethods are the database/sql entry points that take a statement.
+var sqlExecMethods = map[string]bool{
+	"Exec": true, "ExecContext": true,
+	"Query": true, "QueryContext": true,
+	"QueryRow": true, "QueryRowContext": true,
+	"Prepare": true, "PrepareContext": true,
+}
+
+// TestEverySQLStatementInTheModuleIsACompileTimeConstant is what makes the
+// prepare-based guard below COMPLETE rather than merely broad.
+//
+// That guard collects constant strings and asks SQLite what each one writes. It
+// would miss `"UPDATE vault_entries SET " + col + " = ?"`, because there is no
+// constant to hand over. This closes the gap by refusing the shape: every
+// statement handed to Exec/Query/QueryRow/Prepare must be a constant or a named
+// constant, module-wide. Then "every statement the module can execute" and
+// "every constant string in the module" are the same set, by construction.
+func TestEverySQLStatementInTheModuleIsACompileTimeConstant(t *testing.T) {
+	fset := token.NewFileSet()
+	checked, flagged := 0, 0
+	for path := range moduleGoFiles(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !sqlExecMethods[sel.Sel.Name] || len(call.Args) == 0 {
+				return true
+			}
+			checked++
+			// The statement is argument 0 (Exec) or argument 1 (ExecContext).
+			// Accepting either keeps this free of type information: a constant
+			// in one of the first two positions is the statement, and nothing
+			// else in those positions is.
+			limit := 2
+			if len(call.Args) < limit {
+				limit = len(call.Args)
+			}
+			for i := 0; i < limit; i++ {
+				switch call.Args[i].(type) {
+				case *ast.BasicLit, *ast.Ident, *ast.SelectorExpr:
+					return true
+				case *ast.BinaryExpr:
+					if _, ok := foldConstantString(call.Args[i]); ok {
+						return true
+					}
 				}
 			}
-		}
+			flagged++
+			pos := fset.Position(call.Pos())
+			t.Errorf("%s:%d builds a SQL statement dynamically (%s).\n"+
+				"Every statement in this module has to be a compile-time constant, because the guard "+
+				"that proves no statement writes a host-choosing column works by handing statements to "+
+				"SQLite, and it can only hand over what exists at compile time. A statement assembled at "+
+				"runtime is invisible to it, which is how a text-matching guard fails one level up.",
+				pos.Filename, pos.Line, sel.Sel.Name)
+			return true
+		})
+	}
+	if checked < 20 {
+		t.Fatalf("ABORT: only found %d SQL execution call sites in the module; this guard is not looking "+
+			"at the code", checked)
+	}
+	t.Logf("checked %d SQL execution call sites, %d dynamic", checked, flagged)
+}
+
+// ── the probe database ──────────────────────────────────────────────────────
+
+// probeSchema builds two real SQLite databases from the REAL migrations: a
+// control, and a probe in which the named columns of vault_entries are GENERATED.
+//
+// SQLite refuses at PREPARE time to assign a generated column:
+//
+//	cannot UPDATE generated column "rotation_targets"
+//	cannot INSERT into generated column "provider"
+//
+// That refusal is the engine's own answer to "does this statement write that
+// column", derived from its parser rather than from ours. It does not care about
+// table aliases, comments, casing, line breaks, or which package the SQL is in.
+func probeSchema(t *testing.T, generated []string) (control, probe *sql.DB) {
+	t.Helper()
+
+	ctlConn, err := database.Connect(filepath.Join(t.TempDir(), "control"))
+	if err != nil {
+		t.Fatalf("connect control: %v", err)
+	}
+	t.Cleanup(func() { ctlConn.Close() })
+	if err := database.RunMigrations(ctlConn); err != nil {
+		t.Fatalf("migrate control: %v", err)
 	}
 
-	src := readPackageFile(t, egressChokepointFile)
-	// Split into top-level functions. A wrapper is any function that calls a
-	// guarded query.
-	parts := strings.Split(src, "\nfunc ")
-	checked := 0
-	for i, body := range parts {
-		if i == 0 {
-			continue // the file header, before the first func
+	type object struct{ kind, name, sqlText string }
+	var objects []object
+	rows, err := ctlConn.Query(`SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL`)
+	if err != nil {
+		t.Fatalf("read sqlite_master: %v", err)
+	}
+	for rows.Next() {
+		var o object
+		if err := rows.Scan(&o.kind, &o.name, &o.sqlText); err != nil {
+			t.Fatalf("scan sqlite_master: %v", err)
 		}
-		name := body
-		if j := strings.IndexAny(name, "("); j > 0 {
-			name = strings.TrimSpace(name[:j])
+		objects = append(objects, o)
+	}
+	rows.Close()
+	if len(objects) < 10 {
+		t.Fatalf("ABORT: the control database has %d schema objects; the migrations did not run", len(objects))
+	}
+
+	// vault_entries, rebuilt from the engine's own column metadata with the
+	// host-choosing columns made unwritable. PRAGMA table_info, not a text edit
+	// of the CREATE statement: the column list comes from SQLite.
+	cols, err := ctlConn.Query(`PRAGMA table_info(vault_entries)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	gen := map[string]bool{}
+	for _, c := range generated {
+		gen[c] = true
+	}
+	var defs []string
+	seen := map[string]bool{}
+	for cols.Next() {
+		var cid, notNull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := cols.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
 		}
-		calls := ""
-		for m := range guardedMethods {
-			if strings.Contains(body, "."+m+"(") {
-				calls = m
-				break
-			}
+		seen[name] = true
+		if ctype == "" {
+			ctype = "TEXT"
 		}
-		if calls == "" {
+		if gen[name] {
+			// No NOT NULL and no DEFAULT: nothing is ever inserted into this
+			// database, and a generated column may carry neither.
+			defs = append(defs, fmt.Sprintf("%s %s GENERATED ALWAYS AS (NULL) VIRTUAL", name, ctype))
 			continue
 		}
-		checked++
-		if !strings.Contains(body, ".Authorizes(") {
-			t.Errorf("%s in %s calls %s but never calls Ticket.Authorizes.\n"+
-				"A wrapper that performs the write and does not check the ticket is a chokepoint with "+
-				"no lock on it: every caller looks correctly routed and none of them is gated.",
-				name, egressChokepointFile, calls)
+		def := name + " " + ctype
+		if pk == 1 {
+			def += " PRIMARY KEY"
 		}
-		if !strings.Contains(body, "egressgate.Ticket") {
-			t.Errorf("%s in %s calls %s but does not take an egressgate.Ticket, so its callers are not "+
-				"forced to have made a decision at all", name, egressChokepointFile, calls)
+		if notNull == 1 {
+			def += " NOT NULL"
+		}
+		if dflt.Valid {
+			// Parenthesised unconditionally. PRAGMA table_info hands back the
+			// default EXPRESSION with its outer parentheses stripped, and
+			// `DEFAULT lower(hex(randomblob(16)))` is not valid SQLite while
+			// `DEFAULT (lower(hex(randomblob(16))))` is.
+			def += " DEFAULT (" + dflt.String + ")"
+		}
+		defs = append(defs, def)
+	}
+	cols.Close()
+	for _, c := range generated {
+		if !seen[c] {
+			t.Fatalf("ABORT: column %q is classified as choosing a host but vault_entries has no such "+
+				"column. Either the classification names a column that was renamed or dropped, or this "+
+				"guard is reading the wrong table", c)
 		}
 	}
-	if checked < 5 {
-		t.Fatalf("ABORT: only %d wrappers in %s were found to call a guarded query; the file layout "+
-			"changed and this guard is checking almost nothing", checked, egressChokepointFile)
+
+	probeConn, err := database.Connect(filepath.Join(t.TempDir(), "probe"))
+	if err != nil {
+		t.Fatalf("connect probe: %v", err)
 	}
-	t.Logf("checked %d chokepoint wrappers", checked)
+	t.Cleanup(func() { probeConn.Close() })
+
+	// Tables first, then views. Indexes and triggers are irrelevant to PREPARE,
+	// and several are partial indexes on the columns being replaced.
+	for _, o := range objects {
+		if o.kind != "table" || o.name == "vault_entries" || strings.HasPrefix(o.name, "sqlite_") {
+			continue
+		}
+		if _, err := probeConn.Exec(o.sqlText); err != nil {
+			t.Fatalf("probe schema, table %s: %v", o.name, err)
+		}
+	}
+	create := "CREATE TABLE vault_entries (\n  " + strings.Join(defs, ",\n  ") + "\n)"
+	if _, err := probeConn.Exec(create); err != nil {
+		t.Fatalf("probe schema, vault_entries: %v\n%s", err, create)
+	}
+	for _, o := range objects {
+		if o.kind != "view" {
+			continue
+		}
+		if _, err := probeConn.Exec(o.sqlText); err != nil {
+			t.Fatalf("probe schema, view %s: %v", o.name, err)
+		}
+	}
+
+	// SELF-CHECK. A probe that quietly failed to make the columns generated
+	// would report that nothing writes them, which reads exactly like a clean
+	// bill of health. Prove the mechanism on statements written here, including
+	// the alias shape that beat the round-5 pattern.
+	for _, col := range generated {
+		for _, stmt := range []string{
+			fmt.Sprintf("UPDATE vault_entries SET %s = ? WHERE id = ?", col),
+			fmt.Sprintf("UPDATE vault_entries AS ve SET %s = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?", col),
+			fmt.Sprintf("/* comment */ update\n\tVAULT_ENTRIES\n\tas Ve\n\tset %s = ?\nwhere Ve.id = ?", col),
+		} {
+			if _, err := probeConn.Prepare(stmt); err == nil {
+				t.Fatalf("ABORT: the probe database accepted %q, so %s is not actually a generated column "+
+					"and this guard would pass on any write at all", stmt, col)
+			}
+			if _, err := ctlConn.Prepare(stmt); err != nil {
+				t.Fatalf("ABORT: the control database rejected %q (%v), so the comparison below cannot "+
+					"tell a host-choosing write from a broken statement", stmt, err)
+			}
+		}
+	}
+	return ctlConn, probeConn
 }
 
-// TestNoHandWrittenSQLWritesAHostChoosingColumn closes the third door.
-//
-// The two tests above are about the generated query layer. A handler holding
-// *sql.DB can write the column with a string, and neither of them would see it.
-func TestNoHandWrittenSQLWritesAHostChoosingColumn(t *testing.T) {
-	cols := hostChoosingColumns(t)
-	files := moduleGoFiles(t)
-	stmt := regexp.MustCompile(`(?is)(update\s+vault_entries\s+set|insert\s+into\s+vault_entries)`)
+// writesAHostChoosingColumn asks SQLite. It returns the engine's refusal, or "".
+func writesAHostChoosingColumn(control, probe *sql.DB, stmt string) string {
+	cs, err := control.Prepare(stmt)
+	if err != nil {
+		return "" // not a statement this schema can even parse; nothing to say
+	}
+	cs.Close()
+	ps, err := probe.Prepare(stmt)
+	if err == nil {
+		ps.Close()
+		return ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "generated column") {
+		return msg
+	}
+	return ""
+}
 
-	scanned := 0
-	for path, src := range files {
-		scanned++
-		for _, m := range stmt.FindAllStringIndex(src, -1) {
-			// Take a generous window after the statement head; a column name
-			// appearing there is enough to demand a look.
-			end := m[1] + 400
-			if end > len(src) {
-				end = len(src)
+// TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn is the
+// replacement for four regular expressions.
+func TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn(t *testing.T) {
+	cols := hostChoosingColumns(t)
+	control, probe := probeSchema(t, cols)
+
+	fset := token.NewFileSet()
+	var candidates []sqlCandidate
+	for path := range moduleGoFiles(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		candidates = append(candidates, constantStrings(fset, f, path)...)
+	}
+	if len(candidates) < 200 {
+		t.Fatalf("ABORT: only collected %d constant strings from the module; the AST walk is not "+
+			"reaching the source", len(candidates))
+	}
+
+	const egressPkg = "internal/vaultegress/internal/egressq"
+	found := map[string]int{}
+	for _, c := range candidates {
+		refusal := writesAHostChoosingColumn(control, probe, c.text)
+		if refusal == "" {
+			continue
+		}
+		if strings.Contains(c.pkgPath, egressPkg) {
+			found[c.file]++
+			continue
+		}
+		t.Errorf("%s:%d executes a statement that writes a host-choosing column of vault_entries.\n"+
+			"  SQLite says: %s\n"+
+			"  statement:   %s\n"+
+			"Move the query to internal/vaultegress/queries and call it through the ticket-taking "+
+			"wrapper in internal/vaultegress. Nothing may write destination_patterns, provider, "+
+			"provider_meta or rotation_targets without an egressgate.Ticket, and this check is what "+
+			"covers the paths the compiler cannot: a NEW query generated into internal/db, or a "+
+			"hand-written statement.\n"+
+			"Note what did NOT decide this: the text of the SQL. SQLite refused to prepare it.",
+			c.file, c.line, strings.TrimSpace(refusal), collapseWhitespace(c.text))
+	}
+
+	total := 0
+	for _, n := range found {
+		total += n
+	}
+	if total < 6 {
+		t.Fatalf("ABORT: only %d statements in %s were found to write a host-choosing column (%v). Six "+
+			"are known to (CreateVaultEntry, UpdateVaultEntryDestinationPatterns, "+
+			"UpdateVaultEntryProvider, UpdateVaultEntryProviderMeta, UpdateVaultEntryRotationTargets, "+
+			"SeedVaultEntryCapabilityDefaults), so either the generated package moved or this guard "+
+			"stopped recognising the statements it is supposed to allow, in which case it would also "+
+			"stop recognising the ones it is supposed to refuse", total, egressPkg, found)
+	}
+	t.Logf("SQLite reports %d host-choosing write statements, all inside %s", total, egressPkg)
+}
+
+func collapseWhitespace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// ── the compiler as the enforcement mechanism ───────────────────────────────
+
+// TestPlantedEgressBypassesDoNotCompile runs the real toolchain on real planted
+// bypasses and reads its refusals.
+//
+// The packages under testdata/ are invisible to ./... , so they never break the
+// build; this test names them explicitly. Each is a bypass somebody could
+// plausibly write, and each must FAIL to build. A test that greps for a pattern
+// can be spelled around. A method that does not exist cannot be called.
+func TestPlantedEgressBypassesDoNotCompile(t *testing.T) {
+	cases := []struct {
+		dir  string
+		want string
+		why  string
+	}{
+		{
+			dir:  "importtheinternalpackage",
+			want: "use of internal package",
+			why: "importing the generated queries directly. Go's own `internal` rule refuses it, which " +
+				"is why they were moved under internal/vaultegress/internal in the first place",
+		},
+		{
+			dir:  "callremovedmethod",
+			want: "UpdateVaultEntryRotationTargets",
+			why:  "the round-5 defect written out literally: queries.UpdateVaultEntryRotationTargets(...)",
+		},
+		{
+			dir:  "skiptheticket",
+			want: "not enough arguments",
+			why:  "calling the chokepoint wrapper without a Ticket. The Ticket is a parameter, so this is arity",
+		},
+		{
+			dir:  "forgeaticket",
+			want: "cannot refer to unexported field",
+			why: "building an egressgate.Ticket by hand. It has no exported fields, so a forged one " +
+				"cannot be spelled at all",
+		},
+		{
+			dir:  "namethegeneratedparams",
+			want: "use of internal package",
+			why:  "naming the generated parameter struct, to route around the wrapper's own params type",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.dir, func(t *testing.T) {
+			pkg := "./internal/handlers/testdata/egressbypass/" + tc.dir
+			cmd := exec.Command("go", "build", pkg)
+			cmd.Dir = filepath.Join("..", "..")
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("THE BYPASS COMPILES. %s\n%s built clean, so this is a thing the codebase can "+
+					"still express and the enforcement is not by construction.", tc.why, pkg)
 			}
-			window := strings.ToLower(src[m[0]:end])
-			for _, c := range cols {
-				if strings.Contains(window, c) {
-					t.Errorf("%s writes vault_entries.%s with hand-written SQL, going around both the "+
-						"generated query layer and the egress chokepoint. Add a query to "+
-						"internal/db/queries and route it through %s.",
-						path, c, egressChokepointFile)
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("%s failed to build, but not for the reason this is testing.\n"+
+					"  want the compiler to say: %s\n  it said:\n%s", pkg, tc.want, out)
+			}
+			t.Logf("%s (%s)\n%s", tc.dir, tc.why, strings.TrimSpace(string(out)))
+		})
+	}
+}
+
+// TestEveryExportedEgressWriteDemandsATicket closes the way to satisfy the
+// boundary without satisfying its point: add a function to internal/vaultegress
+// that performs the write and asks for nothing.
+//
+// It reads the package's real exported signatures out of the AST, so a wrapper
+// that merely mentions the word Ticket in a comment does not count.
+func TestEveryExportedEgressWriteDemandsATicket(t *testing.T) {
+	dir := filepath.Join("..", "vaultegress")
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", dir, err)
+	}
+	pkg, ok := pkgs["vaultegress"]
+	if !ok {
+		t.Fatalf("ABORT: package vaultegress not found under %s; it was renamed and this guard is "+
+			"checking nothing", dir)
+	}
+
+	checked, exempt := 0, 0
+	for path, f := range pkg.Files {
+		for _, decl := range f.Decls {
+			fn, isFn := decl.(*ast.FuncDecl)
+			if !isFn || fn.Recv != nil || !fn.Name.IsExported() {
+				continue
+			}
+			// A function that reaches the generated querier must demand a
+			// ticket. One that does not (HostChoosingColumns) is exempt, and it
+			// declares that by not calling the writer.
+			touchesWriter := false
+			ast.Inspect(fn, func(n ast.Node) bool {
+				if id, isID := n.(*ast.Ident); isID && id.Name == "writer" {
+					touchesWriter = true
+				}
+				return true
+			})
+			if !touchesWriter {
+				exempt++
+				continue
+			}
+			checked++
+			hasTicket := false
+			for _, p := range fn.Type.Params.List {
+				if sel, isSel := p.Type.(*ast.SelectorExpr); isSel && sel.Sel.Name == "Ticket" {
+					hasTicket = true
 				}
 			}
+			if !hasTicket {
+				t.Errorf("%s: exported func %s reaches the generated egress querier but takes no "+
+					"egressgate.Ticket.\nA wrapper that performs the write without a ticket is a "+
+					"chokepoint with no lock on it: every caller looks correctly routed and none of "+
+					"them is gated.", filepath.Base(path), fn.Name.Name)
+			}
 		}
 	}
-	if scanned < 30 {
-		t.Fatalf("ABORT: only scanned %d files", scanned)
+	if checked < 6 {
+		t.Fatalf("ABORT: only %d exported functions in internal/vaultegress reach the writer; six are "+
+			"known to (SetDestinationPatterns, SeedCapabilityDefaults, SetProvider, SetProviderMeta, "+
+			"SetRotationTargets, CreateEntry), so the file layout changed and this guard is checking "+
+			"almost nothing", checked)
 	}
+	t.Logf("checked %d exported egress writes, %d exported functions exempt", checked, exempt)
 }
 
-// TestTheChokepointHasADeriverForEveryHostChoosingColumn is the last of the four
-// and the one that keeps the gate honest rather than merely present.
+// TestTheChokepointHasADeriverForEveryHostChoosingColumn keeps the gate honest
+// rather than merely present.
 //
 // egressgate.Decide compares two destination sets. If the sets are computed
 // wrongly, the ticket is granted for a write that does move the secret, and
 // every structural check above still passes. So the derivers are named, and a
 // column classified host-choosing with no deriver behind it fails here.
 func TestTheChokepointHasADeriverForEveryHostChoosingColumn(t *testing.T) {
-	src := readPackageFile(t, egressChokepointFile)
-	// column -> the deriver that renders it as a destination set.
+	src := readPackageFile(t, "vault_egress_writes.go")
 	derivers := map[string]string{
 		"destination_patterns": "func ceilingDestinations(",
 		"provider":             "func providerDestinations(",
@@ -383,15 +648,15 @@ func TestTheChokepointHasADeriverForEveryHostChoosingColumn(t *testing.T) {
 	for _, col := range hostChoosingColumns(t) {
 		deriver, ok := derivers[col]
 		if !ok {
-			t.Errorf("vault_entries.%s is classified as choosing a host but %s has no named deriver for "+
-				"it.\nA wrapper cannot decide whether a write ADDS a destination without a function that "+
-				"turns that column's value into the set of places the secret can reach. Write one, add it "+
-				"here, and use it at the write site: without it the ticket is granted on an empty "+
-				"comparison and the gate is decorative.", col, egressChokepointFile)
+			t.Errorf("vault_entries.%s is classified as choosing a host but there is no named deriver "+
+				"for it.\nA wrapper cannot decide whether a write ADDS a destination without a function "+
+				"that turns that column's value into the set of places the secret can reach. Write one, "+
+				"add it here, and use it at the decision site: without it the ticket is granted on an "+
+				"empty comparison and the gate is decorative.", col)
 			continue
 		}
 		if !strings.Contains(src, deriver) {
-			t.Errorf("the deriver %q for vault_entries.%s is gone from %s", deriver, col, egressChokepointFile)
+			t.Errorf("the deriver %q for vault_entries.%s is gone", deriver, col)
 		}
 	}
 }

@@ -5,11 +5,11 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
-// THE ONLY FILE IN THIS PACKAGE THAT MAY WRITE A HOST-CHOOSING COLUMN.
+// HOW A HOST-CHOOSING WRITE IS DECIDED. THE WRITE ITSELF IS NOT IN THIS PACKAGE.
 //
 // Four columns of vault_entries can move where a decrypted secret goes:
 // destination_patterns, provider, provider_meta and rotation_targets. They are
@@ -29,32 +29,47 @@ import (
 // looks exactly like code with nothing to check. So the check moved to where a
 // write cannot happen without it.
 //
-// The rule this file enforces, mechanically:
+// ROUND 5 PUT THAT CHECK IN THIS FILE and held the rule up with a test that read
+// the source and matched it against regular expressions. A skeptic planted four
+// write paths through the gaps in those patterns. The sharpest was an ordinary
+// sqlc query with a table alias,
 //
-//	Every generated query that writes destination_patterns, provider,
-//	provider_meta or rotation_targets is called from THIS FILE and nowhere
-//	else, through a wrapper that demands an egressgate.Ticket naming the same
-//	entry and the same field.
+//	UPDATE vault_entries AS ve SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?
 //
-// A Ticket comes only from egressgate.Decide, which consults
-// mayDirectSecretEgress exactly when the write ADDS a destination. So a new
-// route, or a new column, is covered on the day it is written: it either goes
-// through a wrapper (and is gated) or it does not (and
-// TestEveryHostChoosingWriteGoesThroughTheChokepoint fails, naming the query it
-// called and the column that query writes).
+// against a pattern of `update\s+vault_entries\s+set`. Every plant built, vetted
+// clean and passed all four guards. Proving a property by recognising its
+// textual form always loses, and the answer is never a better pattern.
 //
-// The set of guarded queries is not a list kept here. It is derived by the guard
-// from the GENERATED SQL in internal/db, so a query added next year that writes
-// one of these columns is guarded the moment sqlc emits it.
+// SO THE WRITES ARE NOT IN THIS PACKAGE ANY MORE. They live in
+// internal/vaultegress, whose generated queries sit under
+// internal/vaultegress/internal/egressq, a path Go's own `internal` rule makes
+// unimportable from here. There is no method on *db.Queries to call and no
+// package to import, so the round-5 defect written out literally does not
+// compile:
+//
+//	h.queries.UpdateVaultEntryRotationTargets undefined
+//	(type *db.Queries has no field or method UpdateVaultEntryRotationTargets)
+//
+// What is left here is the half that genuinely belongs to the handlers: the
+// DERIVERS, which render a stored or proposed column value as the set of places
+// the secret could end up, and the DECISIONS, which consult the authority oracle
+// exactly when a write ADDS one of those places. egressgate.Decide turns the two
+// into a Ticket, and every function in internal/vaultegress refuses without one.
+//
+// A write helper living in some other file of this package is now harmless
+// rather than forbidden: it cannot perform the write without a Ticket either,
+// because nothing can.
 
-// The field names a Ticket is issued against. A Ticket for one of these cannot
-// be spent on another, so a handler that has permission to narrow a ceiling
-// cannot use that permission to write a delivery target.
+// The field names a Ticket is issued against, restated from internal/vaultegress
+// so the code that MINTS a ticket and the code that CHECKS it cannot drift onto
+// two spellings of one field. A Ticket for one of these cannot be spent on
+// another, so permission to narrow a ceiling cannot be used to write a delivery
+// target.
 const (
-	egressFieldDestinations   = "destination_patterns"
-	egressFieldProvider       = "provider+provider_meta"
-	egressFieldProviderMeta   = "provider_meta"
-	egressFieldRotationTarget = "rotation_targets"
+	egressFieldDestinations   = vaultegress.FieldDestinations
+	egressFieldProvider       = vaultegress.FieldProvider
+	egressFieldProviderMeta   = vaultegress.FieldProviderMeta
+	egressFieldRotationTarget = vaultegress.FieldRotationTargets
 )
 
 // ── the destination derivers ────────────────────────────────────────────────
@@ -161,85 +176,6 @@ func deliveryDestinationHosts(identities []string) []string {
 	return out
 }
 
-// ── the wrappers ────────────────────────────────────────────────────────────
-//
-// Each takes the querier (the pool, or a caller's qtx, because a helper called
-// between BeginTx and Commit must not reach for the pool) plus a Ticket. The
-// Ticket check is first in every one of them: a wrapper that performed the
-// write and then complained would have already moved the secret.
-
-// setEntryDestinationPatterns writes the capability ceiling.
-func setEntryDestinationPatterns(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.UpdateVaultEntryDestinationPatternsParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldDestinations); err != nil {
-		return err
-	}
-	return q.UpdateVaultEntryDestinationPatterns(ctx, p)
-}
-
-// seedEntryCapabilityDefaults writes the provider preset into the ceiling. It
-// is a ceiling write like any other: it turns "no agent access" into "one host",
-// and three presets expand a tenant value out of the entry's own provider_meta.
-func seedEntryCapabilityDefaults(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.SeedVaultEntryCapabilityDefaultsParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldDestinations); err != nil {
-		return err
-	}
-	return q.SeedVaultEntryCapabilityDefaults(ctx, p)
-}
-
-// setEntryProvider writes provider, provider_meta and auto_rotate together.
-func setEntryProvider(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.UpdateVaultEntryProviderParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldProvider); err != nil {
-		return err
-	}
-	return q.UpdateVaultEntryProvider(ctx, p)
-}
-
-// setEntryProviderMeta writes provider_meta alone. Two callers, both of them the
-// server recording its own work (the rotation write-back of a minted key id, and
-// the at-rest encryption backfill), and neither may change the reachable hosts.
-func setEntryProviderMeta(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.UpdateVaultEntryProviderMetaParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldProviderMeta); err != nil {
-		return err
-	}
-	return q.UpdateVaultEntryProviderMeta(ctx, p)
-}
-
-// setEntryRotationTargets writes the delivery targets. THE round-5 column.
-func setEntryRotationTargets(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.UpdateVaultEntryRotationTargetsParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldRotationTarget); err != nil {
-		return err
-	}
-	return q.UpdateVaultEntryRotationTargets(ctx, p)
-}
-
-// createEntryRow inserts a vault entry, which carries provider and
-// provider_meta on the INSERT.
-//
-// The authority is not in question here and the Ticket says so explicitly
-// rather than by omission: the row being created carries the caller's own
-// user_id, so they ARE the principal mayDirectSecretEgress would name. Making
-// this call a wrapper anyway is the point of a chokepoint. The alternative is
-// one query exempted "because it is obviously fine", which is how the next
-// reviewer discovers a second door.
-func createEntryRow(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
-	p db.CreateVaultEntryParams) error {
-
-	if err := tk.Authorizes(p.ID, egressFieldProvider); err != nil {
-		return err
-	}
-	return q.CreateVaultEntry(ctx, p)
-}
-
 // ── the decisions ───────────────────────────────────────────────────────────
 
 // decideDeliveryEgress answers whether userID may store `next` as this entry's
@@ -252,7 +188,16 @@ func createEntryRow(ctx context.Context, q *db.Queries, tk egressgate.Ticket,
 // rights on the same entry.
 //
 // See DEFERRED (i) for what this replaces and which four guards changed premise.
-func (h *VaultHandler) decideDeliveryEgress(ctx context.Context, userID string, isAdmin bool,
+//
+// THERE IS NO isAdmin PARAMETER, and that is the round-6 fix. Round 5 gave this
+// function one and passed middleware.IsAdmin into it, while targetStillAuthorized
+// asked the same oracle with isAdmin hardcoded false. An instance admin, the
+// principal the rule names in the same breath as the creator, could therefore
+// configure a target that was accepted, reported as saved, and then silently
+// never delivered. A parameter is a thing two call sites can pass differently;
+// mayConfigureDelivery answers the admin question itself, from the users row,
+// for both halves.
+func (h *VaultHandler) decideDeliveryEgress(ctx context.Context, userID string,
 	entryID string, stored, next []RotationTarget) (egressgate.Ticket, error) {
 
 	return egressgate.Decide(egressgate.Request{
@@ -261,7 +206,7 @@ func (h *VaultHandler) decideDeliveryEgress(ctx context.Context, userID string, 
 		Before:  deliveryDestinations(stored),
 		After:   deliveryDestinations(next),
 		MayRedirect: func() bool {
-			return h.mayDirectSecretEgress(ctx, userID, isAdmin, entryID)
+			return h.mayConfigureDelivery(ctx, userID, entryID)
 		},
 	})
 }

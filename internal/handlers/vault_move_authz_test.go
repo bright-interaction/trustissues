@@ -18,6 +18,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // newCollectionAuthzEnv boots a real SQLite database with the embedded
@@ -94,7 +95,7 @@ func mustEntry(t *testing.T, h *VaultHandler, queries *db.Queries, id, ownerID, 
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
-	if err := queries.CreateVaultEntry(context.Background(), db.CreateVaultEntryParams{
+	if err := createVaultEntryFixture(t, queries, vaultegress.CreateEntryParams{
 		ID:             id,
 		UserID:         ownerID,
 		Name:           name,
@@ -487,7 +488,7 @@ func TestManualRotateProviderFailureLeavesSecretIntact(t *testing.T) {
 
 	const entryID = "entry-provider"
 	mustEntry(t, h, queries, entryID, owner, "provider-key", "live-upstream-value")
-	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString(providerName),
 		ProviderMeta: toNullString("{}"),
 		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // PurgeTargetsConfiguredByUser detaches every rotation delivery target that the
@@ -81,7 +81,7 @@ func (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID 
 				"entry", row.ID, "error", tkErr)
 			continue
 		}
-		if uErr := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
+		if uErr := vaultegress.SetRotationTargets(ctx, h.queries, tk, vaultegress.RotationTargetsParams{
 			RotationTargets: toNullString(enc),
 			ID:              row.ID,
 		}); uErr != nil {

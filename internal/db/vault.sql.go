@@ -194,60 +194,6 @@ func (q *Queries) CountVaultEntriesV1(ctx context.Context) (int64, error) {
 	return count, err
 }
 
-const createVaultEntry = `-- name: CreateVaultEntry :exec
-
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
-`
-
-type CreateVaultEntryParams struct {
-	ID                   string         `json:"id"`
-	UserID               string         `json:"user_id"`
-	Name                 string         `json:"name"`
-	EncryptedValue       []byte         `json:"encrypted_value"`
-	Nonce                []byte         `json:"nonce"`
-	Url                  sql.NullString `json:"url"`
-	AliasUrl             sql.NullString `json:"alias_url"`
-	Username             sql.NullString `json:"username"`
-	Category             sql.NullString `json:"category"`
-	Notes                sql.NullString `json:"notes"`
-	AutoLogin            int64          `json:"auto_login"`
-	RotationIntervalDays sql.NullInt64  `json:"rotation_interval_days"`
-	ExpiresAt            sql.NullTime   `json:"expires_at"`
-	Provider             sql.NullString `json:"provider"`
-	ProviderMeta         sql.NullString `json:"provider_meta"`
-	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
-	UrlBidx              string         `json:"url_bidx"`
-	AliasUrlBidx         string         `json:"alias_url_bidx"`
-}
-
-// ============================================================================
-// Create entry
-// ============================================================================
-func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryParams) error {
-	_, err := q.db.ExecContext(ctx, createVaultEntry,
-		arg.ID,
-		arg.UserID,
-		arg.Name,
-		arg.EncryptedValue,
-		arg.Nonce,
-		arg.Url,
-		arg.AliasUrl,
-		arg.Username,
-		arg.Category,
-		arg.Notes,
-		arg.AutoLogin,
-		arg.RotationIntervalDays,
-		arg.ExpiresAt,
-		arg.Provider,
-		arg.ProviderMeta,
-		arg.AutoRotate,
-		arg.UrlBidx,
-		arg.AliasUrlBidx,
-	)
-	return err
-}
-
 const deletePersonalVaultEntriesForUser = `-- name: DeletePersonalVaultEntriesForUser :execresult
 DELETE FROM vault_entries WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '')
 `
@@ -339,6 +285,7 @@ func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetV
 }
 
 const getVaultEntryMeta = `-- name: GetVaultEntryMeta :one
+
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?
 `
@@ -365,6 +312,9 @@ type GetVaultEntryMetaRow struct {
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
+// ============================================================================
+// Create entry
+// ============================================================================
 func (q *Queries) GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error) {
 	row := q.db.QueryRowContext(ctx, getVaultEntryMeta, id)
 	var i GetVaultEntryMetaRow
@@ -823,6 +773,7 @@ func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]
 }
 
 const listVaultEntriesForMetaBackfill = `-- name: ListVaultEntriesForMetaBackfill :many
+
 SELECT id, provider, provider_meta, rotation_targets FROM vault_entries
 `
 
@@ -833,6 +784,9 @@ type ListVaultEntriesForMetaBackfillRow struct {
 	RotationTargets sql.NullString `json:"rotation_targets"`
 }
 
+// ============================================================================
+// Provider integration (API key rotation)
+// ============================================================================
 // provider is selected alongside the two columns being re-encrypted because the
 // egress write gate derives the entry's reachable host set from the
 // (provider, provider_meta) pair. A backfill must be able to show that its write
@@ -1429,24 +1383,6 @@ func (q *Queries) UpdateVaultEntryCustomFields(ctx context.Context, arg UpdateVa
 	return err
 }
 
-const updateVaultEntryDestinationPatterns = `-- name: UpdateVaultEntryDestinationPatterns :exec
-UPDATE vault_entries SET destination_patterns = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type UpdateVaultEntryDestinationPatternsParams struct {
-	DestinationPatterns string `json:"destination_patterns"`
-	ID                  string `json:"id"`
-}
-
-// The capability ceiling: which hosts/paths an agent token minted for this
-// secret may ever reach. Until this existed the column had exactly one writer
-// (the provider preset seed), so a secret created without a recognised provider
-// could never mint a capability token at all and the MCP feature was unusable.
-func (q *Queries) UpdateVaultEntryDestinationPatterns(ctx context.Context, arg UpdateVaultEntryDestinationPatternsParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryDestinationPatterns, arg.DestinationPatterns, arg.ID)
-	return err
-}
-
 const updateVaultEntryExpiresAt = `-- name: UpdateVaultEntryExpiresAt :exec
 UPDATE vault_entries SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
@@ -1524,45 +1460,6 @@ func (q *Queries) UpdateVaultEntryNotes(ctx context.Context, arg UpdateVaultEntr
 	return err
 }
 
-const updateVaultEntryProvider = `-- name: UpdateVaultEntryProvider :exec
-
-UPDATE vault_entries SET provider = ?, provider_meta = ?, auto_rotate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type UpdateVaultEntryProviderParams struct {
-	Provider     sql.NullString `json:"provider"`
-	ProviderMeta sql.NullString `json:"provider_meta"`
-	AutoRotate   sql.NullInt64  `json:"auto_rotate"`
-	ID           string         `json:"id"`
-}
-
-// ============================================================================
-// Provider integration (API key rotation)
-// ============================================================================
-func (q *Queries) UpdateVaultEntryProvider(ctx context.Context, arg UpdateVaultEntryProviderParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryProvider,
-		arg.Provider,
-		arg.ProviderMeta,
-		arg.AutoRotate,
-		arg.ID,
-	)
-	return err
-}
-
-const updateVaultEntryProviderMeta = `-- name: UpdateVaultEntryProviderMeta :exec
-UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type UpdateVaultEntryProviderMetaParams struct {
-	ProviderMeta sql.NullString `json:"provider_meta"`
-	ID           string         `json:"id"`
-}
-
-func (q *Queries) UpdateVaultEntryProviderMeta(ctx context.Context, arg UpdateVaultEntryProviderMetaParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryProviderMeta, arg.ProviderMeta, arg.ID)
-	return err
-}
-
 const updateVaultEntryRotationError = `-- name: UpdateVaultEntryRotationError :exec
 UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
@@ -1602,20 +1499,6 @@ type UpdateVaultEntryRotationLogParams struct {
 
 func (q *Queries) UpdateVaultEntryRotationLog(ctx context.Context, arg UpdateVaultEntryRotationLogParams) error {
 	_, err := q.db.ExecContext(ctx, updateVaultEntryRotationLog, arg.RotationLog, arg.ID)
-	return err
-}
-
-const updateVaultEntryRotationTargets = `-- name: UpdateVaultEntryRotationTargets :exec
-UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type UpdateVaultEntryRotationTargetsParams struct {
-	RotationTargets sql.NullString `json:"rotation_targets"`
-	ID              string         `json:"id"`
-}
-
-func (q *Queries) UpdateVaultEntryRotationTargets(ctx context.Context, arg UpdateVaultEntryRotationTargetsParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryRotationTargets, arg.RotationTargets, arg.ID)
 	return err
 }
 

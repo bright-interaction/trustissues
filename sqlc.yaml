@@ -10,3 +10,23 @@ sql:
         emit_json_tags: true
         emit_interface: true
         emit_empty_slices: true
+
+  # The host-choosing writes, generated into a package Go's `internal` rule puts
+  # out of reach of everything except internal/vaultegress.
+  #
+  # This is not tidiness, it is the enforcement point. While these queries were
+  # generated onto *db.Queries next to everything else, "call the write directly
+  # and skip the authority check" was a thing a handler could express, and five
+  # audit rounds found five different handlers expressing it. Generated here the
+  # method does not exist on any type a handler can name, so the same mistake is
+  # a compile error rather than a finding.
+  - engine: "sqlite"
+    queries: "internal/vaultegress/queries/"
+    schema: "internal/db/schema.sql"
+    gen:
+      go:
+        package: "egressq"
+        out: "internal/vaultegress/internal/egressq"
+        emit_json_tags: true
+        emit_interface: true
+        emit_empty_slices: true

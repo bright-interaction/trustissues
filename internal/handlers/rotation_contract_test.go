@@ -14,6 +14,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // Rotation behaviour matrix.
@@ -462,7 +463,7 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 	mustEntry(t, h, queries, entryID, owner, "Entry "+entryID, before)
 
 	if provider != "" {
-		if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+		if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 			Provider:     toNullString(provider),
 			ProviderMeta: toNullString("{}"),
 			AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},

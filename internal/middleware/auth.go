@@ -76,9 +76,22 @@ func GetSessionID(ctx context.Context) string {
 	return ""
 }
 
+// RoleAdmin is the instance-admin role, as it is stored in users.role and as it
+// is carried on a session.
+//
+// Exported and named because the same string is compared against a SESSION here
+// and against the users ROW in the vault authority checks, and those two answers
+// have to be the same rule. Spelling it twice is how they drift.
+const RoleAdmin = "admin"
+
 // IsAdmin returns true if the authenticated user has the admin role.
+//
+// This reads the SESSION claim. For any decision that is also made later with no
+// request in hand (delivering a rotated secret to a stored target, for instance)
+// use the users row instead, or the two answers can disagree about the same
+// identity.
 func IsAdmin(ctx context.Context) bool {
-	return GetUserRole(ctx) == "admin"
+	return GetUserRole(ctx) == RoleAdmin
 }
 
 // IsVaultOnly returns true if the authenticated user has the vault_only role.

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // vaultColumnEncPrefix marks a vault metadata column (provider_meta,
@@ -177,7 +177,7 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 			if tkErr != nil {
 				return updated, fmt.Errorf("egress decision for provider_meta on %s: %w", row.ID, tkErr)
 			}
-			if err := setEntryProviderMeta(ctx, h.queries, tk, db.UpdateVaultEntryProviderMetaParams{
+			if err := vaultegress.SetProviderMeta(ctx, h.queries, tk, vaultegress.ProviderMetaParams{
 				ProviderMeta: toNullString(enc),
 				ID:           row.ID,
 			}); err != nil {
@@ -200,7 +200,7 @@ func (h *VaultHandler) BackfillMetadataEncryption() (int, error) {
 			if tkErr != nil {
 				return updated, fmt.Errorf("egress decision for rotation_targets on %s: %w", row.ID, tkErr)
 			}
-			if err := setEntryRotationTargets(ctx, h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
+			if err := vaultegress.SetRotationTargets(ctx, h.queries, tk, vaultegress.RotationTargetsParams{
 				RotationTargets: toNullString(enc),
 				ID:              row.ID,
 			}); err != nil {

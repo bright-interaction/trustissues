@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestClearingTargetsRequiresIntent covers BOTH directions of the wipe guard,
@@ -44,7 +45,7 @@ func TestClearingTargetsRequiresIntent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encrypt: %v", err)
 		}
-		if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+		if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
 			RotationTargets: toNullString(enc), ID: entryID,
 		}); err != nil {
 			t.Fatalf("seed: %v", err)
@@ -127,7 +128,7 @@ func TestDamagedTargetsColumnIsNotOverwritten(t *testing.T) {
 	if _, decErr := h.decryptColumn(string(bad)); decErr == nil {
 		t.Fatal("ABORT: the corrupted column still decrypts; the test would be vacuous")
 	}
-	if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+	if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(string(bad)), ID: entryID,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)

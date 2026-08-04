@@ -172,10 +172,6 @@ type Querier interface {
 	// sessions so logout and inactivity kill a leaked token immediately.
 	CreateSession(ctx context.Context, arg CreateSessionParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
-	// ============================================================================
-	// Create entry
-	// ============================================================================
-	CreateVaultEntry(ctx context.Context, arg CreateVaultEntryParams) error
 	DeleteAPIKey(ctx context.Context, arg DeleteAPIKeyParams) (sql.Result, error)
 	DeleteAPIKeysByUser(ctx context.Context, userID string) error
 	DeleteCollection(ctx context.Context, id string) error
@@ -290,6 +286,9 @@ type Querier interface {
 	// a value of their choosing) purely by editing a shared entry. Machine
 	// identities resolve only secrets their creator holds privately.
 	GetVaultEntryForServiceFetch(ctx context.Context, arg GetVaultEntryForServiceFetchParams) (GetVaultEntryForServiceFetchRow, error)
+	// ============================================================================
+	// Create entry
+	// ============================================================================
 	GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error)
 	// ============================================================================
 	// Delete entry
@@ -404,6 +403,9 @@ type Querier interface {
 	// SCOPE (personal vs a specific collection), so recomputing it requires knowing
 	// which scope the row currently lives in.
 	ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error)
+	// ============================================================================
+	// Provider integration (API key rotation)
+	// ============================================================================
 	// provider is selected alongside the two columns being re-encrypted because the
 	// egress write gate derives the entry's reachable host set from the
 	// (provider, provider_meta) pair. A backfill must be able to show that its write
@@ -513,10 +515,6 @@ type Querier interface {
 	// is not lost by this statement. Comparing it makes the guard independent of clock
 	// granularity.
 	RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error)
-	// Seeds the capability-bridge columns from the provider defaults at
-	// enrollment time. Only fills untouched rows so explicit per-entry
-	// patterns are never overwritten.
-	SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error
 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (sql.Result, error)
 	// Disable that refuses to disable the last active admin. Same reasoning as
 	// UpdateUserRoleIfNotLastAdmin.
@@ -547,11 +545,6 @@ type Querier interface {
 	UpdateVaultEntryAutoLogin(ctx context.Context, arg UpdateVaultEntryAutoLoginParams) error
 	UpdateVaultEntryCategory(ctx context.Context, arg UpdateVaultEntryCategoryParams) error
 	UpdateVaultEntryCustomFields(ctx context.Context, arg UpdateVaultEntryCustomFieldsParams) error
-	// The capability ceiling: which hosts/paths an agent token minted for this
-	// secret may ever reach. Until this existed the column had exactly one writer
-	// (the provider preset seed), so a secret created without a recognised provider
-	// could never mint a capability token at all and the MCP feature was unusable.
-	UpdateVaultEntryDestinationPatterns(ctx context.Context, arg UpdateVaultEntryDestinationPatternsParams) error
 	UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVaultEntryExpiresAtParams) error
 	UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error
 	// ============================================================================
@@ -559,15 +552,9 @@ type Querier interface {
 	// ============================================================================
 	UpdateVaultEntryName(ctx context.Context, arg UpdateVaultEntryNameParams) error
 	UpdateVaultEntryNotes(ctx context.Context, arg UpdateVaultEntryNotesParams) error
-	// ============================================================================
-	// Provider integration (API key rotation)
-	// ============================================================================
-	UpdateVaultEntryProvider(ctx context.Context, arg UpdateVaultEntryProviderParams) error
-	UpdateVaultEntryProviderMeta(ctx context.Context, arg UpdateVaultEntryProviderMetaParams) error
 	UpdateVaultEntryRotationError(ctx context.Context, arg UpdateVaultEntryRotationErrorParams) error
 	UpdateVaultEntryRotationInterval(ctx context.Context, arg UpdateVaultEntryRotationIntervalParams) error
 	UpdateVaultEntryRotationLog(ctx context.Context, arg UpdateVaultEntryRotationLogParams) error
-	UpdateVaultEntryRotationTargets(ctx context.Context, arg UpdateVaultEntryRotationTargetsParams) error
 	UpdateVaultEntryURL(ctx context.Context, arg UpdateVaultEntryURLParams) error
 	UpdateVaultEntryUsername(ctx context.Context, arg UpdateVaultEntryUsernameParams) error
 	// ============================================================================

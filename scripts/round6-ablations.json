@@ -1,0 +1,138 @@
+[
+  {
+    "id": "delivery-half-hardcodes-not-admin",
+    "mech": "authority",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
+    "new": "\tif !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {",
+    "test": "TestDeliveryGateAgreesWithWriteGate",
+    "why": "THE ROUND-6 DEFECT ITSELF. The write gate lets an instance admin configure a delivery target and the delivery gate hardcodes isAdmin false, so the target is accepted, reported as saved, and silently never delivered"
+  },
+  {
+    "id": "delivery-half-hardcodes-not-admin-on-the-wire",
+    "mech": "authority",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
+    "new": "\tif !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {",
+    "test": "TestInstanceAdminDeliveryTargetIsAcceptedAndDelivered",
+    "why": "the same defect read off a real HTTP sink rather than off a predicate: the admin's consumer receives nothing across a real rotation"
+  },
+  {
+    "id": "write-half-trusts-the-session-role",
+    "mech": "authority",
+    "file": "internal/handlers/vault_grant.go",
+    "old": "func (h *VaultHandler) mayConfigureDelivery(ctx context.Context, userID, entryID string) bool {\n\treturn h.mayDirectSecretEgress(ctx, userID, h.instanceAdminByRecord(ctx, userID), entryID)\n}",
+    "new": "func (h *VaultHandler) mayConfigureDelivery(ctx context.Context, userID, entryID string) bool {\n\treturn h.mayDirectSecretEgress(ctx, userID, middleware.IsAdmin(ctx), entryID)\n}",
+    "test": "TestDemotedAdminStopsDeliveringAndCannotConfigure",
+    "why": "the same disagreement in the other direction: a session minted before a demotion still claims admin, so the write gate accepts a target the delivery gate will drop"
+  },
+  {
+    "id": "updatetargets-oracle-always-true",
+    "mech": "authority",
+    "file": "internal/handlers/vault_egress_writes.go",
+    "old": "\t\tMayRedirect: func() bool {\n\t\t\treturn h.mayConfigureDelivery(ctx, userID, entryID)\n\t\t},",
+    "new": "\t\tMayRedirect: func() bool {\n\t\t\t_ = h.mayConfigureDelivery(ctx, userID, entryID)\n\t\t\treturn true\n\t\t},",
+    "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
+    "why": "the round-5 defect itself: an accepted vault_only editor may again point a rotation webhook wherever it likes"
+  },
+  {
+    "id": "delivery-destinations-see-nothing",
+    "mech": "derivation",
+    "file": "internal/handlers/vault_egress_writes.go",
+    "old": "\tout := make([]string, 0, len(targets))\n\tfor _, t := range targets {\n\t\tif !targetTransmitsSecret(t) {\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, rotationTargetIdentity(t))\n\t}\n\treturn out\n}",
+    "new": "\tout := make([]string, 0, len(targets))\n\tfor range targets {\n\t\tcontinue\n\t}\n\treturn out\n}",
+    "test": "TestEditorCannotPointARotationWebhookAtAHostTheyChose",
+    "why": "the gate is only as good as the destination set it compares; a deriver that sees nothing makes every write a no-op addition and the oracle is never consulted"
+  },
+  {
+    "id": "wrapper-drops-the-ticket-check",
+    "mech": "chokepoint",
+    "file": "internal/vaultegress/writes.go",
+    "old": "\tif err := tk.Authorizes(p.ID, FieldRotationTargets); err != nil {\n\t\treturn err\n\t}",
+    "new": "\tif err := tk.Authorizes(p.ID, FieldRotationTargets); err != nil {\n\t\t_ = err\n\t}",
+    "test": "TestEveryWriteRefusesATicketThatDoesNotAuthorizeIt",
+    "why": "the compiler forces the Ticket ARGUMENT, not the decision. A wrapper that takes one and ignores it satisfies every structural check in the tree"
+  },
+  {
+    "id": "wrapper-writes-then-complains",
+    "mech": "chokepoint",
+    "file": "internal/vaultegress/writes.go",
+    "old": "\tif err := tk.Authorizes(p.ID, FieldRotationTargets); err != nil {\n\t\treturn err\n\t}\n\treturn writer(q).UpdateVaultEntryRotationTargets(ctx, egressq.UpdateVaultEntryRotationTargetsParams{\n\t\tRotationTargets: p.RotationTargets,\n\t\tID:              p.ID,\n\t})",
+    "new": "\tauthErr := tk.Authorizes(p.ID, FieldRotationTargets)\n\twriteErr := writer(q).UpdateVaultEntryRotationTargets(ctx, egressq.UpdateVaultEntryRotationTargetsParams{\n\t\tRotationTargets: p.RotationTargets,\n\t\tID:              p.ID,\n\t})\n\tif authErr != nil {\n\t\treturn authErr\n\t}\n\treturn writeErr",
+    "test": "TestEveryWriteRefusesATicketThatDoesNotAuthorizeIt",
+    "why": "a wrapper that performs the write and THEN refuses returns the right error and has already moved the secret; only reading the column back tells the two apart"
+  },
+  {
+    "id": "handwritten-alias-sql-in-a-handler",
+    "mech": "chokepoint",
+    "file": "internal/handlers/vault_target_purge.go",
+    "old": "func (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "new": "func (h *VaultHandler) plantedAliasWrite(ctx context.Context, entryID, targets string) error {\n\t_, err := h.db.ExecContext(ctx,\n\t\t`UPDATE vault_entries AS ve SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE ve.id = ?`,\n\t\ttargets, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "test": "TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn",
+    "why": "THE SHAPE THAT BEAT ROUND 5. `UPDATE vault_entries AS ve SET rotation_targets` is invisible to `update\\s+vault_entries\\s+set`; SQLite refuses to prepare it against a schema where the column is GENERATED, whatever it is spelled like"
+  },
+  {
+    "id": "handwritten-provider-meta-sql-in-another-package",
+    "mech": "chokepoint",
+    "file": "cmd/server/main.go",
+    "old": "func main() {",
+    "new": "func plantedProviderMetaWrite(ctx context.Context, conn interface {\n\tExecContext(context.Context, string, ...interface{}) (sqlResult, error)\n}, id, meta string) error {\n\t_, err := conn.ExecContext(ctx,\n\t\t\"UPDATE  vault_entries  SET  provider_meta  =  ?  WHERE  id  =  ?\",\n\t\tmeta, id)\n\treturn err\n}\n\ntype sqlResult interface{ RowsAffected() (int64, error) }\n\nfunc main() {",
+    "test": "TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn",
+    "why": "a second writer in a package the handlers guard never looked at, with doubled whitespace for good measure. The guard walks the whole module and the engine does not care about whitespace",
+    "pkg": "./internal/handlers/"
+  },
+  {
+    "id": "dynamic-sql-hides-the-statement",
+    "mech": "chokepoint",
+    "file": "internal/handlers/vault_target_purge.go",
+    "old": "func (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "new": "func (h *VaultHandler) plantedDynamicWrite(ctx context.Context, col, entryID, v string) error {\n\t_, err := h.db.ExecContext(ctx, fmt.Sprintf(\"UPDATE vault_entries SET %s = ? WHERE id = ?\", col), v, entryID)\n\treturn err\n}\n\nfunc (h *VaultHandler) purgeTargetsConfiguredBy(ctx context.Context, userID string) string {",
+    "test": "TestEverySQLStatementInTheModuleIsACompileTimeConstant",
+    "why": "the way to make a statement invisible to a guard that asks SQLite about statements: do not have one at compile time. Refusing the shape is what makes the prepare-based guard complete rather than merely broad"
+  },
+  {
+    "id": "field-marked-host-choosing-but-unenforced",
+    "mech": "classification",
+    "file": "internal/handlers/egress_field_coverage_test.go",
+    "old": "\t\"injection_spec\": {egressNeutral,",
+    "new": "\t\"injection_spec\": {egressChoosesHost,",
+    "test": "TestNoStatementOutsideTheEgressPackageWritesAHostChoosingColumn",
+    "why": "a column classified as choosing a host with nothing enforcing it. The two statements of the classification are cross-checked, so labelling without enforcing reds instead of reading as coverage"
+  },
+  {
+    "id": "delivery-falls-back-to-plain-write-access",
+    "mech": "authority",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
+    "new": "\tif _, canWrite := vault.entryAccessFor(ctx, target.ConfiguredBy, false, entryID); !canWrite {",
+    "test": "TestPlantedEditorTargetIsRefusedAtDeliveryToo",
+    "why": "a row already stored by an editor, or arriving through a restored backup, keeps delivering because the delivery gate asks the weaker question"
+  },
+  {
+    "id": "attribution-ignores-auth-token",
+    "mech": "attribution",
+    "file": "internal/handlers/vault_targets.go",
+    "old": "\treturn rotationTargetIdentity(t) + \"|auth=\" + t.AuthToken",
+    "new": "\treturn rotationTargetIdentity(t)",
+    "test": "TestUpdateTargetsStampsConfiguringUser",
+    "why": "the destination does not move when an editor swaps auth_token, so the egress gate has nothing to refuse and the editor chooses which of the OWNER's credentials is spent as the delivery bearer token"
+  },
+  {
+    "id": "provider-coverage-swallows-everything",
+    "mech": "derivation",
+    "file": "internal/handlers/vault_egress_writes.go",
+    "old": "\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {\n\t\treturn strings.HasSuffix(want, suffix) && len(want) > len(suffix)\n\t}\n\treturn false",
+    "new": "\tif suffix, ok := strings.CutPrefix(have, \"*\"); ok {\n\t\t_ = suffix\n\t\treturn true\n\t}\n\treturn false",
+    "test": "TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret",
+    "why": "a subsumption rule that says yes too often turns every widening into a no-op addition, and the oracle is never asked"
+  },
+  {
+    "id": "seed-preset-ignores-the-oracle",
+    "mech": "authority",
+    "file": "internal/handlers/vault.go",
+    "old": "\t\tCovers:      destinationCovers,\n\t\tMayRedirect: mayWiden,",
+    "new": "\t\tCovers:      destinationCovers,\n\t\tMayRedirect: func() bool { return true },",
+    "test": "TestEditorCannotWidenTheEgressCeilingOfAnyoneElsesSecret",
+    "why": "an editor re-saving an unchanged provider seeds the capability preset onto an entry whose owner deliberately left the ceiling empty"
+  }
+]

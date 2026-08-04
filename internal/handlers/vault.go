@@ -25,6 +25,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -1069,7 +1070,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	err = createEntryRow(ctx, h.queries, createTicket, db.CreateVaultEntryParams{
+	err = vaultegress.CreateEntry(ctx, h.queries, createTicket, vaultegress.CreateEntryParams{
 		ID:                   entryID,
 		UserID:               userID,
 		Name:                 req.Name,
@@ -1321,7 +1322,7 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries
 			"entry_id", entryID, "provider", provider, "reason", tkErr)
 		return
 	}
-	if err := seedEntryCapabilityDefaults(ctx, q, tk, db.SeedVaultEntryCapabilityDefaultsParams{
+	if err := vaultegress.SeedCapabilityDefaults(ctx, q, tk, vaultegress.CapabilityDefaultsParams{
 		DestinationPatterns: dests,
 		InjectionSpec:       inj,
 		ID:                  entryID,
@@ -1576,7 +1577,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		if err := setEntryDestinationPatterns(ctx, qtx, ceilingTicket, db.UpdateVaultEntryDestinationPatternsParams{
+		if err := vaultegress.SetDestinationPatterns(ctx, qtx, ceilingTicket, vaultegress.DestinationPatternsParams{
 			DestinationPatterns: string(encoded),
 			ID:                  id,
 		}); err != nil {
@@ -1990,7 +1991,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				}
 				encMeta = enc
 			}
-			if err := setEntryProvider(ctx, qtx, providerTicket, db.UpdateVaultEntryProviderParams{
+			if err := vaultegress.SetProvider(ctx, qtx, providerTicket, vaultegress.ProviderParams{
 				Provider:     toNullString(provider),
 				ProviderMeta: toNullString(encMeta),
 				AutoRotate:   sql.NullInt64{Int64: autoRotate, Valid: true},
@@ -3068,7 +3069,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// offboarded, and notify targets are still configured by editors); what
 	// changed is that attribution is no longer the ONLY thing standing between an
 	// editor and the plaintext. See DEFERRED (i).
-	tk, egErr := h.decideDeliveryEgress(r.Context(), userID, middleware.IsAdmin(r.Context()), id, stored, targets)
+	tk, egErr := h.decideDeliveryEgress(r.Context(), userID, id, stored, targets)
 	if egErr != nil {
 		var denied *egressgate.DeniedError
 		if errors.As(egErr, &denied) {
@@ -3095,7 +3096,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to update targets")
 		return
 	}
-	if err := setEntryRotationTargets(r.Context(), h.queries, tk, db.UpdateVaultEntryRotationTargetsParams{
+	if err := vaultegress.SetRotationTargets(r.Context(), h.queries, tk, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(encTargets),
 		ID:              id,
 	}); err != nil {
@@ -3173,7 +3174,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	if err := setEntryProvider(ctx, h.queries, scheduleTicket, db.UpdateVaultEntryProviderParams{
+	if err := vaultegress.SetProvider(ctx, h.queries, scheduleTicket, vaultegress.ProviderParams{
 		Provider:     current.Provider,
 		ProviderMeta: current.ProviderMeta,
 		AutoRotate:   sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},

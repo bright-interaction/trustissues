@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestOffboardedMemberStopsReceivingTheRotatedSecret locks the fix for the worst
@@ -165,7 +166,7 @@ func TestPurgeDropsOnlyTheDepartingMembersTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt targets: %v", err)
 	}
-	if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+	if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(enc), ID: entryID,
 	}); err != nil {
 		t.Fatalf("store targets: %v", err)
