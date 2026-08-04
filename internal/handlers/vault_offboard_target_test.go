@@ -89,7 +89,9 @@ func TestOffboardedMemberStopsReceivingTheRotatedSecret(t *testing.T) {
 	}
 
 	// THE ATTACK: rotate, which is the documented revocation step.
-	res := DeliverRotatedKey(ctx, queries, h, entryID, "Stripe live key", "old", "sk_live_ROTATED_NEW", targets, owner)
+	res := DeliverRotatedKey(ctx, queries, h, entryID, "Stripe live key",
+		h.MintedEntrySecret([]byte("old"), entryID, "Stripe live key"),
+		h.MintedEntrySecret([]byte("sk_live_ROTATED_NEW"), entryID, "Stripe live key"), targets, owner)
 
 	if len(received) != 0 {
 		t.Fatalf("OFFBOARDING FAILED: the removed editor's endpoint received the post-rotation secret: %v", received)
@@ -128,7 +130,9 @@ func TestUnattributedTargetIsRefused(t *testing.T) {
 	}))
 	defer sink.Close()
 
-	res := DeliverRotatedKey(ctx, queries, h, entryID, "Legacy", "old", "new",
+	res := DeliverRotatedKey(ctx, queries, h, entryID, "Legacy",
+		h.MintedEntrySecret([]byte("old"), entryID, "Legacy"),
+		h.MintedEntrySecret([]byte("new"), entryID, "Legacy"),
 		[]RotationTarget{{Type: "webhook", WebhookURL: sink.URL}}, owner)
 
 	if hit {

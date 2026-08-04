@@ -350,12 +350,12 @@ func TestRejectedRenameLeavesEverythingUntouched(t *testing.T) {
 		if e.ID != "atomic-a" {
 			continue
 		}
-		plain, dErr := h.DecryptValue(e.EncryptedValue, e.Nonce, 2)
+		plain, dErr := h.openForTest(e.EncryptedValue, e.Nonce)
 		if dErr != nil {
 			t.Fatalf("decrypt: %v", dErr)
 		}
-		if string(plain) != "ORIGINAL-TOKEN" {
-			t.Errorf("the rejected save replaced the secret value with %q", string(plain))
+		if !plain.EqualsString("ORIGINAL-TOKEN") {
+			t.Errorf("the rejected save replaced the secret value (len %d)", plain.Len())
 		}
 	}
 }

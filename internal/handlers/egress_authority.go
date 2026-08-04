@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // WHERE A DECRYPTED SECRET IS ALLOWED TO GO, STATED ONCE.
@@ -60,12 +62,22 @@ import (
 // not get a free pass, it gets a loud error and a red test.
 
 // ── the authority carried alongside a request ───────────────────────────────
-
-type egressAuthorityKeyType struct{}
-
-// egressAuthorityKey is the context key holding the egressAuthority for the
-// operation currently in flight.
-var egressAuthorityKey = egressAuthorityKeyType{}
+//
+// ROUND 7 CHANGED WHERE THIS COMES FROM, AND ONLY THAT.
+//
+// providerDo is unchanged in spirit: it is still the one door every outbound
+// provider and delivery request goes through, and it still refuses a host that
+// is not the one the operation declared. What changed is who installs the
+// declaration. There used to be three installers (withProviderEgress,
+// withDeliveryEgress, providerEgressContextFor) and any new call site could add
+// a fourth. Now there is exactly one, secretexit.Exit, and it is the same
+// function that hands over the bytes: a request carrying a secret has a receipt
+// because obtaining the secret is what created it.
+//
+// That closes the residual an argument-shaped gate always leaves. Claim a host
+// the owner did not authorise and Exit refuses; claim one they did and then send
+// somewhere else and providerDo refuses, because the receipt says where the
+// exit was authorised FOR.
 
 type egressRecorderKeyType struct{}
 
@@ -83,132 +95,70 @@ type egressAttempt struct {
 	reason  string
 }
 
-// egressAuthority is the answer to "where may the secret this operation holds
-// be sent?", resolved once by the caller that decrypted it and carried to the
-// point the request actually leaves.
-type egressAuthority struct {
-	// what names the operation for the refusal message ("provider datadog",
-	// "rotation delivery target").
-	what string
-	// allow is the host set. Empty means this operation may not egress at all,
-	// which is the correct answer for a local generator such as shared-secret.
-	allow egressAllowance
-}
+// egressAllowance is a host set. It is now secretexit.HostSet, so the set the
+// exit authorised and the set the chokepoint enforces are literally the same
+// type and cannot drift in their spelling rules.
+type egressAllowance = secretexit.HostSet
 
-// egressAllowance is a host set. Exact hosts are the normal case; suffixes
-// exist for the one vendor that hands back its own storage host at runtime and
-// are spelled out at each use.
-type egressAllowance struct {
-	hosts    []string
-	suffixes []string
-}
-
-func (a egressAllowance) empty() bool { return len(a.hosts) == 0 && len(a.suffixes) == 0 }
-
-// allows reports whether host is inside the allowance. Normalization matches
-// providerAPIHost exactly (lowercase, explicit port stripped) so a spelling the
-// inference allowlist would accept cannot be refused here and vice versa.
-func (a egressAllowance) allows(host string) bool {
-	h := providerAPIHost(host)
-	if h == "" {
-		return false
-	}
-	for _, want := range a.hosts {
-		if h == providerAPIHost(want) {
-			return true
-		}
-	}
-	for _, suffix := range a.suffixes {
-		s := strings.ToLower(suffix)
-		if strings.HasSuffix(h, s) && len(h) > len(s) {
-			return true
-		}
-	}
-	return false
-}
-
-// describe renders the allowance for an error message.
-func (a egressAllowance) describe() string {
-	parts := append([]string{}, a.hosts...)
-	for _, s := range a.suffixes {
-		parts = append(parts, "*"+s)
-	}
-	if len(parts) == 0 {
-		return "nowhere (this operation is not allowed to make outbound requests)"
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ", ")
-}
-
-// withProviderEgress installs the authority for spending a vault secret through
-// its configured provider. Call it wherever a stored (provider, provider_meta)
-// pair is about to be handed to a KeyProvider.
-func withProviderEgress(ctx context.Context, provider string, meta map[string]string) context.Context {
-	return context.WithValue(ctx, egressAuthorityKey, egressAuthority{
-		what:  "provider " + provider,
-		allow: declaredProviderEgress(provider, meta),
-	})
-}
-
-// providerEgressContextFor is what the three paths that SPEND a stored provider
+// spendProviderSecret is what the three paths that SPEND a stored provider
 // configuration call: POST /api/vault/{id}/validate, POST /api/vault/{id}/rotate
 // and the scheduled sweep.
 //
-// It does two things the plain withProviderEgress does not, and both matter for
-// a row this process did not write:
+// It is the round-7 replacement for providerEgressContextFor plus
+// withProviderEgress. Those installed an authority ALONGSIDE a plaintext the
+// caller had already obtained; this one obtains the plaintext THROUGH the exit,
+// so there is no arrangement of the code in which the value is in hand and the
+// authority is not.
 //
-//   - it refuses when the entry is PINNED (an admin wired it into the AI gateway
-//     via the AdminOnly ai_key_* setting) and the stored provider configuration
-//     resolves anywhere other than that provider's own host. The write gate can
-//     only guard writes it sees; this also refuses a row from an older binary, a
-//     restored backup, or an import. That is the load-bearing half, because the
-//     declared allowance for a meta-derived provider is computed FROM the same
-//     meta and therefore cannot, by itself, tell a forged row from a real one.
+// It keeps the two things the old function did, and both still matter for a row
+// this process did not write:
+//
+//   - the PIN. An entry an admin wired into the AI gateway (an AdminOnly ai_key_*
+//     setting) is only ever delivered to that provider's own host, so a stored
+//     provider configuration resolving anywhere else is refused. That is the
+//     load-bearing half, because the declared allowance for a meta-derived
+//     provider is computed FROM the same meta and cannot, by itself, tell a
+//     forged row from a real one.
 //   - it fails closed on a read error rather than treating "cannot tell" as
-//     "allowed", which is how a guard stops guarding without anybody noticing.
-func providerEgressContextFor(ctx context.Context, q settingReader, entryID, provider string,
-	meta map[string]string) (context.Context, error) {
+//     "allowed".
+func spendProviderSecret(ctx context.Context, q settingReader, pt secretexit.Plaintext,
+	entryID, provider string, meta map[string]string) (context.Context, string, error) {
 
 	allow := declaredProviderEgress(provider, meta)
 	pin, err := providerPinFor(ctx, q, entryID)
 	if err != nil {
-		return ctx, fmt.Errorf("the entry's AI provider binding could not be read, so its secret "+
+		return ctx, "", fmt.Errorf("the entry's AI provider binding could not be read, so its secret "+
 			"was not sent anywhere: %w", err)
 	}
 	if pin.pinned() {
-		for _, h := range allow.hosts {
+		for _, h := range allow.Hosts {
 			if !pin.allowsHost(h) {
-				return ctx, fmt.Errorf("this secret is the instance's AI provider key and is only ever "+
+				return ctx, "", fmt.Errorf("this secret is the instance's AI provider key and is only ever "+
 					"delivered to %s, but its provider configuration resolves to %q. Unwire it in "+
 					"Settings > AI gateway before using it as a general-purpose secret", pin.describe(), h)
 			}
 		}
-		if len(allow.suffixes) > 0 {
-			return ctx, fmt.Errorf("this secret is the instance's AI provider key and is only ever "+
+		if len(allow.Suffixes) > 0 {
+			return ctx, "", fmt.Errorf("this secret is the instance's AI provider key and is only ever "+
 				"delivered to %s; a provider whose host is chosen by the upstream cannot be used for it",
 				pin.describe())
 		}
 	}
-	return context.WithValue(ctx, egressAuthorityKey, egressAuthority{
-		what:  "provider " + provider,
-		allow: allow,
-	}), nil
-}
-
-// withDeliveryEgress installs the authority for delivering a rotated secret to
-// one operator-configured rotation target.
-//
-// The allowance is the target's own host, which sounds circular and is not: the
-// point is that the chokepoint has NO default. A future delivery type that
-// builds its host from somewhere other than the target row it was authorized
-// against is refused rather than silently trusted, which is precisely how
-// provider_meta got in.
-func withDeliveryEgress(ctx context.Context, rawURL, what string) context.Context {
-	var allow egressAllowance
-	if u, err := url.Parse(strings.TrimSpace(rawURL)); err == nil && u.Hostname() != "" {
-		allow.hosts = []string{u.Hostname()}
+	// A provider that DECLARES NO HOSTS makes no outbound request: the local
+	// generators (shared-secret, generated-key-32), manual, and aws (whose SDK is
+	// not vendored). They still need the value, so it is released with an
+	// IN-PROCESS destination, which mints no receipt. If one of them ever builds
+	// a request, CheckHost refuses it for having no receipt at all, so the
+	// failure is loud on the day it is written rather than an inherited pass.
+	if allow.Empty() {
+		return secretexit.ExitString(ctx, pt, secretexit.ToNowhere("provider "+provider+
+			" (declares no hosts, so it may not egress)"))
 	}
-	return context.WithValue(ctx, egressAuthorityKey, egressAuthority{what: what, allow: allow})
+	// The destination is read off the SECRET'S OWN entry row (its provider and
+	// provider_meta columns), so the authority re-derives what that entry
+	// currently records and requires the host to be inside it.
+	return secretexit.ExitString(ctx, pt, secretexit.ToHosts("provider "+provider,
+		secretexit.ChosenByTheEntrysOwnRecord(), allow))
 }
 
 // withEgressRecorder attaches an observation hook. Tests only; see
@@ -221,27 +171,16 @@ func withEgressRecorder(ctx context.Context, rec *[]egressAttempt) context.Conte
 // through. It is the derivation gate described at the top of this file.
 //
 // It deliberately takes no allowance argument. An argument is something a call
-// site can get wrong quietly; a context value installed by whoever decrypted
-// the secret is something a call site can only get wrong LOUDLY, because
-// forgetting it refuses the request.
+// site can get wrong quietly; a receipt minted by secretexit.Exit, in the same
+// call that handed over the bytes, is something a call site can only get wrong
+// LOUDLY, because a request built without one is refused.
 func providerDo(req *http.Request) (*http.Response, error) {
-	auth, ok := req.Context().Value(egressAuthorityKey).(egressAuthority)
 	host := ""
 	if req.URL != nil {
 		host = req.URL.Hostname()
 	}
 
-	var err error
-	switch {
-	case !ok:
-		err = fmt.Errorf("egress refused: an outbound request to %q was built with no egress authority in "+
-			"its context. Whoever resolves the secret must call withProviderEgress or withDeliveryEgress "+
-			"first; see egress_authority.go", host)
-	case !auth.allow.allows(host):
-		err = fmt.Errorf("egress refused: %s may only reach %s, and %q is not that. If this host is "+
-			"legitimate, declare it in providerEgress (egress_authority.go) so the write gate can also "+
-			"require the right authority to choose it", auth.what, auth.allow.describe(), host)
-	}
+	err := secretexit.CheckHost(req.Context(), host)
 
 	if rec, hasRec := req.Context().Value(egressRecorderKey).(*[]egressAttempt); hasRec && rec != nil {
 		reason := ""
@@ -420,12 +359,12 @@ func declaredProviderEgress(provider string, meta map[string]string) egressAllow
 		for _, h := range decl.hosts(meta) {
 			h = providerAPIHost(h)
 			if h != "" {
-				allow.hosts = append(allow.hosts, h)
+				allow.Hosts = append(allow.Hosts, h)
 			}
 		}
 	}
-	allow.suffixes = append(allow.suffixes, decl.suffixes...)
-	sort.Strings(allow.hosts)
+	allow.Suffixes = append(allow.Suffixes, decl.suffixes...)
+	sort.Strings(allow.Hosts)
 	return allow
 }
 
@@ -465,8 +404,8 @@ func authorityForEgressChange(beforeProvider string, beforeMeta map[string]strin
 	before := declaredProviderEgress(beforeProvider, beforeMeta)
 	after := declaredProviderEgress(afterProvider, afterMeta)
 
-	have := make(map[string]bool, len(before.hosts))
-	for _, h := range before.hosts {
+	have := make(map[string]bool, len(before.Hosts))
+	for _, h := range before.Hosts {
 		have[h] = true
 	}
 	// A suffix allowance carried forward covers its own hosts. Only backblaze
@@ -477,7 +416,7 @@ func authorityForEgressChange(beforeProvider string, beforeMeta map[string]strin
 		if have[h] {
 			return true
 		}
-		for _, s := range before.suffixes {
+		for _, s := range before.Suffixes {
 			if strings.HasSuffix(h, strings.ToLower(s)) && len(h) > len(s) {
 				return true
 			}
@@ -486,8 +425,8 @@ func authorityForEgressChange(beforeProvider string, beforeMeta map[string]strin
 	}
 
 	var change egressChange
-	change.after = append(change.after, after.hosts...)
-	for _, h := range after.hosts {
+	change.after = append(change.after, after.Hosts...)
+	for _, h := range after.Hosts {
 		if !covered(h) {
 			change.added = append(change.added, h)
 		}

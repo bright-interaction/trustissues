@@ -60,7 +60,7 @@ func TestManualRotateRefusesReminderOnlyProviders(t *testing.T) {
 	}
 	// Guard the setup: the stored value must actually be the real token, or the
 	// "unchanged" assertion below is meaningless.
-	if plain, decErr := h.decrypt(before.EncryptedValue, before.Nonce); decErr != nil || string(plain) != realToken {
+	if plain, decErr := h.openForTest(before.EncryptedValue, before.Nonce); decErr != nil || !plain.EqualsString(realToken) {
 		t.Fatalf("ABORT: stored value is not the expected token (err %v)", decErr)
 	}
 
@@ -88,8 +88,8 @@ func TestManualRotateRefusesReminderOnlyProviders(t *testing.T) {
 	if !bytes.Equal(before.EncryptedValue, after.EncryptedValue) || !bytes.Equal(before.Nonce, after.Nonce) {
 		t.Fatal("the refused rotation still rewrote the stored value: the real credential is gone")
 	}
-	plain, decErr := h.decrypt(after.EncryptedValue, after.Nonce)
-	if decErr != nil || string(plain) != realToken {
+	plain, decErr := h.openForTest(after.EncryptedValue, after.Nonce)
+	if decErr != nil || !plain.EqualsString(realToken) {
 		t.Fatalf("the real token no longer decrypts after a refused rotation (err %v)", decErr)
 	}
 }

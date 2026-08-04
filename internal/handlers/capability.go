@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/capability"
 	dbpkg "github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // CapabilityHandler exposes the trustissues secrets bridge:
@@ -36,7 +37,7 @@ import (
 // internal/database/migrations/00020_capability.sql for the schema.
 type CapabilityHandler struct {
 	db    *sql.DB
-	vault alerts.ConfigDecrypter
+	vault entrySecretSource
 	// settings reads the ai_key_* rows that PIN an entry to one provider host.
 	// See secret_egress.go: the pin is what stops an editor who can rewrite
 	// destination_patterns from choosing where the operator's key is delivered.
@@ -56,7 +57,7 @@ func (h *CapabilityHandler) SetHTTPClient(c *http.Client) { h.httpClient = c }
 // handler, which satisfies alerts.ConfigDecrypter) and a fresh signing
 // key derived from the same source the vault uses (cfg.VaultKey), but
 // via a separate HKDF context so a leak of one does not yield the other.
-func NewCapabilityHandler(db *sql.DB, vault alerts.ConfigDecrypter, signingKeySource string) (*CapabilityHandler, error) {
+func NewCapabilityHandler(db *sql.DB, vault entrySecretSource, signingKeySource string) (*CapabilityHandler, error) {
 	key, err := capability.DeriveSigningKey(signingKeySource)
 	if err != nil {
 		return nil, fmt.Errorf("capability: derive signing key: %w", err)
@@ -514,18 +515,33 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Decrypt the secret + look up injection spec.
-	value, spec, err := h.resolveSecret(ctx, tok.SecretID)
+	pt, spec, err := h.resolveSecret(ctx, tok.SecretID, tok.Secret)
 	if err != nil {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "resolve_failed: "+err.Error(), tok.Nonce)
 		writeInternalError(w, r, "secret resolve failed")
 		return
 	}
-	defer func() {
-		// Wipe the plaintext from memory once forwarding is done.
-		for i := range value {
-			value[i] = 0
-		}
-	}()
+	// Wipe the plaintext from memory once forwarding is done.
+	defer pt.Wipe()
+
+	// THE ONE EXIT. Everything above this line is the bridge's own machinery:
+	// the token, the nonce, the method, the CURRENT allow-list, the pin, the
+	// inference routes. All of it reads columns a caller with manage can write,
+	// which is exactly how rounds 2 and 3 got in. This asks the other question,
+	// once: did the OWNER of this entry authorise this host?
+	//
+	// The chooser is the entry's own record, because destination_patterns IS the
+	// ceiling this route enforces, and the authority re-derives it here rather
+	// than trusting that the write gate saw every row.
+	exitCtx, value, exitErr := secretexit.Exit(ctx, pt,
+		secretexit.ToHost("this capability token", secretexit.ChosenByTheEntrysOwnRecord(), host))
+	if exitErr != nil {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
+			r.Method, "denied", 0, "egress_refused", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_not_authorized", exitErr.Error())
+		return
+	}
+	ctx = exitCtx
 
 	// Build upstream request. Body is bounded by maxBodySize; we copy
 	// to a buffer so the upstream can be retried (not implemented yet,
@@ -553,6 +569,15 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The receipt question, same as providerDo asks and same as the AI gateway
+	// asks. The bridge has its own client, so it asks it itself rather than
+	// growing a fourth answer.
+	if cErr := secretexit.CheckHost(upstreamReq.Context(), upstreamReq.URL.Hostname()); cErr != nil {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"denied", 0, "egress_refused_at_send", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_not_authorized", cErr.Error())
+		return
+	}
 	resp, err := h.httpClient.Do(upstreamReq)
 	if err != nil {
 		// NEVER return or persist the raw client error. It is a *url.Error
@@ -1007,7 +1032,7 @@ func hostIsWildcarded(pat string) bool {
 	return strings.Contains(host, "*")
 }
 
-func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID string) ([]byte, InjectionSpec, error) {
+func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID, secretName string) (secretexit.Plaintext, InjectionSpec, error) {
 	row := h.db.QueryRowContext(ctx,
 		`SELECT encrypted_value, nonce, encryption_version, injection_spec FROM vault_entries WHERE id = ?`,
 		secretID)
@@ -1015,11 +1040,12 @@ func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID string) 
 	var encVer sql.NullInt64
 	var injectionRaw string
 	if err := row.Scan(&ct, &nonce, &encVer, &injectionRaw); err != nil {
-		return nil, InjectionSpec{}, err
+		return secretexit.Plaintext{}, InjectionSpec{}, err
 	}
-	plain, err := h.vault.DecryptValue(ct, nonce, int(encVer.Int64))
+	plain, err := h.vault.OpenEntrySecret(ct, nonce, int(encVer.Int64),
+		secretexit.Origin{EntryID: secretID, Name: secretName})
 	if err != nil {
-		return nil, InjectionSpec{}, err
+		return secretexit.Plaintext{}, InjectionSpec{}, err
 	}
 	return plain, parseInjectionSpec(injectionRaw), nil
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
@@ -241,9 +242,9 @@ func TestEditorCannotRedirectTheGatewayKeyThroughTheProviderConfiguration(t *tes
 		})
 		p, m := storedProvider(t, queries, entryID)
 		after := declaredProviderEgress(p, ParseProviderMeta(h.decryptColumnOrLog(m, "{}", "provider_meta")))
-		if after.describe() != before.describe() {
+		if after.Describe() != before.Describe() {
 			t.Fatalf("the reachable host set moved from %s to %s on a write by an editor",
-				before.describe(), after.describe())
+				before.Describe(), after.Describe())
 		}
 	})
 
@@ -537,7 +538,10 @@ func TestProviderDoFailsClosed(t *testing.T) {
 	})
 
 	t.Run("a provider with no declaration reaches nothing", func(t *testing.T) {
-		ctx := withProviderEgress(context.Background(), "a-provider-nobody-declared", map[string]string{})
+		// An exit that authorised an EMPTY host set never happens: Exit refuses a
+		// network destination with no host. So the only way to hold a receipt for
+		// an undeclared provider is not to hold one, and the request is refused.
+		ctx := exitReceiptForTest(t, "a-provider-nobody-declared", declaredProviderEgress("a-provider-nobody-declared", nil))
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/x", nil)
 		resp, err := providerDo(req)
 		if err == nil {
@@ -575,7 +579,8 @@ func (*settingsReadError) Error() string { return "settings table unreadable" }
 // "cannot tell" must not resolve to "allowed". Inverting that branch left every
 // test in this package green, which is the definition of an unguarded property.
 func TestProviderEgressRefusesWhenThePinCannotBeRead(t *testing.T) {
-	_, err := providerEgressContextFor(context.Background(), failingSettingReader{},
+	_, _, err := spendProviderSecret(context.Background(), failingSettingReader{},
+		secretexit.Minted([]byte("k"), secretexit.Origin{EntryID: "some-entry", Name: "x"}, allowAllExitAuthority{}),
 		"some-entry", "openai", map[string]string{})
 	if err == nil {
 		t.Fatal("a failed settings read resolved to 'not pinned', so a transient database error " +
@@ -596,8 +601,8 @@ func TestProviderEgressRefusesWhenThePinCannotBeRead(t *testing.T) {
 // same shape as the "*.supabase.co" preset this codebase already removed once.
 func TestEgressAllowanceRefusesNearMisses(t *testing.T) {
 	allow := egressAllowance{
-		hosts:    []string{"api.openai.com"},
-		suffixes: []string{".backblazeb2.com"},
+		Hosts:    []string{"api.openai.com"},
+		Suffixes: []string{".backblazeb2.com"},
 	}
 	for _, tc := range []struct {
 		host string
@@ -620,18 +625,18 @@ func TestEgressAllowanceRefusesNearMisses(t *testing.T) {
 		{"bacon.example", false, "shares only the first letters of the suffix"},
 		{"", false, "an empty host is not a match for anything"},
 	} {
-		if got := allow.allows(tc.host); got != tc.want {
+		if got := allow.Allows(tc.host); got != tc.want {
 			t.Errorf("allows(%q) = %v, want %v (%s)", tc.host, got, tc.want, tc.why)
 		}
 	}
 
 	// An EMPTY allowance permits nothing. This is the load-bearing default:
 	// declaredProviderEgress returns one for a provider with no declaration, and
-	// the zero-value egressAuthority carries one, so "we never said where this
-	// may go" has to mean "nowhere".
+	// secretexit.Exit refuses a network destination that resolves to one, so "we
+	// never said where this may go" has to mean "nowhere".
 	var empty egressAllowance
 	for _, h := range []string{"api.openai.com", "attacker-controlled.example", "localhost"} {
-		if empty.allows(h) {
+		if empty.Allows(h) {
 			t.Errorf("an empty allowance permitted %q. Empty must mean nowhere, or every provider "+
 				"and every call site that was never declared egresses freely", h)
 		}

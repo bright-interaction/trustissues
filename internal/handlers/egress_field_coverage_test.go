@@ -461,7 +461,7 @@ func adversarialMeta(provider string, allKeys []string) map[string]string {
 				probe[pk] = pv
 			}
 			probe[k] = candidate
-			if !declaredProviderEgress(provider, probe).empty() {
+			if !declaredProviderEgress(provider, probe).Empty() {
 				meta[k] = candidate
 				break
 			}
@@ -560,10 +560,10 @@ func TestProviderRequestsStayInsideTheirDeclaredHosts(t *testing.T) {
 				status = code
 				for _, op := range ops {
 					meta := adversarialMeta(name, allKeys)
-					declaredBefore := declaredProviderEgress(name, meta).describe()
+					declaredBefore := declaredProviderEgress(name, meta).Describe()
 					// Exactly what production installs: the authority declared for
 					// this provider, resolved against the same meta the adapter reads.
-					ctx := withEgressRecorder(withProviderEgress(context.Background(), name, meta), &attempts)
+					ctx := withEgressRecorder(providerExitCtx(name, meta), &attempts)
 					before := len(attempts)
 					op.run(ctx, meta)
 
@@ -574,7 +574,7 @@ func TestProviderRequestsStayInsideTheirDeclaredHosts(t *testing.T) {
 					// host-influencing key would move the entry's destination with
 					// nobody's permission, from inside the rotation it was asked to
 					// perform.
-					if got := declaredProviderEgress(name, meta).describe(); got != declaredBefore {
+					if got := declaredProviderEgress(name, meta).Describe(); got != declaredBefore {
 						t.Errorf("%s.%s (upstream %d) changed its own entry's reachable hosts by "+
 							"writing back into provider_meta: %s -> %s.\n"+
 							"revokeOldKeyAndPersistMeta persists that map unconditionally, so this "+
@@ -596,7 +596,7 @@ func TestProviderRequestsStayInsideTheirDeclaredHosts(t *testing.T) {
 							"write gate compares declared host sets and cannot see a key it does not "+
 							"know about.",
 							name, op.what, a.host, name,
-							declaredProviderEgress(name, meta).describe(), a.reason, name)
+							declaredProviderEgress(name, meta).Describe(), a.reason, name)
 					}
 				}
 			}

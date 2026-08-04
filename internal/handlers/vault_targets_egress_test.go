@@ -254,7 +254,9 @@ func TestPlantedEditorTargetIsRefusedAtDeliveryToo(t *testing.T) {
 			"widening right")
 	}
 
-	results := DeliverRotatedKey(ctx, queries, h, entryID, "team-grafana-x", "old", "sk_live_ROTATED_NEW",
+	results := DeliverRotatedKey(ctx, queries, h, entryID, "team-grafana-x",
+		h.MintedEntrySecret([]byte("old"), entryID, "team-grafana-x"),
+		h.MintedEntrySecret([]byte("sk_live_ROTATED_NEW"), entryID, "team-grafana-x"),
 		ParseRotationTargets(h.decryptColumnOrLog(enc, "[]", "rotation_targets")), operator)
 
 	if hosts, bodies := collector.got(); len(hosts) != 0 {

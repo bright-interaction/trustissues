@@ -122,7 +122,7 @@ func TestUpdateRefusesToOverwriteAnUndecryptableSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read before: %v", err)
 	}
-	if _, decErr := h.decrypt(beforeRow.EncryptedValue, beforeRow.Nonce); decErr == nil {
+	if _, decErr := h.openForTest(beforeRow.EncryptedValue, beforeRow.Nonce); decErr == nil {
 		t.Fatal("ABORT: the entry still decrypts, so this test is not exercising the guard")
 	}
 

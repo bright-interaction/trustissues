@@ -24,9 +24,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // ServiceSecretsHandler exposes these endpoints:
@@ -38,12 +38,13 @@ import (
 //   - GET  /api/service-identities/{id}/audit     (admin only, fetch history)
 type ServiceSecretsHandler struct {
 	queries *db.Queries
-	vault   alerts.ConfigDecrypter
+	vault   entrySecretSource
 }
 
-// NewServiceSecretsHandler constructs the handler. vault is the vault
-// handler (it satisfies alerts.ConfigDecrypter).
-func NewServiceSecretsHandler(queries *db.Queries, vault alerts.ConfigDecrypter) *ServiceSecretsHandler {
+// NewServiceSecretsHandler constructs the handler. vault is the vault handler:
+// the source of OPAQUE entry secrets, not the instance-config decrypter this
+// used to take.
+func NewServiceSecretsHandler(queries *db.Queries, vault entrySecretSource) *ServiceSecretsHandler {
 	return &ServiceSecretsHandler{queries: queries, vault: vault}
 }
 
@@ -190,7 +191,8 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		if row.EncryptionVersion.Valid {
 			encVersion = int(row.EncryptionVersion.Int64)
 		}
-		plaintext, derr := h.vault.DecryptValue(row.EncryptedValue, row.Nonce, encVersion)
+		pt, derr := h.vault.OpenEntrySecret(row.EncryptedValue, row.Nonce, encVersion,
+			secretexit.Origin{EntryID: row.ID, Name: name})
 		if derr != nil {
 			slog.Error("service_secrets: decrypt failed",
 				"service", identity.Name, "name", name, "error", derr)
@@ -198,8 +200,23 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 			writeInternalError(w, r, "decrypt failed")
 			return
 		}
-		secrets[name] = string(plaintext)
-		plaintexts = append(plaintexts, plaintext)
+		// THE ONE EXIT, caller form. A service identity is a machine principal
+		// minted by an admin and bound to the user who created it, so the read
+		// question is asked about that user. The allowed_secrets list above says
+		// which NAMES this identity may ask for; the exit says whether the
+		// entry's owner admits the principal behind it.
+		_, value, exitErr := secretexit.ExitString(r.Context(), pt,
+			secretexit.ToCaller("POST /api/service/secrets", identity.CreatedByUserID.String))
+		pt.Wipe()
+		if exitErr != nil {
+			slog.Error("service_secrets: the entry's owner did not authorise this fetch",
+				"service", identity.Name, "name", name, "error", exitErr)
+			h.audit(identity.ID, identity.Name, "denied", nil, "egress refused for "+name, remoteIP)
+			writeError(w, r, http.StatusForbidden, "destination_not_authorized",
+				"one of the requested secrets is not released to this service identity")
+			return
+		}
+		secrets[name] = value
 	}
 
 	// Touch last_used_at (fire-and-forget; failure here is not fatal).

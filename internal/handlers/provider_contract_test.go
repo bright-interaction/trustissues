@@ -48,7 +48,7 @@ func withFakeUpstream(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // (datadog's "site", grafana's "instance": the round-4 shape) fails HERE, in the
 // test that drives it, instead of shipping and being found by a reviewer.
 func providerCtx(p KeyProvider, meta map[string]string) context.Context {
-	return withProviderEgress(context.Background(), p.Name(), meta)
+	return providerExitCtx(p.Name(), meta)
 }
 
 // rewriteTo sends every request to base, preserving path and query, so a provider's

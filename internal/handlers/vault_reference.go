@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // errAmbiguousVaultReference is returned when a name resolves to more than one
@@ -35,13 +36,26 @@ var errAmbiguousVaultReference = errors.New("vault reference is ambiguous: more 
 // their access" by adding another bespoke scope check; this reuses the single
 // authorization point instead, which is also how it inherits the disabled-account
 // check for free.
-func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userID string) ([]byte, error) {
+//
+// AND THAT WAS STILL NOT ENOUGH, which is the round-6 finding. Everything above
+// answers "may userID REACH this secret". An accepted vault_only VIEWER of a
+// shared collection may, by design (grantFor row 6 gives a viewer read + use),
+// and so the same forgejo_secret target on a PERSONAL entry of their own
+// delivered the team's secret to a host they chose, with nothing on the victim's
+// entry ever written.
+//
+// The answer is not a ninth scope check. What comes back is a
+// secretexit.Plaintext carrying the ORIGIN OF THE REFERENCED ENTRY, so the
+// question "may the destination receive THIS secret" is asked about the right
+// row at the one place it is asked at all. See internal/secretexit.
+func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userID string) (secretexit.Plaintext, error) {
+	var none secretexit.Plaintext
 	if name == "" || userID == "" {
-		return nil, sql.ErrNoRows
+		return none, sql.ErrNoRows
 	}
 	rows, err := h.queries.ResolveVaultReference(ctx, name)
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 
 	// Keep only entries this user may USE right now. Deliberately not
@@ -56,15 +70,20 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 	}
 	switch len(reachable) {
 	case 0:
-		return nil, sql.ErrNoRows
+		return none, sql.ErrNoRows
 	case 1:
 	default:
-		return nil, fmt.Errorf("%w: %q", errAmbiguousVaultReference, name)
+		return none, fmt.Errorf("%w: %q", errAmbiguousVaultReference, name)
 	}
 
-	plaintext, err := h.DecryptValue(reachable[0].EncryptedValue, reachable[0].Nonce, 2)
+	// The origin is the REFERENCED entry, not the entry whose rotation is
+	// running. That single argument is the round-6 fix: the exit asks the owner
+	// of the secret it is about to send, and the secret it is about to send is
+	// this one.
+	plaintext, err := h.OpenEntrySecret(reachable[0].EncryptedValue, reachable[0].Nonce, 2,
+		entryOrigin(reachable[0].ID, name))
 	if err != nil {
-		return nil, fmt.Errorf("decrypt vault reference %q: %w", name, err)
+		return none, fmt.Errorf("decrypt vault reference %q: %w", name, err)
 	}
 	return plaintext, nil
 }

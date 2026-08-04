@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
 // newVaultTestDB opens an in-memory SQLite database with the vault schema
@@ -119,22 +121,22 @@ func TestVaultEncryptDecryptRoundTrip(t *testing.T) {
 		t.Fatal("ciphertext equals plaintext")
 	}
 
-	dec, err := vh.decrypt(ct1, n1)
+	dec, err := vh.openForTest(ct1, n1)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if string(dec) != string(plaintext) {
-		t.Fatalf("round-trip mismatch: %q", dec)
+	if !dec.EqualsString(string(plaintext)) {
+		t.Fatalf("round-trip mismatch (len %d)", dec.Len())
 	}
 
-	dec2, err := vh.DecryptValue(ct2, n2, 2)
-	if err != nil || string(dec2) != string(plaintext) {
-		t.Fatalf("DecryptValue v2 mismatch: %q (err %v)", dec2, err)
+	dec2, err := vh.openForTest(ct2, n2)
+	if err != nil || !dec2.EqualsString(string(plaintext)) {
+		t.Fatalf("second round-trip mismatch (err %v)", err)
 	}
 
 	// A different key must not decrypt.
 	other := NewVaultHandler(nil, nil, &config.Config{VaultKey: "other-key-material"})
-	if _, err := other.decrypt(ct1, n1); err == nil {
+	if _, err := other.openForTest(ct1, n1); err == nil {
 		t.Fatal("decrypt succeeded with wrong key")
 	}
 }
@@ -151,7 +153,7 @@ func TestDecryptRejectsMalformedNonce(t *testing.T) {
 	}
 
 	for _, bad := range [][]byte{nil, {}, {0x00}, make([]byte, len(goodNonce)-1), make([]byte, len(goodNonce)+1)} {
-		if _, err := vh.decrypt(ct, bad); err == nil {
+		if _, err := vh.openForTest(ct, bad); err == nil {
 			t.Fatalf("decrypt accepted malformed nonce (len=%d), want error", len(bad))
 		}
 	}
@@ -163,7 +165,7 @@ func TestDecryptRejectsMalformedNonce(t *testing.T) {
 	}
 
 	// Sanity: the correct nonce still round-trips.
-	if _, err := vh.decrypt(ct, goodNonce); err != nil {
+	if _, err := vh.openForTest(ct, goodNonce); err != nil {
 		t.Fatalf("decrypt with valid nonce failed: %v", err)
 	}
 }
@@ -213,9 +215,9 @@ func TestMigrateEncryption(t *testing.T) {
 	if version != 2 {
 		t.Fatalf("encryption_version = %d, want 2", version)
 	}
-	dec, err := vh.DecryptValue(newCT, newNonce, 2)
-	if err != nil || string(dec) != string(secret) {
-		t.Fatalf("migrated value round-trip failed: %q (err %v)", dec, err)
+	dec, err := vh.openForTest(newCT, newNonce)
+	if err != nil || !dec.EqualsString(string(secret)) {
+		t.Fatalf("migrated value round-trip failed (err %v)", err)
 	}
 
 	// Idempotent: nothing left to migrate.
@@ -348,25 +350,29 @@ func TestResolveReferences(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	out := vh.ResolveReferences("token={{vault:MY_TOKEN}}", "user-a")
+	out := vh.ResolveReferences(context.Background(), "token={{vault:MY_TOKEN}}", "user-a",
+		secretexit.ToCaller("test", "user-a"))
 	if out != "token=resolved-secret" {
 		t.Fatalf("resolve for owner failed: %q", out)
 	}
 
 	// Another user's reference does not resolve (per-user scoping).
-	out = vh.ResolveReferences("token={{vault:MY_TOKEN}}", "user-b")
+	out = vh.ResolveReferences(context.Background(), "token={{vault:MY_TOKEN}}", "user-b",
+		secretexit.ToCaller("test", "user-b"))
 	if out != "token={{vault:MY_TOKEN}}" {
 		t.Fatalf("cross-user reference resolved: %q", out)
 	}
 
 	// Unknown name passes through.
-	out = vh.ResolveReferences("x={{vault:NOPE}}", "user-a")
+	out = vh.ResolveReferences(context.Background(), "x={{vault:NOPE}}", "user-a",
+		secretexit.ToCaller("test", "user-a"))
 	if out != "x={{vault:NOPE}}" {
 		t.Fatalf("unknown reference mutated: %q", out)
 	}
 
 	// Empty userID skips resolution entirely.
-	out = vh.ResolveReferences("token={{vault:MY_TOKEN}}", "")
+	out = vh.ResolveReferences(context.Background(), "token={{vault:MY_TOKEN}}", "",
+		secretexit.ToCaller("test", ""))
 	if out != "token={{vault:MY_TOKEN}}" {
 		t.Fatalf("empty user resolved: %q", out)
 	}
