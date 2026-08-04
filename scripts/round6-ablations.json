@@ -2,20 +2,20 @@
   {
     "id": "delivery-half-hardcodes-not-admin",
     "mech": "authority",
-    "file": "internal/handlers/vault_targets.go",
-    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
-    "new": "\tif !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif !h.mayDirectSecretEgress(ctx, chooser, false, o.EntryID) {",
     "test": "TestDeliveryGateAgreesWithWriteGate",
-    "why": "THE ROUND-6 DEFECT ITSELF. The write gate lets an instance admin configure a delivery target and the delivery gate hardcodes isAdmin false, so the target is accepted, reported as saved, and silently never delivered"
+    "why": "THE ROUND-6 DEFECT ITSELF. The write gate lets an instance admin configure a delivery target and the delivery gate hardcodes isAdmin false, so the target is accepted, reported as saved, and silently never delivered. RETARGETED IN ROUND 7: the delivery half's egress question moved from targetStillAuthorized into secretexit.Exit, which asks it about the entry the SECRET CAME FROM. The property is unchanged and so is this ablation; only the line it lands on moved."
   },
   {
     "id": "delivery-half-hardcodes-not-admin-on-the-wire",
     "mech": "authority",
-    "file": "internal/handlers/vault_targets.go",
-    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
-    "new": "\tif !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif !h.mayDirectSecretEgress(ctx, chooser, false, o.EntryID) {",
     "test": "TestInstanceAdminDeliveryTargetIsAcceptedAndDelivered",
-    "why": "the same defect read off a real HTTP sink rather than off a predicate: the admin's consumer receives nothing across a real rotation"
+    "why": "the same defect read off a real HTTP sink rather than off a predicate: the admin's consumer receives nothing across a real rotation. RETARGETED IN ROUND 7: the delivery half's egress question moved from targetStillAuthorized into secretexit.Exit, which asks it about the entry the SECRET CAME FROM. The property is unchanged and so is this ablation; only the line it lands on moved."
   },
   {
     "id": "write-half-trusts-the-session-role",
@@ -102,11 +102,11 @@
   {
     "id": "delivery-falls-back-to-plain-write-access",
     "mech": "authority",
-    "file": "internal/handlers/vault_targets.go",
-    "old": "\tif !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {",
-    "new": "\tif _, canWrite := vault.entryAccessFor(ctx, target.ConfiguredBy, false, entryID); !canWrite {",
+    "file": "internal/handlers/secret_exit_authority.go",
+    "old": "\t\tif !h.mayConfigureDelivery(ctx, chooser, o.EntryID) {",
+    "new": "\t\tif _, canWrite := h.entryAccessFor(ctx, chooser, false, o.EntryID); !canWrite {",
     "test": "TestPlantedEditorTargetIsRefusedAtDeliveryToo",
-    "why": "a row already stored by an editor, or arriving through a restored backup, keeps delivering because the delivery gate asks the weaker question"
+    "why": "a row already stored by an editor, or arriving through a restored backup, keeps delivering because the delivery gate asks the weaker question. RETARGETED IN ROUND 7: the delivery half's egress question moved from targetStillAuthorized into secretexit.Exit, which asks it about the entry the SECRET CAME FROM. The property is unchanged and so is this ablation; only the line it lands on moved."
   },
   {
     "id": "attribution-ignores-auth-token",

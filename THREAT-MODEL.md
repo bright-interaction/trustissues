@@ -295,7 +295,7 @@ without seeing" into "see". Two rules now hold the boundary (`secret_egress.go`)
 - **Delivery targets are destinations too.** Adding a rotation target whose type
   transmits the value (`webhook`, `forgejo_secret`) is the same act as widening
   the ceiling and takes the same right, at the write (`decideDeliveryEgress`) and
-  at delivery (`targetStillAuthorized`). Removing one, clearing the list,
+  at delivery (`secretexit.Exit`, round 7). Removing one, clearing the list,
   relabelling it, rotating its HMAC secret and configuring a `notify` target stay
   open to `manage`. This was DEFERRED (i) until 2026-08-02 and was the round-5
   blocker: an accepted `vault_only` editor pointed a shared secret's rotation
@@ -335,7 +335,10 @@ changes nothing.
 Adding a delivery destination takes the entry's creator or an instance admin,
 and both halves of that rule (the write gate and the delivery gate) call one
 function, `VaultHandler.mayConfigureDelivery`, which resolves admin status from
-the users row. Round 5 implemented the rule twice and the copies disagreed about
+the users row. Since round 7 the delivery half reaches it through
+`VaultHandler.AuthorizeSecretExit`, the single implementation of the owner rule,
+and asks about the entry the SECRET CAME FROM rather than the entry being
+rotated. Round 5 implemented the rule twice and the copies disagreed about
 admins, so an admin's target was accepted and then silently never delivered.
 `TestDeliveryGateAgreesWithWriteGate` runs both halves over nine principals and
 fails if they ever differ.

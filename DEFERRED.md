@@ -322,10 +322,14 @@ here is identical to the blocker the same round shipped a fix for.
   target, clearing the list, relabelling one, rotating its HMAC signing secret,
   re-saving the panel unchanged, and configuring a `notify` target. Revocation is
   not behind the stricter right.
-* `targetStillAuthorized` asks `mayDirectSecretEgress` too, so a row already
-  stored by an editor on a running instance, or arriving through a restored
-  backup, an import or an older binary, is refused at DELIVERY as well. The write
-  gate can only guard writes it sees.
+* Round 7 moved the delivery half into `secretexit.Exit`, which asks the same
+  question about the entry the SECRET CAME FROM rather than about the entry being
+  rotated. A row already stored by an editor on a running instance, or arriving
+  through a restored backup, an import or an older binary, is still refused at
+  DELIVERY; and on the `forgejo_secret` path, where the `auth_token` names a
+  DIFFERENT entry, the question is now asked about that entry too. That gap was
+  the round-6 break. `targetStillAuthorized` keeps only its account-status rows.
+  See `AUDIT-ROUND-17.md`.
 * `rotationTargetAttribution` adds `auth_token` to the attribution key. Editing
   which credential is spent as the delivery bearer token re-stamps `ConfiguredBy`
   to whoever edited it, closing a sibling the old shape could not reach: the
@@ -381,7 +385,8 @@ by `TestProviderRequestsStayInsideTheirDeclaredHosts`.
   from an AdminOnly `ai_key_*` settings row joined to a compile-time host table,
   so nothing an entry editor can write contributes to it. Enforced at the write,
   at mint, at `/proxy`, at rotation-target write and delivery, and now at
-  validate and both rotation paths (`providerEgressContextFor`).
+  validate and both rotation paths (`spendProviderSecret`, round 7's replacement
+  for `providerEgressContextFor`).
 - **Any other shared secret, row forged by direct database access.** Not
   guarded, and not guardable at this layer: a writer with `sqlite3` on the data
   directory can also read `encrypted_value` and, with the host key material, the
