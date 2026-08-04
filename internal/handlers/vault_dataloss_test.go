@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestRenameConflictIsReportedNotSwallowed locks a half-applied write that
@@ -247,7 +248,7 @@ func TestGuardRunsBeforeEveryWrite(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("seed cf: %v", err)
 		}
-		if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+		if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
 			DestinationPatterns: `["api.stripe.com/v1/*"]`, ID: "entry-gB",
 		}); err != nil {
 			t.Fatalf("seed dp: %v", err)

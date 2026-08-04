@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestCapabilityLookupIsCollectionScoped locks the THIRD door onto the same
@@ -39,7 +40,7 @@ func TestCapabilityLookupIsCollectionScoped(t *testing.T) {
 	const entryID = "entry-shared"
 	mustEntry(t, h, queries, entryID, creator, "Shared prod key", "sk_live_ORIGINAL")
 	placeInCollection(t, queries, entryID, "coll-team")
-	if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+	if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
 		DestinationPatterns: `["api.stripe.com/*"]`, ID: entryID,
 	}); err != nil {
 		t.Fatalf("seed ceiling: %v", err)
@@ -112,7 +113,7 @@ func TestPersonalSecretsStillResolve(t *testing.T) {
 
 	const entryID = "entry-personal"
 	mustEntry(t, h, queries, entryID, owner, "My key", "v")
-	if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+	if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
 		DestinationPatterns: `["api.openai.com/*"]`, ID: entryID,
 	}); err != nil {
 		t.Fatalf("seed ceiling: %v", err)

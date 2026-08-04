@@ -10,6 +10,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestIssueIsCollectionScoped drives the Issue HANDLER, not the lookup helpers.
@@ -50,7 +51,7 @@ func TestIssueIsCollectionScoped(t *testing.T) {
 	const entryID = "entry-issue-shared"
 	mustEntry(t, h, queries, entryID, creator, "Issue shared key", "sk_live_ISSUE")
 	placeInCollection(t, queries, entryID, "coll-issue")
-	if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+	if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
 		DestinationPatterns: `["api.stripe.com/*"]`, ID: entryID,
 	}); err != nil {
 		t.Fatalf("seed ceiling: %v", err)

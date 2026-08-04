@@ -9,6 +9,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // Shared rotation outcome logic: everything that happens AFTER the rotated value
@@ -115,7 +116,7 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 		slog.Error("vault rotation: marshal provider_meta failed", "entry", entryName, "error", mErr)
 	} else if encMeta, encErr := deps.vault.encryptColumn(string(metaJSON)); encErr != nil {
 		slog.Error("vault rotation: encrypt provider_meta failed", "entry", entryName, "error", encErr)
-	} else if pErr := setEntryProviderMeta(ctx, deps.queries, tk, db.UpdateVaultEntryProviderMetaParams{
+	} else if pErr := vaultegress.SetProviderMeta(ctx, deps.queries, tk, vaultegress.ProviderMetaParams{
 		ProviderMeta: toNullString(encMeta),
 		ID:           entryID,
 	}); pErr != nil {

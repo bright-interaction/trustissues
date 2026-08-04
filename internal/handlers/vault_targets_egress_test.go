@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // THE ROUND-5 BLOCKER, REPRODUCED END TO END AND THEN CLOSED.
@@ -241,7 +241,7 @@ func TestPlantedEditorTargetIsRefusedAtDeliveryToo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
-	if err := queries.UpdateVaultEntryRotationTargets(ctx, db.UpdateVaultEntryRotationTargetsParams{
+	if err := setRotationTargetsFixture(t, queries, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(enc), ID: entryID,
 	}); err != nil {
 		t.Fatalf("plant: %v", err)

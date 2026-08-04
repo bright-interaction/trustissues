@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // TestIssueRefusesAmbiguousSecretName locks the fix for a silent wrong-key mint.
@@ -47,7 +47,7 @@ func TestIssueRefusesAmbiguousSecretName(t *testing.T) {
 	mustEntry(t, h, queries, personalID, carol, "stripe", "sk_test_SANDBOX")
 
 	for _, id := range []string{sharedID, personalID} {
-		if err := queries.UpdateVaultEntryDestinationPatterns(ctx, db.UpdateVaultEntryDestinationPatternsParams{
+		if err := setDestinationPatternsFixture(t, queries, vaultegress.DestinationPatternsParams{
 			DestinationPatterns: `["api.stripe.com/*"]`, ID: id,
 		}); err != nil {
 			t.Fatalf("seed ceiling on %s: %v", id, err)

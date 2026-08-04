@@ -39,10 +39,6 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- Create entry
 -- ============================================================================
 
--- name: CreateVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
-
 -- name: GetVaultEntryMeta :one
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?;
@@ -211,12 +207,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
 -- Provider integration (API key rotation)
 -- ============================================================================
 
--- name: UpdateVaultEntryProvider :exec
-UPDATE vault_entries SET provider = ?, provider_meta = ?, auto_rotate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
-
--- name: UpdateVaultEntryProviderMeta :exec
-UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
-
 -- name: ListVaultEntriesForMetaBackfill :many
 -- provider is selected alongside the two columns being re-encrypted because the
 -- egress write gate derives the entry's reachable host set from the
@@ -266,9 +256,6 @@ SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?;
 -- literal text which has already caused three rounds of CAS bugs on this table.
 UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP
 WHERE id = ? AND COALESCE(rotation_log, '') = ?;
-
--- name: UpdateVaultEntryRotationTargets :exec
-UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: ListVaultEntriesNeedingRotation :many
 SELECT id, user_id, name, encrypted_value, nonce, encryption_version, provider, provider_meta, rotation_interval_days, last_rotated_at, rotation_log, rotation_targets, CAST(updated_at AS TEXT) AS updated_at_text
@@ -365,13 +352,6 @@ WHERE collection_id = ? AND rotation_targets IS NOT NULL AND rotation_targets !=
 -- auto-rotation keeps running on those after the account is disabled.
 SELECT id, name, rotation_targets FROM vault_entries
 WHERE rotation_targets IS NOT NULL AND rotation_targets != '' AND rotation_targets != '[]';
-
--- name: UpdateVaultEntryDestinationPatterns :exec
--- The capability ceiling: which hosts/paths an agent token minted for this
--- secret may ever reach. Until this existed the column had exactly one writer
--- (the provider preset seed), so a secret created without a recognised provider
--- could never mint a capability token at all and the MCP feature was unusable.
-UPDATE vault_entries SET destination_patterns = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: DeletePersonalVaultEntriesForUser :execresult
 -- Hard user delete: their PERSONAL entries go with them.

@@ -59,6 +59,17 @@ func TestHandRolledFixturesMatchTheRealSchema(t *testing.T) {
 		if start < 0 {
 			continue
 		}
+		// A file that builds the table out of PRAGMA table_info of a REAL
+		// migrated database is not a hand-rolled fixture and cannot fall behind
+		// the schema: its column list is whatever SQLite says the column list is.
+		// egress_write_chokepoint_test.go does exactly that, to build a probe
+		// database in which the host-choosing columns are GENERATED. Checking it
+		// against a hardcoded required-column list would be checking the wrong
+		// direction, and adding those names to it would be inventing the drift
+		// this guard exists to prevent.
+		if strings.Contains(text, "PRAGMA table_info(vault_entries)") {
+			continue
+		}
 		body, ok := balancedParens(text, start)
 		if !ok {
 			// Fail closed: a fixture this guard cannot parse must not be

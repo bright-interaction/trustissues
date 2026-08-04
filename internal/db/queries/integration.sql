@@ -35,14 +35,6 @@ ORDER BY u.created_at ASC;
 -- name: CountVaultEntriesForUser :one
 SELECT COUNT(*) FROM vault_entries WHERE user_id = ?;
 
--- name: SeedVaultEntryCapabilityDefaults :exec
--- Seeds the capability-bridge columns from the provider defaults at
--- enrollment time. Only fills untouched rows so explicit per-entry
--- patterns are never overwritten.
-UPDATE vault_entries
-SET destination_patterns = ?, injection_spec = ?, updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND destination_patterns = '[]' AND injection_spec = '{}';
-
 -- name: ListExpiringVaultEntries :many
 SELECT id, name, user_id, expires_at
 FROM vault_entries

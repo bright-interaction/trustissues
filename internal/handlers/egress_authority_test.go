@@ -13,6 +13,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // THE ROUND-4 BLOCKER, REPRODUCED AND CLOSED.
@@ -178,7 +179,7 @@ func TestEditorCannotRedirectTheGatewayKeyThroughTheProviderConfiguration(t *tes
 	})
 	mustEntry(t, h, queries, entryID, operator, "team-openai", theKey)
 	placeInCollection(t, queries, entryID, "coll-team")
-	if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString("openai"),
 		ProviderMeta: toNullString("{}"),
 		AutoRotate:   sql.NullInt64{Int64: 0, Valid: true},
@@ -325,7 +326,7 @@ func TestEditorCannotRedirectTheGatewayKeyThroughTheProviderConfiguration(t *tes
 	t.Run("POSITIVE CONTROL: the real key still reaches the real provider", func(t *testing.T) {
 		// Without this, a fix that broke validation outright would pass every
 		// assertion above.
-		if err := queries.UpdateVaultEntryProvider(ctx, db.UpdateVaultEntryProviderParams{
+		if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 			Provider:     toNullString("openai"),
 			ProviderMeta: toNullString("{}"),
 			AutoRotate:   sql.NullInt64{Int64: 0, Valid: true},

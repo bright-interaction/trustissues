@@ -192,23 +192,3 @@ func (q *Queries) ListUsersWithEntryCount(ctx context.Context) ([]ListUsersWithE
 	}
 	return items, nil
 }
-
-const seedVaultEntryCapabilityDefaults = `-- name: SeedVaultEntryCapabilityDefaults :exec
-UPDATE vault_entries
-SET destination_patterns = ?, injection_spec = ?, updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND destination_patterns = '[]' AND injection_spec = '{}'
-`
-
-type SeedVaultEntryCapabilityDefaultsParams struct {
-	DestinationPatterns string `json:"destination_patterns"`
-	InjectionSpec       string `json:"injection_spec"`
-	ID                  string `json:"id"`
-}
-
-// Seeds the capability-bridge columns from the provider defaults at
-// enrollment time. Only fills untouched rows so explicit per-entry
-// patterns are never overwritten.
-func (q *Queries) SeedVaultEntryCapabilityDefaults(ctx context.Context, arg SeedVaultEntryCapabilityDefaultsParams) error {
-	_, err := q.db.ExecContext(ctx, seedVaultEntryCapabilityDefaults, arg.DestinationPatterns, arg.InjectionSpec, arg.ID)
-	return err
-}

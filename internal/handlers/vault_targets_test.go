@@ -18,6 +18,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/database"
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
 // swapProviderHTTP replaces the SSRF-guarded provider client with a plain one
@@ -244,7 +245,7 @@ func newTestVaultEnv(t *testing.T) (*VaultHandler, *db.Queries, string, string) 
 		t.Fatalf("encrypt: %v", err)
 	}
 	const entryID = "entry-under-test"
-	if err := queries.CreateVaultEntry(ctx, db.CreateVaultEntryParams{
+	if err := createVaultEntryFixture(t, queries, vaultegress.CreateEntryParams{
 		ID:             entryID,
 		UserID:         user.ID,
 		Name:           "test-entry",

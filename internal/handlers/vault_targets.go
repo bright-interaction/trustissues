@@ -231,8 +231,20 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	if u.Disabled != 0 {
 		return fmt.Errorf("delivery target skipped: the user who configured it (%s) is disabled", u.Email)
 	}
-	// isAdmin false on purpose: this asks whether THIS user still has access,
-	// not whether the process is privileged.
+	// mayConfigureDelivery, not mayDirectSecretEgress with a hand-supplied
+	// isAdmin. Round 5 wrote `mayDirectSecretEgress(ctx, target.ConfiguredBy,
+	// false, entryID)` here, with the comment "isAdmin false on purpose: this
+	// asks whether THIS user still has access, not whether the process is
+	// privileged". The reasoning was right and the code did not implement it:
+	// "does THIS user still have access" for an instance admin IS yes, because
+	// the write gate had just said so out of middleware.IsAdmin. So an admin
+	// configured a target, the panel said saved, and every rotation afterwards
+	// dropped it in silence.
+	//
+	// mayConfigureDelivery resolves the admin question from the users row, which
+	// is the only source available here AND therefore the source the write half
+	// uses too. Asking a demoted admin's stale session is no longer possible on
+	// either side.
 	//
 	// mayDirectSecretEgress, not entryAccessFor. The doc comment above this
 	// function has always said this asks "whether they would still be allowed to
@@ -249,7 +261,7 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	// mayDirectSecretEgress subsumes the old check. It calls grantFor and requires
 	// manage before it looks at anything else, so every case the write check
 	// caught is still caught, with the account-status rows ahead of it.
-	if !vault.mayDirectSecretEgress(ctx, target.ConfiguredBy, false, entryID) {
+	if !vault.mayConfigureDelivery(ctx, target.ConfiguredBy, entryID) {
 		return fmt.Errorf("delivery target skipped: the user who configured it may no longer choose " +
 			"where this secret is delivered (that takes the secret's owner or an instance admin)")
 	}

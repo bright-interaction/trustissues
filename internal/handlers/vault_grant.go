@@ -5,6 +5,7 @@ import (
 	"database/sql"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
 // entryGrant is what one user may do with one vault entry, right now.
@@ -140,6 +141,50 @@ func (h *VaultHandler) mayDirectSecretEgress(ctx context.Context, userID string,
 		return false
 	}
 	return userID != "" && info.UserID == userID
+}
+
+// instanceAdminByRecord reports whether userID is an instance admin RIGHT NOW,
+// according to the users table.
+//
+// Not middleware.IsAdmin. A session carries the role it was minted with, and the
+// question "may this identity choose where a secret is delivered" is asked twice
+// about the same identity: once when the target is written, with a request in
+// hand, and once at every later delivery, with no request at all. Two sources
+// for one fact is how the two halves came to disagree, so there is one source
+// and it is the row.
+//
+// A missing or disabled account is not an admin. Fail-closed, and it keeps this
+// consistent with grantFor row 2, which refuses a disabled account everything.
+func (h *VaultHandler) instanceAdminByRecord(ctx context.Context, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	u, err := h.queries.GetUserByID(ctx, userID)
+	if err != nil || u.Disabled != 0 {
+		return false
+	}
+	return u.Role == middleware.RoleAdmin
+}
+
+// mayConfigureDelivery is THE answer to "may this identity add a delivery
+// destination to this entry?", and the only one.
+//
+// THE RULE, stated once: the entry's creator, or an instance admin, and in both
+// cases only while they still hold manage on the entry.
+//
+// It exists because round 5 implemented that sentence twice and the two copies
+// disagreed about the second half of it. The write gate passed an admin
+// (middleware.IsAdmin), the delivery gate hardcoded isAdmin false, so an admin
+// could configure a target that was accepted, reported as saved, and then
+// silently never delivered on every subsequent rotation. Of the three possible
+// behaviours (deliver, refuse at the write, accept-then-silent) that is the
+// worst: the operator is told it worked and the consumer never gets the key.
+//
+// There is deliberately NO isAdmin parameter. A parameter is a thing two call
+// sites can pass differently, which is precisely what happened; the admin
+// question is answered here, from the row, for both halves.
+func (h *VaultHandler) mayConfigureDelivery(ctx context.Context, userID, entryID string) bool {
+	return h.mayDirectSecretEgress(ctx, userID, h.instanceAdminByRecord(ctx, userID), entryID)
 }
 
 // managerMayAdoptOrphanedEntry reports whether callerID may rename an entry that
