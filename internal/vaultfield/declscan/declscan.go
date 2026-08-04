@@ -55,15 +55,51 @@ import (
 // ImportPath is the package this scanner recognises calls to.
 const ImportPath = "github.com/bright-interaction/trustissues/internal/vaultfield"
 
-// skipDirs are directories the walk does not descend into.
+// notPartOfTheModule are directory basenames THE GO TOOL ITSELF ignores at any
+// depth, so a .go file inside one belongs to no package and cannot be linked.
 //
 // testdata is skipped deliberately and load-bearing: the Go tool ignores it, so
 // a declaration in there is not part of the product and must not enter the
 // ledger. The fixture that proves this scanner sees code nothing links lives
-// exactly there, and is reached by scanning it explicitly.
-var skipDirs = map[string]bool{
-	".git": true, "node_modules": true, "frontend": true, "docs": true,
-	"scripts": true, "testdata": true,
+// exactly there, and is reached by scanning it explicitly with [ScanDir].
+//
+// This is the ONLY class allowed to match by basename at any depth, and it is
+// allowed because the compiler agrees with it. A dot- or underscore-prefixed
+// directory is ignored by the tool for the same reason and is covered by
+// [skipDir] below rather than listed here.
+var notPartOfTheModule = map[string]bool{"testdata": true}
+
+// projectDirsWithNoGo hold no Go at all and are skipped for speed. They are
+// matched ONLY at the module root.
+//
+// They used to be in one basename set with testdata, matched at any depth, so
+// internal/handlers/scripts/ or internal/docs/ would have been invisible to this
+// scanner: ordinary Go, compiled into the binary, silently outside the ledger a
+// dozen guards read. A skip rule that a directory NAME can trigger anywhere is a
+// spelling for "not scanned", and this package exists because the previous
+// spelling for "not scanned" was a call shape.
+var projectDirsWithNoGo = map[string]bool{
+	"frontend": true, "docs": true, "scripts": true, "node_modules": true,
+}
+
+// skipDir decides whether the walk descends into dir, which lives under root.
+func skipDir(root, dir string) bool {
+	name := filepath.Base(dir)
+	if notPartOfTheModule[name] {
+		return true
+	}
+	if name != "." && name != ".." && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+		return true
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		// Not placeable under the root, so not provably a root-level project
+		// directory. Descend: over-reading is the safe direction for a scanner
+		// whose failure mode is missing a declaration.
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return !strings.Contains(rel, "/") && projectDirsWithNoGo[rel]
 }
 
 // Declaration is one vaultfield.Declare call, as it is written in the source.
@@ -115,7 +151,7 @@ func Scan(root string) ([]Declaration, error) {
 			return err
 		}
 		if d.IsDir() {
-			if path != root && skipDirs[d.Name()] {
+			if path != root && skipDir(root, path) {
 				return filepath.SkipDir
 			}
 			return nil

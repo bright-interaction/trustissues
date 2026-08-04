@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"bytes"
 	"go/ast"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -23,9 +25,9 @@ import (
 // last edited an import somewhere unrelated. Put a Declare in cmd/server and
 // every guard below used to stay green over a column it had never seen.
 //
-// declscan walks the module's FILES, exactly the way the crypto-import pin
-// does, which is what made that pin complete. The declaration set is now the
-// module's set.
+// declscan walks the module's FILES, the way the crypto-import pin and the
+// key-holder pin do. The declaration set is now the module's set rather than a
+// test binary's.
 //
 // vaultfield.Ledger() is still checked, in one place
 // (TestTheStaticLedgerContainsEverythingTheBinaryLinked), as a CONTROL: a
@@ -111,20 +113,60 @@ func lookupDeclared(decls []declscan.Declaration, column string) (declscan.Decla
 //
 // The knowledge now comes from the place plaintext is PRODUCED.
 //
-//   - internal/vaultfield is the only file in the module that imports crypto/aes
-//     or crypto/cipher (TestAESGCMIsOpenedInExactlyOneFile). That is complete
-//     rather than broad: opening AES-GCM data REQUIRES those packages, so the
-//     importer set is the reader set. A wrapper-name set is open-ended; this one
-//     is closed by the language.
-//   - every open there demands a vaultfield.Field, whose only constructor is
-//     vaultfield.Declare.
+//   - every open in internal/vaultfield demands a vaultfield.Field, whose only
+//     constructor is vaultfield.Declare.
 //   - Declare writes the ledger.
+//   - two guards bound what can decrypt WITHOUT going through vaultfield at all.
 //
 // So the tests below no longer ask "did somebody remember to classify this".
 // They ask the questions that are still open once the ledger cannot have holes:
 // is every declaration a real ruling, does every through-the-exit field name a
 // real exit, is any declaration describing dead code, and is the classification's
 // PREMISE (admin-only routes, for the instance-owned class) still true.
+//
+// # THE CENTRAL CLAIM, RESTATED, BECAUSE THE ONE THAT SHIPPED WAS FALSE
+//
+// The previous version of this comment said:
+//
+//	opening AES-GCM data REQUIRES crypto/aes and crypto/cipher, so the importer
+//	set is the reader set ... closed by the language.
+//
+// That sentence is not true and nothing about the language makes it true. AES
+// is arithmetic. A pure-Go AES-GCM implementation imports nothing from crypto/*
+// at all; so does a vendored one; and the module's own go.sum can grow a
+// dependency that carries an AEAD. "Which files can do the arithmetic" is not a
+// question an import graph answers. The guard built on that sentence was a
+// useful NET, and it was sold as a PROOF.
+//
+// So: what actually has to be true for ciphertext THIS PRODUCT WROTE to be
+// opened inside this module?
+//
+//	1. the code has to hold the KEY, and
+//	2. the code has to do an AEAD open with it.
+//
+// Only (1) is scarce. The key enters the process once, as
+// TRUSTISSUES_VAULT_KEY -> config.Config.VaultKey, and everything downstream is
+// a copy of it or a KDF over it. Code that never obtains that material cannot
+// open a single stored byte however it spells its crypto, and code that DOES
+// obtain it can decrypt with an implementation nobody has ever seen. The key is
+// the invariant; the import is a habit.
+//
+// Hence the two guards, in the order of what they are worth:
+//
+//	TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles   the real pin. Every file
+//	  that NAMES vault key material is declared, with a reason. A new decryption
+//	  path in an undeclared file cannot obtain the key without either naming it
+//	  (this reddens) or being handed it by a declared file, which is an edit
+//	  inside the small set this guard makes people look at.
+//
+//	TestAESGCMIsOpenedInExactlyOneFile              the net. Importing the AES
+//	  primitives is how a door is ACTUALLY written, so pinning the importers
+//	  still catches the realistic sixth door on the day it appears. It is not a
+//	  completeness claim and no longer says it is.
+//
+// Neither is a proof on its own, and saying so is the point: a guard that
+// overstates its reach is how round 18 shipped four call shapes and read as
+// coverage.
 
 // ── the ablation this construction has to survive ───────────────────────────
 //
@@ -148,20 +190,22 @@ func lookupDeclared(decls []declscan.Declaration, column string) (declscan.Decla
 // signature, and calling it with vaultfield.Field{} is refused at the first call
 // (TestTheZeroFieldDecryptsNothing).
 
-// aesImports are the two packages you cannot open AES-GCM ciphertext without.
-// crypto/aes gives the block cipher, crypto/cipher gives the AEAD. There is no
-// third way to read what this product has already written to disk, which is what
-// makes pinning their importers a COMPLETE statement rather than a broad one.
+// aesImports are the two standard-library packages a Go AES-GCM open is
+// ORDINARILY written with. crypto/aes gives the block cipher, crypto/cipher
+// gives the AEAD.
+//
+// Not "the two packages you cannot open AES-GCM without": that is what this map
+// used to claim and it is false. AES-GCM is arithmetic and can be written from
+// nothing, imported from a third-party module, or lifted out of any library that
+// ships an AEAD. Pinning these importers catches the door somebody actually
+// writes; it does not close the set. What closes the set is the KEY, which
+// theVaultKeyHolders below is about.
 var aesImports = map[string]bool{
 	"crypto/aes":    true,
 	"crypto/cipher": true,
 }
 
 // theCryptoFiles are the files allowed to import them, each with the reason.
-//
-// This is an enumeration, and that is the point: it enumerates the PRIMITIVE,
-// which the Go standard library closes, instead of the wrappers, which nobody
-// closes. Two entries, and one of them is a different key family.
 var theCryptoFiles = map[string]string{
 	"internal/vaultfield/vaultfield.go": "THE door. Every vault-key-encrypted value in this product " +
 		"becomes plaintext here, and every entry point demands a declared Field, which is what writes " +
@@ -169,15 +213,20 @@ var theCryptoFiles = map[string]string{
 	"internal/shield/crypto.go": "a different key family entirely: the Shield PII tokenizer seals its " +
 		"own session vocabulary under cfg.ShieldKey, never the vault key, and what it holds is tokenized " +
 		"personal data rather than a stored credential. It is out of the vault-key ledger's scope, and " +
-		"TestShieldDoesNotTouchTheVaultKey keeps that true.",
+		"the exemption is CHECKED from both sides: TestShieldDoesNotTouchTheVaultKey says the package " +
+		"never names vault key material, and TestNothingHandsTheVaultKeyToShield says nothing passes it " +
+		"any, which is the side an argument about what a package 'seals its data under' cannot reach.",
 }
 
-// TestAESGCMIsOpenedInExactlyOneFile is THE guard this round exists to add.
+// TestAESGCMIsOpenedInExactlyOneFile is the NET, not the pin.
 //
-// It is what the sixth-door ablation reddens. Every previous version of this
-// boundary asked "which functions look like decryption"; this one asks "which
-// files can do the arithmetic at all", and the answer is fixed by the language
-// rather than by a naming convention.
+// It is what the sixth-door ablation reddens: a new wrapper opening a new
+// encrypted column with hand-written aes/cipher calls matches no call shape and
+// no naming convention, and it still has to import these two packages to be
+// written the way anybody writes it.
+//
+// It is not complete and the comment above says why. The completeness claim
+// lives with the key, in TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles.
 func TestAESGCMIsOpenedInExactlyOneFile(t *testing.T) {
 	fset := token.NewFileSet()
 	parsed := parseModule(t, fset)
@@ -215,11 +264,12 @@ func TestAESGCMIsOpenedInExactlyOneFile(t *testing.T) {
 		}
 		sort.Strings(found[rel])
 		t.Errorf("A SIXTH DECRYPTION DOOR: %s imports %s.\n"+
-			"  Opening AES-GCM ciphertext requires crypto/aes and crypto/cipher, so importing them is\n"+
-			"  the one thing a new decryption path cannot avoid. That is why this guard pins the\n"+
-			"  IMPORTERS and not the function names: round 18 pinned four call shapes and a fifth door\n"+
-			"  (UserHandler.openInviteCode, on the vault-key-encrypted invitations.code column) had\n"+
-			"  already walked past it.\n"+
+			"  Importing the AES primitives is how a decryption path is ACTUALLY written, which is why\n"+
+			"  this guard pins importers instead of function names: round 18 pinned four call shapes and\n"+
+			"  a fifth door (UserHandler.openInviteCode, on the vault-key-encrypted invitations.code\n"+
+			"  column) had already walked past it. It is a net and not a proof; the completeness claim\n"+
+			"  is TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles, because holding the KEY is what a reader\n"+
+			"  of this product's ciphertext cannot avoid.\n"+
 			"  Route the decryption through internal/vaultfield. Its entry points demand a\n"+
 			"  vaultfield.Field, and declaring one is what puts the column in the ledger with a\n"+
 			"  classification and a reason. If this file genuinely belongs to a different key family,\n"+
@@ -237,8 +287,197 @@ func TestAESGCMIsOpenedInExactlyOneFile(t *testing.T) {
 	t.Logf("%d files import the AES primitives, all declared", len(found))
 }
 
-// TestShieldDoesNotTouchTheVaultKey holds up the one exemption above that is an
-// argument rather than a definition.
+// ── THE KEY, which is the thing a reader cannot do without ──────────────────
+
+// vaultKeyFieldNames are the names under which vault key material travels
+// through this module.
+//
+// They are FIELD and VARIABLE names, matched on the AST, not substrings:
+// RotateVaultKeys and the VerifyVaultKey comment in internal/db mention neither
+// a field read nor a key, and a substring scan reported both.
+//
+//	VaultKey       config.Config's field. The one entry point: it is
+//	               os.Getenv("TRUSTISSUES_VAULT_KEY") and nothing else writes it.
+//	encryptionKey  VaultHandler's PBKDF2-derived current key.
+//	legacyKey      VaultHandler's SHA-256 v1 key, still able to open v1 rows.
+//	bidxKey        derived from the same source. It cannot decrypt (it is an HMAC
+//	               key for the URL blind index) and it is listed anyway, because
+//	               the question this guard asks is "who holds material derived
+//	               from the vault key", and answering it per-purpose is how a set
+//	               starts having exceptions.
+var vaultKeyFieldNames = map[string]bool{
+	"VaultKey": true, "encryptionKey": true, "legacyKey": true, "bidxKey": true,
+}
+
+// theVaultKeyHolders is every production file allowed to name vault key
+// material, with what it needs it for.
+//
+// THIS IS THE COMPLETENESS CLAIM the import pin was wrongly making. Ciphertext
+// this product wrote can only be opened by code holding the key that sealed it,
+// whatever crypto that code is written with, so the set of files that can reach
+// the key bounds the set of files that can decrypt.
+//
+// A file counts as a holder when it NAMES one of the key fields above, when it
+// takes a [32]byte or a vaultKey parameter, or when it RETURNS a [32]byte, which
+// is the shape of every KDF here. Those three cover reaching for the key,
+// receiving it, and manufacturing it.
+//
+// THE RESIDUAL, with the two real instances named rather than left as a caveat.
+// A file can also receive the configured key as an ordinarily-typed string
+// parameter under some other name, and two do:
+//
+//	internal/handlers/capability.go   NewCapabilityHandler(..., signingKeySource string),
+//	                                  called from cmd/server/main.go with cfg.VaultKey
+//	internal/capability/token.go      DeriveSigningKey(source string)
+//
+// Neither decrypts anything (they HKDF a signing key with a fixed label, which
+// is one-way), and both are reachable only because a file IN THIS SET passed the
+// value. That is the shape of the whole guarantee rather than a gap in it: key
+// material cannot arrive in a fresh package without an edit inside one of the
+// entries below, so this list is where review concentrates. Widening the match
+// to any string parameter would flag every function in the module and the list
+// would stop being read, which is how a guard stops guarding.
+var theVaultKeyHolders = map[string]string{
+	"internal/config/config.go": "the ENTRY POINT. TRUSTISSUES_VAULT_KEY is read here and nowhere else, " +
+		"and the strength checks on it live beside the read.",
+	"cmd/server/main.go": "wiring. It hands cfg to the handlers that need it and holds no derived key of " +
+		"its own.",
+	"internal/handlers/vault.go": "the vault handler DERIVES the two content keys and the blind-index key " +
+		"here (PBKDF2 for v2, SHA-256 for the v1 rows still on disk) and wipes them on shutdown.",
+	"internal/handlers/vault_column_crypto.go": "the column encrypt/decrypt wrappers, which spend " +
+		"encryptionKey through internal/vaultfield with a declared Field.",
+	"internal/handlers/vault_keycheck.go": "the boot-time check that the configured key actually opens " +
+		"what is stored, plus the re-key path, which is the one place both keys are live at once.",
+	"internal/handlers/auth.go": "TOTP secrets are a vault-key column and are opened through " +
+		"columncrypto with cfg.VaultKey.",
+	"internal/handlers/users.go": "the SMTP relay password is instance-owned configuration under the " +
+		"same key.",
+	"internal/handlers/settings.go": "the same instance-owned settings family, read and written from " +
+		"the settings surface.",
+	"internal/handlers/smtp_password.go": "resolves the stored SMTP relay password, which is that same " +
+		"instance-owned column, and takes the configured key to do it.",
+	"internal/vaultfield/vaultfield.go": "THE door. Every open here takes the derived key and a declared " +
+		"Field, and Declare is what writes the ledger.",
+	"internal/secretexit/secretexit.go": "opens vault_entries.encrypted_value into an opaque Plaintext, " +
+		"which is the one value in this product that may not be handled as bytes.",
+	"internal/columncrypto/columncrypto.go": "the string-column family (TOTP secrets, invitation codes, " +
+		"instance settings). It DERIVES its own key from the configured secret and opens through " +
+		"vaultfield with a declared Field like everything else.",
+}
+
+// TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles is the real pin.
+//
+// It fails in both directions: an undeclared file that names key material is a
+// new holder nobody ruled on, and a declared file that names none is an
+// exemption for code that stopped doing the thing, which reads as a boundary and
+// is not one.
+func TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed := parseModule(t, fset)
+	if len(parsed) < 30 {
+		t.Fatalf("ABORT: parsed only %d module files; this guard is not reading the source", len(parsed))
+	}
+
+	holders := map[string][]string{}
+	note := func(rel, name string) {
+		for _, seen := range holders[rel] {
+			if seen == name {
+				return
+			}
+		}
+		holders[rel] = append(holders[rel], name)
+	}
+	for path, f := range parsed {
+		rel := moduleRelative(path)
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.SelectorExpr:
+				// cfg.VaultKey, h.encryptionKey, h.vault.legacyKey.
+				if vaultKeyFieldNames[v.Sel.Name] {
+					note(rel, v.Sel.Name)
+				}
+			case *ast.Ident:
+				// The struct field declarations and any local binding. VaultKey is
+				// deliberately not matched here: as a bare identifier it is a
+				// struct-literal key in every config fixture and says nothing about
+				// who holds the value.
+				if v.Name != "VaultKey" && vaultKeyFieldNames[v.Name] {
+					note(rel, v.Name)
+				}
+			case *ast.FuncType:
+				// THE OTHER HALF OF HOLDING IT: a file that never names a key field
+				// but takes one as a parameter. internal/vaultfield, secretexit,
+				// columncrypto and the keycheck probe are all in this shape, and
+				// leaving them out would have made the declared set a list of the
+				// callers rather than of the holders.
+				//
+				// Two spellings, both syntactic: the derived key's type, and the
+				// configured key's conventional parameter name.
+				if v.Params != nil {
+					for _, p := range v.Params.List {
+						if renderExpr(fset, p.Type) == "[32]byte" {
+							note(rel, "a [32]byte key parameter")
+						}
+						for _, nm := range p.Names {
+							if nm.Name == "vaultKey" {
+								note(rel, "a vaultKey parameter")
+							}
+						}
+					}
+				}
+				// And the DERIVERS. A function returning [32]byte manufactures key
+				// material out of whatever it was given, which is the shape every
+				// KDF in this module has (vaultV2Key, columncrypto.deriveKey) and
+				// the one way a file becomes a holder without naming a key field or
+				// receiving one.
+				if v.Results != nil {
+					for _, res := range v.Results.List {
+						if renderExpr(fset, res.Type) == "[32]byte" {
+							note(rel, "a function deriving a [32]byte key")
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	// The positive control. If the walk stops finding the file that DERIVES the
+	// keys, this guard would pass over a module where everything had moved.
+	if _, ok := holders["internal/handlers/vault.go"]; !ok {
+		t.Fatalf("ABORT: internal/handlers/vault.go names no vault key material. That is where the "+
+			"content keys are derived, so either the walk is broken or the derivation moved without "+
+			"this guard being told. Files seen holding key material: %v", sortedKeys(holders))
+	}
+
+	for _, rel := range sortedKeys(holders) {
+		if _, allowed := theVaultKeyHolders[rel]; allowed {
+			continue
+		}
+		sort.Strings(holders[rel])
+		t.Errorf("AN UNDECLARED HOLDER OF VAULT KEY MATERIAL: %s names %s.\n"+
+			"  Opening this product's ciphertext takes the KEY, not any particular crypto package, so\n"+
+			"  the set of files that can reach the key is the set of files that can decrypt. That is the\n"+
+			"  claim the AES-import pin used to make and could not support: AES-GCM can be written from\n"+
+			"  arithmetic, and no import graph closes it.\n"+
+			"  If this file genuinely needs the key, add it to theVaultKeyHolders WITH the reason. If it\n"+
+			"  needs to DECRYPT, route that through internal/vaultfield, whose entry points demand a\n"+
+			"  declared Field and therefore put the column in the ledger.",
+			rel, strings.Join(holders[rel], ", "))
+	}
+
+	for rel := range theVaultKeyHolders {
+		if _, ok := holders[rel]; !ok {
+			t.Errorf("A STALE KEY-HOLDER DECLARATION: theVaultKeyHolders allows %s to hold vault key "+
+				"material and it names none.\n  An exemption for code that no longer does the thing "+
+				"reads as a boundary and is not one. Remove it.", rel)
+		}
+	}
+	t.Logf("%d production files hold vault key material, all declared: %v",
+		len(holders), sortedKeys(holders))
+}
+
+// TestShieldDoesNotTouchTheVaultKey is the CALLEE half of the shield exemption.
 //
 // internal/shield is allowed its own AES because it is a different key family.
 // That claim is only true while it stays away from the vault key, so it is
@@ -264,6 +503,121 @@ func TestShieldDoesNotTouchTheVaultKey(t *testing.T) {
 	if checked < 3 {
 		t.Fatalf("ABORT: only scanned %d files under internal/shield; this guard is checking nothing", checked)
 	}
+}
+
+// TestNothingHandsTheVaultKeyToShield is the CALLER half, and it is the half
+// that matters.
+//
+// The exemption above is a statement about what internal/shield does with a key
+// it is GIVEN, and internal/shield does not choose what it is given. Its whole
+// key surface is untyped bytes:
+//
+//	func NewSession(ctx, store, sessionID string, key []byte, ttl, hintLevel) (*Session, error)
+//	func encrypt(plaintext string, key []byte) (string, error)
+//
+// so the package cannot tell cfg.ShieldKey from cfg.VaultKey and would seal the
+// session vocabulary under either one without a word. Every file under
+// internal/shield can pass TestShieldDoesNotTouchTheVaultKey unchanged while a
+// single character elsewhere makes the exemption false, and the ledger would go
+// on reporting shield's columns as out of scope.
+//
+// So the property is checked where it is DECIDED: at the call sites. Nothing
+// anywhere in the module may pass an expression naming vault key material into
+// internal/shield.
+func TestNothingHandsTheVaultKeyToShield(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed := parseModule(t, fset)
+
+	calls, keyed := 0, 0
+	for path, f := range parsed {
+		rel := moduleRelative(path)
+		if strings.HasPrefix(rel, "internal/shield/") {
+			continue // inside the package the qualifier is not written
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "shield" {
+				return true
+			}
+			calls++
+			for _, arg := range call.Args {
+				rendered := renderExpr(fset, arg)
+				if strings.Contains(rendered, "ShieldKey") {
+					keyed++
+				}
+				for name := range vaultKeyFieldNames {
+					if !mentionsIdent(arg, name) {
+						continue
+					}
+					t.Errorf("%s:%d passes %s into shield.%s.\n"+
+						"  internal/shield is exempt from the vault-key ledger because it seals its own data\n"+
+						"  under its OWN key. That exemption is a property of what it is HANDED, and its key\n"+
+						"  parameters are plain []byte, so nothing inside the package can refuse this. Pass\n"+
+						"  cfg.ShieldKey. If the Shield vocabulary genuinely has to move to the vault key,\n"+
+						"  its columns belong in the ledger and the exemption in theCryptoFiles has to go.",
+						rel, fset.Position(arg.Pos()).Line, rendered, sel.Sel.Name)
+				}
+			}
+			return true
+		})
+	}
+
+	// ANTI-VACUITY, both halves. A guard over zero calls is green about nothing,
+	// and a guard that never sees a key argument is not watching the parameter
+	// the whole test is about.
+	if calls == 0 {
+		t.Fatal("ABORT: no calls into internal/shield were found anywhere in the module, so this guard " +
+			"is checking nothing")
+	}
+	if keyed == 0 {
+		t.Fatal("ABORT: no call into internal/shield passes anything named ShieldKey. Either the key " +
+			"argument moved and this guard is now watching a parameter that no longer exists, or Shield " +
+			"is being keyed from somewhere this test cannot see")
+	}
+	t.Logf("%d calls into internal/shield, %d of them carrying a key, none carrying the vault key",
+		calls, keyed)
+}
+
+// mentionsIdent reports whether an expression names ident anywhere inside it,
+// as a bare identifier or as the selected field of a selector.
+//
+// Rendering and substring-matching would be shorter and would also match a
+// string literal or a comment. This is the same reason the holder guard walks
+// the AST: the question is what the expression IS, not what it looks like.
+func mentionsIdent(e ast.Expr, name string) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.SelectorExpr:
+			if v.Sel.Name == name {
+				found = true
+			}
+		case *ast.Ident:
+			if v.Name == name {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// renderExpr prints an expression the way it is written, for a failure message
+// that names the argument rather than describing it.
+func renderExpr(fset *token.FileSet, e ast.Expr) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return "<unprintable expression>"
+	}
+	return buf.String()
 }
 
 // TestTheZeroFieldDecryptsNothing closes the one bypass the type system leaves

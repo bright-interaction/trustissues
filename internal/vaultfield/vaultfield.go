@@ -29,11 +29,17 @@
 //
 //   - Every AES-GCM open in the vault-key family happens in this file. Nothing
 //     else in the module imports crypto/aes or crypto/cipher, which
-//     TestAESGCMIsOpenedInExactlyOneFile checks module-wide. That is complete
-//     rather than broad: opening data sealed with AES-GCM REQUIRES those two
-//     packages, so pinning their importers pins every possible reader of the
-//     bytes that are actually stored. A wrapper set is open-ended; the primitive
-//     set is closed by the language.
+//     TestAESGCMIsOpenedInExactlyOneFile checks module-wide.
+//
+//     That guard is a NET and this comment used to sell it as a proof. It said
+//     opening AES-GCM data REQUIRES those two packages, so the importer set was
+//     "closed by the language". It is not: AES-GCM is arithmetic, a pure-Go
+//     implementation imports nothing from crypto/*, and a vendored AEAD imports
+//     none of it either. What a reader of THIS PRODUCT's ciphertext genuinely
+//     cannot do without is the KEY, and that is pinned separately by
+//     TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles, which declares every file
+//     able to name, receive or derive vault key material. The import pin still
+//     earns its place: it is what a real new door reddens.
 //
 //   - Every open here takes a [Field]. A Field's contents are unexported and
 //     [Declare] is its only constructor, so obtaining one means declaring the

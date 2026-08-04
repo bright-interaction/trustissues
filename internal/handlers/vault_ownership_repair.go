@@ -1,14 +1,18 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
@@ -188,7 +192,20 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if _, tErr := vaultegress.TransferSecretOwnership(ctx, h.queries, proof,
+	// ONE TRANSACTION, and the reason is in the next paragraph. Answering the
+	// ownership question re-arms every recorded destination on the row, so the
+	// answer and the disarming have to land together or the unattended sweep can
+	// fire in between with the old evidence and the new authority.
+	tx, txErr := h.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		logError(r, "vault.ownership: begin failed", "entry", entryID, "error", txErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	qtx := h.queries.WithTx(tx)
+
+	if _, tErr := vaultegress.TransferSecretOwnership(ctx, qtx, proof,
 		vaultegress.TransferOwnershipParams{NewOwnerUserID: actor, ID: entryID}); tErr != nil {
 		if strings.Contains(tErr.Error(), "UNIQUE constraint") {
 			// The transfer moves the custodian as well as the owner, which is
@@ -204,6 +221,20 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	withdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID)
+	if wErr != nil {
+		logError(r, "vault.ownership: could not clear the recorded destinations", "entry", entryID,
+			"error", wErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	if cErr := tx.Commit(); cErr != nil {
+		logError(r, "vault.ownership: commit failed", "entry", entryID, "error", cErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
 	// The URL blind index is keyed to bidxScope(user_id, collection_id), so
 	// moving the custodian of a PERSONAL entry invalidates it and autofill would
 	// silently stop offering the entry. Same recompute MoveToCollection does,
@@ -211,10 +242,165 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 	h.reindexAfterCustodianChange(r, entryID, actor, access.CollectionID)
 
 	LogActivityFromRequest(h.queries, r, "vault.ownership_claimed", fmt.Sprintf(
-		"Entry %s: secret ownership claimed by admin %s (it had none; %s)",
-		entryID, actor, proof.Why()))
+		"Entry %s: secret ownership claimed by admin %s (it had none; %s)%s",
+		entryID, actor, proof.Why(), withdrawn.auditSuffix()))
 
-	w.WriteHeader(http.StatusNoContent)
+	withdrawn.EntryID = entryID
+	withdrawn.SecretOwnerUserID = actor
+	writeJSON(w, http.StatusOK, withdrawn)
+}
+
+// withdrawnEvidence is what a claim took OUT of the row on its way in.
+//
+// It is returned to the admin rather than only logged, because these are values
+// they may well want back and a repair surface that silently deletes an
+// operator's configuration is a worse outage than the one it repairs.
+type withdrawnEvidence struct {
+	EntryID           string `json:"entry_id"`
+	SecretOwnerUserID string `json:"secret_owner_user_id"`
+	// DestinationPatterns is the capability ceiling as it stood, verbatim, so
+	// re-entering it is a copy and not an archaeology exercise.
+	DestinationPatterns []string `json:"cleared_destination_patterns"`
+	// ProviderMetaKeys are the provider_meta keys that chose a host, with the
+	// values they held.
+	ProviderMetaKeys map[string]string `json:"cleared_provider_meta"`
+	// Why is the operator-facing sentence. Present even when nothing was
+	// cleared, so the page can always say what the claim did.
+	Why string `json:"why"`
+}
+
+func (wd withdrawnEvidence) anything() bool {
+	return len(wd.DestinationPatterns) > 0 || len(wd.ProviderMetaKeys) > 0
+}
+
+// auditSuffix renders the withdrawal for the activity row. Empty when there was
+// nothing to withdraw, so an ordinary claim keeps its ordinary line.
+func (wd withdrawnEvidence) auditSuffix() string {
+	if !wd.anything() {
+		return ""
+	}
+	var parts []string
+	if len(wd.DestinationPatterns) > 0 {
+		parts = append(parts, "destination_patterns "+strings.Join(wd.DestinationPatterns, " "))
+	}
+	for _, k := range sortedMetaKeys(wd.ProviderMetaKeys) {
+		parts = append(parts, "provider_meta."+k+" = "+wd.ProviderMetaKeys[k])
+	}
+	return ". Recorded destinations chosen by the previous holder were WITHDRAWN and must be " +
+		"re-entered deliberately: " + strings.Join(parts, "; ")
+}
+
+// disarmRecordedDestinations clears the two columns an attacker who held this
+// row could have written, at the moment the row acquires an owner again.
+//
+// THIS IS THE HALF THAT MAKES THE REPAIR SAFE, and it is the answer to the
+// question the read-time rule leaves open. ownerRecordedDestinations counts
+// destination_patterns and the meta-derived provider hosts only while the
+// entry's recorded owner may still direct its secret. On a row the migration
+// withheld, nobody may, so the evidence is inert. Answering the question turns
+// it back on, and the previous holder is exactly who wrote it: without this, an
+// admin doing the right thing at Settings -> Ownership would silently adopt the
+// attacker's collector as a place their secret may go.
+//
+// Clearing rather than keeping is deliberate, and it costs something real: an
+// entry whose LEGITIMATE ceiling and provider host were withheld loses them too,
+// and the admin has to put them back. They are returned in the response and
+// written into the activity row for exactly that reason. Re-entering them is an
+// ordinary PUT /api/vault/{id} which goes through egressgate.Decide with the new
+// owner as the authority, so what comes back is attributable in a way what was
+// there never was.
+//
+// It is not a permission check and does not need one: clearing a destination is
+// a NARROWING, egressgate.Decide grants a ticket for it without consulting the
+// authority oracle, and that is the same rule that keeps "clear the ceiling"
+// available as the product's only per-secret agent revocation.
+func (h *VaultHandler) disarmRecordedDestinations(ctx context.Context, q *db.Queries,
+	entryID string) (withdrawnEvidence, error) {
+
+	wd := withdrawnEvidence{
+		Why: "nothing was recorded on this entry, so the claim withdrew nothing",
+	}
+	meta, err := q.GetVaultEntryMeta(ctx, entryID)
+	if err != nil {
+		return wd, fmt.Errorf("read entry %s: %w", entryID, err)
+	}
+
+	// destination_patterns.
+	if stored := parseDestinationPatterns(meta.DestinationPatterns); len(stored) > 0 {
+		wd.DestinationPatterns = stored
+		tk, dErr := egressgate.Decide(egressgate.Request{
+			EntryID: entryID,
+			What:    vaultegress.FieldDestinations,
+			Before:  ceilingDestinations(stored),
+			After:   nil,
+		})
+		if dErr != nil {
+			return wd, fmt.Errorf("decide the ceiling clear: %w", dErr)
+		}
+		if sErr := vaultegress.SetDestinationPatterns(ctx, q, tk,
+			vaultegress.DestinationPatternsParams{DestinationPatterns: "", ID: entryID}); sErr != nil {
+			return wd, fmt.Errorf("clear the ceiling: %w", sErr)
+		}
+	}
+
+	// The provider_meta keys that CHOOSE A HOST, and only those. Clearing the
+	// whole column would take out account ids and region-free settings that
+	// name nowhere, which is destruction without a security argument.
+	stored := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", vaultFieldProviderMeta))
+	cleared := map[string]string{}
+	next := map[string]string{}
+	for k, v := range stored {
+		next[k] = v
+	}
+	for _, k := range egressInfluencingMetaKeys() {
+		if v, ok := next[k]; ok {
+			cleared[k] = v
+			delete(next, k)
+		}
+	}
+	if len(cleared) > 0 {
+		wd.ProviderMetaKeys = cleared
+		tk, dErr := egressgate.Decide(egressgate.Request{
+			EntryID: entryID,
+			What:    vaultegress.FieldProviderMeta,
+			Before:  providerDestinations(meta.Provider.String, stored),
+			After:   providerDestinations(meta.Provider.String, next),
+			Covers:  providerDestinationCovers,
+		})
+		if dErr != nil {
+			return wd, fmt.Errorf("decide the provider_meta clear: %w", dErr)
+		}
+		encoded, mErr := json.Marshal(next)
+		if mErr != nil {
+			return wd, fmt.Errorf("encode provider_meta: %w", mErr)
+		}
+		enc, eErr := h.encryptColumn(string(encoded))
+		if eErr != nil {
+			return wd, fmt.Errorf("encrypt provider_meta: %w", eErr)
+		}
+		if sErr := vaultegress.SetProviderMeta(ctx, q, tk,
+			vaultegress.ProviderMetaParams{ProviderMeta: toNullString(enc), ID: entryID}); sErr != nil {
+			return wd, fmt.Errorf("clear the host-choosing provider_meta keys: %w", sErr)
+		}
+	}
+
+	if wd.anything() {
+		wd.Why = "the destinations recorded on this entry were chosen by whoever held it before the " +
+			"migration withheld its owner. Claiming ownership answers the question those records were " +
+			"waiting on, so they were withdrawn rather than adopted. Re-enter the ones you want; the " +
+			"write goes through the same gate as any other, with you as the authority"
+	}
+	return wd, nil
+}
+
+// sortedMetaKeys is a stable rendering order for a message an operator reads.
+func sortedMetaKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // reindexAfterCustodianChange recomputes the URL blind indexes under the entry's

@@ -269,18 +269,45 @@ func TestTheBackfillNeverStampsAnAttackerAsOwner(t *testing.T) {
 				"personal entry and the migration would be a blanket outage wearing a proof",
 		},
 		{
-			name: "an entry whose NAME appears inside another entry's move row is still stamped",
+			name: "THE LOG FORMAT THE CITED COMMIT ACTUALLY WROTE denies the row it names",
+			seed: func(t *testing.T, conn *sql.DB, id string) {
+				// The laundering path, run entirely on a binary from
+				// 2026-07-24 to 2026-07-26: created personal, moved INTO a
+				// collection, adopted by a manager while vault.entry_adopted
+				// did not exist yet, moved back OUT to personal.
+				insertEntry(t, conn, id, "u-manager", "laundered-"+id, "")
+				// VERBATIM from 4e9bd5ec, the commit both migrations cite as
+				// their authority. Closing paren, no comma, no name, no
+				// from/to. The first predicate asked for "(id: X," and could
+				// not see either of these rows.
+				logRow(t, conn, "u-manager", "vault.entry_moved",
+					"Vault entry moved to collection (id: "+id+")")
+				logRow(t, conn, "u-manager", "vault.entry_moved",
+					"Vault entry moved to collection (id: "+id+")")
+			},
+			wantOwner: "",
+			why: "this is the fixture that caught it. The entry is personal now, both of its move rows " +
+				"are in the paren wording, and vault.entry_adopted did not exist when it was taken, so " +
+				"a predicate reading the CURRENT wording sees an entry that has never been in a " +
+				"collection and stamps u-manager: a non-creator, promoted to owner, in the column " +
+				"nothing below an instance admin can move",
+		},
+		{
+			name: "an entry NAMED with another entry's id is withheld, and that is the trade",
 			seed: func(t *testing.T, conn *sql.DB, id string) {
 				insertEntry(t, conn, id, "u-victim", id, "")
-				// The move detail contains the id as the NAME of a different
-				// entry. Matching on the name rather than on "(id: X," would
-				// deny this row.
+				// The move detail carries the moved entry's NAME, and this
+				// row's name is its own id, so a wording-independent match on
+				// the bare id sees itself here.
 				logRow(t, conn, "u-manager", "vault.entry_moved",
 					"Vault entry moved: "+id+" (id: a-completely-different-id, from: personal vault, to: collection c-team)")
 			},
-			wantOwner: "u-victim",
-			why: "the evidence is keyed on the id in its delimiters, not on a substring anywhere in the " +
-				"detail",
+			wantOwner: "",
+			why: "the deliberate cost of not parsing the wording. In production an id is 32 fixed-width " +
+				"hex characters, so hitting this takes NAMING an entry with another entry's id, which " +
+				"is a self-inflicted denial of one row repaired by one admin claim. The alternative is " +
+				"a predicate coupled to a prose string that has already been reworded once with nobody " +
+				"noticing",
 		},
 		{
 			name: "an adoption row naming this entry denies it even when it is personal now",

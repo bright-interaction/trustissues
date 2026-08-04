@@ -47,6 +47,20 @@
 -- afternoon; the alternative is leaving a laundered attacker in place because
 -- an unrelated offboarding might have touched the same row, which is guessing
 -- in the attacker's favour to save a click.
+--
+-- HOW THE MOVE EVIDENCE IS MATCHED, corrected in place
+--
+-- The first cut of this file, like 00034's, asked for '(id: ' || id || ',',
+-- which is the CURRENT wording of the vault.entry_moved detail and not the one
+-- shipped between 2026-07-24 and 2026-07-26 ("Vault entry moved to collection
+-- (id: X)", closing paren, no comma). A migration that reads a prose format is
+-- coupled to a string a handler may reword, and this one had been. It now asks
+-- whether the detail CONTAINS THE ID, which is wording-independent: the id is
+-- 32 fixed-width hex characters, so it cannot be a substring of another id.
+-- The ownership_claimed clause stays delimited on purpose, because it PRESERVES
+-- rather than withholds and its failure direction is therefore the unsafe one.
+-- Migration 00036 applies the same correction to databases that already ran
+-- this file.
 UPDATE vault_entries
 SET secret_owner_user_id = ''
 WHERE secret_owner_user_id != ''
@@ -55,12 +69,12 @@ WHERE secret_owner_user_id != ''
     AND NOT EXISTS (
       SELECT 1 FROM activity_log al
       WHERE al.action = 'vault.entry_moved'
-        AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0
+        AND instr(al.detail, vault_entries.id) > 0
     )
     AND NOT EXISTS (
       SELECT 1 FROM activity_log al
       WHERE al.action = 'vault.entry_adopted'
-        AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0
+        AND instr(al.detail, vault_entries.id) > 0
     )
   )
   AND NOT EXISTS (
@@ -83,12 +97,12 @@ WHERE secret_owner_user_id = ''
   AND NOT EXISTS (
     SELECT 1 FROM activity_log al
     WHERE al.action = 'vault.entry_moved'
-      AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0
+      AND instr(al.detail, vault_entries.id) > 0
   )
   AND NOT EXISTS (
     SELECT 1 FROM activity_log al
     WHERE al.action = 'vault.entry_adopted'
-      AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0
+      AND instr(al.detail, vault_entries.id) > 0
   );
 -- +goose StatementEnd
 

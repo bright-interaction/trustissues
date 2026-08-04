@@ -70,15 +70,31 @@
 -- collection_id itself is written in exactly two places: at creation
 -- (VaultHandler.Create places a new shared entry immediately, logging only
 -- vault.entry_created), and by SetVaultEntryCollection behind
--- PUT /api/vault/{id}/collection, which logs
+-- PUT /api/vault/{id}/collection, which logs vault.entry_moved with the ENTRY
+-- ID in it, and has done since the commit that introduced collections at all
+-- (4e9bd5ec). activity_log is append-only at the DATABASE level: migrations
+-- 00003 and 00027 put triggers on it that abort every UPDATE except the foreign
+-- key's actor anonymization, and every DELETE without exception, and no query in
+-- the module deletes from it.
 --
---   vault.entry_moved   "Vault entry moved: NAME (id: ID, from: X, to: Y)"
+-- WHAT THE PREDICATE MATCHES, AND WHAT IT DELIBERATELY DOES NOT
 --
--- with the ENTRY ID in it, and has done since the commit that introduced
--- collections at all (4e9bd5ec). activity_log is append-only at the DATABASE
--- level: migrations 00003 and 00027 put triggers on it that abort every UPDATE
--- except the foreign key's actor anonymization, and every DELETE without
--- exception, and no query in the module deletes from it.
+-- The detail is prose and has been reworded once already. 4e9bd5ec wrote
+-- "Vault entry moved to collection (id: X)"; the current handler writes "Vault
+-- entry moved: NAME (id: X, from: A, to: B)". The first cut of this migration
+-- matched '(id: ' || id || ',', which reads the SECOND wording and is blind to
+-- the first, so an entry moved through a collection by a binary from
+-- 2026-07-24 to 2026-07-26 looked as though it never had been. See migration
+-- 00036, which is the same correction for databases that already applied this
+-- file.
+--
+-- So it matches the ID ALONE. The id is lower(hex(randomblob(16))): 32 hex
+-- characters, fixed width, so no id is a substring of another. Asking whether
+-- the detail CONTAINS that token assumes nothing about the wording, which is
+-- the property a migration wants from a log it did not write.
+-- TestEveryEntryScopedActivityDetailNamesTheEntryID pins the one assumption
+-- that is left, that a writer of these actions puts the entry id in the detail
+-- at all.
 --
 -- Therefore an entry that is PERSONAL NOW and has NO vault.entry_moved row
 -- naming it has never been in a collection, so adoption was never reachable for
@@ -128,17 +144,17 @@ WHERE user_id != ''
   AND (collection_id IS NULL OR collection_id = '')
   -- ... and this one has never been in a collection either, because the only
   -- post-creation writer of collection_id logs the entry id when it runs.
-  -- instr() rather than LIKE, so an id can carry no wildcard.
+  -- instr() on the bare id rather than on a phrasing: see the note above.
   AND NOT EXISTS (
     SELECT 1 FROM activity_log al
     WHERE al.action = 'vault.entry_moved'
-      AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0
+      AND instr(al.detail, vault_entries.id) > 0
   )
   -- The direct record, for the era that has one.
   AND NOT EXISTS (
     SELECT 1 FROM activity_log al
     WHERE al.action = 'vault.entry_adopted'
-      AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0
+      AND instr(al.detail, vault_entries.id) > 0
   );
 -- +goose StatementEnd
 

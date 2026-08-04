@@ -23,7 +23,13 @@ import { api, ApiError } from '@/lib/api';
 import { vaultApi } from '@/lib/vault-types';
 import { queryKeys } from '@/lib/query-keys';
 import { useAuth } from '@/hooks/useAuth';
-import type { SMTPConfig, VaultPolicy, ApiKeyCreated, AIConfig } from '@/lib/types';
+import type {
+  SMTPConfig,
+  VaultPolicy,
+  ApiKeyCreated,
+  AIConfig,
+  WithdrawnEvidence,
+} from '@/lib/types';
 import { NOTIFICATION_EVENTS, type NotificationEvent } from '@/lib/types';
 
 type SettingsTab =
@@ -1179,6 +1185,11 @@ function ChannelsTab() {
 function OwnershipTab() {
   const queryClient = useQueryClient();
   const [claiming, setClaiming] = useState<string | null>(null);
+  // What the last claim WITHDREW. Held in state rather than only toasted,
+  // because these are values the admin has to be able to read off and put back,
+  // and a toast that scrolls away would make a deliberate fail-closed step
+  // indistinguishable from silent data loss.
+  const [withdrawn, setWithdrawn] = useState<WithdrawnEvidence | null>(null);
 
   const reportQuery = useQuery({
     queryKey: queryKeys.admin.unownedEntries(),
@@ -1187,8 +1198,15 @@ function OwnershipTab() {
 
   const claimMutation = useMutation({
     mutationFn: (id: string) => api.admin.claimSecretOwnership(id),
-    onSuccess: () => {
-      toast.success('Ownership claimed');
+    onSuccess: (result) => {
+      const patterns = result?.cleared_destination_patterns ?? [];
+      const metaKeys = Object.keys(result?.cleared_provider_meta ?? {});
+      setWithdrawn(patterns.length || metaKeys.length ? result : null);
+      toast.success(
+        patterns.length || metaKeys.length
+          ? 'Ownership claimed; recorded destinations withdrawn'
+          : 'Ownership claimed'
+      );
       queryClient.invalidateQueries({
         queryKey: queryKeys.admin.unownedEntries(),
       });
@@ -1222,6 +1240,66 @@ function OwnershipTab() {
           it does is record the decision.
         </p>
       </div>
+
+      {withdrawn && (
+        <div
+          className={`${cardClass} border-amber-200 bg-amber-50`}
+          data-testid="withdrawn-evidence"
+        >
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-amber-900">
+                Recorded destinations were withdrawn, not adopted
+              </p>
+              <p className="mt-1 text-sm text-amber-800">{withdrawn.why}</p>
+              {(withdrawn.cleared_destination_patterns?.length ?? 0) > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-medium text-amber-900">
+                    Agent destinations
+                  </p>
+                  <ul className="mt-1 space-y-0.5">
+                    {withdrawn.cleared_destination_patterns?.map((p) => (
+                      <li
+                        key={p}
+                        className="break-all font-mono text-xs text-amber-900"
+                      >
+                        {p}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {Object.keys(withdrawn.cleared_provider_meta ?? {}).length > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-medium text-amber-900">
+                    Provider settings that named a host
+                  </p>
+                  <ul className="mt-1 space-y-0.5">
+                    {Object.entries(withdrawn.cleared_provider_meta ?? {}).map(
+                      ([key, value]) => (
+                        <li
+                          key={key}
+                          className="break-all font-mono text-xs text-amber-900"
+                        >
+                          {key} = {value}
+                        </li>
+                      )
+                    )}
+                  </ul>
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => setWithdrawn(null)}
+                className="mt-3 text-xs font-medium text-amber-900 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {reportQuery.isLoading && (
         <div className={cardClass}>

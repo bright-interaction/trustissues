@@ -24,6 +24,7 @@ import type {
   CollectionInviteResult,
   PendingInvite,
   OwnershipReport,
+  WithdrawnEvidence,
 } from './types';
 
 export class ApiError extends Error {
@@ -265,8 +266,13 @@ export const api = {
     // one action that repairs it.
     listUnownedEntries: () =>
       request<OwnershipReport>('/admin/vault/ownership'),
+    // Returns what the claim WITHDREW. Answering the ownership question is what
+    // would otherwise re-arm destinations the previous holder chose, so the
+    // claim clears them in the same transaction and reports them here.
     claimSecretOwnership: (id: string) =>
-      request<void>(`/admin/vault/${id}/ownership/claim`, { method: 'POST' }),
+      request<WithdrawnEvidence>(`/admin/vault/${id}/ownership/claim`, {
+        method: 'POST',
+      }),
   },
 
   settings: {
