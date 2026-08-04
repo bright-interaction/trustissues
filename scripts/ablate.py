@@ -76,8 +76,32 @@ def ablate(spec):
 
     try:
         _PENDING[path] = original
+        ablated = text.replace(spec["old"], spec["new"], 1)
+
+        # `extra_import` adds packages the ablation's own code needs.
+        #
+        # It was in a spec before it was in this harness. Round 20 wrote
+        # {"extra_import": "crypto/aes"} for the ablation that plants an aes
+        # reference in an undeclared file, the harness silently ignored the field,
+        # and the run came back "does not compile: undefined: aes" -> INVALID. The
+        # sweep reported that honestly and nobody re-ran it, so the guard the
+        # ablation exists to test went unproven while the report looked complete.
+        #
+        # An unknown key is therefore a hard error rather than a shrug: a spec that
+        # asks for something this file does not do must stop the run, not quietly
+        # become an INVALID that reads like the ablation's own fault.
+        extra = spec.get("extra_import")
+        if extra:
+            imports = [extra] if isinstance(extra, str) else list(extra)
+            anchor = "\nimport (\n"
+            if anchor not in ablated:
+                return {**spec, "result": "INVALID",
+                        "detail": "extra_import needs a parenthesised import block"}
+            at = ablated.index(anchor) + len(anchor)
+            ablated = ablated[:at] + "".join(f'\t"{p}"\n' for p in imports) + ablated[at:]
+
         with open(path, "w") as fh:
-            fh.write(text.replace(spec["old"], spec["new"], 1))
+            fh.write(ablated)
 
         rc, out = run("go build ./... 2>&1")
         if rc != 0:

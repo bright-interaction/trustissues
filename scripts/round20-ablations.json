@@ -1,0 +1,97 @@
+[
+ {
+  "id": "exit-ceiling-has-no-owner-check",
+  "mech": "recorded-evidence",
+  "file": "internal/handlers/secret_exit_authority.go",
+  "old": "\tif ownerMayDirect {\n\t\tfor _, pat := range parseDestinationPatterns(meta.DestinationPatterns) {",
+  "new": "\tif true {\n\t\tfor _, pat := range parseDestinationPatterns(meta.DestinationPatterns) {",
+  "test": "TestDoor1CapabilityProxyRefusesAPlantedCeilingOnAWithheldRow",
+  "why": "THE HEADLINE, written out literally. Step 2 of ownerRecordedDestinations reads destination_patterns off the row with no owner check, which is exactly the state 00034 leaves behind on an already-attacked database"
+ },
+ {
+  "id": "exit-provider-meta-has-no-owner-check",
+  "mech": "recorded-evidence",
+  "file": "internal/handlers/secret_exit_authority.go",
+  "old": "\tdeclared := metaIndependentProviderEgress(meta.Provider.String, providerMeta)\n\tif ownerMayDirect {\n\t\tdeclared = declaredProviderEgress(meta.Provider.String, providerMeta)\n\t}",
+  "new": "\tdeclared := declaredProviderEgress(meta.Provider.String, providerMeta)",
+  "test": "TestDoor2ValidateRefusesAPlantedProviderMetaOnAWithheldRow",
+  "why": "step 3, the round-4 class. A meta-derived host (forgejo's whole base URL) is authorised straight off the column the attacker rewrote, which is doors 2 and 3"
+ },
+ {
+  "id": "exit-empty-owner-is-treated-as-answered",
+  "mech": "recorded-evidence",
+  "file": "internal/handlers/secret_exit_authority.go",
+  "old": "\towner := strings.TrimSpace(info.SecretOwnerUserID)\n\tif owner == \"\" {\n\t\treturn false, nil\n\t}\n\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
+  "new": "\towner := strings.TrimSpace(info.SecretOwnerUserID)\n\tif owner == \"\" {\n\t\towner = info.UserID\n\t}\n\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
+  "test": "TestAWithheldOwnerIsNotLaunderedThroughAnAdminCustodian",
+  "why": "the friendly-looking version: 'fall back to the custodian for rows the migration withheld'. It was first pointed at the door-1 test and MISSED, because that fixture's custodian is an ordinary user and mayConfigureDelivery then compares them against an empty owner and refuses. It is NOT inert against an ADMIN custodian, who returns true on the isAdmin branch before the owner column is read, and an admin adopting an attacked row is what an operator does to clean one up"
+ },
+ {
+  "id": "exit-asks-about-the-caller-not-the-owner",
+  "mech": "recorded-evidence",
+  "file": "internal/handlers/secret_exit_authority.go",
+  "old": "\treturn h.mayConfigureDelivery(ctx, owner, entryID), nil",
+  "new": "\treturn owner != \"\", nil",
+  "test": "TestARecordedOwnerWhoLostManageStopsAuthorisingDestinations",
+  "why": "asking whether an owner is RECORDED instead of whether they may still direct the secret. It is the same shape as the six rounds that asked 'who wrote the row' rather than 'whose is it'. It was first pointed at the door-1 test and MISSED, because that fixture's owner is EMPTY so 'is one recorded' still answers no. It needs a row whose owner is recorded and has since been removed from the collection, which is every instance new enough for the creating statement to have stamped one"
+ },
+ {
+  "id": "repair-adopts-the-previous-holders-ceiling",
+  "mech": "repair",
+  "file": "internal/handlers/vault_ownership_repair.go",
+  "old": "\twithdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID)\n\tif wErr != nil {",
+  "new": "\twithdrawn, wErr := withdrawnEvidence{Why: \"ablated\"}, error(nil)\n\tif wErr != nil {",
+  "test": "TestTheRepairDoesNotReArmThePlantedEvidence",
+  "why": "the half read-time withholding cannot cover. Claiming ownership answers the question the attacker's records were waiting on, so without the withdrawal the admin's repair re-arms their collector under admin authority"
+ },
+ {
+  "id": "an-undeclared-file-holds-the-vault-key",
+  "mech": "crypto-pin",
+  "file": "internal/handlers/mcp.go",
+  "old": "const mcpProtocolVersion = \"2024-11-05\"",
+  "new": "func (h *MCPHandler) ablatedKeyReach() string { return h.cfg.VaultKey }\n\nconst mcpProtocolVersion = \"2024-11-05\"",
+  "test": "TestVaultKeyMaterialIsHeldOnlyByDeclaredFiles",
+  "why": "F1. A file nobody ruled on gains the ability to open every stored byte, and it does so without importing a single crypto package, which is precisely what the import pin could never have seen"
+ },
+ {
+  "id": "an-undeclared-file-imports-the-aes-primitives",
+  "mech": "crypto-pin",
+  "file": "internal/handlers/mcp.go",
+  "old": "const mcpProtocolVersion = \"2024-11-05\"",
+  "new": "var _ = aes.BlockSize\n\nconst mcpProtocolVersion = \"2024-11-05\"",
+  "test": "TestAESGCMIsOpenedInExactlyOneFile",
+  "why": "the sixth-door shape the import net exists for, kept as a net rather than sold as a proof",
+  "extra_import": "crypto/aes"
+ },
+ {
+  "id": "the-vault-key-is-handed-to-shield",
+  "mech": "crypto-pin",
+  "file": "internal/handlers/ai_gateway.go",
+  "old": "\t\t\t[]byte(h.cfg.ShieldKey), 30*time.Minute, shield.ParseHintLevel(h.cfg.ShieldHintLevel))",
+  "new": "\t\t\t[]byte(h.cfg.VaultKey), 30*time.Minute, shield.ParseHintLevel(h.cfg.ShieldHintLevel))",
+  "test": "TestNothingHandsTheVaultKeyToShield",
+  "why": "F3. internal/shield takes a plain []byte and cannot refuse this, so the exemption is decided at the CALL SITE. One character, and the ledger goes on reporting shield's columns as a different key family"
+ },
+ {
+  "id": "the-backfill-reads-a-wording-again",
+  "mech": "migration",
+  "file": "internal/database/migrations/00034_secret_owner.sql",
+  "old": "    WHERE al.action = 'vault.entry_moved'\n      AND instr(al.detail, vault_entries.id) > 0",
+  "new": "    WHERE al.action = 'vault.entry_moved'\n      AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0",
+  "test": "TestTheBackfillNeverStampsAnAttackerAsOwner",
+  "pkg": "./internal/database/",
+  "expect_miss": true,
+  "note": "MASKED BY DESIGN, verified by running it. 00034 is corrected in place, so it only ever runs on a fresh database, and on a fresh database 00035 and 00036 re-derive the same withholding afterwards. Reverting 00034 alone therefore changes no outcome the suite can observe, and that is defence in depth working rather than a blind guard. The layer that is NOT redundant is 00036 on an already-migrated instance, which is its own ablation below.",
+  "why": "the shipped predicate, restored. It reads the CURRENT phrasing of the detail and is blind to the one 4e9bd5ec actually wrote, which is how a non-creator got stamped as owner"
+ },
+ {
+  "id": "the-relaunder-reads-a-wording-again",
+  "mech": "migration",
+  "file": "internal/database/migrations/00036_secret_owner_log_format.sql",
+  "old": "      WHERE al.action = 'vault.entry_moved'\n        AND instr(al.detail, vault_entries.id) > 0\n    )\n    AND NOT EXISTS (\n      SELECT 1 FROM activity_log al\n      WHERE al.action = 'vault.entry_adopted'\n        AND instr(al.detail, vault_entries.id) > 0\n    )\n  )",
+  "new": "      WHERE al.action = 'vault.entry_moved'\n        AND instr(al.detail, '(id: ' || vault_entries.id || ',') > 0\n    )\n    AND NOT EXISTS (\n      SELECT 1 FROM activity_log al\n      WHERE al.action = 'vault.entry_adopted'\n        AND instr(al.detail, 'Entry ' || vault_entries.id || ' ') > 0\n    )\n  )",
+  "test": "TestTheLogFormatMigrationRepairsAParenEraLaundering",
+  "pkg": "./internal/database/",
+  "why": "the same blindness in the re-derivation. It was first pointed at the fresh-database backfill test and MISSED, because on a fresh database the corrected 00034 has already withheld and 00036 repairs nothing. 00036 is load-bearing on exactly one database: the one that ALREADY RAN the broken 00034, which goose will never re-read. That is the database its test now builds, and it is the one every existing instance is in"
+ }
+]
