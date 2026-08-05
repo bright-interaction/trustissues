@@ -40,3 +40,13 @@ SELECT id FROM users WHERE email = ?;
 INSERT INTO users (email, password_hash, name, role)
 VALUES (?, ?, ?, ?)
 RETURNING id;
+
+-- name: ListInvitationCodesForRekey :many
+-- Pending invitation codes are encrypted at rest with the vault handler's
+-- enc:v1: column scheme so "resend invitation" can mail the original code. A
+-- master-key rotation that skipped this column would leave every pending invite
+-- unresendable, which reads as a broken feature rather than as a rotation bug.
+SELECT id, code FROM invitations WHERE code != '' ORDER BY id;
+
+-- name: RekeyInvitationCode :exec
+UPDATE invitations SET code = ? WHERE id = ?;

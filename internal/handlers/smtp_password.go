@@ -25,7 +25,19 @@ import (
 //
 // A decrypt failure is an error, never a fallback to the raw value. Falling back
 // would send ciphertext as the password, which is the exact bug this replaces.
-func resolveSMTPPassword(stored, vaultKey string) (string, error) {
+// vaultKeys is variadic so callers can pass the CURRENT key followed by
+// TRUSTISSUES_VAULT_KEY_PREVIOUS. During a rotation the settings row is still
+// sealed under the old key until the re-encrypt sweep runs, and without the
+// fallback every invitation email would fail to send with a decrypt error for
+// the whole window.
+//
+// The DECLARED FIELD rides along with the key list. It is what vaultfield
+// demands before it will produce plaintext at all, and passing it to a multi-key
+// read is what keeps a rotation-era decrypt from becoming the one family of
+// decryptions that names no column. It is the same field on every attempt: the
+// column being opened is settings.smtp_password whichever key happens to open
+// it. See columncrypto.DecryptStringAny.
+func resolveSMTPPassword(stored string, vaultKeys ...string) (string, error) {
 	if stored == "" {
 		return "", nil
 	}
@@ -33,7 +45,7 @@ func resolveSMTPPassword(stored, vaultKey string) (string, error) {
 		// Legacy row written before at-rest encryption. Still a usable password.
 		return stored, nil
 	}
-	plain, err := columncrypto.DecryptString(stored, vaultKey, vaultFieldSMTPPassword)
+	plain, err := columncrypto.DecryptStringAny(stored, vaultFieldSMTPPassword, vaultKeys...)
 	if err != nil {
 		return "", fmt.Errorf("decrypt smtp password: %w", err)
 	}

@@ -1,0 +1,31 @@
+[Unit]
+Description=Run the Trustissues database backup daily
+Documentation=file:///opt/trustissues/docs/BACKUP.md
+
+[Timer]
+# 03:20 UTC daily. Paired with the shipped retention defaults (keep 7 daily,
+# 4 weekly) this holds roughly ten snapshots, about a week and a month of
+# history, for ten times the size of the database.
+#
+# Want it more often? Change this AND the retention numbers together. An hourly
+# OnCalendar with keep-daily=7 keeps 7 files and throws away 161 a week, which
+# is probably not what you meant.
+OnCalendar=*-*-* 03:20:00
+
+# Spread the load, and stop every box in a fleet from hitting the same backup
+# target in the same second.
+RandomizedDelaySec=20m
+
+# Run the missed backup after a reboot instead of skipping the day. This is the
+# difference between "the box was down overnight" and "there is no Tuesday".
+Persistent=true
+
+# Do not let a slow run and the next trigger overlap on the same SQLite file.
+# Type=oneshot already serialises, but saying it here means the timer logs the
+# skip instead of silently queuing.
+AccuracySec=1m
+
+Unit=trustissues-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -25,6 +25,21 @@ services:
       # the .env.example placeholder values. Generate with: openssl rand -hex 32
       - TRUSTISSUES_JWT_SECRET=${TRUSTISSUES_JWT_SECRET}
       - TRUSTISSUES_VAULT_KEY=${TRUSTISSUES_VAULT_KEY}
+      # Master-key rotation. Both are empty in the steady state and are set only
+      # while a rotation is in flight. They are listed here for the same reason
+      # Shield and ALLOW_KEY_MISMATCH are: a variable absent from this list
+      # cannot be set from .env at all, so the documented procedure would silently
+      # do nothing, and the operator would discover that mid-rotation.
+      #
+      # _PREVIOUS is the OLD key: with it set, decryption falls back to it, so an
+      # unswept store keeps serving instead of blanking every secret.
+      # _REKEY_ON_BOOT=1 runs the re-encrypt sweep before the server accepts
+      # traffic, for deploys where nobody logs in to press the button in
+      # Settings -> Encryption. Remove BOTH once the sweep reports everything on
+      # the current key, otherwise the retired key stays loaded and keeps
+      # opening this data.
+      - TRUSTISSUES_VAULT_KEY_PREVIOUS=${TRUSTISSUES_VAULT_KEY_PREVIOUS:-}
+      - TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT=${TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT:-}
       - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
       - TRUSTISSUES_TRUSTED_PROXY_HOPS=${TRUSTISSUES_TRUSTED_PROXY_HOPS:-1}
       - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}

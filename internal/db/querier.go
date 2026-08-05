@@ -422,7 +422,18 @@ type Querier interface {
 	ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error)
 	ListEnabledNotificationChannels(ctx context.Context) ([]ListEnabledNotificationChannelsRow, error)
 	ListExpiringVaultEntries(ctx context.Context, windowDays string) ([]ListExpiringVaultEntriesRow, error)
+	// Pending invitation codes are encrypted at rest with the vault handler's
+	// enc:v1: column scheme so "resend invitation" can mail the original code. A
+	// master-key rotation that skipped this column would leave every pending invite
+	// unresendable, which reads as a broken feature rather than as a rotation bug.
+	ListInvitationCodesForRekey(ctx context.Context) ([]ListInvitationCodesForRekeyRow, error)
 	ListInvitations(ctx context.Context) ([]ListInvitationsRow, error)
+	// Channel configs are raw AES-GCM under the vault value key, with the nonce in
+	// its own column and NO marker in the payload. encryption_version 0 means the
+	// config was written before at-rest encryption and is plain JSON; the sweep must
+	// see those rows too so it can report them rather than silently treat a
+	// cleartext webhook URL (which can carry a bearer token) as already converted.
+	ListNotificationChannelConfigsForRekey(ctx context.Context) ([]ListNotificationChannelConfigsForRekeyRow, error)
 	ListNotificationChannels(ctx context.Context) ([]ListNotificationChannelsRow, error)
 	// Invitations awaiting the user's decision. These grant no access.
 	ListPendingCollectionInvitesForUser(ctx context.Context, userID string) ([]ListPendingCollectionInvitesForUserRow, error)
@@ -455,6 +466,31 @@ type Querier interface {
 	// (provider, provider_meta) pair. A backfill must be able to show that its write
 	// moves that set nowhere, and it cannot show that without the provider name.
 	ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVaultEntriesForMetaBackfillRow, error)
+	// ============================================================================
+	// Master-key rotation (VaultHandler.RekeyVault, see vault_rekey.go).
+	//
+	// One list + one write per keyed surface. The list queries are deliberately
+	// UNFILTERED: the sweep has to SEE every row to answer "does this open under the
+	// current key", and a WHERE clause that excludes a row excludes it from the
+	// rotation too. The boot key gate has already been burned twice by a probe query
+	// that filtered away the rows that mattered (encryption_version = 2 only, then a
+	// trailing LIMIT on a compound SELECT), and both times the result was a store
+	// that silently reported "nothing to protect here". Filtering happens in Go,
+	// where the reason for skipping a row can be reported.
+	// ============================================================================
+	// Every vault_entries column that holds material derived from the master key, in
+	// one read: the secret value (+ its nonce and derivation version), the eight
+	// enc:v1: metadata columns, and the two blind indexes. user_id and collection_id
+	// come along because the blind index is keyed PER SCOPE, so recomputing it needs
+	// to know which scope the row lives in.
+	//
+	// provider comes along although it is not keyed and is never rewritten here. The
+	// write this feeds is a host-choosing one and therefore takes an egressgate
+	// ticket, and providerDestinations needs the provider NAME as well as the meta
+	// to say which hosts a provider binding can reach. Without it the sweep would
+	// have to mint its ticket on an empty comparison, which is the shape the
+	// chokepoint guards call decorative.
+	ListVaultEntriesForRekey(ctx context.Context) ([]ListVaultEntriesForRekeyRow, error)
 	ListVaultEntriesNeedingRotation(ctx context.Context) ([]ListVaultEntriesNeedingRotationRow, error)
 	ListVaultEntriesV1(ctx context.Context) ([]ListVaultEntriesV1Row, error)
 	// ============================================================================
@@ -505,6 +541,8 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
+	RekeyInvitationCode(ctx context.Context, arg RekeyInvitationCodeParams) error
+	RekeyNotificationChannelConfig(ctx context.Context, arg RekeyNotificationChannelConfigParams) error
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
 	// Re-owning ONE entry (so a single name collision cannot block the rest) is
 	// vaultegress.TransferSecretOwnership now. The statement moved to

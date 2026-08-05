@@ -305,8 +305,17 @@ func TestAESGCMIsOpenedInExactlyOneFile(t *testing.T) {
 //	               the question this guard asks is "who holds material derived
 //	               from the vault key", and answering it per-purpose is how a set
 //	               starts having exceptions.
+//	vaultKeys      the KEYRING: the current master key followed by
+//	               TRUSTISSUES_VAULT_KEY_PREVIOUS. Master-key rotation made the
+//	               dual-key read the ordinary shape, so the functions that used
+//	               to take a `vaultKey string` now take `vaultKeys ...string`,
+//	               and a guard matching only the singular stopped seeing files
+//	               that hold the key just as much as they did before. It is
+//	               listed for the same reason bidxKey is: the question is who
+//	               can REACH key material, not what they do with it.
 var vaultKeyFieldNames = map[string]bool{
 	"VaultKey": true, "encryptionKey": true, "legacyKey": true, "bidxKey": true,
+	"vaultKeys": true,
 }
 
 // theVaultKeyHolders is every production file allowed to name vault key
@@ -348,6 +357,13 @@ var theVaultKeyHolders = map[string]string{
 		"encryptionKey through internal/vaultfield with a declared Field.",
 	"internal/handlers/vault_keycheck.go": "the boot-time check that the configured key actually opens " +
 		"what is stored, plus the re-key path, which is the one place both keys are live at once.",
+	"internal/handlers/vault_rekey.go": "the master-key sweep. It is the one file that holds BOTH keys " +
+		"on purpose and for the whole of a conversion: classifying a row means asking which key opens " +
+		"it, and re-encrypting it means sealing under the other one. It re-derives the v1 key from the " +
+		"master key string rather than reading legacyKey, because MigrateEncryption zeroes that field " +
+		"after boot and a sweep triggered from the admin API later would otherwise read zeroes and " +
+		"report every v1 row unreadable. Everything it opens goes through internal/vaultfield or " +
+		"internal/secretexit with a declared Field; it does no crypto of its own.",
 	"internal/handlers/auth.go": "TOTP secrets are a vault-key column and are opened through " +
 		"columncrypto with cfg.VaultKey.",
 	"internal/handlers/users.go": "the SMTP relay password is instance-owned configuration under the " +

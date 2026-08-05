@@ -175,8 +175,22 @@ Backup rules (the short version):
   database's tail over your restored file and silently undo the restore. Start
   with the **same** `TRUSTISSUES_VAULT_KEY`; a different key yields
   `[decryption error]` on every secret, permanently.
-- Automated/scheduled backups are deferred (`DEFERRED.md`); run the script from
-  cron or a systemd timer for now.
+- **Schedule it.** `sudo ./deploy/systemd/install.sh` installs a daily backup
+  timer, a weekly restore drill, retention (keep 7 daily / 4 weekly) and email
+  alerting on failure, all driven by `/etc/trustissues/backup.env`. Hosts
+  without systemd get the same two jobs from
+  `deploy/cron/trustissues-backup.cron`. Run
+  `sudo ./deploy/systemd/install.sh --test-alert` once: an unconfigured alerter
+  is silent by design, so an untested one is indistinguishable from none.
+- **Prove it restores.** `./scripts/restore-drill.sh /secure/backups` restores
+  the newest snapshot into a throwaway directory and checks a known row survived.
+  It also fails when the newest snapshot is too old, which is how a timer that
+  stopped weeks ago gets noticed. A backup nobody has restored is a hypothesis.
+- Keep the snapshots off the database's own disk. `backup.sh` refuses a
+  destination inside the data directory and warns when the two share a
+  filesystem. See `docs/BACKUP.md`.
+- An in-process `trustissues backup` subcommand and off-host replication are
+  still deferred (`DEFERRED.md` section (d)).
 
 ### File permissions
 

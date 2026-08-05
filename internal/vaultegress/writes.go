@@ -73,6 +73,12 @@ const (
 	FieldProvider        = "provider+provider_meta"
 	FieldProviderMeta    = "provider_meta"
 	FieldRotationTargets = "rotation_targets"
+	// FieldRekey is the master-key sweep's whole-row re-encryption. It is its own
+	// subject rather than a reuse of FieldProvider or FieldRotationTargets
+	// because the statement behind it assigns BOTH of those columns, and a ticket
+	// minted to narrow one of them must not be spendable on a write that touches
+	// the other. A rekey ticket is equally unspendable on a targeted write.
+	FieldRekey = "rekey"
 )
 
 // HostChoosingColumns is every vault_entries column whose value can change where
@@ -124,6 +130,26 @@ type ProviderMetaParams struct {
 type RotationTargetsParams struct {
 	RotationTargets sql.NullString
 	ID              string
+}
+
+// RekeyEntryParams re-encrypts every keyed column of one entry under the current
+// master key. It carries provider_meta and rotation_targets, which is why it is
+// in this package at all.
+type RekeyEntryParams struct {
+	EncryptedValue    []byte
+	Nonce             []byte
+	EncryptionVersion sql.NullInt64
+	Url               sql.NullString
+	AliasUrl          sql.NullString
+	Username          sql.NullString
+	Category          sql.NullString
+	Notes             sql.NullString
+	ProviderMeta      sql.NullString
+	RotationTargets   sql.NullString
+	CustomFields      string
+	UrlBidx           string
+	AliasUrlBidx      string
+	ID                string
 }
 
 // CreateEntryParams inserts a vault entry, which carries provider and
@@ -269,5 +295,41 @@ func CreateEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Cre
 		AutoRotate:           p.AutoRotate,
 		UrlBidx:              p.UrlBidx,
 		AliasUrlBidx:         p.AliasUrlBidx,
+	})
+}
+
+// RekeyEntry re-encrypts one entry's keyed columns under the current master key.
+//
+// A re-encryption moves no destination: the same webhook URL and the same
+// provider binding come out the other side, sealed under a different key. That
+// is a property of the CALLER, though, not of the statement, and this package
+// exists because a property of the caller cannot be enforced by reading SQL.
+// The statement assigns provider_meta and rotation_targets, so it takes a ticket
+// like every other host-choosing write.
+//
+// The ticket a sweep mints for it states Before == After, derived from the
+// values it just decrypted, so egressgate.Decide grants it with nothing added
+// and never consults the authority oracle. That is what a re-encryption pass
+// should look like from the gate's point of view, and it is the same shape
+// VaultHandler.BackfillMetadataEncryption already uses for the same reason.
+func RekeyEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p RekeyEntryParams) error {
+	if err := tk.Authorizes(p.ID, FieldRekey); err != nil {
+		return err
+	}
+	return writer(q).RekeyVaultEntry(ctx, egressq.RekeyVaultEntryParams{
+		EncryptedValue:    p.EncryptedValue,
+		Nonce:             p.Nonce,
+		EncryptionVersion: p.EncryptionVersion,
+		Url:               p.Url,
+		AliasUrl:          p.AliasUrl,
+		Username:          p.Username,
+		Category:          p.Category,
+		Notes:             p.Notes,
+		ProviderMeta:      p.ProviderMeta,
+		RotationTargets:   p.RotationTargets,
+		CustomFields:      p.CustomFields,
+		UrlBidx:           p.UrlBidx,
+		AliasUrlBidx:      p.AliasUrlBidx,
+		ID:                p.ID,
 	})
 }
