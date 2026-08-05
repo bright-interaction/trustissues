@@ -43,8 +43,22 @@ ALTER TABLE secret_ownership_claims ADD COLUMN previous_custodian_user_id TEXT N
 
 -- +goose Down
 -- +goose StatementBegin
--- Not dropped, for the same reason 00037 does not drop the tables: these record
--- a displaced holder, and losing them turns a claim that was undoable into one
--- that is not, silently, on rows an operator may already be relying on.
-SELECT 1;
+-- THE COLUMNS GO, which is what 00034 does with the column it adds and is the
+-- only version of this that survives a down/up cycle.
+--
+-- ALTER TABLE ADD COLUMN is not idempotent and SQLite has no IF NOT EXISTS for
+-- it, so a Down that did nothing would leave the columns in place, and the next
+-- Up would fail with "duplicate column name" on a database that is otherwise
+-- perfectly healthy. That failure appears on no fresh install and no
+-- forward-only upgrade, which makes 3am the first time anyone meets it.
+--
+-- It costs what a down migration always costs: any claim not yet undone loses
+-- the record of what it displaced, so it stops being undoable. That is the
+-- honest meaning of reverting this file. 00037 is the one that must not drop,
+-- because the TABLES there carry decisions no later migration can reconstruct.
+ALTER TABLE secret_ownership_claims DROP COLUMN previous_owner_user_id;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+ALTER TABLE secret_ownership_claims DROP COLUMN previous_custodian_user_id;
 -- +goose StatementEnd

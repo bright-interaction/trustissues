@@ -281,8 +281,14 @@ func TestDemotingAnAdminMakesTheirLiveEntriesClaimable(t *testing.T) {
 	h.ClaimSecretOwnership(claim, vaultAuthzRequest(http.MethodPost,
 		"/api/admin/vault/entry-role/ownership/claim", claimer, "admin", "entry-role", ""))
 	t.Logf("claim after the demotion -> %d %s", claim.Code, strings.TrimSpace(claim.Body.String()))
+	// NOT `return`. This fixture strands the entry deliberately, so the claim is
+	// expected to succeed and a non-200 means the repair surface is broken rather
+	// than that there is nothing left to measure. The early-out this replaces made
+	// the whole test pass when the claim 500d, which is how removing migration
+	// 00038 (the columns the claim writes) left it green.
 	if claim.Code != http.StatusOK {
-		return
+		t.Fatalf("ABORT: the stranded row could not be claimed (%d: %s), so the repair surface itself "+
+			"is broken", claim.Code, strings.TrimSpace(claim.Body.String()))
 	}
 
 	// Undo the demotion. The role comes back. Does anything else?
@@ -457,8 +463,12 @@ func TestAManagerStillCausesIrreversibleLossThroughProductRoutesAlone(t *testing
 	h.ClaimSecretOwnership(claim, vaultAuthzRequest(http.MethodPost,
 		"/api/admin/vault/entry-prod/ownership/claim", admin, "admin", "entry-prod", ""))
 	t.Logf("admin claim -> %d %s", claim.Code, strings.TrimSpace(claim.Body.String()))
+	// NOT `return`, for the reason given in the test above: the demotion strands
+	// this entry on purpose, so a claim that does not succeed is a broken repair
+	// surface and must be reported as one.
 	if claim.Code != http.StatusOK {
-		return
+		t.Fatalf("ABORT: the stranded row could not be claimed (%d: %s), so the repair surface itself "+
+			"is broken", claim.Code, strings.TrimSpace(claim.Body.String()))
 	}
 
 	// The manager puts the role back. One call, same route.
