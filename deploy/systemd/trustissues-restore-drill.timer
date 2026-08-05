@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the Trustissues restore drill weekly
+Documentation=file:///opt/trustissues/docs/BACKUP.md
+
+[Timer]
+# Mondays 04:10 UTC, an hour after the nightly backup so the drill exercises a
+# snapshot from a few hours ago rather than one it raced.
+OnCalendar=Mon *-*-* 04:10:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=trustissues-restore-drill.service
+
+[Install]
+WantedBy=timers.target

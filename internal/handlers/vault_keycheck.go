@@ -60,7 +60,18 @@ var ErrVaultKeyMismatch = errors.New("vault key does not match the data in this 
 // Call this immediately after RunMigrations and before MigrateTOTPSecrets,
 // MigrateEncryption and the backfills. Those all rewrite rows under the current
 // key, so running them under a wrong key is itself destructive.
-func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) error {
+//
+// vaultKeys is the keyring: the CURRENT key first, then TRUSTISSUES_VAULT_KEY_PREVIOUS
+// when a rotation is configured. Accepting the previous key here is what makes
+// rotation possible at all. Without it, the first boot after a key change is
+// refused by this very gate, so the operator can never reach the admin UI to run
+// the re-encrypt sweep and the only remaining route is the escape hatch that
+// re-seals the sentinel and blanks the data.
+func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKeys ...string) error {
+	vaultKey := ""
+	if len(vaultKeys) > 0 {
+		vaultKey = vaultKeys[0]
+	}
 	stored, err := queries.GetSetting(ctx, vaultKeyCheckSetting)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read vault keycheck: %w", err)
@@ -77,7 +88,7 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 		//
 		// So probe the data first. Only seal when the configured key is either
 		// demonstrably correct, or there is nothing yet to be wrong about.
-		hasCiphertext, opens, probeErr := vaultKeyOpensExistingData(ctx, queries, vaultKey)
+		hasCiphertext, opens, probeErr := vaultKeyOpensExistingData(ctx, queries, vaultKeys...)
 		if probeErr != nil {
 			return fmt.Errorf("probe existing ciphertext: %w", probeErr)
 		}
@@ -104,11 +115,59 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 		return nil
 	}
 
-	plain, decErr := columncrypto.DecryptString(stored, vaultKey, vaultFieldKeySentinel)
+	plain, decErr := columncrypto.DecryptStringAny(stored, vaultFieldKeySentinel, vaultKeys...)
 	if decErr != nil || plain != vaultKeyCheckPlaintext {
 		return ErrVaultKeyMismatch
 	}
 	return nil
+}
+
+// SentinelOnPreviousKey reports whether the key sentinel opens under the
+// PREVIOUS master key but not the current one, i.e. whether this store still
+// needs the re-encrypt sweep.
+//
+// It is a separate question from VerifyVaultKey, which only answers "may this
+// process safely touch the data". A store that boots fine on the previous key is
+// exactly the state an operator must not be left unaware of: everything works,
+// nothing is broken, and the old key (the one they are trying to retire) is
+// still the only thing holding the data together. Both the boot log and the
+// admin status endpoint read this so the operator does not have to know the
+// feature exists to discover they are mid-rotation.
+//
+// A missing sentinel (fresh database) answers false: there is nothing to sweep.
+func SentinelOnPreviousKey(ctx context.Context, queries *db.Queries, currentKey, previousKey string) (bool, error) {
+	if previousKey == "" || previousKey == currentKey {
+		return false, nil
+	}
+	stored, err := queries.GetSetting(ctx, vaultKeyCheckSetting)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && stored == "") {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read vault keycheck: %w", err)
+	}
+	if plain, decErr := columncrypto.DecryptString(stored, currentKey, vaultFieldKeySentinel); decErr == nil &&
+		plain == vaultKeyCheckPlaintext {
+		return false, nil
+	}
+	plain, decErr := columncrypto.DecryptString(stored, previousKey, vaultFieldKeySentinel)
+	return decErr == nil && plain == vaultKeyCheckPlaintext, nil
+}
+
+// ResealVaultKeycheck stamps the sentinel under the CURRENT key. The rekey sweep
+// calls it LAST, inside the same transaction as the data conversion, so the
+// sentinel and the data can never disagree about which key this store is on.
+//
+// Ordering matters in one direction only: if the sentinel moved first and the
+// conversion then failed, the transaction rolls back and both revert together.
+// If the sentinel were written OUTSIDE the transaction it would survive a
+// rollback, and the next boot would accept a key that no longer opens the data.
+func ResealVaultKeycheck(ctx context.Context, queries *db.Queries, vaultKey string) error {
+	sealed, err := columncrypto.EncryptString(vaultKeyCheckPlaintext, vaultKey)
+	if err != nil {
+		return fmt.Errorf("seal vault keycheck: %w", err)
+	}
+	return queries.UpsertSetting(ctx, db.UpsertSettingParams{Key: vaultKeyCheckSetting, Value: sealed})
 }
 
 // vaultKeyOpensExistingData reports whether this database already holds
@@ -125,7 +184,12 @@ func VerifyVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) e
 // sealing is safe. Errors reading the database are returned rather than treated
 // as "no data": failing to read must never be mistaken for an empty vault, or
 // the guard silently degrades back into the fail-open it exists to prevent.
-func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKey string) (hasCiphertext, opens bool, err error) {
+//
+// vaultKeys is the keyring (current first, then the previous key when a rotation
+// is configured). Every probe tries all of them: a store mid-rotation is holding
+// ciphertext that only the previous key opens, and reporting "this key does not
+// open my data" for that state would refuse the boot that is supposed to fix it.
+func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKeys ...string) (hasCiphertext, opens bool, err error) {
 	// Probe 1: every sealed vault secret, at whatever version it carries.
 	//
 	// This used to ask for ONE row (LIMIT 1) filtered to encryption_version = 2,
@@ -150,12 +214,12 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 	for _, row := range rows {
 		hasCiphertext = true
 		if row.EncryptionVersion.Valid && row.EncryptionVersion.Int64 == 1 {
-			if vaultSecretOpensLegacy(row.EncryptedValue, row.Nonce, vaultKey) {
+			if vaultSecretOpensLegacy(row.EncryptedValue, row.Nonce, vaultKeys...) {
 				return true, true, nil
 			}
 			continue
 		}
-		if vaultSecretOpens(row.EncryptedValue, row.Nonce, vaultKey) {
+		if vaultSecretOpens(row.EncryptedValue, row.Nonce, vaultKeys...) {
 			return true, true, nil
 		}
 	}
@@ -171,7 +235,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 			continue
 		}
 		hasCiphertext = true
-		if _, decErr := columncrypto.DecryptString(v, vaultKey, vaultFieldTOTPSecret); decErr == nil {
+		if _, decErr := columncrypto.DecryptStringAny(v, vaultFieldTOTPSecret, vaultKeys...); decErr == nil {
 			return true, true, nil
 		}
 	}
@@ -218,7 +282,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 				continue
 			}
 			hasCiphertext = true
-			if _, decErr := columncrypto.DecryptString(b.Blob, vaultKey, vaultFieldBootProbe); decErr == nil {
+			if _, decErr := columncrypto.DecryptStringAny(b.Blob, vaultFieldBootProbe, vaultKeys...); decErr == nil {
 				return true, true, nil
 			}
 		case "vaultcolumn":
@@ -226,7 +290,7 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 				continue
 			}
 			hasCiphertext = true
-			if vaultColumnOpens(b.Blob, vaultKey) {
+			if vaultColumnOpens(b.Blob, vaultKeys...) {
 				return true, true, nil
 			}
 		case "rawgcm":
@@ -251,16 +315,31 @@ func vaultV2Key(vaultKey string) [32]byte {
 }
 
 // vaultSecretOpens mirrors VaultHandler.decrypt for a v2 row without needing a
-// constructed handler (the key check runs before one exists).
+// constructed handler (the key check runs before one exists). It returns true if
+// ANY key on the ring opens the row, so a store mid-rotation still answers yes.
 //
 // The crypto is vaultfield's, and the probe entry point returns a BOOL: it wipes
 // the plaintext rather than handing it back, so this cannot become a second way
 // to read an entry's value when somebody edits the caller. It names
-// vault_entries.encrypted_value because that is the column it opens.
-func vaultSecretOpens(ciphertext, nonce []byte, vaultKey string) bool {
+// vault_entries.encrypted_value because that is the column it opens, and it
+// names it on EVERY key attempt: which key opened a row is not a different
+// column, so the ledger entry is the same one either way.
+func vaultSecretOpens(ciphertext, nonce []byte, vaultKeys ...string) bool {
 	if len(ciphertext) == 0 || len(nonce) == 0 {
 		return false
 	}
+	for _, vaultKey := range vaultKeys {
+		if vaultKey == "" {
+			continue
+		}
+		if vaultSecretOpensOne(ciphertext, nonce, vaultKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func vaultSecretOpensOne(ciphertext, nonce []byte, vaultKey string) bool {
 	key := vaultV2Key(vaultKey)
 	defer wipeKey(&key)
 	return vaultfield.Opens(key, ciphertext, nonce, vaultFieldEntryValueProbe)
@@ -272,13 +351,22 @@ func vaultSecretOpens(ciphertext, nonce []byte, vaultKey string) bool {
 // NewVaultHandler still builds as legacyKey for MigrateEncryption. The probe
 // needs it so a v1-only database can answer "yes, this key opens my data"
 // rather than "I contain nothing", which is what cemented a wrong key.
-func vaultSecretOpensLegacy(ciphertext, nonce []byte, vaultKey string) bool {
+func vaultSecretOpensLegacy(ciphertext, nonce []byte, vaultKeys ...string) bool {
 	if len(ciphertext) == 0 || len(nonce) == 0 {
 		return false
 	}
-	key := sha256.Sum256([]byte(vaultKey + ":secrets-vault"))
-	defer wipeKey(&key)
-	return vaultfield.Opens(key, ciphertext, nonce, vaultFieldEntryValueProbe)
+	for _, vaultKey := range vaultKeys {
+		if vaultKey == "" {
+			continue
+		}
+		key := sha256.Sum256([]byte(vaultKey + ":secrets-vault"))
+		opened := vaultfield.Opens(key, ciphertext, nonce, vaultFieldEntryValueProbe)
+		wipeKey(&key)
+		if opened {
+			return true
+		}
+	}
+	return false
 }
 
 func wipeKey(k *[32]byte) {
@@ -290,9 +378,52 @@ func wipeKey(k *[32]byte) {
 // EnforceVaultKey runs VerifyVaultKey and stops the process on a mismatch,
 // printing what the operator actually needs to do. Split from VerifyVaultKey so
 // the check itself stays testable without exiting the test binary.
-func EnforceVaultKey(ctx context.Context, queries *db.Queries, vaultKey string) {
-	err := VerifyVaultKey(ctx, queries, vaultKey)
+//
+// vaultKeys is the keyring, current key first.
+func EnforceVaultKey(ctx context.Context, queries *db.Queries, vaultKeys ...string) {
+	vaultKey := ""
+	if len(vaultKeys) > 0 {
+		vaultKey = vaultKeys[0]
+	}
+	previousKey := ""
+	if len(vaultKeys) > 1 {
+		previousKey = vaultKeys[1]
+	}
+
+	err := VerifyVaultKey(ctx, queries, vaultKeys...)
 	if err == nil {
+		// The gate passed, but it may have passed on the OLD key. That state boots
+		// clean, serves every request, and looks identical to a healthy instance,
+		// which is precisely why it has to be said out loud on every boot: the key
+		// the operator is trying to retire is still the only one that opens this
+		// data, and removing TRUSTISSUES_VAULT_KEY_PREVIOUS now would orphan
+		// everything. The admin status endpoint says the same thing in the UI, for
+		// the operator who never reads container logs.
+		if onPrev, sErr := SentinelOnPreviousKey(ctx, queries, vaultKey, previousKey); sErr != nil {
+			slog.Error("vault: could not determine which key this store is sealed under", "error", sErr)
+		} else if onPrev {
+			slog.Warn("vault: THIS STORE IS STILL SEALED UNDER THE PREVIOUS KEY. " +
+				"Reads work only because TRUSTISSUES_VAULT_KEY_PREVIOUS is set. " +
+				"Run the re-encrypt sweep (Settings -> Encryption, or POST /api/admin/vault-key/rekey, " +
+				"or set TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT=1) and only then remove the previous key.")
+		} else if previousKey != "" {
+			// The sweep is DONE and the previous key is still in the environment.
+			//
+			// Said on every boot, not once. After the sweep re-seals the sentinel
+			// SentinelOnPreviousKey answers false forever, so the only thing that
+			// ever mentioned the retired key was the sweep's own one-shot log line
+			// in whichever process happened to run it. The admin UI covers this
+			// with a green banner, which is no help at all to a headless deploy
+			// driven by TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT: exactly the
+			// deployments where nobody opens Settings. A retired key that stays
+			// loaded still opens this data and still opens every pre-sweep backup,
+			// which is the whole thing a rotation after a compromise is meant to
+			// end.
+			slog.Warn("vault: rotation is complete but TRUSTISSUES_VAULT_KEY_PREVIOUS is STILL SET. " +
+				"Every value in this store is now sealed under the current key, so the retired key is no " +
+				"longer needed for anything: it is simply still loaded and still opens this data. " +
+				"Remove it from the environment and restart.")
+		}
 		return
 	}
 	if !errors.Is(err, ErrVaultKeyMismatch) {
@@ -344,16 +475,29 @@ What to do:
 	os.Exit(1)
 }
 
-// vaultColumnOpens reports whether an "enc:v1:" column value decrypts under
-// vaultKey, without needing a constructed VaultHandler (the key check runs before
-// one exists). It mirrors VaultHandler.decryptColumn, and the v2 derivation is the
-// same one vaultSecretOpens uses.
+// vaultColumnOpens reports whether an "enc:v1:" column value decrypts under any
+// key on the ring, without needing a constructed VaultHandler (the key check runs
+// before one exists). It mirrors VaultHandler.decryptColumn, and the v2 derivation
+// is the same one vaultSecretOpens uses.
 //
 // It used to do its own AES-GCM, which made it a decryption door the round-18
 // ledger could not see (it matched none of the four call shapes that guard
 // derived from). It goes through vaultfield now, with the probe field, and
-// returns a bool.
-func vaultColumnOpens(stored, vaultKey string) bool {
+// returns a bool. The ring loop is on the outside of that, so adding the
+// previous key added key attempts and not a second door.
+func vaultColumnOpens(stored string, vaultKeys ...string) bool {
+	for _, k := range vaultKeys {
+		if k == "" {
+			continue
+		}
+		if vaultColumnOpensOne(stored, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func vaultColumnOpensOne(stored, vaultKey string) bool {
 	key := vaultV2Key(vaultKey)
 	defer wipeKey(&key)
 	return vaultfield.ColumnOpens(key, stored, vaultFieldBootProbe)

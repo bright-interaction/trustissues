@@ -14,38 +14,86 @@ behind these.
 
 ## (a) Master-key (VAULT_KEY) rotation path
 
-**Today.** There is no dual-key read and no re-encrypt routine. Changing
-`TRUSTISSUES_VAULT_KEY` in place orphans all data (proven: a reboot of the same
-data dir under a new key returns `[decryption error]` for every secret). The
-only supported rotation is the manual export / re-import in `SECURITY.md`.
+**SHIPPED.** Kept here as the record of what was built and where it deviated
+from this design. Operator procedure: `SECURITY.md`, "Rotating the vault key".
+Code: `internal/handlers/vault_rekey.go` (registry + sweep),
+`vault_rekey_api.go` (endpoints), `Settings -> Encryption` in the frontend.
 
-**Design when built.**
-1. Add an optional `TRUSTISSUES_VAULT_KEY_PREVIOUS`. Decryption tries the current
-   key, then the previous key (dual-key read), so a restored or half-rotated
-   store keeps working.
-2. Run a re-encrypt sweep (boot flag or admin-triggered) across **every** keyed
-   surface in one transaction: `vault_entries.encrypted_value`, `provider_meta`,
-   `rotation_targets`, `users.totp_secret`, notification-channel configs, and
-   capability / service-identity secrets. Miss one column and that data is
-   orphaned, so the sweep must be exhaustive and list-driven.
-3. Stamp a per-row key id / version so a partial sweep is resumable and a row's
-   key is self-describing.
-4. Preflight: verify every row re-encrypts under the new key before committing;
-   abort the whole transaction on any failure.
+What landed against the four design points:
 
-**Prerequisite (do this first).** `columncrypto.EncryptString` emits bare base64
-with no structural marker, so "is this plaintext?" is answered by "did decrypt
-throw." That is what lets the boot TOTP migration double-encrypt a seed on a key
-mismatch (`Enc_B(Enc_A(seed))`), which is irreversible. Add an `enc:` prefix so
-plaintext detection is structural, and only ever treat unprefixed values as
-plaintext, before any rotation sweep can be trusted.
+1. **Done.** `TRUSTISSUES_VAULT_KEY_PREVIOUS` is optional and read-only: every
+   decrypt path tries the current key then the previous one
+   (`columncrypto.DecryptStringAny`, `VaultHandler.previous`), and no encrypt
+   path ever touches it. That asymmetry means ordinary edits converge the store
+   on the current key by themselves and the sweep only has to finish the rows
+   nobody touched. The boot gate (`VerifyVaultKey`) accepts the ring too, which
+   is what makes rotation reachable at all: without it the first boot after a
+   key change is refused before the operator can run anything.
+2. **Done, and wider than this list.** The sweep covers sixteen surfaces, not
+   the six named here. The three the original list missed are the ones worth
+   remembering: `vault_entries.custom_fields` (explicitly allowed to hold secret
+   values), `invitations.code`, and `url_bidx` / `alias_url_bidx`. The blind
+   indexes are the sharpest omission, because they are HMACs rather than
+   ciphertext: a stale one does not fail to decrypt, it stops matching, so
+   browser autofill silently returns nothing with no error anywhere. Autofill
+   now also looks up under both keys while a rotation is configured, so the
+   window is covered even before the sweep runs.
+   Conversely, `capability` and `service-identity` secrets turned out NOT to be
+   surfaces: the capability signing key is HKDF-derived and signs 5-minute
+   in-memory tokens (a rotation just invalidates in-flight ones), and both
+   `service_identities.key_hash` and `api_keys.key_hash` are one-way hashes with
+   no plaintext to re-seal.
+3. **Deliberately NOT done.** No per-row key id was added. Trial decryption
+   under the keyring answers "which key opens this row" authoritatively, and a
+   stored key id would be a second source of truth that can disagree with the
+   bytes it describes. Every recent data-loss bug here has that shape (a
+   declared property nothing enforces; a boot probe that understood one of three
+   crypto families; a version filter that excluded the rows it was meant to
+   check). Resumability is preserved without it: "needs conversion" is
+   recomputed from the data on every run, so the sweep is idempotent and a
+   crashed one is fixed by running it again.
+4. **Done.** The sweep plans every replacement in memory first, refuses outright
+   if any marked ciphertext opens under neither key (`ErrRekeyBlocked`, nothing
+   written), writes inside one transaction, then re-scans INSIDE that
+   transaction and rolls back unless every surface reports current. That
+   re-scan is what turns "the sweep says it covered everything" into "the sweep
+   proved it", and it is the thing that would catch a future surface someone
+   registers but forgets to convert.
 
-**Why safe to defer.** A single trusted operator can rotate with the documented
-export / re-import during a short maintenance window. Rotation is rare
-(suspected compromise or policy), not a routine operation, so a manual procedure
-is acceptable for v1. The real risk is an *accidental* naive rotation, and that
-is mitigated with loud warnings in `.env.example`, the compose file,
-`README.md`, and `THREAT-MODEL.md`.
+**Prerequisite: was already satisfied.** `columncrypto` grew the `tienc:v1:`
+marker and `IsEncrypted` before this work, so plaintext detection is structural.
+The sweep still refuses to touch unmarked values it cannot open, and it tries
+BOTH keys on unmarked legacy ciphertext, because classifying old-key ciphertext
+as plaintext is exactly what produces the irreversible `Enc_new(Enc_old(v))`.
+
+**The guards.** `vault_rekey_coverage_test.go` walks the real migrated schema and
+fails when any column is neither a registered keyed surface nor an explicit
+entry in `notKeyedColumns` with a stated reason. Adding an encrypted column
+without deciding how it rotates does not compile past CI. A second test asserts
+every registered surface is actually reached by a scanner, so a surface cannot
+sit in the operator's status page reporting zero rows and reading as clean.
+
+Both of those are INVENTORY guards, and inventory was not enough. They both
+answered yes for `notification_channels.config` while the sweep was handing
+base64 text to AES-GCM (so it refused every store that had ever created a
+channel) and writing raw bytes into a base64 column (which would have destroyed
+every webhook URL and bot token, after the original had been re-encrypted away).
+The column was registered. It was scanned. It was also completely broken.
+
+So `vault_rekey_format_test.go` states each crypto family's on-disk format as a
+pair and asserts both directions: the sweep's reader must accept what the
+production writer produces, and the production reader must accept what the
+sweep's writer produces. The closures call the real functions on both sides,
+including the notification reader in `internal/alerts`, so the guard cannot drift
+into asserting a private theory of the format. A new family without a contract
+fails the test.
+
+`vault_rotation_callsites_test.go` closes the other half: the dual-key helpers
+each had a unit test and every one of their CALL SITES was untested, so all four
+could be reverted to single-key with the suite still green. It drives `Match`,
+`Login` with 2FA, the SMTP test button and the invitation mailer against a
+mid-rotation store, and adds source-level guards so a new call site cannot pass
+the current key alone or look an entry up under a single blind index.
 
 ## (b) Append-only / tamper-evident audit tables
 
@@ -87,23 +135,68 @@ teammates need to audit agent secret usage without shell access.
 
 ## (d) Automated / scheduled backups
 
-**Today.** Backups are manual: `scripts/backup.sh` plus the procedure in
-`docs/BACKUP.md`. There is no built-in `trustissues backup` subcommand and no
-scheduler.
+**Mostly SHIPPED.** Scheduling, retention and a restore drill are in the tree.
+What remains deferred is narrower than this entry used to describe, so the two
+halves are separated below.
 
-**Design when built.** (1) A `trustissues backup <path>` subcommand that calls
-the SQLite online backup API in-process (no external `sqlite3` dependency),
-writes 0600, and optionally prunes by age / count. (2) An optional internal
-scheduler (or documented cron / systemd timer, which works today) that runs it on
-an interval and reports success to a notification channel. Keep the
-key-separation rule front and centre so an automated job never co-locates the
-backup with the vault key.
+**What ships now.**
 
-**Why safe to defer.** Durability is achievable now with the shipped script run
-from cron or a systemd timer, which is the standard way a self-hoster schedules
-any job. The missing piece is convenience, not capability. The correctness-
-critical part (WAL-safe snapshot + key separation) is already documented and
-scripted.
+- `deploy/systemd/`: a backup service + daily timer, a restore-drill service +
+  weekly timer, a templated failure alerter, one `backup.env` for all of them,
+  and an `install.sh` that installs, verifies the `OnFailure=` chain resolves to
+  a real unit, and can fire a test alert. `install.sh --root DIR` rehearses the
+  whole install into a throwaway tree, which is how the suite executes it: the
+  version that demanded `OnFailure=` on the `.timer` units aborted every real
+  install and no test noticed, because nothing ever ran the installer.
+- `deploy/cron/trustissues-backup.cron`: the same two jobs for hosts without
+  systemd, each with explicit failure alerting because cron's own reporting
+  needs an MTA nobody has.
+- `scripts/prune-backups.sh`: keep N daily / M weekly (defaults 7 and 4), refuse
+  a keep-nothing or non-numeric policy, refuse to run inside the live data
+  directory at all, clean stale `.part` files.
+- `scripts/restore-drill.sh`: restore the newest snapshot through the real
+  `restore.sh` into a throwaway directory, fail on a stale (or future-stamped)
+  snapshot, refuse a non-numeric freshness limit rather than ignoring it, and
+  check a named row survived the round trip.
+- `scripts/backup.sh`: destination configurable via `TRUSTISSUES_BACKUP_DIR`,
+  refuses to write into the live data directory (physical paths, so a symlink is
+  not a way around it), warns when the backups share a filesystem with the
+  database.
+- `scripts/restore.sh --compose`: driven end to end by the suite against a real
+  docker daemon (a throwaway compose project, a real named volume, a real
+  unprivileged image user), covering the fresh-host `docker compose create`, the
+  chown that keeps the app from crash-looping on its first write, and the refusal
+  when the service user cannot write what was restored. Those cases SKIP loudly
+  on a machine without docker and the summary line says how many skipped.
+- Every one of those behaviours has a case in `scripts/test-backup-restore.sh`
+  that has been watched to fail without it, with one deliberate exception:
+  `prune-backups.sh`'s "the newest snapshot is never a deletion candidate" guard
+  is belt-and-braces on top of the bucket arithmetic, so it only fires when that
+  arithmetic is already wrong. Deleting the guard keeps the suite green, which is
+  the honest state of it. The ablation specs are in
+  `scripts/ablations/backups.json`, runnable with `scripts/ablate.py`.
+
+**Still deferred: the in-process `trustissues backup` subcommand.** The scripts
+shell out to the `sqlite3` CLI, so a host without it cannot take a backup and
+the failure surfaces at 03:20 rather than at install time. A `trustissues backup
+<path>` subcommand calling the online backup API in-process would remove that
+dependency and let the server report success to a notification channel directly,
+which the shell path cannot do.
+
+**Still deferred: off-host replication.** The timer, the retention policy and
+the drill all operate on one directory on one host. Copying snapshots off the
+box is left to the operator's own `restic` / `rclone` / object-storage job.
+`docs/BACKUP.md` says so explicitly rather than implying the schedule covers it.
+
+**Also not covered: backing up from inside the container.** The units run
+`sqlite3` on the host against the Compose volume's `_data` path. The documented
+`docker compose exec` route still works but nothing schedules it.
+
+**Why the remainder is safe to defer.** All three are convenience or reach, not
+correctness. The correctness-critical parts (a WAL-safe snapshot, verified
+before it is kept, key separation, a retention policy that cannot delete the
+newest copy, and a drill that proves the newest snapshot actually restores) are
+scripted, scheduled, alerted on, and tested.
 
 ## (e) Per-secret reveal granularity in the audit
 

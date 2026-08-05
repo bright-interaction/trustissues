@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -69,9 +70,75 @@ func (h *VaultHandler) encryptColumn(plaintext string) (string, error) {
 // matching the wrapper's name. UserHandler.openInviteCode called this one, so
 // invitations.code, a bearer credential that redeems into an account, was
 // decrypted by a door the ledger could not see.
+//
+// When a rotation is configured it also tries the PREVIOUS master key, so an
+// unswept row still reads. Every read choke in the vault funnels through here,
+// so this one fallback is what keeps a half-rotated store serving instead of
+// blanking url/username/category/notes (and then having the edit form write
+// those blanks back over recoverable ciphertext, which is the data loss
+// VerifyVaultKey exists to stop).
 func (h *VaultHandler) decryptColumn(stored string, field vaultfield.Field) (string, error) {
-	return vaultfield.OpenColumn(h.encryptionKey, stored, field)
+	plain, _, err := h.decryptColumnWithKeyAge(stored, field)
+	return plain, err
 }
+
+// decryptColumnWithKeyAge is decryptColumn plus WHICH key opened the value.
+//
+// The rekey sweep needs this: "did this open under the current key" is the only
+// self-describing statement about a row's key, because nothing stamps a key id
+// on the row. Trial decryption is the authority rather than a stored marker on
+// purpose. A stored key id is a second source of truth that can disagree with
+// the bytes, and this codebase has been bitten repeatedly by a declared property
+// nothing enforces; the ciphertext cannot lie about which key opens it.
+//
+// onPrevious is false for cleartext and empty values: there is nothing to
+// convert, so they must not be counted as needing a rewrite.
+//
+// IT TAKES THE FIELD, AND SO DOES EVERY KEY ATTEMPT INSIDE IT.
+//
+// The master-key rotation and the field ledger were built in parallel on two
+// branches, and each one alone breaks the other. This function used to own a
+// hand-written AES-GCM open (openVaultColumn) and try it under two keys; the
+// ledger moved every vault-key AES-GCM open into internal/vaultfield and made a
+// declared Field the precondition for any of them. Keeping the private opener
+// would have put a second decryption door back in this file, which is precisely
+// what TestAESGCMIsOpenedInExactlyOneFile exists to redden, and it would have
+// made rotation-era reads the one family of decryptions that names no column,
+// reintroducing the "keyed by CALL SITE" defect the ledger replaced on the read
+// path that a rotation makes the common one. Dropping the previous-key attempt
+// instead would strand every value written under the old key the moment a sweep
+// is half done.
+//
+// So both survive: the trial is current-then-previous as before, and BOTH
+// attempts go through vaultfield.OpenColumn with the same declared field. The
+// field is a ledger input, not a key input, so a row sealed under the previous
+// key opens exactly when it should and is still counted against the column it
+// belongs to.
+//
+// The zero Field short-circuits rather than falling through to the previous key.
+// vaultfield.ErrUndeclared means the CALLER is undeclared, not that this key is
+// the wrong one, and no other key can repair that; retrying would only turn an
+// error that says what to do into the vaguer "nothing opens this column".
+func (h *VaultHandler) decryptColumnWithKeyAge(stored string, field vaultfield.Field) (plain string, onPrevious bool, err error) {
+	plain, err = vaultfield.OpenColumn(h.encryptionKey, stored, field)
+	if err == nil {
+		return plain, false, nil
+	}
+	if errors.Is(err, vaultfield.ErrUndeclared) {
+		return "", false, err
+	}
+	if h.previous != nil {
+		if out, prevErr := vaultfield.OpenColumn(h.previous.value, stored, field); prevErr == nil {
+			return out, true, nil
+		}
+	}
+	return "", false, fmt.Errorf("decrypt column %s: %w", field.Name(), errVaultColumnUndecryptable)
+}
+
+// errVaultColumnUndecryptable is the sentinel wrapped by decryptColumnWithKeyAge
+// when no configured key opens a marked column. It carries no key material and
+// no ciphertext: this string reaches logs.
+var errVaultColumnUndecryptable = errors.New("no configured vault key opens this column")
 
 // decryptColumnOrLog decrypts a stored column, returning fallback (and logging)
 // on a decrypt error so a single corrupted row never emits ciphertext to a

@@ -32,6 +32,24 @@ type Querier interface {
 	// rather than against a regular expression, so putting one in the wrong file is
 	// caught rather than merely discouraged.
 	CreateVaultEntry(ctx context.Context, arg CreateVaultEntryParams) error
+	// Writes every keyed column of one entry at once, for the master-key sweep.
+	//
+	// One statement rather than per-column updates on purpose: a row must never be
+	// half-converted, with (say) the value on the new key and notes still on the old
+	// one. The sweep also runs inside a transaction, so this is belt and braces, but
+	// the single statement is what makes the invariant local to the row.
+	//
+	// It lives in THIS package because it assigns provider_meta and
+	// rotation_targets. A re-encryption is not a redirection, but "it does not
+	// change the destinations" is a property of the caller, not of the statement,
+	// and this package exists precisely because that distinction cannot be enforced
+	// by reading SQL. So it takes a ticket like every other host-choosing write, and
+	// vaultegress.RekeyEntry is the only way to reach it.
+	//
+	// updated_at is deliberately NOT touched. Re-encryption is not a user edit, and
+	// bumping it would make every entry look freshly modified in the UI right after
+	// an incident, which is the worst possible moment to lose that signal.
+	RekeyVaultEntry(ctx context.Context, arg RekeyVaultEntryParams) error
 	// Seeds the capability-bridge columns from the provider defaults at
 	// enrollment time. Only fills untouched rows so explicit per-entry
 	// patterns are never overwritten.

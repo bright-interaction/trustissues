@@ -71,7 +71,22 @@ func providerExitCtx(providerName string, meta map[string]string) context.Contex
 // opaque, so an assertion on it is either EqualsString or a length, never a
 // read: the tests are held to the same rule the code is.
 func (h *VaultHandler) openForTest(ciphertext, nonce []byte) (secretexit.Plaintext, error) {
-	return h.OpenEntrySecret(ciphertext, nonce, 2,
+	return h.openVersionForTest(ciphertext, nonce, 2)
+}
+
+// openVersionForTest is openForTest for a row at a stated encryption_version.
+//
+// The rotation tests need it: they seed v1 rows on purpose, and "does the
+// RETIRED key still open this" is only a meaningful question when the version is
+// pinned rather than assumed. It replaced their calls to VaultHandler.DecryptValue,
+// which was the rotation branch's raw-bytes reader and is gone. The assertions
+// those tests make are unchanged; what changed is that the value now comes back
+// opaque, so they compare it with EqualsString instead of reading it, which is
+// the same rule the production code is held to.
+func (h *VaultHandler) openVersionForTest(ciphertext, nonce []byte, encVersion int) (
+	secretexit.Plaintext, error) {
+
+	return h.OpenEntrySecret(ciphertext, nonce, encVersion,
 		secretexit.Origin{EntryID: "test", Name: "test"})
 }
 

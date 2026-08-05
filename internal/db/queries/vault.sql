@@ -476,3 +476,53 @@ ORDER BY e.created_at ASC, e.id ASC;
 -- answer proves nothing and the migration never treats it as proof on its own.
 SELECT COUNT(*) FROM activity_log
 WHERE action = 'vault.entry_adopted' AND instr(detail, 'Entry ' || sqlc.arg(entry_id) || ' ') > 0;
+
+-- ============================================================================
+-- Master-key rotation (VaultHandler.RekeyVault, see vault_rekey.go).
+--
+-- One list + one write per keyed surface. The list queries are deliberately
+-- UNFILTERED: the sweep has to SEE every row to answer "does this open under the
+-- current key", and a WHERE clause that excludes a row excludes it from the
+-- rotation too. The boot key gate has already been burned twice by a probe query
+-- that filtered away the rows that mattered (encryption_version = 2 only, then a
+-- trailing LIMIT on a compound SELECT), and both times the result was a store
+-- that silently reported "nothing to protect here". Filtering happens in Go,
+-- where the reason for skipping a row can be reported.
+-- ============================================================================
+
+-- name: ListVaultEntriesForRekey :many
+-- Every vault_entries column that holds material derived from the master key, in
+-- one read: the secret value (+ its nonce and derivation version), the eight
+-- enc:v1: metadata columns, and the two blind indexes. user_id and collection_id
+-- come along because the blind index is keyed PER SCOPE, so recomputing it needs
+-- to know which scope the row lives in.
+--
+-- provider comes along although it is not keyed and is never rewritten here. The
+-- write this feeds is a host-choosing one and therefore takes an egressgate
+-- ticket, and providerDestinations needs the provider NAME as well as the meta
+-- to say which hosts a provider binding can reach. Without it the sweep would
+-- have to mint its ticket on an empty comparison, which is the shape the
+-- chokepoint guards call decorative.
+SELECT id, user_id, collection_id, encrypted_value, nonce, encryption_version,
+       url, alias_url, username, category, notes,
+       provider, provider_meta, rotation_targets, custom_fields,
+       url_bidx, alias_url_bidx
+FROM vault_entries
+ORDER BY id;
+
+-- RekeyVaultEntry USED TO LIVE HERE and is now in
+-- internal/vaultegress/queries/vault_egress.sql.
+--
+-- It writes provider_meta and rotation_targets, which are HOST-CHOOSING
+-- columns, and nothing outside internal/vaultegress may write one of those
+-- without an egressgate.Ticket. Generated into this package the statement was
+-- reachable as h.queries.RekeyVaultEntry, i.e. a way to set a delivery target
+-- with no decision behind it, and TestNoStatementOutsideTheEgressPackageWrites
+-- AHostChoosingColumn refuses it: SQLite will not even prepare the statement
+-- against a schema where those columns are GENERATED.
+--
+-- Moving it kept BOTH properties the merge had to hold together. The sweep
+-- still writes every keyed column of a row in ONE statement, so a row can never
+-- be half-converted, and the write still goes through the ticket chokepoint.
+-- The ticket it takes is the re-encryption kind: same destinations in, same
+-- destinations out.

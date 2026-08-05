@@ -103,10 +103,18 @@ def ablate(spec):
         with open(path, "w") as fh:
             fh.write(ablated)
 
-        rc, out = run("go build ./... 2>&1")
+        # `build` defaults to the Go build, so every existing spec file is
+        # unaffected. Shell guards override it with `bash -n <file>`: the point of
+        # this step is "the ablation produced something runnable", and for a shell
+        # script that is a parse check, not a compiler. Without an override a shell
+        # ablation would run `go build` (which passes, since no Go changed) and
+        # then `go test ./scripts/` (which fails with "no Go files"), reporting
+        # CAUGHT for every spec including the ones that catch nothing.
+        build_cmd = spec.get("build") or "go build ./..."
+        rc, out = run(f"{build_cmd} 2>&1")
         if rc != 0:
             first = next((l for l in out.splitlines() if l.strip() and not l.startswith("#")), "")
-            return {**spec, "result": "INVALID", "detail": "does not compile: " + first[:160]}
+            return {**spec, "result": "INVALID", "detail": f"`{build_cmd}` failed: " + first[:160]}
 
         # ALWAYS run the whole package, never only the guard you have in mind.
         #
@@ -122,13 +130,22 @@ def ablate(spec):
         # not always in the package that implements it: ablating shield.ValidHintLevel
         # is caught by a test in internal/config, and running only the edited file's
         # package reported MISSED. Default stays the edited file's package.
+        # `cmd` names the guard to run when it is not `go test`. The shell tooling
+        # under scripts/ is guarded by scripts/test-backup-restore.sh, which is a
+        # whole suite rather than a package, so those specs set it explicitly.
         pkg = spec.get("pkg") or "./" + os.path.dirname(spec["file"]) + "/"
-        rc, out = run(f"go test {pkg} -count=1 -timeout 120s 2>&1")
+        test_cmd = spec.get("cmd") or f"go test {pkg} -count=1 -timeout 120s"
+        rc, out = run(f"{test_cmd} 2>&1")
         if "panic: test timed out" in out:
             return {**spec, "result": "TIMEOUT", "detail": "the ablated code hangs; treat as caught only if a guard bounds it"}
         if rc != 0:
             msg = next((l.strip() for l in out.splitlines()
                         if ".go:" in l and ("Error" in l or ":" in l) and "--- FAIL" not in l), "")
+            # Shell suites report "  FAIL <what broke>" and have no .go: lines, so
+            # without this fallback a CAUGHT shell ablation reports an empty detail
+            # and reads exactly like a harness that ran nothing.
+            if not msg:
+                msg = next((l.strip() for l in out.splitlines() if "FAIL" in l), "")
             return {**spec, "result": "CAUGHT", "detail": msg[:200]}
         # A MISS does not distinguish "the guard broke" from "a later fix made this
         # bug unreachable". Three of the four misses in the first full 111-spec

@@ -65,3 +65,28 @@ UPDATE vault_entries SET destination_patterns = ?, updated_at = CURRENT_TIMESTAM
 UPDATE vault_entries
 SET destination_patterns = ?, injection_spec = ?, updated_at = CURRENT_TIMESTAMP
 WHERE id = ? AND destination_patterns = '[]' AND injection_spec = '{}';
+
+-- name: RekeyVaultEntry :exec
+-- Writes every keyed column of one entry at once, for the master-key sweep.
+--
+-- One statement rather than per-column updates on purpose: a row must never be
+-- half-converted, with (say) the value on the new key and notes still on the old
+-- one. The sweep also runs inside a transaction, so this is belt and braces, but
+-- the single statement is what makes the invariant local to the row.
+--
+-- It lives in THIS package because it assigns provider_meta and
+-- rotation_targets. A re-encryption is not a redirection, but "it does not
+-- change the destinations" is a property of the caller, not of the statement,
+-- and this package exists precisely because that distinction cannot be enforced
+-- by reading SQL. So it takes a ticket like every other host-choosing write, and
+-- vaultegress.RekeyEntry is the only way to reach it.
+--
+-- updated_at is deliberately NOT touched. Re-encryption is not a user edit, and
+-- bumping it would make every entry look freshly modified in the UI right after
+-- an incident, which is the worst possible moment to lose that signal.
+UPDATE vault_entries
+SET encrypted_value = ?, nonce = ?, encryption_version = ?,
+    url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
+    provider_meta = ?, rotation_targets = ?, custom_fields = ?,
+    url_bidx = ?, alias_url_bidx = ?
+WHERE id = ?;

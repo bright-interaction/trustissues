@@ -40,6 +40,31 @@ type Config struct {
 	// entries, TOTP seeds, notification channel configs).
 	// Env: TRUSTISSUES_VAULT_KEY (required).
 	VaultKey string
+	// VaultKeyPrevious is the master key this data directory was encrypted with
+	// BEFORE the current one. Set it only while a rotation is in flight.
+	//
+	// It exists because changing TRUSTISSUES_VAULT_KEY in place used to orphan
+	// every encrypted value: the boot gate refused to start (correctly, the data
+	// was still recoverable), and the only documented way forward was a manual
+	// export / re-import. That is not a recovery path you want to discover during
+	// a suspected key compromise. With this set, every decrypt tries the current
+	// key and then this one, so a store that is unswept, half-swept, or restored
+	// from a backup taken before the sweep keeps serving.
+	//
+	// It is NOT a permanent setting. Leaving it configured means the old key is
+	// still live in the environment and still opens everything, which is the
+	// opposite of what rotating after a compromise is for. Run the re-encrypt
+	// sweep, confirm the status page reports the store fully on the current key,
+	// then remove it.
+	// Env: TRUSTISSUES_VAULT_KEY_PREVIOUS (optional).
+	VaultKeyPrevious string
+	// RekeyOnBoot runs the re-encrypt sweep once at startup, before the server
+	// accepts traffic. The interactive path (admin UI / API) is the primary one,
+	// because a rotation is an incident and the operator wants to see the report.
+	// This flag exists for headless deploys where nobody logs in: set the new
+	// key, set the previous key, set this to 1, restart, then remove both.
+	// Env: TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT (default false).
+	RekeyOnBoot bool
 	// BaseURL is the externally reachable URL of this instance.
 	// Env: TRUSTISSUES_BASE_URL (default http://localhost:8080).
 	BaseURL string
@@ -74,6 +99,8 @@ func Load() (*Config, error) {
 		TrustedProxyHops: envInt("TRUSTISSUES_TRUSTED_PROXY_HOPS", 1),
 		JWTSecret:        os.Getenv("TRUSTISSUES_JWT_SECRET"),
 		VaultKey:         os.Getenv("TRUSTISSUES_VAULT_KEY"),
+		VaultKeyPrevious: os.Getenv("TRUSTISSUES_VAULT_KEY_PREVIOUS"),
+		RekeyOnBoot:      envBool("TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT", false),
 		BaseURL:          envStr("TRUSTISSUES_BASE_URL", "http://localhost:8080"),
 		DataDir:          envStr("TRUSTISSUES_DATA_DIR", "./data"),
 		FrontendDir:      envStr("TRUSTISSUES_FRONTEND_DIR", "./frontend/dist"),
@@ -144,6 +171,47 @@ func (c *Config) Validate() error {
 		errs = append(errs, "TRUSTISSUES_VAULT_KEY must be at least 32 characters")
 	} else if isWeakSecret(c.VaultKey) {
 		errs = append(errs, "TRUSTISSUES_VAULT_KEY looks like a placeholder or low-entropy value (generate a real one: openssl rand -hex 32)")
+	}
+
+	// The previous key describes data that ALREADY EXISTS. That is what makes it
+	// different from every other secret validated here, and why strength is a
+	// warning rather than a refusal.
+	//
+	// Refusing a short or weak previous key does not make anything safer: the
+	// data is already sealed under it either way. All it does is make the one
+	// rotation that matters most impossible. An instance whose key was set before
+	// these checks existed, or forced through with TRUSTISSUES_ALLOW_KEY_MISMATCH,
+	// cannot name that key as PREVIOUS, so it cannot rotate away from it, and
+	// that is exactly the population with the weakest key in the estate. The
+	// operator is told, loudly, and then allowed to proceed.
+	//
+	// Equal-to-current stays a hard error. It is not a weak key, it is a no-op
+	// that REPORTS as a configured rotation on every status surface, which is
+	// precisely the state in which somebody deletes the old key from their
+	// password manager believing the rotation is set up.
+	if c.VaultKeyPrevious != "" {
+		switch {
+		case c.VaultKeyPrevious == c.VaultKey:
+			errs = append(errs, "TRUSTISSUES_VAULT_KEY_PREVIOUS is identical to TRUSTISSUES_VAULT_KEY; "+
+				"that is a no-op that reports as a configured rotation. Set it to the OLD key, or unset it")
+		case len(c.VaultKeyPrevious) < 32:
+			slog.Warn("config: TRUSTISSUES_VAULT_KEY_PREVIOUS is shorter than 32 characters. " +
+				"Accepted, because it is the key your existing data is already sealed under and refusing it " +
+				"would block the rotation away from it. Complete the re-encrypt sweep, then remove it.")
+		case isWeakSecret(c.VaultKeyPrevious):
+			slog.Warn("config: TRUSTISSUES_VAULT_KEY_PREVIOUS looks like a placeholder or low-entropy value. " +
+				"Accepted, because it is the key your existing data is already sealed under and refusing it " +
+				"would block the rotation away from it. Complete the re-encrypt sweep, then remove it.")
+		}
+	}
+
+	// A boot sweep with nothing to sweep from is a misconfiguration, not a
+	// no-op: the operator set the flag expecting a rotation to happen, and
+	// without the previous key the sweep can only ever report "already current"
+	// while every row sealed under the old key stays orphaned.
+	if c.RekeyOnBoot && c.VaultKeyPrevious == "" {
+		errs = append(errs, "TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT is set but TRUSTISSUES_VAULT_KEY_PREVIOUS is empty; "+
+			"the sweep would have no old key to convert from")
 	}
 
 	// Shield is optional, but if enabled its key must be a real AES-256 key. It
@@ -233,6 +301,27 @@ func envStr(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
+	return defaultVal
+}
+
+// envBool returns the value of an environment variable as a bool or a default.
+// Accepts the usual 1/true/yes/on spellings (case-insensitive). A value that is
+// set but unrecognised is logged and treated as the default rather than silently
+// read as false: an operator who wrote REKEY_ON_BOOT=TRUE and got no rotation
+// would have no way to tell why.
+func envBool(key string, defaultVal bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defaultVal
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	slog.Error("config: ignoring malformed boolean env var, using the default",
+		"key", key, "value", v, "default", defaultVal)
 	return defaultVal
 }
 

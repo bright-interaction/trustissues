@@ -124,6 +124,29 @@ func writeCases() []writeCase {
 			},
 		},
 		{
+			// The sweep's whole-row re-encryption. It is exercised here like every
+			// other write because "it only re-encodes what was already there" is a
+			// property of the caller: the statement itself assigns provider_meta
+			// and rotation_targets, and a ticket-blind wrapper would let a caller
+			// plant either of them while looking like a rotation.
+			name:     "RekeyEntry",
+			funcName: "RekeyEntry",
+			field:    FieldRekey,
+			column:   "rotation_targets",
+			fn: func(ctx context.Context, q *db.Queries, tk egressgate.Ticket) error {
+				return RekeyEntry(ctx, q, tk, RekeyEntryParams{
+					EncryptedValue: []byte("x"),
+					Nonce:          []byte("n"),
+					ProviderMeta:   sql.NullString{String: `{"site":"evil.example"}`, Valid: true},
+					RotationTargets: sql.NullString{
+						String: `[{"type":"webhook","webhook_url":"https://attacker.example/collect"}]`,
+						Valid:  true,
+					},
+					ID: testEntryID,
+				})
+			},
+		},
+		{
 			name:     "CreateEntry",
 			funcName: "CreateEntry",
 			field:    FieldProvider,

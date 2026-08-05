@@ -84,6 +84,69 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 	return err
 }
 
+const rekeyVaultEntry = `-- name: RekeyVaultEntry :exec
+UPDATE vault_entries
+SET encrypted_value = ?, nonce = ?, encryption_version = ?,
+    url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
+    provider_meta = ?, rotation_targets = ?, custom_fields = ?,
+    url_bidx = ?, alias_url_bidx = ?
+WHERE id = ?
+`
+
+type RekeyVaultEntryParams struct {
+	EncryptedValue    []byte         `json:"encrypted_value"`
+	Nonce             []byte         `json:"nonce"`
+	EncryptionVersion sql.NullInt64  `json:"encryption_version"`
+	Url               sql.NullString `json:"url"`
+	AliasUrl          sql.NullString `json:"alias_url"`
+	Username          sql.NullString `json:"username"`
+	Category          sql.NullString `json:"category"`
+	Notes             sql.NullString `json:"notes"`
+	ProviderMeta      sql.NullString `json:"provider_meta"`
+	RotationTargets   sql.NullString `json:"rotation_targets"`
+	CustomFields      string         `json:"custom_fields"`
+	UrlBidx           string         `json:"url_bidx"`
+	AliasUrlBidx      string         `json:"alias_url_bidx"`
+	ID                string         `json:"id"`
+}
+
+// Writes every keyed column of one entry at once, for the master-key sweep.
+//
+// One statement rather than per-column updates on purpose: a row must never be
+// half-converted, with (say) the value on the new key and notes still on the old
+// one. The sweep also runs inside a transaction, so this is belt and braces, but
+// the single statement is what makes the invariant local to the row.
+//
+// It lives in THIS package because it assigns provider_meta and
+// rotation_targets. A re-encryption is not a redirection, but "it does not
+// change the destinations" is a property of the caller, not of the statement,
+// and this package exists precisely because that distinction cannot be enforced
+// by reading SQL. So it takes a ticket like every other host-choosing write, and
+// vaultegress.RekeyEntry is the only way to reach it.
+//
+// updated_at is deliberately NOT touched. Re-encryption is not a user edit, and
+// bumping it would make every entry look freshly modified in the UI right after
+// an incident, which is the worst possible moment to lose that signal.
+func (q *Queries) RekeyVaultEntry(ctx context.Context, arg RekeyVaultEntryParams) error {
+	_, err := q.db.ExecContext(ctx, rekeyVaultEntry,
+		arg.EncryptedValue,
+		arg.Nonce,
+		arg.EncryptionVersion,
+		arg.Url,
+		arg.AliasUrl,
+		arg.Username,
+		arg.Category,
+		arg.Notes,
+		arg.ProviderMeta,
+		arg.RotationTargets,
+		arg.CustomFields,
+		arg.UrlBidx,
+		arg.AliasUrlBidx,
+		arg.ID,
+	)
+	return err
+}
+
 const seedVaultEntryCapabilityDefaults = `-- name: SeedVaultEntryCapabilityDefaults :exec
 UPDATE vault_entries
 SET destination_patterns = ?, injection_spec = ?, updated_at = CURRENT_TIMESTAMP

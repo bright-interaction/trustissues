@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -101,6 +102,58 @@ func EncryptString(plaintext, key string) (string, error) {
 		return "", err
 	}
 	return marker + base64.StdEncoding.EncodeToString(packed), nil
+}
+
+// DecryptStringAny tries every key in order and returns the first that opens
+// the value. It is the dual-key read used while a master-key rotation is in
+// flight: pass the CURRENT key first and TRUSTISSUES_VAULT_KEY_PREVIOUS second,
+// so a store that is half-swept (or restored from a backup taken before the
+// sweep) keeps reading instead of returning "[decryption error]" for every row.
+//
+// Order matters and current-first is deliberate. AES-GCM authenticates, so a
+// wrong key cannot produce a false positive and the fallback is safe, but the
+// common case must not pay two PBKDF2 lookups. Both are memoized anyway
+// (deriveKey), so the second attempt costs one AES-GCM open.
+//
+// Empty keys are skipped rather than tried: an unset TRUSTISSUES_VAULT_KEY_PREVIOUS
+// is the normal state and must not turn into a decrypt attempt under "".
+// The error returned is the FIRST key's error, because that is the one the
+// operator is configured on and the one they need to see.
+//
+// IT TAKES THE FIELD, and that is the whole point of this signature.
+//
+// Rotation and the field ledger were built in parallel on two branches and the
+// naive merge of them compiled to neither: this function was calling
+// DecryptString with two arguments while DecryptString had grown a third, so the
+// tree did not build at all. The two easy repairs are both wrong. Dropping the
+// field turns every rotation-era read back into a decryption that names no
+// column, which is exactly the "keyed by CALL SITE" defect the ledger replaced,
+// and it would do it silently on the read path that is about to become the
+// common one. Dropping the multi-key attempt strands every value written under
+// the previous key the moment a rotation is half-swept.
+//
+// So the field rides along and is passed to every attempt. It is an AAD input,
+// not a key input: the same field is bound whichever key opens the value, so a
+// row sealed under the previous key opens exactly when it should and is still
+// counted against the column it belongs to.
+func DecryptStringAny(encrypted string, f vaultfield.Field, keys ...string) (string, error) {
+	var firstErr error
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		plain, err := DecryptString(encrypted, k, f)
+		if err == nil {
+			return plain, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		return "", fmt.Errorf("no decryption key configured")
+	}
+	return "", firstErr
 }
 
 // DecryptString decrypts a value produced by EncryptString. It accepts both the

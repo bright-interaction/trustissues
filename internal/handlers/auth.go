@@ -76,11 +76,17 @@ type userInfo struct {
 // transparently handling both the encrypted form (current) and legacy
 // plaintext rows. A decrypt failure means the value was never ciphertext, so
 // it is returned as-is.
-func decryptTOTPSecret(stored, key string) string {
+//
+// keys is variadic so callers pass the CURRENT master key followed by
+// TRUSTISSUES_VAULT_KEY_PREVIOUS. Without the fallback, the first login after a
+// master-key change would fail 2FA for every enrolled user: the seed is still
+// sealed under the old key until the re-encrypt sweep runs, the decrypt fails,
+// and the ciphertext gets fed to the TOTP validator as if it were the seed.
+func decryptTOTPSecret(stored string, keys ...string) string {
 	if stored == "" {
 		return ""
 	}
-	if dec, err := columncrypto.DecryptString(stored, key, vaultFieldTOTPSecret); err == nil {
+	if dec, err := columncrypto.DecryptStringAny(stored, vaultFieldTOTPSecret, keys...); err == nil {
 		return dec
 	}
 	return stored
@@ -104,18 +110,36 @@ func (h *AuthHandler) MigrateTOTPSecrets() error {
 		// Already at-rest encrypted (marked): NEVER re-encrypt. A decrypt failure
 		// here is a key mismatch or corruption, not plaintext; re-encrypting would
 		// make a recoverable mismatch permanent. Log and leave untouched.
+		//
+		// A seed that opens under the PREVIOUS key is not a mismatch, it is a
+		// rotation that has not been swept yet, so it is not an error. Converting
+		// it is the rekey sweep's job (RekeyVault), not this migration's: this one
+		// runs on every boot and its contract is "encrypt plaintext", and giving it
+		// a second job that rewrites ciphertext is how the double-encryption bug
+		// happened in the first place.
 		if columncrypto.IsEncrypted(stored) {
 			if _, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey, vaultFieldTOTPSecret); derr != nil {
-				slog.Error("totp.migrate: marked secret failed to decrypt under current key, leaving untouched", "user_id", row.ID, "error", derr)
+				if _, prevErr := columncrypto.DecryptStringAny(stored, vaultFieldTOTPSecret, h.cfg.VaultKeyPrevious); prevErr == nil {
+					slog.Info("totp.migrate: secret is sealed under the previous vault key; run the re-encrypt sweep to convert it", "user_id", row.ID)
+				} else {
+					slog.Error("totp.migrate: marked secret failed to decrypt under current key, leaving untouched", "user_id", row.ID, "error", derr)
+				}
 			}
 			continue
 		}
 		// Unmarked. Legacy binaries wrote bare-base64 ciphertext without a marker;
-		// if it still decrypts under the current key it is already encrypted (just
-		// missing the marker) and we recover the seed, otherwise it is genuine
-		// plaintext to be encrypted now.
+		// if it still decrypts under EITHER configured key it is already encrypted
+		// (just missing the marker) and we recover the seed, otherwise it is
+		// genuine plaintext to be encrypted now.
+		//
+		// The previous key has to be in this test. Without it, an unmarked legacy
+		// ciphertext sealed under the OLD key fails the decrypt, gets classified as
+		// plaintext, and is re-encrypted as Enc_new(Enc_old(seed)). That is the
+		// irreversible corruption the marker was introduced to prevent, reachable
+		// again through the one row shape the marker does not cover.
 		seed := stored
-		if dec, derr := columncrypto.DecryptString(stored, h.cfg.VaultKey, vaultFieldTOTPSecret); derr == nil {
+		if dec, derr := columncrypto.DecryptStringAny(stored, vaultFieldTOTPSecret,
+			h.cfg.VaultKey, h.cfg.VaultKeyPrevious); derr == nil {
 			seed = dec
 		}
 		enc, eerr := columncrypto.EncryptString(seed, h.cfg.VaultKey)
@@ -415,7 +439,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey)
+		secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey, h.cfg.VaultKeyPrevious)
 		// spendTOTPStep, not ValidateCode: the code is accepted only if its time step
 		// can also be CONSUMED, which makes a captured code unusable twice inside its
 		// own 60-second window.
@@ -795,7 +819,7 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	secret := decryptTOTPSecret(nullStringToString(secretRow), h.cfg.VaultKey)
+	secret := decryptTOTPSecret(nullStringToString(secretRow), h.cfg.VaultKey, h.cfg.VaultKeyPrevious)
 	if secret == "" {
 		writeBadRequest(w, r, "run setup first")
 		return
@@ -925,7 +949,7 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 	// The password has already been verified above, so accepting a recovery code here
 	// requires BOTH factors: something known and something issued at enrolment. That
 	// is the same bar as a normal disable.
-	secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey)
+	secret := decryptTOTPSecret(nullStringToString(totpState.TotpSecret), h.cfg.VaultKey, h.cfg.VaultKeyPrevious)
 	if !spendTOTPStep(r.Context(), h.queries, userID, secret, req.Code) {
 		if !consumeRecoveryCode(r.Context(), h.queries, userID, req.Code) {
 			recordFailure()

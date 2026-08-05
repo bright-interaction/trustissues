@@ -324,3 +324,61 @@ export interface RestoredOwnership {
   };
   why: string;
 }
+
+// Master-key rotation status, from GET /admin/vault-key.
+//
+// Mirrors handlers.RekeyReport. The server never sends a key, only a short
+// salted fingerprint, so this type has nowhere to leak one.
+export interface RekeySurface {
+  table: string;
+  column: string;
+  setting_key?: string;
+  family: string;
+  why: string;
+  scanned: number;
+  on_current: number;
+  on_previous: number;
+  plaintext: number;
+  // Blind indexes only: an HMAC that matches no key on the ring. Repairable by
+  // recomputing it, so unlike on_previous it needs no old key.
+  stale: number;
+  unreadable: number;
+  converted: number;
+}
+
+// A value no configured key opens. Carries the row id, never the value.
+export interface RekeyBlocker {
+  table: string;
+  column: string;
+  setting_key?: string;
+  row_id: string;
+  reason: string;
+}
+
+// status is one of:
+//   already_current  every keyed value opens under the current key
+//   needs_rekey      at least one value is still on the previous key
+//   converted        a sweep just ran and moved everything to the current key
+//   blocked          at least one value opens under NEITHER configured key
+export interface VaultKeyStatus {
+  status: 'already_current' | 'needs_rekey' | 'converted' | 'blocked';
+  previous_key_configured: boolean;
+  current_key_fingerprint: string;
+  previous_key_fingerprint?: string;
+  surfaces: RekeySurface[];
+  blockers: RekeyBlocker[];
+  blockers_total: number;
+  values_on_current: number;
+  values_on_previous: number;
+  // Stale lookup indexes. Kept separate from values_on_previous because the
+  // remedy differs: the sweep recomputes these with no previous key, so a store
+  // whose only problem is stale indexes must not be told to go and find an old
+  // key it never lost.
+  values_stale: number;
+  values_unreadable: number;
+  rows_converted: number;
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  error?: string;
+}
