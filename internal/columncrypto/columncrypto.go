@@ -132,10 +132,20 @@ func EncryptString(plaintext, key string) (string, error) {
 // common one. Dropping the multi-key attempt strands every value written under
 // the previous key the moment a rotation is half-swept.
 //
-// So the field rides along and is passed to every attempt. It is an AAD input,
-// not a key input: the same field is bound whichever key opens the value, so a
-// row sealed under the previous key opens exactly when it should and is still
-// counted against the column it belongs to.
+// So the field rides along and is passed to every attempt.
+//
+// WHAT THE FIELD IS, STATED PRECISELY, because it is easy to assume more. It is
+// NOT additional authenticated data: internal/vaultfield passes nil as the AAD
+// argument at every Seal and Open, so the column name does not enter the
+// ciphertext and a value sealed for one column will open under another column's
+// Field. What it is instead is a DECLARATION, refused when zero
+// (vaultfield.ErrUndeclared), and the thing the encrypted-field ledger derives
+// its coverage from. Passing it to every key attempt is therefore about the
+// ledger seeing a decryption that happened, not about the crypto.
+//
+// Because it is not bound, order is irrelevant to correctness here: a row sealed
+// under the previous key opens on whichever attempt has the right key, and is
+// counted against the column its caller declared either way.
 func DecryptStringAny(encrypted string, f vaultfield.Field, keys ...string) (string, error) {
 	var firstErr error
 	for _, k := range keys {
