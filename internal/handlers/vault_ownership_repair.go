@@ -169,7 +169,20 @@ func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry,
 	}
 	defer rows.Close()
 
-	out := []unownedEntry{}
+	// DRAIN FIRST, THEN ASK. The authority question is a QUERY, and asking it
+	// while this cursor is open holds two connections per request.
+	//
+	// database.Connect caps the pool at 10. At 9 concurrent requests this route
+	// answered in about 400ms; at exactly 10 every connection was held by a
+	// cursor waiting for a connection, no request completed, and an unrelated
+	// SELECT on the same *sql.DB never returned. Nothing cancels those contexts,
+	// so the outage lasted as long as the callers held their sockets: one admin
+	// page took the whole process's database down. The same rows and the same
+	// query count with the cursor closed first answer in about 120ms.
+	type pending struct {
+		e unownedEntry
+	}
+	var drained []pending
 	for rows.Next() {
 		var e unownedEntry
 		var collectionID, createdAt, updatedAt sql.NullString
@@ -181,7 +194,18 @@ func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry,
 		e.CollectionID = collectionID.String
 		e.CreatedAt = createdAt.String
 		e.UpdatedAt = updatedAt.String
+		drained = append(drained, pending{e: e})
+	}
+	if rErr := rows.Err(); rErr != nil {
+		return nil, fmt.Errorf("iterate entries with a recorded owner: %w", rErr)
+	}
+	if cErr := rows.Close(); cErr != nil {
+		return nil, fmt.Errorf("close the recorded-owner cursor: %w", cErr)
+	}
 
+	out := []unownedEntry{}
+	for _, p := range drained {
+		e := p.e
 		live, lErr := h.recordedOwnerMayDirect(ctx, e.ID)
 		if lErr != nil {
 			// A read error is not "this row is fine". Skipping it would hide a
@@ -197,7 +221,7 @@ func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry,
 			"removed from the collection it lives in, which any manager of that collection can do"
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // whyNoRecordedOwner says, per row, which branch of the backfill withheld it.
