@@ -638,12 +638,12 @@ func main() {
 					r.Get("/", vaultHandler.ListUnownedEntries)
 				})
 				r.Post("/vault/{id}/ownership/claim", vaultHandler.ClaimSecretOwnership)
-					// The undo. A claim is reachable whenever the recorded owner
-					// cannot direct the entry, and almost every way to get there is
-					// a reversible call a collection manager can make without
-					// touching the entry. Without this route the helpful admin
-					// action makes the reversible thing permanent.
-					r.Post("/vault/{id}/ownership/restore", vaultHandler.RestoreSecretOwnership)
+				// The undo. A claim is reachable whenever the recorded owner
+				// cannot direct the entry, and almost every way to get there is
+				// a reversible call a collection manager can make without
+				// touching the entry. Without this route the helpful admin
+				// action makes the reversible thing permanent.
+				r.Post("/vault/{id}/ownership/restore", vaultHandler.RestoreSecretOwnership)
 
 				r.Route("/notification-channels", func(r chi.Router) {
 					r.Get("/", notificationChannelsHandler.List)

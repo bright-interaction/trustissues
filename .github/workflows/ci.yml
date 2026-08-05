@@ -1,0 +1,53 @@
+# CI for the public repo (github.com/bright-interaction/trustissues).
+#
+# THIS FILE IS DELIBERATELY THIN. Every actual check lives in scripts/ci.sh, which you
+# can run yourself:
+#
+#   bash scripts/ci.sh
+#
+# Two reasons for the split. A contributor can reproduce CI locally instead of
+# discovering a failure after pushing. And this repository is a filtered mirror
+# published by a job that authenticates with a repository deploy key, which GitHub does
+# not permit to create or update anything under .github/workflows/. Keeping the steps
+# out of this file means a change to a check no longer breaks the publish at its final
+# push, after every gate has already passed.
+#
+# So: edit scripts/ci.sh freely. Editing THIS file is a rare, deliberate act (an action
+# version bump, a trigger change) and needs a push from a credential holding the
+# `workflow` scope.
+#
+# BUN IS NOT OPTIONAL HERE. The Go binary serves the built frontend, and `bun run
+# build` runs `tsc` first, so without the bun setup step the UI is neither type-checked
+# nor built and scripts/ci.sh reports that check as DID NOT RUN. npm is not a
+# substitute: package.json carries an `overrides` block that npm resolves differently.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the secret scan reads full history, not just the tip
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: All checks (build, vet, gofmt, migrations, tests, frontend, secrets, vulnerabilities)
+        run: bash scripts/ci.sh

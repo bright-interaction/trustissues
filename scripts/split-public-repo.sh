@@ -34,10 +34,17 @@ SPLIT_BRANCH="trustissues-public-split"
 # docker-compose.yml deliberately STAYS: unlike CookieProof, this one IS the
 # self-hoster's compose (loopback bind, the documented env list, the drain-aware
 # stop_grace_period), and the README tells a new operator to use it.
+#
+# docker-compose.prod.yml is the opposite case and GOES: it is the estate deploy
+# config the deploy-trustissues pipeline drives, it names the house proxy network
+# and the house image tag, and a self-hoster who followed it would end up with a
+# container attached to a network that does not exist. Same call pare made for
+# its estate compose.
 STRIP_PATHS=(
   CLAUDE.md
   .claude
   AUDIT-ROUND-14-PENDING.md
+  docker-compose.prod.yml
 )
 
 for arg in "$@"; do
