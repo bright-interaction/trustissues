@@ -262,10 +262,24 @@ export interface UnownedEntry {
   updated_at: string;
   why: string;
   // Set only for the second class on this page: an entry that HAS a recorded
-  // owner who may no longer direct it, because they were removed from the
-  // collection it lives in. Empty for the rows the upgrade itself withheld.
+  // owner who may no longer direct it. Empty for the rows the upgrade itself
+  // withheld.
   recorded_owner_user_id: string;
   recorded_owner_email: string;
+  // Which of the ways to lose manage happened, when the server can tell. The
+  // page used to assert one cause for all of them ("removed from the
+  // collection"), which sent operators to ask a collection manager about a
+  // removal that had not happened. Empty for the withheld class.
+  cause: string;
+  // The action that puts the row back WITHOUT moving ownership, when one
+  // exists. It is the first thing to try: taking ownership is the heavier of
+  // the two.
+  remedy: string;
+  // Whether `remedy` undoes the cause through an ordinary product route. The
+  // difference between "somebody's account is gone" and "somebody's collection
+  // role changed for an afternoon", which must not be presented as the same
+  // situation.
+  reversible: boolean;
 }
 
 export interface OwnershipReport {
@@ -286,5 +300,27 @@ export interface WithdrawnEvidence {
   secret_owner_user_id: string;
   cleared_destination_patterns: string[] | null;
   cleared_provider_meta: Record<string, string> | null;
+  why: string;
+}
+
+// What undoing a claim put back.
+//
+// A claim is reachable whenever the recorded owner cannot direct the entry, and
+// almost every way to get there is a reversible call a collection manager can
+// make without touching the entry at all. Without an undo, the helpful admin
+// action on this page is what makes the reversible thing permanent.
+//
+// The destinations the claim withdrew are NOT put back automatically: they come
+// back here so the restored owner can re-enter the ones they want through an
+// ordinary save, which goes through the same gate as any other write with a
+// live authority behind it.
+export interface RestoredOwnership {
+  entry_id: string;
+  secret_owner_user_id: string;
+  previous_custodian_user_id?: string;
+  withdrawn_not_restored?: {
+    destination_patterns: string[] | null;
+    provider_meta: Record<string, string> | null;
+  };
   why: string;
 }

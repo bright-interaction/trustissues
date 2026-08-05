@@ -241,12 +241,40 @@ func TestDemotingAnAdminMakesTheirLiveEntriesClaimable(t *testing.T) {
 	if listed == nil {
 		t.Skip("the demoted admin's entry is not listed; nothing further to probe")
 	}
-	t.Logf("listed after the demotion: why=%q collection_id=%q recorded_owner=%q adoption_recorded=%v",
-		listed.Why, listed.CollectionID, listed.RecordedOwnerUserID, listed.AdoptionRecorded)
+	t.Logf("listed after the demotion: cause=%q reversible=%v why=%q remedy=%q collection_id=%q",
+		listed.Cause, listed.Reversible, listed.Why, listed.Remedy, listed.CollectionID)
 	if strings.Contains(listed.Why, "removed from the collection it lives in") {
 		t.Errorf("THE OPERATOR IS TOLD A FALSE CAUSE: nobody touched collection %q. The owner's "+
 			"INSTANCE ROLE changed from admin to user, which is reversible and routine, and the page "+
 			"asserts a manager stranded the row", listed.CollectionID)
+	}
+	// WHAT HAPPENED HERE IS NOT KNOWABLE FROM THE ROW, and the page must not
+	// pretend otherwise. The victim was never a member of coll-role; they held
+	// manage through the instance admin flag alone. A member who was REMOVED from
+	// coll-role leaves exactly the same state behind: no collection_members row,
+	// and a users row that is not an admin. So the only honest page is one that
+	// names both readings, and the test that would let it name one is a test that
+	// defends whichever one it happens to name.
+	if listed.Cause != causeOwnerNotInCollection {
+		t.Errorf("THE PAGE DIAGNOSES A CAUSE IT CANNOT PROVE: the victim was NEVER in %q and lost the "+
+			"instance admin role, which is indistinguishable from having been removed. The honest "+
+			"cause is %q; the page says %q", listed.CollectionID, causeOwnerNotInCollection, listed.Cause)
+	}
+	// The instance-role reading is the one that actually happened, so the sentence
+	// has to contain it. Without this the merged cause could carry the old
+	// removal-only sentence under a new name and nothing would notice.
+	if !strings.Contains(listed.Why, "instance admin role") {
+		t.Errorf("THE SENTENCE STILL TELLS ONE STORY: an instance role went admin -> user and the "+
+			"page's explanation does not mention that as a possibility.\n  why: %s", listed.Why)
+	}
+	if !strings.Contains(listed.Remedy, "admin role") {
+		t.Errorf("THE REMEDY OMITS THE ONE THAT WOULD WORK HERE: restoring the instance admin role "+
+			"repairs this row and the page does not say so.\n  remedy: %s", listed.Remedy)
+	}
+	if !listed.Reversible || listed.Remedy == "" {
+		t.Errorf("THE PAGE DOES NOT OFFER THE CHEAP REPAIR: restoring one instance role puts this row "+
+			"back with nothing written on the entry, but the page reports reversible=%v remedy=%q, so "+
+			"the only action it presents is the irreversible one", listed.Reversible, listed.Remedy)
 	}
 
 	claim := httptest.NewRecorder()
@@ -257,19 +285,88 @@ func TestDemotingAnAdminMakesTheirLiveEntriesClaimable(t *testing.T) {
 		return
 	}
 
-	// Undo the demotion. The role comes back; nothing else does.
+	// Undo the demotion. The role comes back. Does anything else?
 	if _, err := h.db.Exec(`UPDATE users SET role = 'admin' WHERE id = ?`, victim); err != nil {
 		t.Fatalf("re-promote the owner: %v", err)
 	}
+	restore := httptest.NewRecorder()
+	h.RestoreSecretOwnership(restore, vaultAuthzRequest(http.MethodPost,
+		"/api/admin/vault/entry-role/ownership/restore", claimer, "admin", "entry-role", ""))
+	t.Logf("restore after re-promotion -> %d %s", restore.Code, strings.TrimSpace(restore.Body.String()))
+
 	after, _ := queries.GetVaultEntryAccess(ctx, "entry-role")
 	meta, _ := queries.GetVaultEntryMeta(ctx, "entry-role")
-	t.Logf("after re-promotion: owner=%q custodian=%q destination_patterns=%q",
+	t.Logf("after re-promotion and restore: owner=%q custodian=%q destination_patterns=%q",
 		after.SecretOwnerUserID, after.UserID, meta.DestinationPatterns)
 	if after.SecretOwnerUserID != victim {
 		t.Errorf("A REVERSIBLE ROLE CHANGE COST A LIVE OWNERSHIP PERMANENTLY: entry-role was owned by "+
-			"%q, who was demoted to `user` for a while. The row is now owned by %q, held by %q, and the "+
-			"ceiling its owner configured is %q. Restoring the role restores none of it and there is no "+
-			"un-claim route", victim, after.SecretOwnerUserID, after.UserID, meta.DestinationPatterns)
+			"%q, who was demoted to `user` for a while. The role was put back and the claim was undone "+
+			"through POST .../ownership/restore (%d: %s), and the row is still owned by %q and held by "+
+			"%q. The ceiling its owner configured is %q",
+			victim, restore.Code, strings.TrimSpace(restore.Body.String()),
+			after.SecretOwnerUserID, after.UserID, meta.DestinationPatterns)
+	}
+	// The restore must put the CUSTODIAN back too, not just the owner column.
+	// Leaving the entry in the admin's namespace would mean the victim cannot
+	// find their own secret, which is the same outage wearing a different label.
+	if after.UserID != victim {
+		t.Errorf("THE RESTORE MOVED THE OWNER AND LEFT THE ENTRY IN SOMEBODY ELSE'S NAMESPACE: "+
+			"owner=%q custodian=%q", after.SecretOwnerUserID, after.UserID)
+	}
+}
+
+// TestARestoreCannotBeAimedAtAnybodyTheProductDidNotRecord is the guard on the
+// route the two tests above rely on.
+//
+// The restore is the ONLY path in the module that makes somebody other than the
+// acting admin the owner, which is precisely the shape AuthorizeTransfer refuses
+// ("a route that can name an arbitrary recipient is a route that can make a
+// collection manager the owner"). What makes it safe is that the recipient is
+// read from the claim record rather than from the request. This asserts the
+// recipient is not reachable, by driving the route on an entry whose claim
+// displaced NOBODY: the withheld class. There is no previous holder to return
+// it to, and the answer must be a refusal rather than a guess at the custodian.
+func TestARestoreCannotBeAimedAtAnybodyTheProductDidNotRecord(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	manager := mustUser(t, queries, "aim-manager@example.com", "user", "manager-login-password")
+	admin := mustUser(t, queries, "aim-admin@example.com", "admin", "admin-login-password")
+	mustCollection(t, queries, "coll-aim", manager, map[string]string{manager: collRoleManager})
+	mustEntry(t, h, queries, "entry-aim", manager, "team-key-aim", "sk_live_AIM")
+	placeInCollection(t, queries, "entry-aim", "coll-aim")
+
+	// The withheld class: the migration could not prove an owner, so the column
+	// is empty and the claim below displaces nobody.
+	if _, err := h.db.Exec(`UPDATE vault_entries SET secret_owner_user_id = '' WHERE id = ?`,
+		"entry-aim"); err != nil {
+		t.Fatalf("model the withheld row: %v", err)
+	}
+	claim := httptest.NewRecorder()
+	h.ClaimSecretOwnership(claim, vaultAuthzRequest(http.MethodPost,
+		"/api/admin/vault/entry-aim/ownership/claim", admin, "admin", "entry-aim", ""))
+	if claim.Code != http.StatusOK {
+		t.Fatalf("ABORT: the withheld row could not be claimed (%d: %s), so there is no claim record "+
+			"to aim a restore at", claim.Code, claim.Body.String())
+	}
+
+	restore := httptest.NewRecorder()
+	h.RestoreSecretOwnership(restore, vaultAuthzRequest(http.MethodPost,
+		"/api/admin/vault/entry-aim/ownership/restore", admin, "admin", "entry-aim", ""))
+	t.Logf("restore of a claim that displaced nobody -> %d %s",
+		restore.Code, strings.TrimSpace(restore.Body.String()))
+	if restore.Code == http.StatusOK {
+		t.Errorf("THE RESTORE INVENTED A HOLDER: this claim displaced nobody, so there is no recorded "+
+			"state to return the entry to, and the route answered %d", restore.Code)
+	}
+	after, _ := queries.GetVaultEntryAccess(ctx, "entry-aim")
+	if after.SecretOwnerUserID != admin {
+		t.Errorf("THE REFUSED RESTORE MOVED THE OWNER ANYWAY: owner=%q, expected the claiming admin %q",
+			after.SecretOwnerUserID, admin)
+	}
+	if after.SecretOwnerUserID == manager {
+		t.Errorf("THE RESTORE GUESSED THE CUSTODIAN AND HANDED A COLLECTION MANAGER THE OWNERSHIP: "+
+			"owner=%q", after.SecretOwnerUserID)
 	}
 }
 
@@ -338,9 +435,21 @@ func TestAManagerStillCausesIrreversibleLossThroughProductRoutesAlone(t *testing
 		if e.ID != "entry-prod" {
 			continue
 		}
+		t.Logf("listed: cause=%q reversible=%v why=%q remedy=%q",
+			e.Cause, e.Reversible, e.Why, e.Remedy)
 		if stillMember && strings.Contains(e.Why, "removed from the collection it lives in") {
 			t.Errorf("THE OPERATOR IS TOLD A FALSE CAUSE: %q is still an ACCEPTED member of %q. They "+
 				"were demoted to viewer. The page says they were removed", victim, "coll-prod")
+		}
+		if stillMember && e.Cause != causeOwnerDemotedInCollection {
+			t.Errorf("THE PAGE DIAGNOSES THE WRONG CAUSE: %q is still an accepted member of %q with a "+
+				"role below manage, so the cause is %q. The page says %q",
+				victim, "coll-prod", causeOwnerDemotedInCollection, e.Cause)
+		}
+		if !e.Reversible || e.Remedy == "" {
+			t.Errorf("THE PAGE DOES NOT OFFER THE CHEAP REPAIR: one role change on the collection puts "+
+				"this row back with nothing written on the entry, but the page reports reversible=%v "+
+				"remedy=%q", e.Reversible, e.Remedy)
 		}
 	}
 
@@ -353,10 +462,17 @@ func TestAManagerStillCausesIrreversibleLossThroughProductRoutesAlone(t *testing
 	}
 
 	// The manager puts the role back. One call, same route.
-	restore := httptest.NewRecorder()
-	coll.AddMember(restore, collectionRequest(http.MethodPost, "/api/collections/coll-prod/members",
+	restoreRole := httptest.NewRecorder()
+	coll.AddMember(restoreRole, collectionRequest(http.MethodPost, "/api/collections/coll-prod/members",
 		manager, "user", "coll-prod", `{"email":"prod-victim@example.com","role":"manager"}`))
-	t.Logf("manager restores the role -> %d", restore.Code)
+	t.Logf("manager restores the role -> %d", restoreRole.Code)
+
+	// And the admin undoes their own claim. THE MANAGER CANNOT DO THIS PART, and
+	// must not be able to: the restore is AdminOnly like the claim it reverses.
+	restore := httptest.NewRecorder()
+	h.RestoreSecretOwnership(restore, vaultAuthzRequest(http.MethodPost,
+		"/api/admin/vault/entry-prod/ownership/restore", admin, "admin", "entry-prod", ""))
+	t.Logf("admin restore -> %d %s", restore.Code, strings.TrimSpace(restore.Body.String()))
 
 	after, _ := queries.GetVaultEntryAccess(ctx, "entry-prod")
 	meta, _ := queries.GetVaultEntryMeta(ctx, "entry-prod")
@@ -364,9 +480,15 @@ func TestAManagerStillCausesIrreversibleLossThroughProductRoutesAlone(t *testing
 		after.SecretOwnerUserID, after.UserID, meta.DestinationPatterns)
 	if after.SecretOwnerUserID != victim {
 		t.Errorf("A NON-ADMIN CONVERTED A REVERSIBLE DEMOTION INTO PERMANENT LOSS, using only "+
-			"POST /api/collections/{id}/members twice: the owner is now %q, the custodian is %q, and "+
-			"the ceiling %q the victim configured is gone. The role came back; the ownership did not",
+			"POST /api/collections/{id}/members twice: the role came back and the admin undid their "+
+			"claim through POST .../ownership/restore (%d: %s), and the owner is still %q, the "+
+			"custodian %q, and the ceiling %q the victim configured is gone",
+			restore.Code, strings.TrimSpace(restore.Body.String()),
 			after.SecretOwnerUserID, after.UserID, meta.DestinationPatterns)
+	}
+	if after.UserID != victim {
+		t.Errorf("THE RESTORE LEFT THE ENTRY IN THE ADMIN'S NAMESPACE: owner=%q custodian=%q",
+			after.SecretOwnerUserID, after.UserID)
 	}
 }
 
@@ -508,14 +630,39 @@ func TestClassificationDecidesWhetherThePlantedHostIsEverDisarmed(t *testing.T) 
 	}
 	t.Logf("laundered+live: the entry authorises %v", recorded.Hosts)
 
+	// THE ROW IS IN NEITHER CLASS AND THE CLAIM REFUSES IT, and both of those are
+	// correct: its owner column names somebody who CAN direct it, so it is not
+	// stranded, and moving a live ownership would be the second transfer path the
+	// module exists to not have.
+	//
+	// What was wrong was the refusal. It ended at "ownership moves only when...",
+	// which reads as "the product has no remedy for this row", and the remedy an
+	// operator reaches for when they believe that is sqlite3. Disarming does not
+	// need ownership: clearing the ceiling and the host-choosing provider settings
+	// is a NARROWING, and an instance admin may always make one. So the refusal
+	// has to say so, and then the saying has to be true.
 	if !listedWhileLive && claimA.Code == http.StatusConflict && len(recorded.Hosts) > 0 {
-		t.Errorf("THE REPAIR ROUTE DECLINES TO DISARM A HOST THE PREVIOUS HOLDER CHOSE: with the "+
-			"attacker's id in secret_owner_user_id the row is neither in the withheld class nor in the "+
-			"expired class, GET /api/admin/vault/ownership does not show it, and "+
-			"POST .../ownership/claim answers %d. The planted evidence stays armed (%v) and the "+
-			"product's only repair surface says there is nothing to repair",
-			claimA.Code, recorded.Hosts)
+		body := claimA.Body.String()
+		if !strings.Contains(body, "disarm") {
+			t.Errorf("THE REFUSAL IS A DEAD END: the row is in neither class, the page does not show "+
+				"it, and POST .../ownership/claim answers %d without naming any action that would "+
+				"disarm the planted evidence (%v). An operator who believes there is no remedy reaches "+
+				"for sqlite3.\n  body: %s", claimA.Code, recorded.Hosts, strings.TrimSpace(body))
+		}
+		for _, host := range recorded.Hosts {
+			if !strings.Contains(body, host) {
+				t.Errorf("THE REFUSAL DOES NOT SAY WHAT THE ROW AUTHORISES: %q is a host this entry "+
+					"will deliver to and the refusal does not mention it, so an admin cannot tell "+
+					"whether this row needs their attention.\n  body: %s", host, strings.TrimSpace(body))
+			}
+		}
 	}
+
+	// The remedy that refusal names is exercised end to end, against its own
+	// listener, in TestTheNamedRemedyActuallyDisarmsALaunderedAndLiveRow. It is a
+	// separate test because disarming this row here would leave classification B
+	// below nothing to withdraw, and the two classifications have to be driven
+	// against the SAME armed row for their answers to be comparable.
 
 	// CLASSIFICATION B: the same row, once the laundered owner loses manage.
 	// One manager-gated call by any other manager of the collection.
@@ -549,6 +696,99 @@ func TestClassificationDecidesWhetherThePlantedHostIsEverDisarmed(t *testing.T) 
 			"request lines: %q\n  bodies:        %q", auths, lines, payloads)
 	}
 	t.Logf("expired-class repair: the attacker's listener received %d requests after the claim", len(lines))
+}
+
+// TestTheNamedRemedyActuallyDisarmsALaunderedAndLiveRow drives the action the
+// claim's refusal now points at, on the row that refusal is about.
+//
+// The laundered-and-live row is the one the repair page cannot find: its owner
+// column names somebody, that somebody can still direct it, so it is neither the
+// withheld class nor the expired class. The claim refuses it and should, because
+// moving a live ownership is the second transfer path this module exists to not
+// have. That left the refusal itself as the whole operator surface for the row,
+// and the refusal used to end at "ownership moves only when...".
+//
+// It is not true that nothing can be done, and this proves what can: an instance
+// admin clears the ceiling and the host-choosing provider settings with an
+// ordinary save. That is a NARROWING, egressgate.Decide grants a ticket for one
+// without consulting the authority oracle, so it needs no ownership at all.
+//
+// The premise guards matter as much as the assertion. The recorded owner must
+// still be live AFTER the disarm, because a save that knocked the entry out of
+// its collection would produce the same empty host set with the planted values
+// sitting on the row untouched, and the test would pass for the wrong reason.
+func TestTheNamedRemedyActuallyDisarmsALaunderedAndLiveRow(t *testing.T) {
+	env := newAttackedEnv(t, "remedy")
+	sink := newHeaderSink(t)
+	env.pointProviderAt(t, sink.URL)
+	ctx := context.Background()
+
+	admin := mustUser(t, env.queries, "remedy-admin@example.com", "admin", "admin-login-password")
+
+	if _, err := env.h.db.Exec(`UPDATE vault_entries SET secret_owner_user_id = ? WHERE id = ?`,
+		env.attacker, env.entryID); err != nil {
+		t.Fatalf("model the laundered owner: %v", err)
+	}
+	live, lErr := env.h.recordedOwnerMayDirect(ctx, env.entryID)
+	if lErr != nil {
+		t.Fatalf("liveness: %v", lErr)
+	}
+	if !live {
+		t.Fatal("ABORT: the laundered owner cannot direct the entry, so this is not the row the " +
+			"refusal is about")
+	}
+	before, bErr := env.h.ownerRecordedDestinations(ctx, env.entryID)
+	if bErr != nil {
+		t.Fatalf("read destinations: %v", bErr)
+	}
+	if len(before.Hosts) == 0 {
+		t.Fatal("ABORT: the row authorises nothing before the disarm, so there is nothing to disarm")
+	}
+	t.Logf("armed: the entry authorises %v", before.Hosts)
+
+	// THE REMEDY, with no ownership move anywhere in it.
+	disarm, _ := json.Marshal(map[string]any{
+		"destination_patterns": []string{},
+		"provider_meta":        "{}",
+	})
+	put := httptest.NewRecorder()
+	env.h.Update(put, vaultAuthzRequest(http.MethodPut, "/api/vault/"+env.entryID, admin, "admin",
+		env.entryID, string(disarm)))
+	t.Logf("admin disarms without taking ownership -> %d", put.Code)
+	if put.Code != http.StatusOK {
+		t.Fatalf("THE NAMED REMEDY DOES NOT WORK: an ordinary save by an instance admin clearing the "+
+			"ceiling and the host-choosing provider settings answered %d: %s",
+			put.Code, put.Body.String())
+	}
+
+	stillLive, _ := env.h.recordedOwnerMayDirect(ctx, env.entryID)
+	owner, _ := env.queries.GetVaultEntryAccess(ctx, env.entryID)
+	after, aErr := env.h.ownerRecordedDestinations(ctx, env.entryID)
+	if aErr != nil {
+		t.Fatalf("read destinations after the disarm: %v", aErr)
+	}
+	t.Logf("after the disarm: owner=%q still live=%v, authorises %v",
+		owner.SecretOwnerUserID, stillLive, after.Hosts)
+	if owner.SecretOwnerUserID != env.attacker || !stillLive {
+		t.Fatal("ABORT: the disarm changed WHO may direct the entry rather than WHAT it authorises, " +
+			"so the empty host set does not measure the disarm")
+	}
+	if len(after.Hosts) > 0 {
+		t.Errorf("THE DISARM DID NOT DISARM: the entry still authorises %v", after.Hosts)
+	}
+
+	// THE WIRE, because a host set computed in-process is a claim about what the
+	// unattended sweep will do, and this is the sweep doing it.
+	RotateVaultKeys(env.h.db, env.queries, env.h)
+	if !env.h.WaitForDelivery(30 * time.Second) {
+		t.Fatal("the sweep did not drain")
+	}
+	auths, lines, payloads := sink.received()
+	if sink.sawSecret(env.secret) {
+		t.Fatalf("THE DISARMED ROW STILL DELIVERED TO THE PLANTED HOST.\n  auth headers:  %q\n  "+
+			"request lines: %q\n  bodies:        %q", auths, lines, payloads)
+	}
+	t.Logf("after the disarm the attacker's listener received %d requests", len(lines))
 }
 
 // TestWhereTheRepairPageStartsStarvingThePool finds the concurrency at which the

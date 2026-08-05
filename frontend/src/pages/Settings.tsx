@@ -28,6 +28,7 @@ import type {
   VaultPolicy,
   ApiKeyCreated,
   AIConfig,
+  RestoredOwnership,
   WithdrawnEvidence,
 } from '@/lib/types';
 import { NOTIFICATION_EVENTS, type NotificationEvent } from '@/lib/types';
@@ -1185,6 +1186,11 @@ function ChannelsTab() {
 function OwnershipTab() {
   const queryClient = useQueryClient();
   const [claiming, setClaiming] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  // What the last restore put back, and what it deliberately did not. Same
+  // reason as `withdrawn` below: the destinations are NOT re-armed by the undo,
+  // so the operator has to be able to read them off after the fact.
+  const [restored, setRestored] = useState<RestoredOwnership | null>(null);
   // What the last claim WITHDREW. Held in state rather than only toasted,
   // because these are values the admin has to be able to read off and put back,
   // and a toast that scrolls away would make a deliberate fail-closed step
@@ -1216,6 +1222,23 @@ function OwnershipTab() {
     onSettled: () => setClaiming(null),
   });
 
+  // UNDOING A CLAIM. The route refuses while the recorded holder still cannot
+  // reach the entry, so the error it returns is the instruction: put back
+  // whatever changed first. Surfacing that text verbatim is the point.
+  const restoreMutation = useMutation({
+    mutationFn: (id: string) => api.admin.restoreSecretOwnership(id),
+    onSuccess: (result) => {
+      toast.success('Ownership returned to the holder recorded on the claim');
+      setRestored(result);
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.unownedEntries(),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+    onSettled: () => setRestoring(null),
+  });
+
   const entries = reportQuery.data?.entries ?? [];
 
   return (
@@ -1236,15 +1259,37 @@ function OwnershipTab() {
         </p>
         <p className="mt-3 text-sm text-slate-500">
           The list also includes entries that do record an owner who can no
-          longer reach them. Removing someone from a collection is enough:
-          nothing is written on the entry, and it silently stops contributing
-          every destination it has. Those rows are marked{' '}
-          <span className="font-medium text-slate-700">owner unreachable</span>.
+          longer reach them. Changing one collection role is enough: nothing is
+          written on the entry, and it silently stops contributing every
+          destination it has. Those rows are marked{' '}
+          <span className="font-medium text-slate-700">owner unreachable</span>{' '}
+          and each one says what actually happened to it.
+        </p>
+        <p className="mt-3 text-sm text-slate-500">
+          <span className="font-medium text-slate-700">
+            Try the listed repair before taking ownership.
+          </span>{' '}
+          Most of these are reversible: a collection role, an instance role or a
+          disabled account went one way and can go back, with nothing written on
+          the entry at all. Taking ownership works too, and it also moves the
+          entry into your namespace and withdraws the destinations its owner had
+          configured. You can undo a claim here afterwards, but the cheaper
+          repair costs nobody anything.
         </p>
         <p className="mt-3 text-sm text-slate-500">
           Claiming makes you the owner and the custodian of that one entry. It
           grants you nothing you did not already have as an instance admin; what
           it does is record the decision.
+        </p>
+        <p className="mt-3 text-sm text-slate-500">
+          An entry whose owner of record{' '}
+          <span className="font-medium text-slate-700">can</span> still reach it
+          is not listed here and cannot be claimed, because moving a live
+          ownership would be a second transfer path. If such an entry names a
+          host you do not trust, you do not need ownership to disarm it: clear
+          its agent destinations and any provider setting that names a host on
+          the entry itself. Narrowing what a secret may reach is something an
+          instance admin may always do.
         </p>
       </div>
 
@@ -1308,6 +1353,71 @@ function OwnershipTab() {
         </div>
       )}
 
+      {restored && (
+        <div
+          className={`${cardClass} border-emerald-200 bg-emerald-50`}
+          data-testid="restored-ownership"
+        >
+          <div className="flex items-start gap-2">
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-emerald-900">
+                The claim was undone
+              </p>
+              <p className="mt-1 text-sm text-emerald-800">{restored.why}</p>
+              {(restored.withdrawn_not_restored?.destination_patterns?.length ??
+                0) > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-medium text-emerald-900">
+                    Agent destinations to re-enter
+                  </p>
+                  <ul className="mt-1 space-y-0.5">
+                    {restored.withdrawn_not_restored?.destination_patterns?.map(
+                      (p) => (
+                        <li
+                          key={p}
+                          className="break-all font-mono text-xs text-emerald-900"
+                        >
+                          {p}
+                        </li>
+                      )
+                    )}
+                  </ul>
+                </div>
+              )}
+              {Object.keys(
+                restored.withdrawn_not_restored?.provider_meta ?? {}
+              ).length > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-medium text-emerald-900">
+                    Provider settings to re-enter
+                  </p>
+                  <ul className="mt-1 space-y-0.5">
+                    {Object.entries(
+                      restored.withdrawn_not_restored?.provider_meta ?? {}
+                    ).map(([key, value]) => (
+                      <li
+                        key={key}
+                        className="break-all font-mono text-xs text-emerald-900"
+                      >
+                        {key} = {value}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => setRestored(null)}
+                className="mt-3 text-xs font-medium text-emerald-900 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {reportQuery.isLoading && (
         <div className={cardClass}>
           <div className="flex items-center gap-2 text-sm text-slate-500">
@@ -1355,6 +1465,11 @@ function OwnershipTab() {
                         owner unreachable
                       </span>
                     )}
+                    {entry.reversible && (
+                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">
+                        reversible
+                      </span>
+                    )}
                     {entry.adoption_recorded && (
                       <span className="flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">
                         <AlertTriangle className="h-3 w-3" />
@@ -1374,20 +1489,46 @@ function OwnershipTab() {
                     )}
                   </p>
                   <p className="mt-1 text-xs text-slate-500">{entry.why}</p>
+                  {entry.remedy && (
+                    <p className="mt-2 rounded-lg bg-emerald-50 px-2 py-1.5 text-xs text-emerald-900">
+                      <span className="font-medium">Try this first: </span>
+                      {entry.remedy}
+                    </p>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  disabled={claimMutation.isPending && claiming === entry.id}
-                  onClick={() => {
-                    setClaiming(entry.id);
-                    claimMutation.mutate(entry.id);
-                  }}
-                  className="h-8 shrink-0 self-center rounded-lg bg-slate-900 px-3 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
-                >
-                  {claimMutation.isPending && claiming === entry.id
-                    ? 'Claiming'
-                    : 'Take ownership'}
-                </button>
+                <div className="flex shrink-0 flex-col items-end justify-center gap-2">
+                  <button
+                    type="button"
+                    disabled={claimMutation.isPending && claiming === entry.id}
+                    onClick={() => {
+                      setClaiming(entry.id);
+                      claimMutation.mutate(entry.id);
+                    }}
+                    className="h-8 rounded-lg bg-slate-900 px-3 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {claimMutation.isPending && claiming === entry.id
+                      ? 'Claiming'
+                      : 'Take ownership'}
+                  </button>
+                  {/* The undo, offered on the rows where it can apply. It
+                      refuses unless a claim is recorded AND the holder it
+                      displaced can reach the entry again, and the refusal text
+                      is the instruction, so it is worth showing rather than
+                      hiding behind a guess about which rows qualify. */}
+                  <button
+                    type="button"
+                    disabled={restoreMutation.isPending && restoring === entry.id}
+                    onClick={() => {
+                      setRestoring(entry.id);
+                      restoreMutation.mutate(entry.id);
+                    }}
+                    className="h-8 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    {restoreMutation.isPending && restoring === entry.id
+                      ? 'Undoing'
+                      : 'Undo a claim'}
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
