@@ -99,9 +99,40 @@ CREATE TABLE IF NOT EXISTS secret_ownership_claims (
 UPDATE vault_entries
 SET secret_owner_user_id = ''
 WHERE secret_owner_user_id != ''
-  -- ONLY ROWS 00034 DECIDED ABOUT, for the reason written on the table in
-  -- 00034: a repair undoes the backfill, never the creating statement.
-  AND EXISTS (SELECT 1 FROM secret_owner_backfill b WHERE b.entry_id = vault_entries.id)
+  -- ROWS THAT EXISTED WHEN 00034 RAN, asked of the clock rather than of a table.
+  --
+  -- This clause used to be
+  --
+  --   AND EXISTS (SELECT 1 FROM secret_owner_backfill b WHERE b.entry_id = vault_entries.id)
+  --
+  -- and that was a STRICT REGRESSION, proved by running the real chain: the same
+  -- v34 database IS repaired by the pre-00037 code and is NOT repaired with that
+  -- clause in place. secret_owner_backfill is populated by exactly one INSERT,
+  -- inside 00034. This migration only ever runs on a database that ALREADY
+  -- applied a broken 00034, goose never re-reads a recorded file, so 00034 never
+  -- runs there and the table is created EMPTY by this file's own CREATE IF NOT
+  -- EXISTS. The gate matched nothing, both repairs became no-ops on the only
+  -- population they exist for, and a laundered manager ownership survived
+  -- permanently with no operator notice.
+  --
+  -- goose_db_version.tstamp is recorded on every instance that ran 00034,
+  -- including the ones with no provenance table, so it answers the same question
+  -- without depending on bookkeeping that may never have been written.
+  --
+  -- BOTH AMBIGUITIES RESOLVE TOWARD REPAIRING. A missing tstamp and a row created
+  -- in the same second as the migration both count as "existed then", so the row
+  -- is in scope and its unprovable ownership is withdrawn. Withholding an owner
+  -- costs an admin one click at Settings -> Ownership; leaving a laundered one
+  -- standing cannot be undone at all. CURRENT_TIMESTAMP is second-granular, so
+  -- that second of overlap is real and is spent in the recoverable direction.
+  AND (
+    vault_entries.created_at IS NULL
+    OR vault_entries.created_at <= COALESCE(
+         (SELECT tstamp FROM goose_db_version
+          WHERE version_id = 34 AND is_applied = 1
+          ORDER BY id DESC LIMIT 1),
+         vault_entries.created_at)
+  )
   AND NOT (
     (collection_id IS NULL OR collection_id = '')
     AND NOT EXISTS (

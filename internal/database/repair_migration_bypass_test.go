@@ -166,14 +166,30 @@ func TestTheRepairMigrationsAreNotNoOpsForRowsCreatedAfter00034(t *testing.T) {
 	conn := openAtVersion(t, 34)
 	seedPeople(t, conn)
 
+	// created_at IS THE DISCRIMINATOR, so these rows carry one that is genuinely
+	// after 00034 rather than whatever second the test happens to run in.
+	// CURRENT_TIMESTAMP is second-granular; a row written in the same second as
+	// the migration is deliberately treated as having existed then, and modelling
+	// "created in a LATER deploy window" is what this test is actually about.
 	mustExec(t, conn,
 		`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, collection_id,
-		   secret_owner_user_id)
-		 VALUES ('e-new-shared', 'u-victim', 'made-after-34', X'00', X'00', 'c-team', 'u-victim')`)
+		   secret_owner_user_id, created_at)
+		 VALUES ('e-new-shared', 'u-victim', 'made-after-34', X'00', X'00', 'c-team', 'u-victim',
+		         datetime('now', '+1 day'))`)
 	mustExec(t, conn,
 		`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, collection_id,
-		   secret_owner_user_id)
-		 VALUES ('e-new-personal', 'u-victim', 'personal-after-34', X'00', X'00', NULL, 'u-victim')`)
+		   secret_owner_user_id, created_at)
+		 VALUES ('e-new-personal', 'u-victim', 'personal-after-34', X'00', X'00', NULL, 'u-victim',
+		         datetime('now', '+1 day'))`)
+	// THE OTHER HALF, and the half whose absence let a strict regression ship.
+	// A row that existed WHEN 00034 ran, laundered into the manager's name, must
+	// still be withdrawn. Guarding only the keep-side made the suite defend a
+	// repair that did nothing at all.
+	mustExec(t, conn,
+		`INSERT INTO vault_entries (id, user_id, name, encrypted_value, nonce, collection_id,
+		   secret_owner_user_id, created_at)
+		 VALUES ('e-laundered-before', 'u-manager', 'laundered-before-34', X'00', X'00', 'c-team',
+		         'u-manager', datetime('now', '-1 day'))`)
 
 	if err := goose.Up(conn, "migrations"); err != nil {
 		t.Fatalf("goose up: %v", err)
@@ -181,6 +197,14 @@ func TestTheRepairMigrationsAreNotNoOpsForRowsCreatedAfter00034(t *testing.T) {
 	if got := ownerOf(t, conn, "e-new-personal"); got != "u-victim" {
 		t.Fatalf("ABORT: even the personal entry lost its owner (%q); this test is measuring "+
 			"something else", got)
+	}
+	if got := ownerOf(t, conn, "e-laundered-before"); got != "" {
+		t.Fatalf("THE REPAIR DID NOTHING FOR THE POPULATION IT EXISTS FOR.\n"+
+			"  e-laundered-before existed when 00034 ran and its owner column names the manager who "+
+			"adopted it, which is precisely what 00035 and 00036 are written to withdraw.\n"+
+			"  secret_owner_user_id after the chain = %q, want empty\n"+
+			"Scoping the repair to a table only 00034 populates made both migrations no-ops on every "+
+			"database that already ran 00034, which is the only database they ever run on.", got)
 	}
 	if got := ownerOf(t, conn, "e-new-shared"); got != "u-victim" {
 		t.Fatalf("THE REPAIR MIGRATIONS WITHDREW AN OWNERSHIP NOTHING EVER PUT IN DOUBT.\n"+
