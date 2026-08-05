@@ -117,10 +117,15 @@ func GenerateOTPAuthURI(email, issuer, secret string) string {
 	)
 }
 
-// GenerateRecoveryCodes creates 8 single-use recovery codes. Each
-// code is 8 hex characters (4 random bytes). Both the plaintext and
-// bcrypt-hashed versions are returned so the caller can display the
+// GenerateRecoveryCodes creates 8 single-use recovery codes. Each code is 16 hex
+// characters (recoveryCodeBytes = 8 random bytes, 64 bits). Both the plaintext
+// and bcrypt-hashed versions are returned so the caller can display the
 // plaintext once and store only the hashes.
+//
+// This comment said "8 hex characters (4 random bytes)", describing the narrower
+// code space from before DY-31 widened it. The constant is the truth; the
+// sentence was two years of reassurance about the wrong number, and
+// TestRecoveryCodesAreEightSingleUseCodes now pins the real width.
 func GenerateRecoveryCodes() (plaintextCodes []string, hashedCodes []string, err error) {
 	plaintextCodes = make([]string, 0, recoveryCodeCount)
 	hashedCodes = make([]string, 0, recoveryCodeCount)

@@ -416,6 +416,10 @@ func main() {
 	// capability replay-nonce sweep.
 	go handlers.RunScheduledRotations(appCtx, dbConn, queries, vaultHandler)
 	go handlers.RunExpiryReminders(appCtx, queries, dispatcher)
+	// login_attempts had no sweep at all, so it accumulated a plaintext email and
+	// source IP per attempt for the life of the deployment. It is the one table an
+	// unauthenticated caller can write a row of their choosing into.
+	go handlers.RunLoginAttemptRetention(appCtx, queries)
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()

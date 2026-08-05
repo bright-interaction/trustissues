@@ -227,9 +227,11 @@ quietly dropped because the operator-visible behaviour changed.
   meanwhile. If you are running a build older than `027ed79d7` and have any reason
   to think a session or extension API key leaked, treat the account password as
   guessable and rotate it.
-- `login_attempts` holds a plaintext email and source IP per attempt and nothing
-  purges it (R8). It is the one table where an unauthenticated caller can write a
-  row of their choosing, bounded by the login limiter.
+- `login_attempts` holds a plaintext email and source IP per attempt, and is the
+  one table where an unauthenticated caller can write a row of their choosing,
+  bounded by the login limiter. It is swept hourly down to a 24 hour window
+  (R8). Nothing reads a row older than 15 minutes; the login audit trail is
+  `activity_log`, which is append-only and is not what gets swept.
 - Account roles: `admin` (full control), `user` (own entries + own profile),
   `vault_only` (browser-extension role, authenticates with an API key).
 - Shared team vaults ("collections") with per-collection roles: `viewer`
@@ -304,7 +306,7 @@ mitigation until the code-side fix ships.
 | R5 | **X-Forwarded-For trust must be bounded.** Trusting XFF from any private/loopback peer lets a neighbor spoof the source IP. | A neighboring container can spoof source IP for rate-limit + audit. | Set `TRUSTISSUES_TRUSTED_PROXY_HOPS` to the exact number of proxies in front (1 for a single Caddy) so only that many hops are trusted; run behind that one proxy on an isolated network and do not co-locate untrusted containers on the same bridge. |
 | R6 | ~~Extension API key never shown in the UI.~~ **Resolved.** Settings has an "API keys" tab where any user, including `vault_only`, mints a key, sees it once, and copies it to connect the extension. | Was: users could not self-serve an extension key. Note this table claimed "Resolved" while the router still redirected `vault_only` away from `/settings`, so it was false for the only role that needs it; fixed alongside this row. | None needed; issue keys from Settings. `vault_only` sees an Account and API keys tab only, enforced server-side by `AdminOnly` on every other surface. |
 | R7 | ~~Secrets only length-checked.~~ **Resolved.** The server refuses to boot on a low-entropy or placeholder `TRUSTISSUES_VAULT_KEY`/`JWT_SECRET`, on top of the 32-char minimum. | Was: a lazy operator could run with a known key. | Generate both with `openssl rand -hex 32`. |
-| R8 | **`login_attempts` is never purged.** Every attempt writes a plaintext email plus source IP and nothing sweeps the table. Since 2026-08-05 unknown addresses accrue rows too (that is the enumeration fix), so it grows a little faster. | Unbounded growth of a table of addresses and IPs; a keyless backup reveals who has been trying to log in and from where, alongside the entry-name inventory. Bounded by the 30-per-15-minutes login limiter, so this is a slow leak, not a flood. | Add a retention sweep, or `DELETE FROM login_attempts WHERE created_at < datetime('now','-30 days')` on a timer. Nothing in the app depends on rows older than 15 minutes. |
+| R8 | ~~`login_attempts` is never purged.~~ **Resolved.** A janitor sweeps rows older than `handlers.LoginAttemptRetention` (24h) hourly and once at boot, so an instance that has been accumulating since before this existed is cleaned on its first boot with it. | Was: unbounded growth of a table of plaintext addresses and IPs, readable from a keyless backup, and the one table an unauthenticated caller can write a row of their choosing into. | None needed. The window is a constant rather than a setting, deliberately: nothing reads a row older than 15 minutes, and `TestLoginAttemptRetentionOutlivesEveryReader` derives every reader's window from the query files and fails if the constant stops exceeding the longest one. The login audit trail is `activity_log`, which is append-only and untouched by the sweep. |
 | R9 | **Only `activity_log` is append-only.** Its `_no_update`/`_no_delete` triggers ABORT tampering (00003, amended by 00027 to allow anonymization). `capability_log` and `service_secret_audit` have no triggers at all. | Someone with direct SQLite access can erase the capability and service-secret trail without tripping anything, while the human-action trail resists it. The trails disagree about how well they are protected. | Direct filesystem access to the DB is already game over for confidentiality (see trust boundaries), so this is about post-incident reconstruction, not prevention. Ship the same triggers on both tables; tracked as DEFERRED (b). |
 | R10 | **Nothing reads `capability_log`.** The table is written on every capability issue and use and there is no endpoint, no UI and no export over it. | The capability trail exists but cannot be reviewed without opening the database by hand, which means in practice it is not reviewed. | `sqlite3 $TRUSTISSUES_DATA_DIR/trustissues.db 'SELECT * FROM capability_log ORDER BY created_at DESC LIMIT 50'` until DEFERRED (c) ships. |
 | R11 | **Audit actor attribution is lost on user deletion.** `activity_log.user_id` is `ON DELETE SET NULL`. | Deleting a user anonymizes their entire history in the one trail that IS tamper-evident, so "who did this" becomes unanswerable for exactly the person most likely to be under investigation. | Disable accounts instead of deleting them (`disabled = 1` is enforced at every auth path and keeps the rows intact). Tracked as DEFERRED (f). |
@@ -522,6 +524,7 @@ holds 5 vault entries, 28 activity rows and 0 ownership claims, so several risks
 described here are latent rather than live, and an item's position in this file is
 not a statement about how urgent it is. Second, the per-round documents in this
 directory each restate the previous round's residuals, so four of them describing
-the same unresolved thing is one finding, not four. `AUDIT-ROUND-14-PENDING.md`
-says PENDING in its filename and COMPLETE on line 1; the line is right and the
-filename is a fossil.
+the same unresolved thing is one finding, not four. The round-14 write-up was
+called `AUDIT-ROUND-14-PENDING.md` while saying COMPLETE on line 1, which is the
+kind of contradiction that costs a reader an hour; it is `AUDIT-ROUND-14.md` now,
+matching its five siblings and the glob the mirror strips them by.

@@ -541,6 +541,26 @@ type Querier interface {
 	// url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 	MatchVaultEntriesByURL(ctx context.Context, arg MatchVaultEntriesByURLParams) ([]MatchVaultEntriesByURLRow, error)
 	MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error
+	// Retention sweep for login_attempts.
+	//
+	// Nothing purged this table, so it accumulated a plaintext email and source IP
+	// per attempt for the life of the deployment. It is the one table an
+	// UNAUTHENTICATED caller can put a row of their choosing into, and since the
+	// 2026-08-05 enumeration fix an address with no account writes a row too, so it
+	// grows faster than it used to.
+	//
+	// Deleting old rows costs nothing, because this table is a rate-limiting
+	// mechanism and not an audit trail. Every live reader (the per-email and per-IP
+	// lockout counts, and vault.reauthLocked which reuses the per-email one) looks
+	// back exactly 15 minutes; ListRecentLoginAttemptsByEmail has no callers at all.
+	// The actual audit trail for logins is activity_log, which is append-only and
+	// tamper-evident and is not touched by this.
+	//
+	// The window is passed in rather than baked here so one Go constant is the
+	// single source of truth, and TestLoginAttemptRetentionOutlivesEveryReader can
+	// derive the readers' windows from this file and prove the constant exceeds all
+	// of them.
+	PruneLoginAttempts(ctx context.Context, datetime interface{}) (sql.Result, error)
 	RekeyInvitationCode(ctx context.Context, arg RekeyInvitationCodeParams) error
 	RekeyNotificationChannelConfig(ctx context.Context, arg RekeyNotificationChannelConfigParams) error
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
