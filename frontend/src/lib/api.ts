@@ -24,6 +24,7 @@ import type {
   CollectionInviteResult,
   PendingInvite,
   OwnershipReport,
+  RestoredOwnership,
   WithdrawnEvidence,
 } from './types';
 
@@ -271,6 +272,15 @@ export const api = {
     // claim clears them in the same transaction and reports them here.
     claimSecretOwnership: (id: string) =>
       request<WithdrawnEvidence>(`/admin/vault/${id}/ownership/claim`, {
+        method: 'POST',
+      }),
+    // The undo. Ownership goes back to the holder the claim recorded it
+    // displacing, and to nobody else: the recipient is read from that record,
+    // never from this request. Refuses while that holder still cannot reach the
+    // entry, because returning it then would strand the row again and spend the
+    // undo.
+    restoreSecretOwnership: (id: string) =>
+      request<RestoredOwnership>(`/admin/vault/${id}/ownership/restore`, {
         method: 'POST',
       }),
   },

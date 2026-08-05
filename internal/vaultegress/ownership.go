@@ -140,6 +140,82 @@ func AuthorizeTransfer(req TransferRequest) (TransferProof, error) {
 	return TransferProof{entryID: entry, to: to, why: why, granted: true}, nil
 }
 
+// RestoreRequest is everything AuthorizeRestore needs.
+type RestoreRequest struct {
+	// EntryID is the entry whose ownership goes back. The proof is bound to it.
+	EntryID string
+	// Actor is the admin undoing the claim.
+	Actor string
+	// ActorIsInstanceAdmin must be resolved from the USERS ROW, as above.
+	ActorIsInstanceAdmin bool
+	// RecordedPreviousOwner is what secret_ownership_claims stored when the claim
+	// displaced somebody. IT MUST COME FROM THAT ROW AND NOT FROM THE REQUEST.
+	// The whole safety argument below rests on this value being one the product
+	// wrote about this entry, never one a caller chose.
+	RecordedPreviousOwner string
+	// To is who the caller intends to make the owner. AuthorizeRestore exists to
+	// check that it equals RecordedPreviousOwner and nothing else.
+	To string
+	// Why is the recorded reason, and it is required, as above.
+	Why string
+}
+
+// AuthorizeRestore is the second and last constructor for a TransferProof, and
+// it is the ONLY way ownership reaches a principal who is not the acting admin.
+//
+// THE RULE: an instance admin may put an entry back with the exact holder the
+// product recorded that a claim displaced, and may not name anybody else.
+//
+// WHY THIS IS NOT THE THIRD-PARTY TRANSFER AuthorizeTransfer REFUSES. That
+// refusal is about a route whose recipient a CALLER chooses, because such a
+// route can be driven to make a collection manager the owner and it looks like
+// an administrative convenience while it does it. Here the recipient is read out
+// of secret_ownership_claims.previous_owner_user_id, which ClaimSecretOwnership
+// wrote from the entry's own row before it moved anything. There is no request
+// field that reaches it. The most this route can do is return an entry to the
+// state the product itself recorded one of its own actions displacing, which is
+// strictly less than the claim that created the record was already allowed to do.
+//
+// WHY IT HAS TO EXIST. A claim is reachable exactly when the recorded owner
+// cannot direct the entry, and almost every way to get there is reversible and
+// is not an admin's doing: a collection manager removes the owner from the
+// collection, or changes their role to viewer, and any admin who then does the
+// helpful thing on the Ownership page makes it permanent. Without a way back,
+// "somebody's collection role changed for an afternoon" and "somebody left the
+// company" cost the same thing, and the cheaper one is available to a manager.
+//
+// The empty RecordedPreviousOwner is refused rather than defaulted. A claim on a
+// row the backfill withheld displaced nobody, and defaulting to the custodian
+// there would invent a holder the product never recorded.
+func AuthorizeRestore(req RestoreRequest) (TransferProof, error) {
+	entry := strings.TrimSpace(req.EntryID)
+	actor := strings.TrimSpace(req.Actor)
+	to := strings.TrimSpace(req.To)
+	prev := strings.TrimSpace(req.RecordedPreviousOwner)
+	why := strings.TrimSpace(req.Why)
+
+	deny := func(reason string) (TransferProof, error) {
+		return TransferProof{}, &TransferDeniedError{EntryID: entry, Actor: actor, To: to, Reason: reason}
+	}
+	switch {
+	case entry == "":
+		return deny("no entry was named, and a proof that names no entry would authorise every transfer")
+	case actor == "":
+		return deny("no acting principal was named")
+	case why == "":
+		return deny("no reason was recorded, so the restore would not be attributable")
+	case !req.ActorIsInstanceAdmin:
+		return deny("that takes an instance admin, resolved from the users row")
+	case prev == "":
+		return deny("nothing recorded a previous holder for this entry, so there is no state to " +
+			"return it to; a restore that guessed one would be inventing an owner")
+	case to != prev:
+		return deny("a restore may only return the entry to the holder recorded on the claim it " +
+			"undoes; naming any other recipient is the third-party transfer AuthorizeTransfer refuses")
+	}
+	return TransferProof{entryID: entry, to: to, why: why, granted: true}, nil
+}
+
 // Why is the recorded reason, so the caller can log what it just did.
 func (p TransferProof) Why() string { return p.why }
 
