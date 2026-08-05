@@ -43,8 +43,24 @@ SPLIT_BRANCH="trustissues-public-split"
 STRIP_PATHS=(
   CLAUDE.md
   .claude
-  AUDIT-ROUND-14-PENDING.md
   docker-compose.prod.yml
+)
+
+# The audit round-ups are stripped by GLOB, not by name.
+#
+# This list named `AUDIT-ROUND-14-PENDING.md` and nothing else, and five more
+# round documents (15 through 19) appeared after it was written. Every one of
+# them is a reproducible attack write-up against this exact product, several with
+# the working call sequence spelled out, and they would all have been published
+# while round 14 was carefully withheld. Nobody edits a strip list when they add
+# a document, which is the point: a guard that recognises one spelling is the
+# defect that keeps recurring across this estate (CLAUDE.md section 15 is an
+# essay about the same shape in the mirror gates themselves).
+#
+# git filter-repo takes literal paths for --path, so globs go through
+# --path-glob and are asserted separately below.
+STRIP_GLOBS=(
+  'AUDIT-ROUND-*.md'
 )
 
 for arg in "$@"; do
@@ -101,9 +117,11 @@ CLONE="$WORK/trustissues-public"
 echo "Cloning $SPLIT_BRANCH -> $CLONE (single-branch) ..."
 git clone --quiet --single-branch --no-tags --branch "$SPLIT_BRANCH" "file://$ROOT" "$CLONE"
 
-if [ "${#STRIP_PATHS[@]}" -gt 0 ]; then
-  FR_ARGS=(); for p in "${STRIP_PATHS[@]}"; do FR_ARGS+=(--path "$p"); done
-  echo "Stripping internal-only paths from all history: ${STRIP_PATHS[*]}"
+if [ "${#STRIP_PATHS[@]}" -gt 0 ] || [ "${#STRIP_GLOBS[@]}" -gt 0 ]; then
+  FR_ARGS=()
+  for p in "${STRIP_PATHS[@]}"; do FR_ARGS+=(--path "$p"); done
+  for g in "${STRIP_GLOBS[@]}"; do FR_ARGS+=(--path-glob "$g"); done
+  echo "Stripping internal-only paths from all history: ${STRIP_PATHS[*]} ${STRIP_GLOBS[*]}"
   ( cd "$CLONE" && git filter-repo --force --invert-paths "${FR_ARGS[@]}" )
 fi
 
@@ -134,6 +152,25 @@ mirror_enterprise_check "$CLONE" || exit 1
 # Defense in depth: fail if a stripped path survived.
 for p in "${STRIP_PATHS[@]}"; do
   [ -e "$CLONE/$p" ] && { echo "REFUSING: stripped path '$p' still present." >&2; exit 1; }
+done
+# Same for the globs. Two rules, both learned the hard way:
+#
+# 1. The survivors are captured and the CONTENT is tested, never a pipeline exit
+#    status. `producer | grep -q` returns 141 on SIGPIPE under pipefail, so that
+#    form reads "clean" exactly when there is most to find (CLAUDE.md section 15).
+# 2. Matching is done by `find -name`, which takes the pattern as a literal
+#    argument, NOT by letting the shell expand an unquoted `$g`. Shell globbing of
+#    a parameter expansion is interpreter-specific: bash does it, zsh does not
+#    without `${~g}`, and `set -f` disables it everywhere. A guard whose matching
+#    depends on which shell invoked it is not a guard. The first draft of this
+#    block used `ls -d -- $g` and reported CLEAN against a planted file.
+for g in "${STRIP_GLOBS[@]}"; do
+  survivors="$( find "$CLONE" -maxdepth 1 -name "$g" -print 2>/dev/null || true )"
+  if [ -n "$survivors" ]; then
+    echo "REFUSING: stripped glob '$g' still matches:" >&2
+    echo "$survivors" >&2
+    exit 1
+  fi
 done
 
 # Build-check the mirror. Every gate below uses a blocking if/else, never

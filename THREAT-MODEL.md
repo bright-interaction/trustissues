@@ -5,7 +5,16 @@ protects, what it does not, and the handful of ways you can lose all your data.
 It is written for the person running the server, not just the person who wrote
 it.
 
-Last reviewed: 2026-07-21 (operator-surface hardening pass).
+Last reviewed: 2026-08-05 (authentication-path review).
+
+The revision before this one was dated 2026-07-21 and was the document a
+deploying operator is told to read first, while the system underneath it had
+moved through audit rounds 15 to 19, migrations 00033 to 00038, the secret exit,
+`internal/vaultfield` and the whole ownership surface. Two of its claims had gone
+from true to false in that time (see "Authentication and session model"). If you
+are reading a copy whose date is older than the newest `AUDIT-ROUND-*.md` in this
+directory, assume the same has happened again and check the code before trusting
+a sentence here.
 
 ## What this system holds
 
@@ -110,10 +119,27 @@ and it has clear limits.
 
 - A stolen database file or backup (ciphertext is useless without the key).
 - A stolen disk / volume snapshot.
-- Casual read of the DB by another local user IF file permissions hold (note:
-  the DB file is currently mode 0644, see Residual risks).
+- Casual read of the DB by another local user, since the server sets umask 0o077
+  and chmods the db plus its `-wal`/`-shm` to 0600 (dir 0700) on boot (R3). An
+  earlier revision of this file still warned that the file was mode 0644 while
+  the table below already recorded the fix; the 0600 statement is the correct one.
 - Values leaking into logs (verified: secret values, passwords, and key
   material do not appear in logs even at debug level).
+
+**What the column encryption specifically does NOT bind.** Every encrypted
+column is sealed with AES-256-GCM under the same vault key, and
+`internal/vaultfield` passes `nil` as the AEAD's additional authenticated data at
+all five `Seal`/`Open` sites. The `vaultfield.Field` a caller supplies is a
+DECLARATION, refused when zero, from which the encrypted-field ledger derives
+coverage. It is not a cryptographic binding. So a ciphertext lifted out of one
+column and written into another decrypts cleanly under the second column's
+`Field`, and an attacker with DB WRITE access can move sealed values between
+columns without ever holding the key. This does not weaken the keyless-backup
+story, which is what R1/R3 are about, and an attacker with database write access
+already has other paths. It matters when you reason about integrity rather than
+confidentiality: the ledger tells you which columns are encrypted, not that a
+given ciphertext belongs where it sits. A code comment claimed otherwise until
+2026-08-05 (`352bdb327`).
 
 **It does NOT protect against:**
 
@@ -133,14 +159,77 @@ If you need the property that even the operator cannot read secrets
 
 ## Authentication and session model
 
-- Passwords are hashed with Argon2id; legacy bcrypt hashes upgrade on next
-  login. Login has per-email lockout (5 failures / 15 min), per-IP throttling,
-  and constant-time behavior for unknown accounts.
-- Sessions are stateless JWTs signed with `TRUSTISSUES_JWT_SECRET`, delivered as
-  an HttpOnly + Secure + SameSite=Strict cookie. Losing the JWT secret only
-  forces everyone to log in again; it does NOT threaten stored data.
-- Optional TOTP 2FA, with hashed single-use recovery codes. Admins can require
-  2FA team-wide in the vault policy.
+This is the part of the system that had gone longest without being read. Rounds
+1 to 19 audited what a session may REACH; round 14 recorded that nothing had
+audited how a session is OBTAINED, and no later round picked it up. That review
+ran on 2026-08-05 and is the reason for this revision. Three ordering defects
+came out of it, all fixed in `027ed79d7`, and they are described here rather than
+quietly dropped because the operator-visible behaviour changed.
+
+- Passwords are hashed with Argon2id (m=64MiB, t=3, p=4); legacy bcrypt hashes
+  upgrade on next login. Argon2 work is bounded by a 4-slot semaphore, so a login
+  flood becomes latency and then 503, never a memory-exhaustion crash. Capacity
+  exhaustion is answered as 503 and is never counted as a failed attempt, at every
+  one of the six sites that verify a password, because counting it would make
+  saturating the semaphore an account-lockout vector.
+- Login has a per-email lockout (5 failures / 15 min, with a graduated delay from
+  the third), per-IP throttling (20 failures / 15 min), a per-IP request limiter
+  (30 / 15 min) and a dummy-hash verify so an unknown address cannot be told apart
+  by latency. **The dummy hash was only half of that until 2026-08-05.** An address
+  with no account returned before recording anything, so its failure counter stayed
+  at zero forever: five wrong passwords at a real address answered 429 and the same
+  five at an unknown address answered a fast 401, which made the status code a
+  certain account-existence oracle. Both paths now accrue, delay and lock out
+  identically.
+- **Sessions are NOT stateless JWTs, and have not been since migration 00022.**
+  The JWT signed with `TRUSTISSUES_JWT_SECRET` carries a session id as its `jti`,
+  and every request revalidates the server-side `sessions` row: missing, revoked
+  (logout), bound to a different user, idle past `session_idle_minutes` (default
+  15), or past the row's absolute `expires_at` all reject with 401. A password
+  change revokes every session row, moves the `sessions_valid_after` cutoff so
+  older tokens die by `iat`, and revokes the user's API keys as well, because
+  changing the password is the incident-response action after a compromise.
+  A stolen token therefore stops working on logout, on password change, and on
+  15 minutes of inactivity, rather than living to its natural expiry. Two knobs
+  govern this and they are deliberately separate: `session_idle_minutes` is the
+  HTTP session, `vault_auto_lock_max_minutes` is the browser-side vault lock.
+  They shared one key once, so widening the vault auto-lock silently widened every
+  HTTP session.
+- Losing the JWT secret forces everyone to log in again and does NOT threaten
+  stored data, which is still true. But note the asymmetry with the sentence above:
+  because sessions are now server-side rows, an attacker who steals the JWT secret
+  and forges a token must also name a live session id, so the secret alone is no
+  longer sufficient to mint a working session.
+- The session cookie is HttpOnly + Secure + SameSite=Strict, and every
+  state-changing `/api` route additionally passes an Origin/Referer check that
+  fails open only for callers that send none of `Origin`, `Referer` or
+  `Sec-Fetch-Site` (a browser always sends at least one; the CLI and MCP
+  connectors do not).
+- Optional TOTP 2FA. A code is accepted only if its 30-second time step can also
+  be CONSUMED, so an observed code is not replayable inside its own window, and
+  recovery codes are spent under a compare-and-swap that refuses the login if the
+  spend does not persist. Enabling 2FA requires the PASSWORD, not just a session,
+  because enrolment is irreversible by the owner and a session thief could
+  otherwise lock them out permanently. Disabling requires the password plus either
+  a live code or a recovery code.
+- Admins can require 2FA team-wide in the vault policy, which is enforced by
+  refusing self-service disables. **That refusal used to spend the second factor
+  before refusing**, so a user under the policy who tried to turn 2FA off burned a
+  single-use recovery code and got a 409 anyway; eight attempts left an account
+  with no recovery path at all and nothing reissues them. The policy is now
+  consulted on the password alone, before anything is consumed.
+- **`POST /api/auth/totp/verify` checked its lockout after the password verify's
+  early return until 2026-08-05**, so the check could only ever fire once the
+  password was already correct. The endpoint sits under the 500/min API limiter
+  rather than the login limiter, so a stolen session had a password oracle two
+  orders of magnitude faster than `/api/auth/login` with the lockout switched off,
+  and the failures it recorded locked the real owner out of the login page
+  meanwhile. If you are running a build older than `027ed79d7` and have any reason
+  to think a session or extension API key leaked, treat the account password as
+  guessable and rotate it.
+- `login_attempts` holds a plaintext email and source IP per attempt and nothing
+  purges it (R8). It is the one table where an unauthenticated caller can write a
+  row of their choosing, bounded by the login limiter.
 - Account roles: `admin` (full control), `user` (own entries + own profile),
   `vault_only` (browser-extension role, authenticates with an API key).
 - Shared team vaults ("collections") with per-collection roles: `viewer`
@@ -215,6 +304,11 @@ mitigation until the code-side fix ships.
 | R5 | **X-Forwarded-For trust must be bounded.** Trusting XFF from any private/loopback peer lets a neighbor spoof the source IP. | A neighboring container can spoof source IP for rate-limit + audit. | Set `TRUSTISSUES_TRUSTED_PROXY_HOPS` to the exact number of proxies in front (1 for a single Caddy) so only that many hops are trusted; run behind that one proxy on an isolated network and do not co-locate untrusted containers on the same bridge. |
 | R6 | ~~Extension API key never shown in the UI.~~ **Resolved.** Settings has an "API keys" tab where any user, including `vault_only`, mints a key, sees it once, and copies it to connect the extension. | Was: users could not self-serve an extension key. Note this table claimed "Resolved" while the router still redirected `vault_only` away from `/settings`, so it was false for the only role that needs it; fixed alongside this row. | None needed; issue keys from Settings. `vault_only` sees an Account and API keys tab only, enforced server-side by `AdminOnly` on every other surface. |
 | R7 | ~~Secrets only length-checked.~~ **Resolved.** The server refuses to boot on a low-entropy or placeholder `TRUSTISSUES_VAULT_KEY`/`JWT_SECRET`, on top of the 32-char minimum. | Was: a lazy operator could run with a known key. | Generate both with `openssl rand -hex 32`. |
+| R8 | **`login_attempts` is never purged.** Every attempt writes a plaintext email plus source IP and nothing sweeps the table. Since 2026-08-05 unknown addresses accrue rows too (that is the enumeration fix), so it grows a little faster. | Unbounded growth of a table of addresses and IPs; a keyless backup reveals who has been trying to log in and from where, alongside the entry-name inventory. Bounded by the 30-per-15-minutes login limiter, so this is a slow leak, not a flood. | Add a retention sweep, or `DELETE FROM login_attempts WHERE created_at < datetime('now','-30 days')` on a timer. Nothing in the app depends on rows older than 15 minutes. |
+| R9 | **Only `activity_log` is append-only.** Its `_no_update`/`_no_delete` triggers ABORT tampering (00003, amended by 00027 to allow anonymization). `capability_log` and `service_secret_audit` have no triggers at all. | Someone with direct SQLite access can erase the capability and service-secret trail without tripping anything, while the human-action trail resists it. The trails disagree about how well they are protected. | Direct filesystem access to the DB is already game over for confidentiality (see trust boundaries), so this is about post-incident reconstruction, not prevention. Ship the same triggers on both tables; tracked as DEFERRED (b). |
+| R10 | **Nothing reads `capability_log`.** The table is written on every capability issue and use and there is no endpoint, no UI and no export over it. | The capability trail exists but cannot be reviewed without opening the database by hand, which means in practice it is not reviewed. | `sqlite3 $TRUSTISSUES_DATA_DIR/trustissues.db 'SELECT * FROM capability_log ORDER BY created_at DESC LIMIT 50'` until DEFERRED (c) ships. |
+| R11 | **Audit actor attribution is lost on user deletion.** `activity_log.user_id` is `ON DELETE SET NULL`. | Deleting a user anonymizes their entire history in the one trail that IS tamper-evident, so "who did this" becomes unanswerable for exactly the person most likely to be under investigation. | Disable accounts instead of deleting them (`disabled = 1` is enforced at every auth path and keeps the rows intact). Tracked as DEFERRED (f). |
+| R12 | **The rename oracle is mitigated, not closed.** `UNIQUE(user_id, name)` is table-level, so a rename still asks a question about the creator's private namespace; the shipped fix bounds who may ask. | A narrow existence oracle over another user's entry names, for the principals still permitted to rename. | None available at the operator level. The complete fix (partial indexes) needs a `vault_entries` rebuild that would cascade-delete `capability_grants`; tracked as DEFERRED (h). |
 
 ## Deployment assumptions (non-negotiable)
 
@@ -346,6 +440,38 @@ admins, so an admin's target was accepted and then silently never delivered.
 `TestDeliveryGateAgreesWithWriteGate` runs both halves over nine principals and
 fails if they ever differ.
 
+**Who the owner IS, which turned out to be the next question.** The gate asks
+"did the owner of the secret being sent authorise this destination", and until
+round 8 it resolved owner from `vault_entries.user_id`. That is a column an
+ordinary product route lets a collection manager write to their own id:
+`AdoptAndRenameVaultEntry`, reached by `PUT /api/vault/{id}` with a new name once
+the creator is no longer an accepted member, and a manager can bring that
+precondition about themselves with `DELETE /api/collections/{id}/members/{creator}`,
+which is manager-gated too. Two ordinary calls made the attacker the owner and the
+exit then authorised them correctly. Ownership therefore moved to
+`vault_entries.secret_owner` (migration 00034), a column no member route writes,
+with 00035 and 00036 relaundering and reformatting the backfill and 00037 creating
+the bookkeeping tables for instances already past those versions.
+
+Transferring ownership is now an explicit, admin-only act:
+`POST /api/admin/vault/{id}/ownership/claim`. An entry becomes claimable only when
+its recorded owner has lost manage, and every way that happens (a manager removing
+them from the collection or demoting them to viewer, an admin demoting their
+instance role or disabling their account) is itself routine and reversible, while
+the claim was not. Migration 00038 records the previous holder so a claim can be
+undone. Prod holds zero ownership claims, so this surface is latent rather than
+exercised; treat the claim route as an admin action with an audit trail, not as
+part of normal member management.
+
+**The ledger that says which columns are encrypted.** Round 8 replaced a prose
+scope boundary with `theEncryptedFieldLedger` and a test that derives the real set
+from the module's AST. Round 9 found it derived from four CALL SHAPES, so a
+decryption spelled a fifth way was invisible to it. The current derivation is a
+markup scan rather than a shape match, but keep the lesson: a guard that
+recognises one spelling of the thing it guards is the recurring defect in this
+codebase, and the ledger is a completeness claim, not an enforcement point. Pair
+it with the compile-time refusals above, which are.
+
 **What this does not cover.** `auto_rotate` still takes only `manage` and is
 classified `egressTriggersDelivery`: it decides WHETHER the secret moves, never
 WHERE. An API-key-only caller can still set it without a password and make the
@@ -364,3 +490,38 @@ network.
 **Fail-safe posture.** A set-but-wrong-length `TRUSTISSUES_SHIELD_KEY` refuses to
 boot rather than silently disabling tokenization; the gateway rejects (never
 forwards) a request whose body cannot be tokenized while Shield is on.
+
+## What has NOT been reviewed
+
+Nineteen audit rounds is a lot of rounds, and the number is misleading unless you
+also know where they pointed. Almost all of them went at one surface: what an
+authenticated principal may reach, and specifically what can make a decrypted
+secret leave the process. That surface is now guarded by things a handler cannot
+route around, and it is the part of this system you should trust most.
+
+The following have never been read by any round, and are listed here so nobody
+mistakes nineteen rounds for coverage. This is round 14's own list, minus the
+authentication path, which was read on 2026-08-05.
+
+- `internal/handlers/vault_providers.go` (1852 lines), the largest unread file.
+  Every rotation finding to date is about the wrapper. The code doing the actual
+  upstream mint and revoke calls, response parsing and per-provider credential
+  shapes has never been read.
+- `internal/alerts/channels.go`, the off-box egress sink. A refuted "teammate
+  email leaks in `last_rotation_error`" finding was argued at the caller; nobody
+  read what is actually POSTed.
+- `vault_ssrf.go`, `vault_target_purge.go` and `collection_target_purge.go`. At
+  least one refutation depends on purge behaviour that was never read.
+- The generated SQL in `internal/db`. The compare-and-swap contract is asserted in
+  Go comments; the UPDATE that would make it true is unread.
+- All 22 files under `frontend/src/`. Two confirmed findings are claims about what
+  the operator SEES.
+
+Two more honest caveats about this document. Scale first: production currently
+holds 5 vault entries, 28 activity rows and 0 ownership claims, so several risks
+described here are latent rather than live, and an item's position in this file is
+not a statement about how urgent it is. Second, the per-round documents in this
+directory each restate the previous round's residuals, so four of them describing
+the same unresolved thing is one finding, not four. `AUDIT-ROUND-14-PENDING.md`
+says PENDING in its filename and COMPLETE on line 1; the line is right and the
+filename is a fossil.
