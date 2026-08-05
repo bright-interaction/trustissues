@@ -366,6 +366,28 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	row, err := h.queries.GetUserByEmail(r.Context(), req.Email)
 	if err == sql.ErrNoRows {
+		// The unknown-account path has to look EXACTLY like the known one, and
+		// the dummy hash verify is only half of that.
+		//
+		// It equalizes latency, which is what it was added for. But the lockout
+		// above reads a counter that this branch never fed: an address with no
+		// account returned here before recording anything, so its failure count
+		// stayed at zero forever. Five wrong passwords at a real address then
+		// answered 429 (plus the graduated two- and four-second delays); the
+		// same five at an unknown address answered a fast 401 every time. The
+		// status code alone gave a certain answer to "does this person have a
+		// vault account", which is the exact question the dummy hash exists to
+		// refuse, only louder and without needing to measure anything.
+		//
+		// Recording the attempt for an unknown address costs one insert bounded
+		// by the login limiter (30 per 15 min per IP) and makes both paths
+		// accrue, delay and lock out identically. There is no activity_log event
+		// because there is no account to attribute one to.
+		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
+			Email: req.Email, IpAddress: ip, Success: 0,
+		}); dbErr != nil {
+			logError(r, "login: failed to record failed attempt for an unknown address", "error", dbErr)
+		}
 		// Equalize timing with the real path (which runs a hash verify) so a
 		// missing account cannot be distinguished by response latency.
 		_, _ = passwordhash.Verify(req.Password, dummyPasswordHash)
@@ -769,6 +791,29 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The lockout is checked BEFORE the password, which is the whole point of it.
+	//
+	// This block used to sit after the verify's early return below, so it was only
+	// ever evaluated once the password was already correct: against a guesser it
+	// was unreachable code carrying a comment claiming it prevented brute force.
+	// The endpoint is mounted under the ordinary /api limiter (500 req/min per IP),
+	// not the login limiter (30 per 15 min), so a stolen session had a password
+	// oracle two orders of magnitude faster than /api/auth/login with the account
+	// lockout switched off, and every wrong guess still wrote a login_attempts row
+	// that locked the real owner out of the login page.
+	//
+	// TOTPDisable checks the same counter in the right order. One property, two
+	// doors, fixed at one of them, which is the shape that keeps recurring here.
+	ip := middleware.ClientIP(r)
+	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), userEmail)
+	if err != nil {
+		logError(r, "totp.verify: failed to query attempts", "error", err)
+	}
+	if failCount >= 5 {
+		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
+		return
+	}
+
 	// ENABLING 2FA requires the password, not just a session.
 	//
 	// Enrolment used to need only a live session or API key. Turning 2FA ON is an
@@ -794,22 +839,11 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	if pwErr != nil || !pwOK {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
-			Email: userEmail, IpAddress: middleware.ClientIP(r), Success: 0,
+			Email: userEmail, IpAddress: ip, Success: 0,
 		}); dbErr != nil {
 			logError(r, "totp.verify: failed to record attempt", "error", dbErr)
 		}
 		writeUnauthorized(w, r, "your password is required to enable two-factor authentication")
-		return
-	}
-
-	// Rate limit TOTP verify attempts per user to prevent brute force
-	ip := middleware.ClientIP(r)
-	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), userEmail)
-	if err != nil {
-		logError(r, "totp.verify: failed to query attempts", "error", err)
-	}
-	if failCount >= 5 {
-		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
 		return
 	}
 
@@ -932,6 +966,28 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Honour the vault policy, and do it BEFORE spending the second factor.
+	//
+	// "Require two-factor authentication for all users" was written to the settings
+	// table, read back to render the checkbox, and enforced nowhere: any user could
+	// switch 2FA straight off with the policy on, so an admin who ticked it got a
+	// compliance indicator rather than a control.
+	//
+	// The refusal originally sat below the code check, which made a refused attempt
+	// destructive: the TOTP step was claimed, or worse a recovery code was consumed,
+	// and then the request was refused anyway. Recovery codes are the case that
+	// bites. There are eight, they are single-use, and no route exists to reissue
+	// them, so eight refused attempts under this policy left an account with no
+	// recovery path at all, having never once succeeded at anything. Refusing on the
+	// password alone costs the user nothing and locks nobody out: a refused disable
+	// is a no-op either way, and the policy state is already readable by every
+	// authenticated role through the vault-policy settings read.
+	if settingBool(r.Context(), h.queries, "require_totp", false) {
+		writeError(w, r, http.StatusConflict, "totp_required",
+			"two-factor authentication is required by the vault policy and cannot be disabled; ask an administrator to change the policy first")
+		return
+	}
+
 	totpState, err := h.queries.GetUserTOTPState(r.Context(), userID)
 	if err != nil {
 		logError(r, "totp.disable: failed to query 2FA state", "error", err)
@@ -957,18 +1013,6 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		logError(r, "totp.disable: 2FA removed with a recovery code", "user_id", userID)
-	}
-
-	// Honour the vault policy. "Require two-factor authentication for all users"
-	// was written to the settings table, read back to render the checkbox, and
-	// enforced nowhere: any user could switch 2FA straight off with the policy
-	// on, so an admin who ticked it got a compliance indicator rather than a
-	// control. Refusing here is the enforcement point that cannot lock anyone
-	// out, since the user demonstrably has a working code to reach this line.
-	if settingBool(r.Context(), h.queries, "require_totp", false) {
-		writeError(w, r, http.StatusConflict, "totp_required",
-			"two-factor authentication is required by the vault policy and cannot be disabled; ask an administrator to change the policy first")
-		return
 	}
 
 	if err := h.queries.DisableTOTP(r.Context(), userID); err != nil {
