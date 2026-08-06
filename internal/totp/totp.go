@@ -10,6 +10,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"math/big"
 	"net/url"
@@ -33,6 +34,40 @@ const (
 
 // modulus is 10^codeDigits, used to truncate the HMAC result.
 var modulus = new(big.Int).Exp(big.NewInt(10), big.NewInt(codeDigits), nil)
+
+// recoveryCodeCost is the bcrypt cost for recovery-code hashes, overridable ONLY
+// from tests via SetTestCost.
+//
+// This is the sibling of passwordhash's argon2 knob, and it was missing, which
+// is the shape that keeps recurring here: one property, several doors, fixed at
+// one of them. internal/handlers' TestMain lowers the argon2 cost and says in
+// its own comment that without it the package "would approach Go's default
+// 10-minute timeout". It approached it anyway. Enrolling 2FA mints eight bcrypt
+// hashes at DefaultCost, a failed recovery code compares against all eight, and
+// dozens of tests enrol, so the half nobody capped was the half that grew. The
+// package measured 612s under -race with a 600s CI ceiling.
+//
+// A suite too slow to run is a worse security outcome than a cheap KDF in tests,
+// which is the same argument passwordhash makes for the same reason.
+var recoveryCodeCost = bcrypt.DefaultCost
+
+// SetTestCost lowers the recovery-code bcrypt cost for the duration of a test
+// binary.
+//
+// It panics if called from a non-test binary. That check is the whole point: an
+// accidental import from production code must fail loudly at startup rather than
+// quietly hashing every recovery code at a cost an attacker can brute force.
+// Detection is by the test flag the go tool always defines.
+func SetTestCost() {
+	if flag.Lookup("test.v") == nil {
+		panic("totp: SetTestCost called outside a test binary; " +
+			"this would weaken every stored recovery code")
+	}
+	recoveryCodeCost = bcrypt.MinCost
+}
+
+// ProdCost reports whether the production bcrypt cost is in force.
+func ProdCost() bool { return recoveryCodeCost == bcrypt.DefaultCost }
 
 // GenerateSecret produces a 20-byte random secret encoded as an
 // unpadded base32 string suitable for use with authenticator apps.
@@ -137,7 +172,7 @@ func GenerateRecoveryCodes() (plaintextCodes []string, hashedCodes []string, err
 		}
 
 		plain := hex.EncodeToString(buf)
-		hashed, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+		hashed, err := bcrypt.GenerateFromPassword([]byte(plain), recoveryCodeCost)
 		if err != nil {
 			return nil, nil, fmt.Errorf("totp: hashing recovery code: %w", err)
 		}

@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,13 +146,20 @@ func TestRequireTOTPRefusalDoesNotBurnASecondFactor(t *testing.T) {
 // the same five at an unknown address produced a fast 401 every time. Status
 // code alone gave a certain answer to "does this person have a vault account".
 //
-// This runs for roughly ten seconds: the graduated delay on attempts four and
-// five is the behaviour under test, so it cannot be skipped.
+// It is deliberately structured to do no sleeping. Login's graduated delay fires
+// at three recorded failures, so the accrual half stops at three probes, and the
+// lockout half seeds both addresses to five and probes once: the `failCount >= 5`
+// check returns before the sleep, so the boundary is reachable for free. Seeding
+// is honest here only because the first half already proved the handler records
+// for both; seeding alone would assume what is being tested. The earlier version
+// of this test spent twelve seconds in time.Sleep, in a package that was already
+// over ci-go's 600s -race ceiling.
 func TestLoginDoesNotRevealWhichEmailsHaveAccounts(t *testing.T) {
-	_, queries := newCollectionAuthzEnv(t)
+	vh, queries := newCollectionAuthzEnv(t)
 	ah := NewAuthHandler(queries, &config.Config{
 		JWTSecret: strings.Repeat("j", 32), VaultKey: strings.Repeat("k", 32),
 	})
+	ctx := context.Background()
 
 	const real = "enumeration-target@example.com"
 	const ghost = "no-such-account@example.com"
@@ -161,58 +167,67 @@ func TestLoginDoesNotRevealWhichEmailsHaveAccounts(t *testing.T) {
 
 	// Distinct source addresses so the per-IP limit (20) cannot be what stops
 	// either probe first; the property under test is the per-EMAIL counter.
-	probe := func(email, ip string) *httptest.ResponseRecorder {
+	probe := func(email, ip string) int {
 		rec := httptest.NewRecorder()
 		body := `{"email":"` + email + `","password":"definitely-not-the-password"}`
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
 		req.RemoteAddr = ip + ":40000"
 		ah.Login(rec, req)
-		return rec
+		return rec.Code
 	}
 
+	// Half one: the handler must RECORD identically. Three probes each, which is
+	// one below the graduated delay's threshold.
 	var realCodes, ghostCodes []int
-	for i := 0; i < 6; i++ {
-		realCodes = append(realCodes, probe(real, "198.51.100.10").Code)
-		ghostCodes = append(ghostCodes, probe(ghost, "198.51.100.20").Code)
+	for i := 0; i < 3; i++ {
+		realCodes = append(realCodes, probe(real, "198.51.100.10"))
+		ghostCodes = append(ghostCodes, probe(ghost, "198.51.100.20"))
 	}
-
-	// Guard the setup: the real account must actually reach the lockout, or the
-	// comparison proves nothing.
-	if realCodes[5] != http.StatusTooManyRequests {
-		t.Fatalf("ABORT: the real account answered %v and never locked out; the oracle under test is absent",
-			realCodes)
-	}
-
 	for i := range realCodes {
 		if realCodes[i] != ghostCodes[i] {
-			t.Fatalf("probe %d: real account answered %d, unknown address answered %d.\n"+
-				"real=%v ghost=%v\n"+
-				"An unknown address never accrues a failed attempt, so it never locks out. That makes "+
-				"the status code a certain account-existence oracle and defeats the dummy-hash timing "+
-				"equalization the same handler goes to the trouble of doing.",
+			t.Fatalf("probe %d: real account answered %d, unknown address answered %d (real=%v ghost=%v)",
 				i+1, realCodes[i], ghostCodes[i], realCodes, ghostCodes)
 		}
 	}
 
-	// And the equalization must come from recording the attempt, not from
-	// having quietly stopped locking real accounts out.
-	n, err := queries.CountRecentFailedLoginAttemptsByEmail(context.Background(), ghost)
+	realN, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, real)
 	if err != nil {
-		t.Fatalf("count attempts: %v", err)
+		t.Fatalf("count real: %v", err)
 	}
-	if n == 0 {
-		t.Fatal("the unknown address recorded no failed attempts; the two paths agree only by accident")
+	ghostN, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, ghost)
+	if err != nil {
+		t.Fatalf("count ghost: %v", err)
+	}
+	if realN != 3 {
+		t.Fatalf("ABORT: the real address recorded %d of 3 attempts; the comparison below is vacuous", realN)
+	}
+	if ghostN != realN {
+		t.Fatalf("after 3 identical probes the real address recorded %d failures and the unknown "+
+			"address recorded %d.\n"+
+			"An address that never accrues never locks out, so five wrong passwords answer 429 at a "+
+			"real address and a fast 401 at an unknown one. That makes the status code a certain "+
+			"account-existence oracle and defeats the dummy-hash timing equalization the same handler "+
+			"goes to the trouble of doing.", realN, ghostN)
 	}
 
-	// A real login must still work after all this, from a fresh address.
-	var out authResponse
-	rec := httptest.NewRecorder()
-	body := `{"email":"` + real + `","password":"` + totpTestPassword + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
-	req.RemoteAddr = "198.51.100.30:40000"
-	ah.Login(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected the target account to still be locked out (429), got %d", rec.Code)
+	// Half two: at the lockout boundary the two must still answer alike. Seed
+	// both to five (the >=5 branch returns before the graduated sleep, so this
+	// costs nothing) and probe once each.
+	for _, email := range []string{real, ghost} {
+		if _, err := vh.db.ExecContext(ctx,
+			`INSERT INTO login_attempts (email, ip_address, success)
+			 VALUES (?, '203.0.113.9', 0), (?, '203.0.113.9', 0)`, email, email); err != nil {
+			t.Fatalf("seed %s: %v", email, err)
+		}
 	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	realLocked := probe(real, "198.51.100.11")
+	ghostLocked := probe(ghost, "198.51.100.21")
+	if realLocked != http.StatusTooManyRequests {
+		t.Fatalf("ABORT: the real account answered %d at five failures instead of 429; the oracle "+
+			"under test is absent and the comparison proves nothing", realLocked)
+	}
+	if ghostLocked != realLocked {
+		t.Fatalf("at the lockout boundary the real address answered %d and the unknown address "+
+			"answered %d; the status code still separates them", realLocked, ghostLocked)
+	}
 }

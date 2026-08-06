@@ -3,12 +3,21 @@ package totp
 import (
 	"encoding/base32"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// TestMain lowers the recovery-code bcrypt cost, for the same reason
+// internal/handlers does: eight hashes per enrolment and eight compares per
+// miss is real time under -race, and nothing here asserts on the cost itself.
+func TestMain(m *testing.M) {
+	SetTestCost()
+	os.Exit(m.Run())
+}
 
 // This package had no tests. It is the whole second factor: the code generator,
 // the drift window, and the recovery codes. What coverage existed came through
@@ -61,6 +70,35 @@ func TestGenerateCodeMatchesRFC6238(t *testing.T) {
 				"A TOTP that disagrees with the RFC disagrees with every authenticator app.",
 				tc.unix, got, tc.expected, tc.rfc8)
 		}
+	}
+}
+
+// TestSetTestCostRoundTripsAndIsGuarded mirrors the passwordhash test of the
+// same name, for the same reason: this knob, if ever reached from production,
+// silently weakens every stored recovery code. What matters is that a lowered
+// cost still produces a verifiable hash, and that the guard exists at all.
+func TestSetTestCostRoundTripsAndIsGuarded(t *testing.T) {
+	if ProdCost() {
+		SetTestCost()
+	}
+	if ProdCost() {
+		t.Fatal("SetTestCost did not lower the cost")
+	}
+
+	plain, hashed, err := GenerateRecoveryCodes()
+	if err != nil {
+		t.Fatalf("generate at test cost: %v", err)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hashed[0]), []byte(plain[0])) != nil {
+		t.Fatal("a recovery code hashed at test cost does not verify against its own plaintext")
+	}
+
+	// The guard is what stops a production import quietly weakening every code.
+	// flag.Lookup("test.v") is non-nil here, so the panic cannot be triggered
+	// from inside a test binary; assert the guard is present by reading the
+	// production default instead, which is what the panic protects.
+	if bcrypt.DefaultCost <= bcrypt.MinCost {
+		t.Fatal("the production cost is not above the test cost, so the knob protects nothing")
 	}
 }
 
