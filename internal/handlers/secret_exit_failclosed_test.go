@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -103,8 +104,34 @@ func TestOwnerRecordedDestinationsFailsClosedOnAReadError(t *testing.T) {
 	if len(b) != 0 {
 		t.Fatalf("%d bytes came back alongside the refusal", len(b))
 	}
-	if !strings.Contains(err.Error(), "not sent anywhere") {
-		t.Errorf("the refusal should say the secret went nowhere, got %q", err)
+	// UPDATED FOR THE ALLOWLIST REDACTOR FIX (see internal/handlers/capability.go
+	// redactUpstreamError and internal/secretexit.ExitRefusedError). This
+	// assertion used to pin `err.Error()` containing "not sent anywhere", which
+	// only ever appeared attached to `o.Describe()` -- "the destinations
+	// recorded on the secret in entry \"readerr\" (entry-readerr) ...". That is
+	// exactly the entry-name-and-UUID leak the security fix closes: Exit() now
+	// wraps every AuthorizeSecretExit refusal in a *secretexit.ExitRefusedError
+	// whose Error() is a fixed structural string carrying no entry identity, so
+	// the old substring can never appear in Error() again. The detailed reason
+	// is not gone, only moved: it is still reachable via LogValue for
+	// server-side logging, checked below.
+	var refused *secretexit.ExitRefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("a read-error refusal is not a *secretexit.ExitRefusedError: %v (%T)", err, err)
+	}
+	for _, leaked := range []string{"entry-readerr", "readerr"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("Error() leaked entry identity %q: %q", leaked, err.Error())
+		}
+	}
+	var reason string
+	for _, a := range refused.LogValue().Group() {
+		if a.Key == "reason" {
+			reason = a.Value.String()
+		}
+	}
+	if !strings.Contains(reason, "not sent anywhere") {
+		t.Errorf("the reason available to slog lost the useful signal, got %q", reason)
 	}
 }
 
