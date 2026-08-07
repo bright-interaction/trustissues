@@ -80,6 +80,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -525,6 +526,40 @@ func (p Plaintext) MarshalJSON() ([]byte, error) { return []byte(strconv.Quote(r
 // nobody can be asked and therefore nothing is allowed.
 var ErrNoAuthority = errors.New("secretexit: this secret carries no authority, so no destination can be authorised")
 
+// ExitRefusedError is what [Exit] returns when the [Authority] declines a
+// destination.
+//
+// Error() is deliberately structural: which secret-exit call was refused,
+// nothing else. The REASON the Authority gave -- and AuthorizeSecretExit's
+// implementation in this product (see internal/handlers/secret_exit_authority.go)
+// builds that reason from the entry's name and UUID, the chooser's user id,
+// the destination host, and even the owner's WHOLE authorised destination
+// set -- is exactly the detail this package exists to keep off the wire. A
+// refusal here is not a bug: it is the owner rule working, on a path that
+// still has to report failure somewhere, and "somewhere" used to be
+// last_rotation_error, the rotation_log ring, and whatever notification
+// webhook an admin configured.
+//
+// LogValue keeps the reason visible to slog and only to slog, mirroring how
+// upstreamHTTPError in the handlers package treats an upstream response
+// body: caller-facing structural failure, full detail server-side.
+type ExitRefusedError struct {
+	what   string
+	reason error
+}
+
+func (e *ExitRefusedError) Error() string {
+	return "secret egress refused: this destination was not authorised (see server logs for the reason)"
+}
+
+// LogValue makes the refusal reason visible to slog and only to slog.
+func (e *ExitRefusedError) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("what", e.what),
+		slog.String("reason", e.reason.Error()),
+	)
+}
+
 // Exit is THE ONE EXIT. Every path by which a decrypted secret value leaves this
 // process goes through here, because it is the only exported way to obtain the
 // bytes.
@@ -558,7 +593,7 @@ func Exit(ctx context.Context, p Plaintext, d Destination) (context.Context, []b
 			p.o.Describe(), d.what)
 	}
 	if err := p.a.AuthorizeSecretExit(ctx, p.o, d); err != nil {
-		return ctx, nil, fmt.Errorf("egress refused: %w", err)
+		return ctx, nil, &ExitRefusedError{what: d.what, reason: err}
 	}
 	out := ctx
 	if d.kind == destNetwork {
