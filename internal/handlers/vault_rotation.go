@@ -154,6 +154,21 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 
+		// A provider that destroys its predecessor IN PLACE (see
+		// predecessorDestroysInPlace) has no recoverable CAS-conflict path yet: a
+		// write lost to persistRotatedValue after such a mint is a credential that
+		// exists nowhere, not the "both keys live, retry" case rotFailConflict
+		// promises. Refuse BEFORE calling provider.Rotate, so nothing is ever
+		// minted that this pass could then lose.
+		if role == providerAuto && predecessorDestroysInPlace[providerName] {
+			slog.Warn("vault rotation: refusing to auto-rotate a provider that destroys its "+
+				"predecessor in place; no CAS-safe recovery exists yet",
+				"provider", providerName, "entry", entry.Name)
+			recordRotationFailure(ctx, queries, vaultHandler, entry.ID, entry.Name, providerName,
+				entry.RotationLog.String, rotFailDestroysInPlace, "auto", nil)
+			return
+		}
+
 		// Decrypt current value. It comes back opaque: the sweep runs with nobody
 		// watching, so it is the path where a value held as a bare string is
 		// hardest to notice going somewhere it should not.
