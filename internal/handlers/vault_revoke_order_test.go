@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -32,10 +33,13 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 	meta := map[string]string{"key_id": "old-key-id"}
 
 	// Step 1: defer. Nothing may be destroyed upstream yet.
-	deferRevokeOldProviderKey(meta, "DELETE", "https://api.example.com/keys/old-key-id")
+	deferRevokeOldProviderKey(meta, "DELETE", "https://api.example.com/keys/old-key-id", revokeAuthBearer)
 
 	if meta[pendingRevokeMethod] != "DELETE" || meta[pendingRevokeURL] == "" {
 		t.Fatal("the pending revoke was not recorded: the old key would stay live at the provider forever")
+	}
+	if meta[pendingRevokeAuth] != revokeAuthBearer {
+		t.Fatalf("the auth scheme was not recorded: got %q, want %q", meta[pendingRevokeAuth], revokeAuthBearer)
 	}
 	if meta["last_revoke_error"] != "" {
 		t.Fatalf("deferring recorded a failure without attempting anything: %q", meta["last_revoke_error"])
@@ -43,7 +47,7 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 	// Deferring must not have touched the network, so no outcome is known yet.
 	// Guard the setup: if the markers were absent the assertions below would
 	// pass against a no-op.
-	if len(meta) != 3 {
+	if len(meta) != 4 {
 		t.Fatalf("unexpected meta after defer: %+v", meta)
 	}
 
@@ -59,7 +63,7 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 
 	// Step 2 ran, so the transient markers must be gone: leaving them would
 	// re-run the revoke on every later rotation and would be persisted.
-	if meta[pendingRevokeMethod] != "" || meta[pendingRevokeURL] != "" {
+	if meta[pendingRevokeMethod] != "" || meta[pendingRevokeURL] != "" || meta[pendingRevokeAuth] != "" {
 		t.Fatalf("transient revoke markers survived: %+v", meta)
 	}
 	// key_id must be untouched by the revoke machinery.
@@ -77,7 +81,7 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 // network) and the cheapest way to force a real failure without egress.
 func TestDeferredRevokeFailureIsNeverSilent(t *testing.T) {
 	meta := map[string]string{"key_id": "old"}
-	deferRevokeOldProviderKey(meta, "DELETE", "http://10.0.0.1/keys/old")
+	deferRevokeOldProviderKey(meta, "DELETE", "http://10.0.0.1/keys/old", revokeAuthBearer)
 	performPendingRevoke(testExitCtx(context.Background(), "revoke fixture",
 		secretexit.HostSet{Hosts: []string{"api.example.com"}}), meta, "manual",
 		testPlaintext("NEW-SECRET-VALUE"))
@@ -90,7 +94,7 @@ func TestDeferredRevokeFailureIsNeverSilent(t *testing.T) {
 	if strings.Contains(meta["last_revoke_error"], "NEW-SECRET-VALUE") {
 		t.Fatalf("the revoke error leaked the new secret: %q", meta["last_revoke_error"])
 	}
-	if meta[pendingRevokeURL] != "" {
+	if meta[pendingRevokeURL] != "" || meta[pendingRevokeAuth] != "" {
 		t.Fatal("a failed revoke left its markers behind and would retry forever")
 	}
 }
@@ -112,29 +116,57 @@ func TestPerformPendingRevokeIsANoOpWithoutAPendingRevoke(t *testing.T) {
 }
 
 // TestNoProviderRevokesBeforeReturning is the structural guard: it fails if any
-// Rotate body ever calls the immediate revoke again instead of deferring.
+// Rotate body ever calls an immediate revoke instead of deferring.
+//
+// There is NO exception any more. Backblaze used to be the one: it called
+// backblazeRevokeOldKey directly, inline, right before Rotate returned,
+// commented as "best-effort... because b2_delete_key needs an authorize step
+// first" and treated by an earlier version of this very test as legitimate.
+// That inline call is the P0 this file exists to close: it ran BEFORE the
+// caller encrypted or persisted the new value and BEFORE the caller's
+// compare-and-swap could even run, so a CAS conflict on the write (a
+// concurrent edit, a lost race) destroyed the old key at Backblaze while the
+// newly minted key was discarded. Nobody was left holding a working
+// credential, and the 409 response the caller got back claimed "the old key is
+// still live and the new one is stranded upstream", which was false.
+// TestBackblazeCASConflictLeavesThePredecessorLive is the runtime proof; this
+// is the structural guard that stops it from being reintroduced by a future
+// edit, which no unit test would otherwise catch until a credential was
+// destroyed in production.
 func TestNoProviderRevokesBeforeReturning(t *testing.T) {
-	// The only legitimate callers of the immediate helper are performPendingRevoke
-	// (after persist) and the Backblaze inline path, which needs the new key pair
-	// to authenticate its own revoke and is documented as such.
-	//
-	// This is asserted on the source rather than at runtime because the failure
-	// mode is a future edit re-introducing an inline call, which no unit test
-	// would otherwise catch until a credential was destroyed in production.
 	src := mustReadSource(t, "vault_providers.go")
-	for _, marker := range []string{
-		`revokeOldProviderKey(ctx, meta, "DELETE", "https://api.resend.com`,
-		`revokeOldProviderKey(ctx, meta, "DELETE", "https://api.sendgrid.com`,
-		`revokeOldProviderKey(ctx, meta, "DELETE", "https://console.neon.tech`,
-	} {
-		if strings.Contains(src, marker) {
-			t.Errorf("a Rotate body revokes inline again (%s...): the old key would be destroyed "+
-				"before the new one is persisted. Use deferRevokeOldProviderKey instead", marker[:60])
+
+	// Every registered provider's Rotate body, extracted the same way
+	// TestPredecessorFateMatchesTheCode does, so a new adapter is covered on
+	// the day it is written rather than the day someone remembers to add it to
+	// a marker list.
+	rotateRe := regexp.MustCompile(`(?s)func \(p \*(\w+)\) Rotate\(ctx context\.Context.*?\n\}\n`)
+	matches := rotateRe.FindAllStringSubmatch(src, -1)
+	if len(matches) < 8 {
+		t.Fatalf("ABORT: only %d Rotate bodies matched; the matcher has drifted and this guard is "+
+			"vacuous", len(matches))
+	}
+	for _, m := range matches {
+		typ, body := m[1], m[0]
+		for _, fn := range []string{"revokeOldProviderKey(", "backblazeRevokeOldKey("} {
+			if strings.Contains(body, fn) {
+				t.Errorf("%s.Rotate calls %s inline: the old key would be destroyed at the provider "+
+					"before the caller's compare-and-swap has persisted the new one. A CAS conflict "+
+					"then leaves the old key dead upstream and the new one discarded, with nobody "+
+					"holding a working credential. Use deferRevokeOldProviderKey instead.", typ, fn)
+			}
 		}
 	}
 	// And the deferral must still be present, or nothing revokes at all.
 	if !strings.Contains(src, "deferRevokeOldProviderKey(meta,") {
 		t.Error("no provider defers a revoke: old keys would never be revoked")
+	}
+	// Backblaze specifically must have moved to the deferred path: this is the
+	// fix this test exists to lock, named explicitly so a revert reads as a
+	// revert rather than a mysterious new failure.
+	if !strings.Contains(src, `deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2)`) {
+		t.Error("backblaze no longer defers its revoke via the b2 scheme; it may have reverted to " +
+			"an inline call")
 	}
 }
 
