@@ -2677,6 +2677,26 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	rotateCtx := ctx
 	{
 		if providerRoleFor == providerAuto {
+			// A provider that destroys its predecessor IN PLACE (see
+			// predecessorDestroysInPlace) has no recoverable CAS-conflict path yet:
+			// by the time persistRotatedValue would run, the OLD value is already
+			// dead at the provider, so a lost write is a credential that exists
+			// nowhere, not the "both keys live, reload and retry" conflict this
+			// handler otherwise reports. Refuse BEFORE calling provider.Rotate, so
+			// nothing is ever minted that a CAS miss could then lose.
+			if predecessorDestroysInPlace[providerName] {
+				logError(r, "vault.rotate: refusing to auto-rotate a provider that destroys its "+
+					"predecessor in place; no CAS-safe recovery exists yet",
+					"entry", id, "provider", providerName)
+				recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
+					entryRow.RotationLog.String, rotFailDestroysInPlace, rotationMethod, &userID)
+				writeError(w, r, http.StatusConflict, "destroys_in_place_unsupported",
+					"this provider replaces the credential in place with no separable revoke step, "+
+						"so a write conflict here could destroy it with no copy anywhere; rotate it in "+
+						"the provider's own dashboard, then edit this entry and paste the new value. "+
+						"Nothing was changed.")
+				return
+			}
 			provider := resolvedProvider
 			providerMeta = ParseProviderMeta(h.decryptColumnOrLog(entryRow.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 			// THE ONE EXIT, network form. The old value is released only if the
@@ -2875,8 +2895,18 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// about a row the caller is looking at sends them hunting for the wrong
 		// problem. It also matters that a provider has usually ALREADY minted the
 		// replacement key by this point, so record the orphan rather than
-		// dropping it silently: the old key is still live and the new one is
-		// stranded upstream with nobody holding it.
+		// dropping it silently.
+		//
+		// "The old key is still live" is true ONLY for a provider whose revoke is
+		// DEFERRED past this CAS (deferRevokeOldProviderKey runs later, after a
+		// successful persist) -- backblaze, resend, sendgrid, twilio, neon. For
+		// those, both keys are live and reload-and-retry is genuinely recoverable.
+		// A provider in predecessorDestroysInPlace (e.g. cloudflare) cannot reach
+		// this branch at all: the providerAuto guard above refuses it before
+		// provider.Rotate is ever called, specifically because for that provider
+		// the old key is ALREADY dead by the time a mint would complete, so a lost
+		// write here would strand the new value with no copy anywhere and no live
+		// predecessor to fall back to.
 		logError(r, "vault.rotate: entry changed during rotation, value not stored", "entry", id)
 		if providerName != "" {
 			recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,

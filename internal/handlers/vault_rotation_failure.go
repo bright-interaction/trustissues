@@ -26,8 +26,20 @@ const (
 	rotFailDecrypt  = "decrypt failed (details in server logs)"
 	rotFailProvider = "provider rotation failed (details in server logs)"
 	rotFailEncrypt  = "new value could not be encrypted; the provider may have already issued a replacement key (details in server logs)"
+	// rotFailConflict's "will be retried" promise is only true for providers
+	// whose revoke is DEFERRED past the CAS (see deferRevokeOldProviderKey): for
+	// those, a lost write leaves both keys live and the next pass can safely
+	// try again. It is never used for a provider in predecessorDestroysInPlace,
+	// which is refused before minting instead (see rotFailDestroysInPlace) for
+	// exactly the reason that a retry promise would be false for them: the old
+	// value is already dead and a lost write has no copy anywhere to retry from.
 	rotFailConflict = "the secret was changed during the rotation pass, so the new value was not written; the provider may have issued a replacement key, and the entry will be retried on the next pass"
 	rotFailPersist  = "new value could not be saved; the provider may have already issued a replacement key (details in server logs)"
+	// rotFailDestroysInPlace is recorded when a provider in
+	// predecessorDestroysInPlace is skipped BEFORE any upstream call is made.
+	// Nothing was minted and nothing was lost; this is a refusal, not a partial
+	// rotation.
+	rotFailDestroysInPlace = "rotation skipped: this provider replaces the credential in place with no separable revoke step, so a write conflict here could destroy it with no copy anywhere; rotate it in the provider's own dashboard, then edit this entry and paste the new value"
 )
 
 // recordRotationFailure is the single exit for every hard failure in the
