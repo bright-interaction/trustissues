@@ -727,32 +727,86 @@ func injectSecret(req *http.Request, spec InjectionSpec, value []byte) error {
 	return nil
 }
 
-// redactUpstreamError renders an outbound proxy error safe to persist to the
-// capability_log.error audit column. net/http surfaces transport failures
-// (DNS, connection refused/timeout, TLS, and the GuardedWebhookClient SSRF
-// block) as *url.Error values whose Error() embeds the full request URL,
-// including RawQuery. When a secret is injected as a query parameter
-// (InjectionSpec.Type == "query", see injectSecret) that URL carries the
-// decrypted secret in cleartext, so persisting err.Error() verbatim would
-// write the secret at rest. This strips the query string and any userinfo
-// from the embedded URL while keeping the operation + transport failure
-// reason for debugging. Callers of the proxy still receive only a generic
-// message, never this string.
+// redactUpstreamError renders an outbound proxy or delivery failure safe to
+// persist to capability_log.error, last_rotation_error, and the
+// rotation_log ring -- and safe to ship off-box to whatever notification
+// webhook an admin configured (n8n, Zapier, Slack). All of those are
+// OFF-BOX or admin-configured-webhook destinations, so nothing that comes
+// out of here may carry a value, a URL path, an identity, or a destination
+// set.
+//
+// This is an ALLOWLIST, not a blocklist. It used to strip only *url.Error,
+// so every OTHER error type fell through the final `return err.Error()`
+// unredacted: a disabled teammate's email address, another vault entry's
+// name and UUID, an owner's whole authorised destination set, a referenced
+// entry's name on an auth_token resolve failure. The rotFail* constants in
+// vault_rotation_failure.go are the model this follows: a failure CLASS
+// that carries no value, no URL, no identity. A new error type contributes
+// NOTHING here until it is deliberately added below, so the failure mode of
+// forgetting is "the operator sees a generic message", never "the
+// operator's webhook receives a secret". The unredacted cause always goes
+// to slog at the call site.
 func redactUpstreamError(err error) string {
 	if err == nil {
 		return ""
 	}
+
+	// Stdlib context sentinels: fixed text, no dynamic content, genuinely
+	// useful (distinguishes a cancelled/timed-out attempt from a hard
+	// failure). Exact equality, deliberately NOT errors.Is: a *url.Error
+	// unwraps to context.DeadlineExceeded on a timed-out dial, and errors.Is
+	// would walk into it and match, returning uerr.Error() -- the raw URL,
+	// query string and all -- instead of falling through to the *url.Error
+	// branch below that redacts it.
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return err.Error()
+	}
+
+	// upstreamHTTPError is structural by construction: Error() is "upstream
+	// returned HTTP %d ..." with the response body held back for LogValue
+	// only. See upstream_error.go.
+	var he *upstreamHTTPError
+	if errors.As(err, &he) {
+		return he.Error()
+	}
+
+	// secretexit.ExitRefusedError is structural by construction: the full
+	// refusal reason (entry name/UUID, chooser id, destination set) is held
+	// back for LogValue only. See internal/secretexit.
+	var ee *secretexit.ExitRefusedError
+	if errors.As(err, &ee) {
+		return ee.Error()
+	}
+
+	// deliveryRefusalError (vault_targets.go) is a fixed, non-secret-bearing
+	// structural string built at the refusal site: an unattributed or
+	// disabled-configurer target, or an unrecognised/retired target type.
+	var de *deliveryRefusalError
+	if errors.As(err, &de) {
+		return de.Error()
+	}
+
+	// *url.Error is a transport failure (DNS, connection refused/timeout,
+	// TLS, the GuardedWebhookClient SSRF block) whose Error() embeds the
+	// full request URL. When a secret is injected as a query parameter
+	// (InjectionSpec.Type == "query", see injectSecret) that URL carries the
+	// decrypted secret in cleartext. Reduced to scheme + host: the PATH is
+	// not safe to keep either, because the path IS the credential for a
+	// Slack webhook (https://hooks.slack.com/services/T00/B00/<secret>) or
+	// an n8n webhook (https://n8n.example/webhook/<uuid>).
 	var uerr *url.Error
 	if errors.As(err, &uerr) {
 		safeURL := "[redacted]"
 		if u, perr := url.Parse(uerr.URL); perr == nil {
-			u.RawQuery = ""
-			u.User = nil
-			safeURL = u.String()
+			safeURL = u.Scheme + "://" + u.Host
 		}
 		return fmt.Sprintf("%s %q: %v", uerr.Op, safeURL, uerr.Err)
 	}
-	return err.Error()
+
+	// Everything else is unclassified: a generic vault-lookup error, an
+	// fmt.Errorf wrapping who knows what. Default to a fixed structural
+	// string rather than risk one more field slipping through unclassified.
+	return "delivery target failed (details in server logs)"
 }
 
 func parseDestinationPatterns(raw string) []string {

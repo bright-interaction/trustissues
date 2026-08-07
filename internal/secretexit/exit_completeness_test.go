@@ -3,6 +3,7 @@ package secretexit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -317,8 +318,30 @@ func TestExitFailsClosed(t *testing.T) {
 		if len(b) != 0 {
 			t.Fatalf("bytes were returned alongside the refusal: %d of them", len(b))
 		}
-		if !strings.Contains(err.Error(), "the owner said no") {
-			t.Errorf("the refusal reason was lost: %v", err)
+		// UPDATED: Exit() now wraps every Authority refusal in an
+		// *ExitRefusedError, whose Error() is a FIXED structural string. The
+		// product's one Authority implementation (VaultHandler.AuthorizeSecretExit)
+		// builds refusal reasons out of an entry's name and UUID, a chooser's
+		// user id, and even the owner's whole authorised destination set, and
+		// those refusals flow into last_rotation_error and admin-configured
+		// notification webhooks on the delivery path -- exactly the detail this
+		// package exists to keep off the wire. The reason is not lost, only
+		// moved: LogValue keeps it available for slog.
+		var refused *ExitRefusedError
+		if !errors.As(err, &refused) {
+			t.Fatalf("a refusal is not an *ExitRefusedError: %v (%T)", err, err)
+		}
+		if strings.Contains(err.Error(), "the owner said no") {
+			t.Errorf("Error() is supposed to be structural now, but it still carries the raw reason: %v", err)
+		}
+		var reason string
+		for _, a := range refused.LogValue().Group() {
+			if a.Key == "reason" {
+				reason = a.Value.String()
+			}
+		}
+		if !strings.Contains(reason, "the owner said no") {
+			t.Errorf("the refusal reason was lost even from LogValue: %v", reason)
 		}
 	})
 }

@@ -71,8 +71,17 @@ func TestRedactUpstreamError(t *testing.T) {
 	if strings.Contains(got, "api_key") || strings.Contains(got, "foo=bar") || strings.Contains(got, "?") {
 		t.Fatalf("redacted error retained the query string: %q", got)
 	}
-	// Keeps operation, host+path, and transport reason for operator debugging.
-	for _, want := range []string{"Post", "https://10.0.0.1/v1/chat", "deadline exceeded"} {
+	// UPDATED: the redactor used to keep the path (u.RawQuery = ""; u.User =
+	// nil, but the path survived), and this test asserted that as a WANT. That
+	// was itself a leak: the path IS the credential for a Slack webhook
+	// (https://hooks.slack.com/services/T00/B00/<secret>) or an n8n webhook
+	// (https://n8n.example/webhook/<uuid>). The fix reduces the URL to
+	// scheme+host, so the path must now be ABSENT, not present.
+	if strings.Contains(got, "/v1/chat") {
+		t.Fatalf("redacted error retained the URL path, which can itself be the credential: %q", got)
+	}
+	// Keeps operation, host, and transport reason for operator debugging.
+	for _, want := range []string{"Post", "https://10.0.0.1", "deadline exceeded"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("redacted error dropped %q: %q", want, got)
 		}
