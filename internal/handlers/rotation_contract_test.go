@@ -316,7 +316,7 @@ func (p *revokeFailingProvider) Rotate(_ context.Context, _ string, meta map[str
 	// Mint a successor, then register the revoke of the predecessor exactly the
 	// way resend/sendgrid/neon do.
 	meta["key_id"] = "new-" + randomHex(4)
-	deferRevokeOldProviderKey(meta, "DELETE", revokeTargetURL)
+	deferRevokeOldProviderKey(meta, "DELETE", revokeTargetURL, revokeAuthBearer)
 	return "ROTATED-" + randomHex(8), nil
 }
 
@@ -700,7 +700,7 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 		// vault_providers.go documents them as never reaching the database.
 		for i, v := range versions {
 			plain := e.h.decryptColumnOrLog(v, "{}", vaultFieldProviderMeta)
-			for _, marker := range []string{pendingRevokeMethod, pendingRevokeURL} {
+			for _, marker := range []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth} {
 				if strings.Contains(plain, marker) {
 					t.Errorf("%s: provider_meta write #%d persisted the transient marker %q\n"+
 						"  value: %s\n"+

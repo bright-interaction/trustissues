@@ -210,7 +210,35 @@ var providerHTTP = alerts.GuardedWebhookClient(15 * time.Second)
 const (
 	pendingRevokeMethod = "pending_revoke_method"
 	pendingRevokeURL    = "pending_revoke_url"
+	// pendingRevokeAuth names the auth SCHEME the deferred revoke must use,
+	// because "authenticate as the new key" is not one rule: Resend, SendGrid
+	// and Neon accept "Authorization: Bearer <secret>", Twilio's Basic auth is
+	// (ApiKeySid, ApiKeySecret) and NEVER a bare bearer token, and Backblaze
+	// needs an authorize-then-delete round trip that has no single header at
+	// all. Hardcoding Bearer here once sent every Twilio deferred revoke out as
+	// a 401: meta["key_sid"] had already advanced to the successor, so the
+	// orphaned key was never a revoke candidate again and a compromised Twilio
+	// credential had no remaining path to be killed.
+	pendingRevokeAuth = "pending_revoke_auth"
 )
+
+// The values pendingRevokeAuth may hold. An empty/unrecognised value falls
+// back to bearer, which is what every scheme used to be hardcoded to.
+const (
+	revokeAuthBearer = "bearer"
+	revokeAuthBasic  = "basic"
+	revokeAuthB2     = "b2"
+)
+
+// basicAuthUsernameMetaKey names, per provider, which provider_meta key holds
+// the USERNAME half of a "basic" scheme deferred revoke. The password half is
+// always the freshly rotated secret (Twilio pairs ApiKeySid with
+// ApiKeySecret, never the account sid). Only providers that actually use the
+// basic scheme need an entry; performPendingRevoke refuses the revoke rather
+// than sending a malformed header when one is missing.
+var basicAuthUsernameMetaKey = map[string]string{
+	"twilio": "key_sid",
+}
 
 // successorScopes builds the scope/capability list for a newly minted key: the
 // operator's own list from provider_meta when set (comma or space separated),
@@ -265,43 +293,86 @@ func successorScopes(meta map[string]string, metaKey string, fallback, required 
 //
 // The new key is not stored here. The caller passes it to
 // performPendingRevoke, so no secret is ever written into provider_meta.
-func deferRevokeOldProviderKey(meta map[string]string, method, url string) {
+//
+// authScheme is one of revokeAuthBearer, revokeAuthBasic or revokeAuthB2 and is
+// the whole point of taking a parameter here rather than assuming Bearer: the
+// three registered auto-rotating providers that defer a revoke each authenticate
+// differently, and getting this wrong is not a degraded revoke but a guaranteed
+// 401/403 that leaves the predecessor live forever with no further mechanism to
+// kill it (see performPendingRevoke).
+//
+// For revokeAuthB2, url does NOT carry a request URL: B2's delete endpoint is
+// only known after an authorize round trip performed with the NEW credentials,
+// so there is nothing fixed to store at defer time. It carries the OLD key id
+// to delete instead; performPendingRevoke's b2 arm does the round trip itself.
+func deferRevokeOldProviderKey(meta map[string]string, method, url, authScheme string) {
 	meta[pendingRevokeMethod] = method
 	meta[pendingRevokeURL] = url
+	meta[pendingRevokeAuth] = authScheme
 }
 
 // performPendingRevoke runs a revoke recorded by deferRevokeOldProviderKey,
-// authenticating with the NEW key, and clears the transient markers.
+// authenticating with the NEW key THE WAY THE PROVIDER ACTUALLY ACCEPTS, and
+// clears the transient markers.
 //
 // Call it only after the new value is durably stored. A failure sets
 // meta["last_revoke_error"], which downgrades the rotation to partial and
 // alarms, exactly as an inline failure used to.
-// newKey is opaque. The revoke sends "Authorization: Bearer <the new secret>" to
-// a method and URL taken out of provider_meta, so it is an EXIT and it takes the
+//
+// newKey is opaque. The revoke sends it, authenticated per pendingRevokeAuth, to
+// a method and URL taken out of provider_meta (or, for scheme "b2", derived from
+// an authorize round trip B2 itself requires), so it is an EXIT and it takes the
 // entry's own recorded destinations to authorise it, exactly like the Rotate call
 // that minted the value.
 func performPendingRevoke(ctx context.Context, meta map[string]string, provider string,
 	newKey secretexit.Plaintext) {
 
-	method, url := meta[pendingRevokeMethod], meta[pendingRevokeURL]
+	method, url, scheme := meta[pendingRevokeMethod], meta[pendingRevokeURL], meta[pendingRevokeAuth]
 	delete(meta, pendingRevokeMethod)
 	delete(meta, pendingRevokeURL)
-	if method == "" || url == "" {
+	delete(meta, pendingRevokeAuth)
+	if url == "" {
 		return
 	}
-	auth := ""
-	if !newKey.IsZero() && !newKey.Empty() {
-		exitCtx, plain, err := secretexit.ExitString(ctx, newKey,
-			secretexit.ToHosts("the deferred revoke for provider "+provider,
-				secretexit.ChosenByTheEntrysOwnRecord(), declaredProviderEgress(provider, meta)))
-		if err != nil {
-			meta["last_revoke_error"] = "revoke old key: " + err.Error()
+	if newKey.IsZero() || newKey.Empty() {
+		return
+	}
+	exitCtx, plain, err := secretexit.ExitString(ctx, newKey,
+		secretexit.ToHosts("the deferred revoke for provider "+provider,
+			secretexit.ChosenByTheEntrysOwnRecord(), declaredProviderEgress(provider, meta)))
+	if err != nil {
+		meta["last_revoke_error"] = "revoke old key: " + err.Error()
+		return
+	}
+	ctx = exitCtx
+
+	switch scheme {
+	case revokeAuthB2:
+		// url carries the OLD key id (see deferRevokeOldProviderKey's doc).
+		// meta["key_id"] already holds the NEW key id: Backblaze's Rotate writes
+		// it before deferring, precisely so this authorize step can authenticate
+		// as the key that is about to survive the rotation.
+		newKeyID := meta["key_id"]
+		if newKeyID == "" {
+			meta["last_revoke_error"] = "revoke old key: no new key id recorded to authorize the b2 revoke with"
 			return
 		}
-		ctx = exitCtx
-		auth = "Bearer " + plain
+		backblazeRevokeOldKey(ctx, meta, newKeyID, plain, url)
+	case revokeAuthBasic:
+		userKey := basicAuthUsernameMetaKey[provider]
+		user := ""
+		if userKey != "" {
+			user = meta[userKey]
+		}
+		if user == "" {
+			meta["last_revoke_error"] = "revoke old key: no basic-auth username recorded for provider " + provider
+			return
+		}
+		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+plain))
+		revokeOldProviderKey(ctx, meta, method, url, auth)
+	default: // revokeAuthBearer, and an unset/unrecognised scheme as a safe default
+		revokeOldProviderKey(ctx, meta, method, url, "Bearer "+plain)
 	}
-	revokeOldProviderKey(ctx, meta, method, url, auth)
 }
 
 // revokeOldProviderKey issues a revoke (usually DELETE) of the previous key and
@@ -623,7 +694,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// old (now-deleted) id and every rotation leaves its immediate predecessor live.
 	oldID := meta["key_id"]
 	if oldID != "" && oldID != result.ID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/"+oldID)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/"+oldID, revokeAuthBearer)
 	}
 	meta["key_id"] = result.ID
 	return result.Token, nil
@@ -686,7 +757,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	// deleted id and every rotation leaves its predecessor live).
 	oldID := meta["api_key_id"]
 	if oldID != "" && oldID != result.APIKeyID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID, revokeAuthBearer)
 	}
 	meta["api_key_id"] = result.APIKeyID
 	return result.APIKey, nil
@@ -773,7 +844,7 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// the first rotation.
 	if oldSid != "" && oldSid != result.Sid {
 		deferRevokeOldProviderKey(meta, "DELETE",
-			"https://api.twilio.com/2010-04-01/Accounts/"+accountSid+"/Keys/"+oldSid+".json")
+			"https://api.twilio.com/2010-04-01/Accounts/"+accountSid+"/Keys/"+oldSid+".json", revokeAuthBasic)
 	}
 	return result.Secret, nil
 }
@@ -907,7 +978,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	newID := fmt.Sprintf("%d", result.ID)
 	oldID := meta["key_id"]
 	if oldID != "" && oldID != newID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID, revokeAuthBearer)
 	}
 	if result.ID != 0 {
 		meta["key_id"] = newID
@@ -1290,16 +1361,32 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 	if result.ApplicationKey == "" {
 		return "", fmt.Errorf("empty applicationKey returned")
 	}
-	// Best-effort revoke of the OLD key (b2_delete_key needs an authorize step
-	// first, so this is inline rather than via revokeOldProviderKey).
-	if result.ApplicationKeyID != "" && keyID != result.ApplicationKeyID {
-		backblazeRevokeOldKey(ctx, meta, result.ApplicationKeyID, result.ApplicationKey, keyID)
-	}
-	// CRITICAL: record the NEW key's id. Backblaze Basic-auth is keyID:secret, so
-	// leaving meta["key_id"] as the OLD id would pair it with the NEW secret and
-	// break auth on the very next Validate/Rotate (not just leak the old key).
+	// CRITICAL: record the NEW key's id BEFORE deferring the revoke. Backblaze
+	// Basic-auth is keyID:secret, so leaving meta["key_id"] as the OLD id would
+	// pair it with the NEW secret and break auth on the very next
+	// Validate/Rotate (not just leak the old key). It also has to happen first
+	// for a second reason now: performPendingRevoke's b2 arm authenticates B2's
+	// authorize step as the NEW key pair, and reads the id straight out of
+	// meta["key_id"].
 	if result.ApplicationKeyID != "" {
 		meta["key_id"] = result.ApplicationKeyID
+	}
+	// Queue the predecessor's deletion. This used to run INLINE, right here,
+	// before Rotate returned - "best-effort, because b2_delete_key needs an
+	// authorize step first" - which meant the old key was destroyed at
+	// Backblaze before the caller had encrypted or persisted the new one, and
+	// before the caller's compare-and-swap could even fail. Every other
+	// adapter defers (see deferRevokeOldProviderKey's doc); Backblaze was the
+	// one exception, and the exception was the bug: a CAS conflict on the
+	// caller's write discarded the newly minted key while the old one was
+	// ALREADY gone upstream, leaving nobody holding a working credential.
+	//
+	// B2 still needs its authorize round trip before b2_delete_key, so there is
+	// no fixed delete URL to store here; performPendingRevoke's "b2" scheme
+	// arm does that round trip itself, once the caller says the new value is
+	// durably stored.
+	if result.ApplicationKeyID != "" && keyID != result.ApplicationKeyID {
+		deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2)
 	}
 	return result.ApplicationKey, nil
 }
@@ -1308,6 +1395,11 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 // b2_authorize_account round-trip (with the NEW creds) to discover the storage
 // apiUrl + a short-lived token before b2_delete_key can be called. Any failure
 // is recorded in meta["last_revoke_error"] and never fails the rotation.
+//
+// Called from exactly one place: performPendingRevoke's "b2" scheme arm, once
+// the caller has durably stored the new value. It used to be called inline from
+// Rotate, before the new value was persisted; see deferRevokeOldProviderKey's
+// doc for why that was the bug this file exists to have fixed.
 func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID, newKey, oldKeyID string) {
 	auth := base64.StdEncoding.EncodeToString([]byte(newKeyID + ":" + newKey))
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.backblazeb2.com/b2api/v3/b2_authorize_account", nil)
