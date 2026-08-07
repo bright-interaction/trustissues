@@ -504,12 +504,18 @@ func egressInfluencingMetaKeys() []string {
 // sending one is either confused or aiming a request.
 //
 // pending_revoke_url is the sharpest of them: performPendingRevoke issues
-// method+URL straight out of the map with "Authorization: Bearer <the new
-// secret>". A client that could plant it would have the rotation scheduler post
-// the freshly minted credential wherever it said. providerDo refuses that today
-// (the URL is outside the provider's declared hosts), and refusing the WRITE as
-// well means the row never carries the attempt at all.
-var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, "last_revoke_error"}
+// method+URL straight out of the map, authenticated per pending_revoke_auth. A
+// client that could plant pending_revoke_url would have the rotation scheduler
+// post the freshly minted credential wherever it said. providerDo refuses that
+// today (the URL is outside the provider's declared hosts), and refusing the
+// WRITE as well means the row never carries the attempt at all.
+//
+// pending_revoke_auth is reserved for the same reason: it selects which
+// credentials the deferred revoke sends ("basic" pairs a meta-recorded id with
+// the new secret, "b2" drives a whole authorize-then-delete flow), so a client
+// that could plant it could redirect what gets authenticated where, same as the
+// method/URL pair.
+var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth, "last_revoke_error"}
 
 // rejectReservedProviderMetaKeys reports the first server-owned key found in a
 // client-supplied provider_meta, if any.

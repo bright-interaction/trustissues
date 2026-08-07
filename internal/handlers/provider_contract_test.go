@@ -144,6 +144,22 @@ func TestTwilioRotatePairsTheNewSecretWithItsOwnSid(t *testing.T) {
 	} else if !strings.Contains(meta[pendingRevokeURL], "SKnew123") {
 		t.Errorf("the queued revoke does not target the PREVIOUS key: %s", meta[pendingRevokeURL])
 	}
+
+	// A revoke being QUEUED is not enough: it also has to be able to
+	// authenticate, or it 401s at Twilio the moment it runs and the orphaned
+	// SK key (its sid already overwritten by the successor above) is never a
+	// revoke candidate again. Twilio Basic auth is (ApiKeySid, ApiKeySecret)
+	// and NEVER a bare bearer token, which performPendingRevoke used to send
+	// unconditionally. Assert the SCHEME that was recorded, not just that a
+	// revoke exists: a test that stops here is the one that shipped that bug.
+	if meta[pendingRevokeAuth] != revokeAuthBasic {
+		t.Fatalf("pending_revoke_auth = %q, want %q.\n"+
+			"Without the basic scheme, performPendingRevoke authenticates the deferred DELETE with "+
+			"\"Authorization: Bearer <new secret>\", which Twilio rejects with a 401. The predecessor "+
+			"key then stays live forever: meta[\"key_sid\"] has already advanced to the successor by "+
+			"the time the revoke runs, so the orphaned key is never queued for deletion again.",
+			meta[pendingRevokeAuth], revokeAuthBasic)
+	}
 }
 
 // TestTwilioValidateUsesTheSameIdentityAsRotate is the other half.

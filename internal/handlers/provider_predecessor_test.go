@@ -46,7 +46,18 @@ func TestEveryAutoRotatingProviderDeclaresPredecessorFate(t *testing.T) {
 //
 // A table that drifts from the adapters is worse than no table: it would tell an
 // operator a predecessor is destroyed when it is not. So the claim is checked against
-// whether the provider's Rotate actually queues or performs a revoke.
+// whether the provider's Rotate actually queues a revoke.
+//
+// codeRevokes used to also accept a bare "RevokeOldKey"/"revokeOldKey" substring,
+// which is how this test kept passing while Backblaze called backblazeRevokeOldKey
+// INLINE, before the caller had persisted the new value: the table said "revokes:
+// true" and the substring matched, so the test never noticed that the revoke ran at
+// the wrong time, only that a revoke-shaped call existed somewhere in the body. It
+// checks ONLY for the deferred call now, so a provider that reverts to revoking
+// inline (Backblaze or a new adapter making the same mistake) fails HERE, not just in
+// TestNoProviderRevokesBeforeReturning, which asserts the same property a different
+// way. A table entry of `Revokes: true` now means, specifically, "Rotate queues a
+// deferred revoke", not merely "some revoke-sounding call is reachable from Rotate".
 func TestPredecessorFateMatchesTheCode(t *testing.T) {
 	src, err := os.ReadFile("vault_providers.go")
 	if err != nil {
@@ -80,14 +91,19 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 		}
 		checked++
 
-		codeRevokes := strings.Contains(rot, "deferRevokeOldProviderKey") ||
-			strings.Contains(rot, "RevokeOldKey") ||
-			strings.Contains(rot, "revokeOldKey")
+		codeRevokes := strings.Contains(rot, "deferRevokeOldProviderKey")
 
 		if fate.Revokes && !codeRevokes {
-			t.Errorf("%s (%s) is declared as revoking its predecessor, but its Rotate neither queues "+
-				"nor performs a revoke. The table would tell an operator the old key is dead when "+
-				"it is live.", name, typ)
+			t.Errorf("%s (%s) is declared as revoking its predecessor, but its Rotate does not queue "+
+				"a DEFERRED revoke (deferRevokeOldProviderKey). The table would tell an operator the "+
+				"old key is dead when it is live, or (if some other revoke-shaped call is present) "+
+				"live only until a CAS conflict destroys it before the new value is ever stored.",
+				name, typ)
+		}
+		if !fate.Revokes && (codeRevokes || strings.Contains(rot, "RevokeOldKey") || strings.Contains(rot, "revokeOldKey")) &&
+			!strings.Contains(fate.Note, "local secret") {
+			t.Errorf("%s (%s) DOES revoke its predecessor but is declared as not doing so; the UI "+
+				"would understate what rotation achieves.", name, typ)
 		}
 		if !fate.Revokes && codeRevokes && !strings.Contains(fate.Note, "local secret") {
 			t.Errorf("%s (%s) DOES revoke its predecessor but is declared as not doing so; the UI "+
