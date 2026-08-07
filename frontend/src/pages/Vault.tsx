@@ -2497,6 +2497,15 @@ export default function Vault() {
                             }));
                           }
                         }}
+                        onProviderSaved={(patch) => {
+                          // Same reason as onScheduleSaved: vaultEntries is local
+                          // useState, not react-query, so the row badge and the
+                          // panel's own seed would keep showing the old provider
+                          // until a manual reload without this.
+                          setVaultEntries((prev) =>
+                            prev.map((e) => (e.id === entry.id ? { ...e, ...patch } : e))
+                          );
+                        }}
                       />
                     )}
                   </div>
