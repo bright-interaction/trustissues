@@ -74,6 +74,30 @@ export interface RotationTarget {
   auth_token?: string; // vault entry NAME holding the Forgejo token
 }
 
+// ProviderInfo mirrors handlers.ProviderInfo (GET /vault/providers). It is the
+// single source for what a rotation provider is called, whether it can
+// auto-rotate, what provider_meta fields it needs, and what happens to the key
+// it replaces. The frontend must NOT hardcode a second copy of this list: the
+// per-provider meta shape (required_meta) and the revoke behavior
+// (predecessor_fate) come from here so the two cannot drift.
+export interface ProviderInfo {
+  name: string;
+  label: string;
+  can_auto_rotate: boolean;
+  // Kept for completeness; predecessor_fate is the field to render (see below).
+  revokes_predecessor: boolean;
+  // The honest, four-valued answer to "what happens to the key rotation
+  // replaces". "unknown" means NOT YET VERIFIED against the vendor's API, not
+  // "confirmed both keys stay live" -- render it as a question, not a claim.
+  predecessor_fate: 'revokes' | 'leaves_live' | 'not_applicable' | 'unknown';
+  predecessor_note?: string;
+  dashboard_url: string;
+  // provider_meta fields whose absence makes rotation/validation fail for this
+  // provider, keyed by field name with a human-readable label as the value.
+  // Empty object means the provider needs no extra fields.
+  required_meta: Record<string, string>;
+}
+
 export interface ImportEntry {
   name: string;
   url: string;
@@ -140,8 +164,20 @@ export const serviceIdentityKeys = {
   audit: (id: string) => ['service-identities', 'audit', id] as const,
 };
 
+// Query keys for the provider catalog. Same rationale as serviceIdentityKeys
+// above: queryKeys in src/lib/query-keys.ts is platform-owned and does not
+// reserve this one.
+export const providerKeys = {
+  all: ['vault-providers'] as const,
+  list: () => ['vault-providers', 'list'] as const,
+};
+
 export const vaultApi = {
   list: () => request<VaultEntry[]>('/vault'),
+  // The provider catalog: what a rotation provider is called, whether it can
+  // auto-rotate, what provider_meta fields it needs, and its predecessor fate.
+  // This is the ONLY source for that; see ProviderInfo's doc comment.
+  listProviders: () => request<ProviderInfo[]>('/vault/providers'),
   create: (data: {
     name: string;
     value: string;
@@ -157,6 +193,12 @@ export const vaultApi = {
     collection_id?: string | null;
     // Optional arbitrary label/value pairs, encrypted at rest with the entry.
     custom_fields?: CustomField[];
+    // Rotation provider (see vaultApi.listProviders) and its provider_meta,
+    // a JSON-encoded object of the fields that provider's Rotate/Validate
+    // reads (see ProviderInfo.required_meta). Omit both to create a
+    // manually-managed entry.
+    provider?: string;
+    provider_meta?: string;
   }) =>
     request<VaultEntry>('/vault', {
       method: 'POST',
@@ -177,6 +219,14 @@ export const vaultApi = {
       // Sending the array REPLACES the whole set; omit to leave it unchanged;
       // send [] to clear all.
       custom_fields?: CustomField[];
+      // Rotation provider + its provider_meta (JSON-encoded object). Omit
+      // either to leave it unchanged; send provider: '' to detach. The server
+      // requires the entry's owner or an instance admin to WIDEN where the
+      // secret can be sent (a provider/provider_meta change that adds a
+      // host); a narrower or same-host change is allowed for any editor. See
+      // FRONTEND-CONTRACT.md and internal/handlers/egress_authority.go.
+      provider?: string;
+      provider_meta?: string;
       // The capability ceiling: hosts an agent token minted for this secret may
       // reach ("api.example.com/v1/*"). Omit to leave unchanged; [] clears it,
       // which DISABLES minting rather than widening it. The server rejects host
