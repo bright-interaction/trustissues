@@ -224,14 +224,39 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 		}
 	}
 
-	// Probe 2: a columncrypto-sealed TOTP seed.
+	// Probe 2: every TOTP seed.
+	//
+	// This used to `continue` before setting hasCiphertext when the value did not
+	// carry columncrypto's "tienc:v1:" marker, i.e. columncrypto.IsEncrypted(v) was
+	// false. That marker is a WRITE-side classifier: MigrateTOTPSecrets uses it to
+	// decide "this is already in the target format, never re-encrypt it". Legacy
+	// binaries wrote bare-base64 ciphertext with no marker at all (see
+	// MigrateTOTPSecrets's own handling of that shape), so a database whose only
+	// ciphertext was one of those unmarked rows reported "no ciphertext", the gate
+	// sealed the sentinel under whatever key was configured, and the CORRECT key
+	// was refused forever. Worse, MigrateTOTPSecrets runs immediately after this
+	// gate: finding the row still unmarked, it treated it as genuine plaintext and
+	// encrypted it AGAIN, producing Enc_wrong(Enc_right(seed)) -- the correct key
+	// was then cryptographically unrecoverable, not merely administratively
+	// refused.
+	//
+	// users.totp_secret only ever holds ciphertext once non-empty (see
+	// ListUsersWithTOTPSecret, filtered to != ''), so PRESENCE alone proves
+	// hasCiphertext, exactly like the rawgcm arm below. The decrypt attempt is
+	// unconditional too: columncrypto.DecryptString(Any) already accepts bare
+	// legacy ciphertext by design, and AES-GCM authentication means a wrong key can
+	// never produce a false "opens", so there is no safety reason to gate the
+	// attempt on the marker -- only a correctness reason not to. A store whose
+	// ONLY ciphertext is unmarked legacy data must still open under its correct
+	// key, or this fix would trade the fail-open bug for a fail-closed one that
+	// bricks exactly the legacy installs it exists to protect.
 	seeds, sErr := queries.ListUsersWithTOTPSecret(ctx)
 	if sErr != nil {
 		return hasCiphertext, false, fmt.Errorf("read totp secrets: %w", sErr)
 	}
 	for _, s := range seeds {
 		v := nullStringToString(s.TotpSecret)
-		if !columncrypto.IsEncrypted(v) {
+		if v == "" {
 			continue
 		}
 		hasCiphertext = true
@@ -278,9 +303,15 @@ func vaultKeyOpensExistingData(ctx context.Context, queries *db.Queries, vaultKe
 	for _, b := range blobs {
 		switch b.Family {
 		case "columncrypto":
-			if !columncrypto.IsEncrypted(b.Blob) {
-				continue
-			}
+			// Same shape and same fix as probe 2 above: settings.smtp_password is
+			// a known-encrypted column (the query already filters to value != ''),
+			// so a non-empty value is ciphertext whether or not it carries the
+			// "tienc:v1:" marker. Gating hasCiphertext on IsEncrypted here was the
+			// unmarked-legacy hole applied to a second column: it let a database
+			// whose only ciphertext was an unmarked SMTP password look empty to
+			// this probe. The decrypt attempt stays unconditional for the same
+			// reason as probe 2: DecryptStringAny accepts unmarked ciphertext and
+			// AES-GCM auth makes the attempt safe either way.
 			hasCiphertext = true
 			if _, decErr := columncrypto.DecryptStringAny(b.Blob, vaultFieldBootProbe, vaultKeys...); decErr == nil {
 				return true, true, nil
