@@ -67,6 +67,9 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 	body := string(src)
 
 	rotateRe := regexp.MustCompile(`(?s)func \(p \*(\w+)\) Rotate\(ctx context\.Context.*?\n\}\n`)
+	// A full-line comment is prose, not a call. Stripping it is what makes the
+	// checks below falsifiable; see codeRevokes for the bug that proved it.
+	commentLine := regexp.MustCompile(`(?m)^\s*//.*$`)
 	nameRe := func(typ string) string {
 		m := regexp.MustCompile(`func \(p \*` + typ + `\) Name\(\) string\s*\{?\s*return "([^"]+)"`).FindStringSubmatch(body)
 		if len(m) == 2 {
@@ -92,7 +95,17 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 		}
 		checked++
 
-		codeRevokes := strings.Contains(rot, "deferRevokeOldProviderKey")
+		// Two defenses, because the first version of this tightened check was vacuous
+		// for the ONE provider it was written to protect. Backblaze's Rotate carries a
+		// comment explaining the deferred-revoke fix, and that comment contains the
+		// literal "deferRevokeOldProviderKey". A bare substring match over the raw body
+		// therefore reported codeRevokes=true for Backblaze no matter what the code did:
+		// replacing the real deferred call with the old INLINE backblazeRevokeOldKey left
+		// this test green, and only TestNoProviderRevokesBeforeReturning and
+		// TestBackblazeCASConflictLeavesThePredecessorLive caught the regression. So:
+		// strip full-line comments, and require the call syntax rather than the bare name.
+		code := commentLine.ReplaceAllString(rot, "")
+		codeRevokes := strings.Contains(code, "deferRevokeOldProviderKey(")
 
 		if fate.Status == fateRevokes && !codeRevokes {
 			t.Errorf("%s (%s) is declared as revoking its predecessor, but its Rotate does not queue "+
@@ -105,7 +118,7 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 		// the "declared as not revoking" side, even though codeRevokes no longer accepts
 		// them: an adapter that revokes inline is both a mis-declaration AND the CAS bug,
 		// and dropping the substrings here would let it pass this direction silently.
-		if fate.Status != fateRevokes && (codeRevokes || strings.Contains(rot, "RevokeOldKey") || strings.Contains(rot, "revokeOldKey")) &&
+		if fate.Status != fateRevokes && (codeRevokes || strings.Contains(code, "RevokeOldKey") || strings.Contains(code, "revokeOldKey")) &&
 			!strings.Contains(fate.Note, "local secret") {
 			t.Errorf("%s (%s) DOES revoke its predecessor but is declared as not doing so; the UI "+
 				"would understate what rotation achieves.", name, typ)
