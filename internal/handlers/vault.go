@@ -3131,6 +3131,30 @@ func (h *VaultHandler) Providers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ListProviders())
 }
 
+// validateFailUnreachable is the ONE structural reason ValidateKey ever puts
+// in the "error" field of its response.
+//
+// It replaces validErr.Error() for every failure of provider.Validate,
+// regardless of cause, because provider.Validate's error is the RAW result of
+// dialling a host the caller (up to and including a vault_only role) chose via
+// their own entry's provider_meta. That error text tells apart:
+//
+//   - resolves to a private address: GuardedWebhookClient's dial control
+//     returns "blocked outbound to private address <resolved-ip>:<port>",
+//     naming the address it just resolved
+//   - does not resolve at all: "no such host"
+//   - resolves publicly but refuses or times out: "connection refused" vs
+//     "i/o timeout"
+//
+// which is exactly the triage an internal-network prober wants: create an
+// entry, point provider "forgejo" at provider_meta.instance, POST validate
+// with your own password, read which of the three you got, adjust, repeat.
+// Modelled on the rotFail* constants in vault_rotation_failure.go, which never
+// let a rotation failure's raw error reach anything an operator's UI renders
+// either. The real validErr still reaches slog, keyed by entry and user, so an
+// operator debugging a real outage loses nothing.
+const validateFailUnreachable = "the provider could not be reached"
+
 // ValidateKey handles POST /api/vault/{id}/validate and checks if a key is still valid.
 func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -3246,7 +3270,27 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		"provider": meta.Provider.String,
 	}
 	if validErr != nil {
-		result["error"] = validErr.Error()
+		// STRUCTURAL REASON ONLY. validErr can be GuardedWebhookClient's dial-time
+		// SSRF block ("blocked outbound to private address 10.0.1.42:8500", which
+		// names the RESOLVED address), a DNS failure ("no such host"), or a refused
+		// or timed-out TCP connect, and those three read differently on purpose:
+		// resolves-and-is-private vs does-not-resolve vs resolves-and-is-refused is
+		// exactly the triage an internal-network prober wants. Any authenticated
+		// caller, including the vault_only role the public invite-redeem endpoint
+		// hands out, may create their own entry with an attacker-chosen provider
+		// host (forgejo's/zitadel's "instance" is a whole URL) and read this field
+		// back, which turns the vault into a port-scanning, DNS-resolving oracle
+		// for the server's own network.
+		//
+		// The rotFail* constants in vault_rotation_failure.go are the model: what
+		// gets PERSISTED never carries validErr.Error(), only a fixed structural
+		// reason, with the real error going to slog. This is the same discipline
+		// applied to what gets RETURNED, which had never had it: rotate and the
+		// scheduler both call recordRotationFailure and never leak, but validate
+		// wrote the raw error straight into the response body.
+		logError(r, "vault.validate: provider validation failed", "entry", id, "user", userID,
+			"provider", meta.Provider.String, "error", validErr)
+		result["error"] = validateFailUnreachable
 	}
 
 	writeJSON(w, http.StatusOK, result)
