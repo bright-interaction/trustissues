@@ -23,12 +23,21 @@ import (
 type AuthHandler struct {
 	queries *db.Queries
 	cfg     *config.Config
+	// vault is optional and used only by ChangePassword to purge a caller's
+	// own rotation delivery targets as part of full credential invalidation.
+	// Wired by SetVault after construction, matching UserHandler; nil simply
+	// skips that step.
+	vault *VaultHandler
 }
 
 // NewAuthHandler creates a new AuthHandler.
 func NewAuthHandler(queries *db.Queries, cfg *config.Config) *AuthHandler {
 	return &AuthHandler{queries: queries, cfg: cfg}
 }
+
+// SetVault wires the vault handler used by ChangePassword to purge the
+// caller's own rotation delivery targets during credential invalidation.
+func (h *AuthHandler) SetVault(v *VaultHandler) { h.vault = v }
 
 // dummyPasswordHash is verified against on the no-account login path so
 // response latency does not reveal whether an email has an account. Computed
@@ -676,30 +685,20 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Revoke every outstanding token for this account so one stolen under the
-	// old password cannot outlive the change. We then mint a fresh token
-	// (issued now, so it survives the revocation cutoff) and return it,
-	// letting a cooperating client keep the current session alive while all
-	// older tokens die.
-	if err := h.queries.InvalidateUserSessions(r.Context(), db.InvalidateUserSessionsParams{
-		SessionsValidAfter: time.Now().Unix(),
-		ID:                 userID,
-	}); err != nil {
-		logError(r, "change-password: failed to invalidate sessions", "error", err, "user_id", userID)
+	// Revoke every outstanding credential for this account so one stolen under
+	// the old password cannot outlive the change: sessions, API keys, and any
+	// service identity the account owns (see invalidateCredentials; this used
+	// to stop at sessions and API keys, which left a stolen service key
+	// reading the account's vault straight through the incident-response
+	// change meant to cut it off). We then mint a fresh token (issued now, so
+	// it survives the revocation cutoff) and return it, letting a cooperating
+	// client keep the current session alive while all older tokens die.
+	email, emailErr := h.queries.GetUserEmailByID(r.Context(), userID)
+	if emailErr != nil {
+		logError(r, "change-password: failed to look up email for activity log", "error", emailErr, "user_id", userID)
+		email = userID
 	}
-	// Also revoke the server-side session rows so tokens minted before the
-	// change die immediately, independent of the iat-based cutoff above. The
-	// fresh token minted below gets a new, non-revoked session row.
-	if err := h.queries.RevokeUserSessions(r.Context(), userID); err != nil {
-		logError(r, "change-password: failed to revoke sessions", "error", err, "user_id", userID)
-	}
-	// API keys are a separate credential and outlive sessions unless we cut
-	// them too. Changing the password is the incident-response action a user
-	// takes after a compromise, so a stolen extension key must not survive it.
-	// The owner mints a replacement from POST /api/api-keys afterwards.
-	if err := h.queries.RevokeAPIKeysByUser(r.Context(), userID); err != nil {
-		logError(r, "change-password: failed to revoke api keys", "error", err, "user_id", userID)
-	}
+	invalidateCredentials(r, h.queries, h.vault, userID, email, "Changing password for")
 
 	LogActivityFromRequest(h.queries, r, "auth.password_changed",
 		"Password changed; sessions and API keys revoked")

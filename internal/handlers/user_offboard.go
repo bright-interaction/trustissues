@@ -6,47 +6,81 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
-// offboardUser runs every revocation step that must happen when a person loses
-// access, and records what it did on the activity log.
+// invalidateCredentials revokes every standing credential a user holds:
+// sessions, API keys, and any service identities they created (plus the
+// rotation delivery targets those identities and their entries reference).
+// It records what it did on the activity log.
 //
-// It exists because this one property, "when someone is offboarded their reach
-// actually ends", has now been fixed FIVE times in five separate places:
-// collection removal, rotation-target delivery, capability minting, the shared
-// entryAccessFor gate, and now service identities. Each fix closed one door and
-// the next audit round found another, because every caller re-implemented its
-// own idea of what offboarding means. Anything added here is inherited by all
-// three callers (disable, delete, password reset) instead of by whichever one
-// the author happened to be editing.
+// It exists because this one property, "when someone's credentials are
+// invalidated their reach actually ends", has now been fixed FIVE times in
+// five separate places: collection removal, rotation-target delivery,
+// capability minting, the shared entryAccessFor gate, and service identities.
+// Each fix closed one door and the next audit round found another, because
+// every caller re-implemented its own idea of what invalidation means. A
+// docstring here once claimed this was "inherited by all three callers
+// (disable, delete, password reset)" while the code had only two: password
+// reset revoked sessions and API keys inline but never touched service
+// identities, so a stolen service key kept reading the victim's vault straight
+// through an admin's incident-response reset. Anything added here is now
+// inherited by EVERY caller (disable, delete, admin password reset, and
+// self-service password change) instead of by whichever one the author
+// happened to be editing.
 //
-// Best-effort by design: an offboarding that half-completes because a cleanup
-// step errored is worse than one that finishes and reports what it could not
-// tidy. Every step logs its own failure and none of them abort the caller.
+// Best-effort by design: an invalidation that half-completes because a
+// cleanup step errored is worse than one that finishes and reports what it
+// could not tidy. Every step logs its own failure and none of them abort the
+// caller.
 //
 // The authoritative controls are still the runtime gates (FetchOwnSecrets
 // refuses a disabled or deleted owner, targetStillAuthorized refuses delivery,
 // entryAccessFor refuses access). This function is what makes the revocation
 // VISIBLE in the product rather than surfacing as a mystery 401 at the next
-// boot, and what stops dead endpoints from sitting in the UI looking live.
-func (h *UserHandler) offboardUser(r *http.Request, userID, email string) {
+// boot, and what stops dead endpoints and live service keys from sitting
+// around looking active.
+//
+// reason is a short present-tense lead-in used to make each caller's activity
+// log entries distinguishable ("Disabling", "Deleting", "Resetting password
+// for", "Changing password for").
+func invalidateCredentials(r *http.Request, queries *db.Queries, vault *VaultHandler, userID, email, reason string) {
 	if userID == "" {
 		return
 	}
+	ctx := r.Context()
 
-	// 1. Service identities. FetchOwnSecrets resolves every secret as the
+	// 1. Sessions. The iat-based cutoff catches tokens that carry an iat claim;
+	// revoking the server-side rows is what makes it unconditional.
+	if err := queries.InvalidateUserSessions(ctx, db.InvalidateUserSessionsParams{
+		SessionsValidAfter: time.Now().Unix(),
+		ID:                 userID,
+	}); err != nil {
+		slog.Error("credentials: failed to invalidate sessions", "user", userID, "reason", reason, "error", err)
+	}
+	if err := queries.RevokeUserSessions(ctx, userID); err != nil {
+		slog.Error("credentials: failed to revoke sessions", "user", userID, "reason", reason, "error", err)
+	}
+
+	// 2. API keys. A second standing credential that would otherwise survive
+	// a session revocation untouched.
+	if err := queries.RevokeAPIKeysByUser(ctx, userID); err != nil {
+		slog.Error("credentials: failed to revoke api keys", "user", userID, "reason", reason, "error", err)
+	}
+
+	// 3. Service identities. FetchOwnSecrets resolves every secret as the
 	// identity's created_by_user_id, so a live key outlives its owner and keeps
 	// reading their personal vault, including values rotated after they left.
-	names, listErr := h.queries.ListServiceIdentitiesByUser(r.Context(), sql.NullString{String: userID, Valid: true})
+	names, listErr := queries.ListServiceIdentitiesByUser(ctx, sql.NullString{String: userID, Valid: true})
 	if listErr != nil {
-		slog.Error("offboard: could not list service identities", "user", userID, "error", listErr)
+		slog.Error("credentials: could not list service identities", "user", userID, "reason", reason, "error", listErr)
 	} else if len(names) > 0 {
-		if _, revErr := h.queries.RevokeServiceIdentitiesByUser(r.Context(), sql.NullString{String: userID, Valid: true}); revErr != nil {
-			slog.Error("offboard: could not revoke service identities", "user", userID, "error", revErr)
+		if _, revErr := queries.RevokeServiceIdentitiesByUser(ctx, sql.NullString{String: userID, Valid: true}); revErr != nil {
+			slog.Error("credentials: could not revoke service identities", "user", userID, "reason", reason, "error", revErr)
 		} else {
 			labels := make([]string, 0, len(names))
 			for _, n := range names {
@@ -55,26 +89,26 @@ func (h *UserHandler) offboardUser(r *http.Request, userID, email string) {
 			// Named explicitly: each one is a machine credential that will stop
 			// working at its next boot, and the admin needs to know which
 			// services to re-provision before that happens.
-			LogActivityFromRequest(h.queries, r, "admin.service_identities_revoked",
-				fmt.Sprintf("Offboarding %s: revoked %d service key(s), these services must be re-provisioned: %v",
-					email, len(labels), labels))
-			slog.Info("offboard: revoked service identities", "user", userID, "count", len(labels))
+			LogActivityFromRequest(queries, r, "admin.service_identities_revoked",
+				fmt.Sprintf("%s %s: revoked %d service key(s), these services must be re-provisioned: %v",
+					reason, email, len(labels), labels))
+			slog.Info("credentials: revoked service identities", "user", userID, "reason", reason, "count", len(labels))
 		}
 	}
 
-	// 2. Rotation delivery targets they configured, across every entry
+	// 4. Rotation delivery targets they configured, across every entry
 	// including their own personal ones (auto-rotation keeps running on those).
-	if h.vault != nil {
-		if summary := h.vault.PurgeTargetsConfiguredByUser(r.Context(), userID); summary != "" {
-			LogActivityFromRequest(h.queries, r, "admin.user_targets_purged",
-				fmt.Sprintf("Offboarding cleanup for %s: %s", email, summary))
+	if vault != nil {
+		if summary := vault.PurgeTargetsConfiguredByUser(ctx, userID); summary != "" {
+			LogActivityFromRequest(queries, r, "admin.user_targets_purged",
+				fmt.Sprintf("%s %s: %s", reason, email, summary))
 		}
 	}
 }
 
 // disposeVaultEntriesOnDelete handles the departing user's secrets on a HARD
-// delete, and is deliberately NOT part of offboardUser: disabling an account is
-// reversible and must leave the entries exactly where they are.
+// delete, and is deliberately NOT part of invalidateCredentials: disabling an
+// account is reversible and must leave the entries exactly where they are.
 //
 // vault_entries.user_id has no foreign key (every other user-owned table has
 // one) and DeleteUser is a bare DELETE FROM users, so entries used to survive
