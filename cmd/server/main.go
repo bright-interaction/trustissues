@@ -329,6 +329,9 @@ func main() {
 	// the user handler needs the vault. Wired here because the vault handler is
 	// constructed after it.
 	userHandler.SetVault(vaultHandler)
+	// ChangePassword invalidates the caller's own rotation delivery targets as
+	// part of full credential invalidation, same reasoning as userHandler above.
+	authHandler.SetVault(vaultHandler)
 	if _, err := vaultHandler.BackfillMetadataEncryption(); err != nil {
 		slog.Error("vault metadata backfill failed", "error", err)
 	}

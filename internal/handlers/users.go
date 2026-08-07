@@ -251,13 +251,14 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		LogActivityFromRequest(h.queries, r, action, fmt.Sprintf("User %s", target.Email))
 
-		// Disabling is an offboarding control, so it has to detach delivery
-		// endpoints the same way removing someone from a collection does.
-		// Cutting only HTTP access left their rotation webhook receiving fresh
-		// plaintext on the next sweep, which meant the rotation an admin runs
-		// BECAUSE of an incident was what delivered the new key to them.
+		// Disabling is an offboarding control, so it has to invalidate standing
+		// credentials and detach delivery endpoints the same way removing
+		// someone from a collection does. Cutting only HTTP access left their
+		// rotation webhook receiving fresh plaintext on the next sweep, which
+		// meant the rotation an admin runs BECAUSE of an incident was what
+		// delivered the new key to them.
 		if *req.Disabled {
-			h.offboardUser(r, targetID, target.Email)
+			invalidateCredentials(r, h.queries, h.vault, targetID, target.Email, "Disabling")
 		}
 	}
 
@@ -332,12 +333,13 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// delete previously did none of this, so it was strictly weaker than the
 	// Disable toggle next to it.
 	//
-	// Only the REVERSIBLE half runs here. offboardUser revokes service
-	// identities and purges rotation targets, which is the right outcome for a
-	// user being removed and is recoverable (re-mint, re-add) if the delete is
-	// then refused. The IRREVERSIBLE half, deleting the personal vault, is
-	// deliberately deferred until after the authoritative guard has run.
-	h.offboardUser(r, targetID, target.Email)
+	// Only the REVERSIBLE half runs here. invalidateCredentials revokes
+	// sessions, API keys and service identities and purges rotation targets,
+	// which is the right outcome for a user being removed and is recoverable
+	// (re-mint, re-add) if the delete is then refused. The IRREVERSIBLE half,
+	// deleting the personal vault, is deliberately deferred until after the
+	// authoritative guard has run.
+	invalidateCredentials(r, h.queries, h.vault, targetID, target.Email, "Deleting")
 
 	// The guard is ON the delete, so a concurrent second delete cannot slip
 	// between a count and a write and take the last admin with it. The
@@ -379,10 +381,21 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ResetPassword handles POST /api/admin/users/{id}/reset-password. Sets a
-// new password for the target user and revokes their outstanding sessions.
+// ResetPassword handles POST /api/admin/users/{id}/reset-password. Sets a new
+// password for the target user and invalidates their standing credentials
+// (sessions, API keys, service identities). Refuses to target the caller's
+// own account: an admin resetting their own password this way would need no
+// current password, unlike ChangePassword, which is exactly the shape a
+// stolen admin API key uses to escalate to a login it controls. Admins change
+// their own password through ChangePassword instead.
 func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	targetID := chi.URLParam(r, "id")
+	callerID := middleware.GetUserID(r.Context())
+
+	if targetID == callerID {
+		writeBadRequest(w, r, "you cannot reset your own password here; use change password instead")
+		return
+	}
 
 	var req struct {
 		Password string `json:"password"`
@@ -423,26 +436,11 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Revoke every outstanding session for the target so tokens minted under
-	// the old password die with it.
-	if err := h.queries.InvalidateUserSessions(r.Context(), db.InvalidateUserSessionsParams{
-		SessionsValidAfter: time.Now().Unix(),
-		ID:                 targetID,
-	}); err != nil {
-		logError(r, "users.reset_password: failed to invalidate sessions", "error", err)
-	}
-	// Also drop the server-side session rows, matching ChangePassword. The
-	// iat cutoff above only catches tokens that carry an iat claim, so this is
-	// what makes the reset unconditional.
-	if err := h.queries.RevokeUserSessions(r.Context(), targetID); err != nil {
-		logError(r, "users.reset_password: failed to revoke sessions", "error", err, "user_id", targetID)
-	}
 	// An admin resetting a compromised account's password has to be able to
-	// cut off the attacker completely, and API keys are a second credential
-	// that would otherwise survive the reset.
-	if err := h.queries.RevokeAPIKeysByUser(r.Context(), targetID); err != nil {
-		logError(r, "users.reset_password: failed to revoke api keys", "error", err, "user_id", targetID)
-	}
+	// cut off the attacker completely: sessions, API keys, and any service
+	// identity the account owns, which used to survive a password reset
+	// untouched despite the offboarding docstring claiming otherwise.
+	invalidateCredentials(r, h.queries, h.vault, targetID, target.Email, "Resetting password for")
 
 	LogActivityFromRequest(h.queries, r, "admin.user_password_reset",
 		fmt.Sprintf("Password reset for %s; sessions and API keys revoked", target.Email))
