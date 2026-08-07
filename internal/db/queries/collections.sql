@@ -46,6 +46,16 @@ SELECT id, name, description, created_by, created_at, updated_at FROM collection
 -- name: CountCollectionEntries :one
 SELECT COUNT(*) FROM vault_entries WHERE collection_id = ?;
 
+-- name: ListCollectionVaultEntryNamesSample :many
+-- A bounded sample of the entries a collection holds, read by DeleteCollection
+-- right before the FK cascade destroys them, so activity_log can name what was
+-- lost instead of just noting that something was. Capped by LIMIT (the caller
+-- passes it) rather than returned in full: a collection with hundreds of
+-- entries would otherwise write an unbounded blob into the one append-only
+-- trail this product has, and the exact count from CountCollectionEntries
+-- already sits beside the sample in the log line for anything past the cap.
+SELECT id, name FROM vault_entries WHERE collection_id = ? ORDER BY name ASC LIMIT ?;
+
 -- ============================================================================
 -- Membership
 -- ============================================================================

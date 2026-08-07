@@ -39,6 +39,7 @@ export const queryKeys = {
   collections: {
     all: ['collections'] as const,
     list: () => ['collections', 'list'] as const,
+    detail: (id: string) => ['collections', 'detail', id] as const,
     members: (id: string) => ['collections', 'members', id] as const,
     // Invitations waiting on the current user (consent-based membership).
     pendingInvites: () => ['collections', 'pending-invites'] as const,

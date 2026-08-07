@@ -417,6 +417,14 @@ type Querier interface {
 	// statement aborted and EVERY shared entry kept the deleted user's id, silently,
 	// while the confirmation dialog promised the team would keep them.
 	ListCollectionVaultEntriesForUser(ctx context.Context, userID string) ([]ListCollectionVaultEntriesForUserRow, error)
+	// A bounded sample of the entries a collection holds, read by DeleteCollection
+	// right before the FK cascade destroys them, so activity_log can name what was
+	// lost instead of just noting that something was. Capped by LIMIT (the caller
+	// passes it) rather than returned in full: a collection with hundreds of
+	// entries would otherwise write an unbounded blob into the one append-only
+	// trail this product has, and the exact count from CountCollectionEntries
+	// already sits beside the sample in the log line for anything past the cap.
+	ListCollectionVaultEntryNamesSample(ctx context.Context, arg ListCollectionVaultEntryNamesSampleParams) ([]ListCollectionVaultEntryNamesSampleRow, error)
 	// Accepted memberships only. A pending invitation must not surface the
 	// collection (or its entries) until the invitee opts in.
 	ListCollectionsForUser(ctx context.Context, userID string) ([]ListCollectionsForUserRow, error)

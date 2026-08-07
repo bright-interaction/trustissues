@@ -981,6 +981,21 @@ function CollectionManageModal({
     queryFn: () => api.collections.listMembers(collection.id),
   });
 
+  // The list view's `collection` prop never carries entry_count (only GET
+  // /collections/{id} does), so this fetches it once to have a real number to
+  // SHOW the manager in the delete confirmation below. That displayed number,
+  // and only that number, is what gets sent with the delete: re-fetching the
+  // count at the moment of the click instead would make the server's compare
+  // check trivially true and turn the confirmation into theater. If this
+  // count is stale by the time they click confirm, the server refusing is the
+  // correct outcome, not a bug: it means the collection changed since the
+  // human looked at it, which is exactly when they should stop and look again.
+  const { data: freshCollection } = useQuery<Collection>({
+    queryKey: queryKeys.collections.detail(collection.id),
+    queryFn: () => api.collections.get(collection.id),
+  });
+  const displayedEntryCount = freshCollection?.entry_count;
+
   function invalidateMembers() {
     queryClient.invalidateQueries({ queryKey: queryKeys.collections.members(collection.id) });
     queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
@@ -1037,15 +1052,31 @@ function CollectionManageModal({
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  // entryCount is exactly the number rendered in the confirm prompt below,
+  // passed in from the click handler rather than re-read here, so what gets
+  // sent is provably what the human confirmed.
   const deleteCollectionMutation = useMutation({
-    mutationFn: () => api.collections.remove(collection.id),
+    mutationFn: (entryCount: number | undefined) => api.collections.remove(collection.id, entryCount),
     onSuccess: () => {
       toast.success('Collection deleted');
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       onDeleted();
     },
-    onError: (err) => toast.error(errorMessage(err)),
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 409) {
+        // The server's compare-and-swap rejected a stale or missing count.
+        // This means the collection changed since it was last viewed, so the
+        // fix is to show the operator the current state and let them decide
+        // again, never to resubmit automatically with a "corrected" number.
+        toast.error('This collection changed since you last viewed it. Review its current contents, then delete again if you still intend to.');
+        queryClient.invalidateQueries({ queryKey: queryKeys.collections.detail(collection.id) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.collections.members(collection.id) });
+        setConfirmDelete(false);
+        return;
+      }
+      toast.error(errorMessage(err));
+    },
   });
 
   return (
@@ -1116,11 +1147,17 @@ function CollectionManageModal({
               </button>
               {confirmDelete ? (
                 <span className="flex items-center gap-2">
-                  <span className="text-xs text-slate-500">Delete and all its entries?</span>
+                  <span className="text-xs text-slate-500">
+                    {typeof displayedEntryCount === 'number'
+                      ? displayedEntryCount > 0
+                        ? `Delete this collection and its ${displayedEntryCount} secret${displayedEntryCount === 1 ? '' : 's'}?`
+                        : 'Delete this empty collection?'
+                      : 'Checking collection contents...'}
+                  </span>
                   <button
                     type="button"
-                    onClick={() => deleteCollectionMutation.mutate()}
-                    disabled={deleteCollectionMutation.isPending}
+                    onClick={() => deleteCollectionMutation.mutate(displayedEntryCount)}
+                    disabled={deleteCollectionMutation.isPending || typeof displayedEntryCount !== 'number'}
                     className="rounded-lg bg-rose-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50"
                   >
                     Confirm delete
