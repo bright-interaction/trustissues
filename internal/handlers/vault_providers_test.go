@@ -49,6 +49,57 @@ func TestListProviders(t *testing.T) {
 	}
 }
 
+// TestRequiredProviderMetaMatchesRegistry keeps requiredProviderMeta from
+// silently rotting: a typo'd or retired provider name in the table would sit
+// there forever with no test ever reading it, exactly like RequiredMeta itself
+// sat unpopulated with no test noticing.
+func TestRequiredProviderMetaMatchesRegistry(t *testing.T) {
+	for name, fields := range requiredProviderMeta {
+		if _, ok := ProviderRegistry[name]; !ok {
+			t.Errorf("requiredProviderMeta declares provider %q, which is not in ProviderRegistry", name)
+		}
+		for key, label := range fields {
+			if strings.TrimSpace(key) == "" {
+				t.Errorf("provider %q has a blank required_meta key", name)
+			}
+			if strings.TrimSpace(label) == "" {
+				t.Errorf("provider %q field %q has a blank label", name, key)
+			}
+		}
+	}
+}
+
+// TestListProvidersExposesRequiredMeta is the regression for the actual P0: the
+// struct field existed, nothing ever set it, and every response answered
+// "required_meta": null for all 33 providers. A provider search here for one
+// this table declares must come back non-empty.
+func TestListProvidersExposesRequiredMeta(t *testing.T) {
+	infos := ListProviders()
+	byName := make(map[string]ProviderInfo, len(infos))
+	for _, info := range infos {
+		byName[info.Name] = info
+		if info.RequiredMeta == nil {
+			t.Errorf("provider %q has nil RequiredMeta; ListProviders must always emit a map so the "+
+				"frontend can tell \"no required fields\" apart from \"the API didn't say\"", info.Name)
+		}
+	}
+	for name, want := range requiredProviderMeta {
+		got, ok := byName[name]
+		if !ok {
+			continue // TestRequiredProviderMetaMatchesRegistry already reports this
+		}
+		if len(got.RequiredMeta) != len(want) {
+			t.Errorf("provider %q: ListProviders reported %d required_meta fields, table has %d",
+				name, len(got.RequiredMeta), len(want))
+		}
+		for key := range want {
+			if _, ok := got.RequiredMeta[key]; !ok {
+				t.Errorf("provider %q: ListProviders did not surface required field %q", name, key)
+			}
+		}
+	}
+}
+
 func TestSharedSecretProviderRotate(t *testing.T) {
 	p := &SharedSecretProvider{}
 	v1, err := p.Rotate(context.Background(), "", nil)
