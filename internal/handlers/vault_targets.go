@@ -56,6 +56,19 @@ type RotationTarget struct {
 	ConfiguredBy string `json:"configured_by,omitempty"`
 }
 
+// deliveryRefusalError is a delivery-target failure whose message is a fixed,
+// non-secret-bearing structural string: never a response body, an owner's
+// destination set, an entry's name or UUID, or an account's email. It exists
+// so redactUpstreamError can allowlist these specific messages by TYPE,
+// rather than relying on every call site remembering to hand-build one of
+// the few safe strings and nothing else. Same "carries no value" contract as
+// the rotFail* constants in vault_rotation_failure.go, expressed as a type
+// here because these strings are scoped to delivery-target refusals rather
+// than the auto-rotation sweep.
+type deliveryRefusalError struct{ msg string }
+
+func (e *deliveryRefusalError) Error() string { return e.msg }
+
 // targetTransmitsSecret reports whether this target type actually carries the
 // secret VALUE off the box. webhook POSTs it as new_value; forgejo_secret writes
 // it into a repository secret. notify sends a channel message about the
@@ -154,9 +167,14 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 			// retired type already fails below and never sends anything, so
 			// checking it here would only obscure that error.
 			if authErr := targetStillAuthorized(ctx, vault, entryID, target); authErr != nil {
-				results = append(results, DeliveryResult{Target: target, Success: false, Error: authErr.Error()})
+				// Route through the same redactor as the sibling failure path
+				// below (~line 191): targetStillAuthorized's disabled-configurer
+				// message names the configurer's email (see its doc comment),
+				// which must never reach last_rotation_error or an
+				// admin-configured webhook.
+				results = append(results, DeliveryResult{Target: target, Success: false, Error: redactUpstreamError(authErr)})
 				slog.Error("vault delivery: target refused, configurer no longer has write on the entry",
-					"type", target.Type, "entry", entryName, "configured_by", target.ConfiguredBy)
+					"type", target.Type, "entry", entryName, "configured_by", target.ConfiguredBy, "error", authErr)
 				continue
 			}
 			if target.Type == "forgejo_secret" {
@@ -168,26 +186,22 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 			// Notification is handled separately by the caller via ChannelDispatcher
 			continue
 		default:
-			err = fmt.Errorf("unknown target type: %s", target.Type)
+			err = &deliveryRefusalError{msg: fmt.Sprintf("unknown target type: %s", target.Type)}
 		}
 
 		result := DeliveryResult{Target: target, Success: err == nil}
 		if err != nil {
 			// summarizeDelivery folds result.Error into last_rotation_error,
 			// which the API returns, the browser renders verbatim, AND
-			// dispatchRotationAlert ships to notification channels off-box. Two
-			// different leaks have to be closed here:
-			//
-			//   - a transport failure is a *url.Error whose Error() embeds the
-			//     full target URL (internal IPs for an SSRF-blocked webhook,
-			//     plus any query/userinfo). redactUpstreamError rewrites it.
-			//   - a non-2xx used to be built with fmt.Errorf including up to
-			//     200 bytes of the raw upstream body, which redactUpstreamError
-			//     does NOT touch (it only matches *url.Error), so the body went
-			//     straight through. Those sites now return upstreamHTTPError,
-			//     whose Error() is structural and whose body is slog-only.
-			//
-			// The unredacted cause stays in the slog line below.
+			// dispatchRotationAlert ships to notification channels off-box.
+			// redactUpstreamError is an ALLOWLIST: it recognises upstreamHTTPError
+			// (a non-2xx; body held back for slog only), secretexit.ExitRefusedError
+			// (an owner-rule refusal; the entry name/UUID, chooser id, and
+			// destination set it can name are held back for slog only), and
+			// *url.Error (a transport failure; reduced to scheme+host) as
+			// structural-by-construction, and reduces everything else -- including
+			// any error type nobody has classified yet -- to a fixed generic
+			// string. The unredacted cause stays in the slog line below.
 			result.Error = redactUpstreamError(err)
 			slog.Error("vault delivery: target failed",
 				"type", target.Type,
@@ -216,10 +230,10 @@ func DeliverRotatedKey(ctx context.Context, queries *db.Queries, vault *VaultHan
 func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID string, target RotationTarget) error {
 	if vault == nil || entryID == "" {
 		// No way to check. Fail closed rather than deliver unverified.
-		return fmt.Errorf("delivery target could not be authorized (no entry context); re-save the target to re-enable it")
+		return &deliveryRefusalError{msg: "delivery target could not be authorized (no entry context); re-save the target to re-enable it"}
 	}
 	if target.ConfiguredBy == "" {
-		return fmt.Errorf("delivery target has no recorded configurer; re-save it in the rotation panel to re-enable delivery")
+		return &deliveryRefusalError{msg: "delivery target has no recorded configurer; re-save it in the rotation panel to re-enable delivery"}
 	}
 	// Account status first, so a disabled or deleted configurer produces an
 	// accurate reason. entryAccessFor now refuses them too, but it would report
@@ -227,10 +241,16 @@ func targetStillAuthorized(ctx context.Context, vault *VaultHandler, entryID str
 	// collection membership instead of at the account they just disabled.
 	u, uErr := vault.queries.GetUserByID(ctx, target.ConfiguredBy)
 	if uErr != nil {
-		return fmt.Errorf("delivery target skipped: the user who configured it no longer exists")
+		return &deliveryRefusalError{msg: "delivery target skipped: the user who configured it no longer exists"}
 	}
 	if u.Disabled != 0 {
-		return fmt.Errorf("delivery target skipped: the user who configured it (%s) is disabled", u.Email)
+		// Name a CLASS, not a person: this message reaches last_rotation_error
+		// and any admin-configured notification webhook off-box, so it must not
+		// carry a teammate's email address. The email is still worth an
+		// operator's attention, so it goes to slog, which stays on-box.
+		slog.Warn("vault delivery: target's configurer is disabled",
+			"configured_by", target.ConfiguredBy, "email", u.Email)
+		return &deliveryRefusalError{msg: "delivery target skipped: the account that configured it is disabled"}
 	}
 	// THE EGRESS QUESTION USED TO BE ASKED HERE TOO, AND IS NOT ANY MORE.
 	//
