@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -216,8 +217,36 @@ func (h *CollectionHandler) Update(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// collectionDeleteEntrySample caps how many entry names DeleteCollection
+// samples for the activity log. The exact count still comes from
+// CountCollectionEntries and is always logged in full, so a collection past
+// the cap is never under-reported, only under-NAMED; 25 is enough to name
+// every entry in the overwhelming majority of real collections while keeping
+// the append-only activity_log row bounded regardless of how large a
+// collection grows.
+const collectionDeleteEntrySample = 25
+
 // Delete handles DELETE /api/collections/{id} (manager or admin only). Deleting
-// a collection cascades to its members and entries.
+// a collection cascades to its members and entries via the FK's ON DELETE
+// CASCADE, and that cascade is the ONLY thing in this product that can destroy
+// a whole batch of secrets in one call with no recovery path (backups are
+// deferred, and activity_log is the sole tamper-evident trail). Two things
+// therefore happen before DeleteCollection ever runs:
+//
+//  1. Compare-and-swap on the entry count. A non-empty collection refuses the
+//     delete unless the caller's ?entry_count= matches what the server
+//     currently counts, the same shape as the last-manager and rotation CAS
+//     guards elsewhere in this handler set: the caller must prove it knew the
+//     state it was about to destroy, not just click a button. This is a
+//     server-enforced backstop behind the UI's own confirmation dialog, not a
+//     replacement for it: the dialog can be skipped by anyone calling the API
+//     directly, and unlike its /members siblings this route allows a plain
+//     0-secret collection to be deleted with no confirmation at all, which
+//     matches "nothing is lost" and keeps an empty collection cheap to clean up.
+//  2. The collection's name and a capped sample of the entries about to die
+//     are read and logged BEFORE the cascade, so activity_log can answer
+//     "which credentials do we now have to rotate upstream" afterwards
+//     instead of only recording that a collection with some id was deleted.
 func (h *CollectionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	role, ok := h.role(r, id)
@@ -229,12 +258,69 @@ func (h *CollectionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeForbidden(w, r, "only a collection manager can delete it")
 		return
 	}
+
+	c, err := h.queries.GetCollection(r.Context(), id)
+	if err != nil {
+		writeNotFound(w, r, "collection not found")
+		return
+	}
+
+	entryCount, err := h.queries.CountCollectionEntries(r.Context(), sql.NullString{String: id, Valid: true})
+	if err != nil {
+		logError(r, "collections.delete: entry count failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	if entryCount > 0 {
+		raw := r.URL.Query().Get("entry_count")
+		if raw == "" {
+			writeConflict(w, r, fmt.Sprintf(
+				"this collection holds %d entries; resend the delete with ?entry_count=%d to confirm you intend to destroy them",
+				entryCount, entryCount))
+			return
+		}
+		expected, convErr := strconv.ParseInt(raw, 10, 64)
+		if convErr != nil || expected != entryCount {
+			writeConflict(w, r, fmt.Sprintf(
+				"entry_count is stale: this collection now holds %d entries, refresh and confirm again", entryCount))
+			return
+		}
+	}
+
+	// Read the damage before the cascade, not after: once DeleteCollection runs
+	// there is nothing left to name.
+	sample, sampleErr := h.queries.ListCollectionVaultEntryNamesSample(r.Context(), db.ListCollectionVaultEntryNamesSampleParams{
+		CollectionID: sql.NullString{String: id, Valid: true},
+		Limit:        collectionDeleteEntrySample,
+	})
+	if sampleErr != nil {
+		// Best-effort: a failed sample must not block a delete the caller is
+		// otherwise authorized and confirmed to make. The count above is still
+		// logged, so the operation is never recorded as a bare id even if this
+		// fails.
+		logError(r, "collections.delete: entry sample failed", "error", sampleErr)
+	}
+
 	if err := h.queries.DeleteCollection(r.Context(), id); err != nil {
 		logError(r, "collections.delete: failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	LogActivityFromRequest(h.queries, r, "collection.delete", fmt.Sprintf("Collection deleted (id: %s)", id))
+
+	detail := fmt.Sprintf("Collection deleted: %s (id: %s), %d entries destroyed", c.Name, id, entryCount)
+	if len(sample) > 0 {
+		names := make([]string, len(sample))
+		for i, e := range sample {
+			names[i] = e.Name
+		}
+		if int64(len(sample)) < entryCount {
+			detail += fmt.Sprintf("; sample of %d: %v (+%d more not shown)", len(names), names, entryCount-int64(len(names)))
+		} else {
+			detail += fmt.Sprintf(": %v", names)
+		}
+	}
+	LogActivityFromRequest(h.queries, r, "collection.delete", detail)
 	w.WriteHeader(http.StatusNoContent)
 }
 

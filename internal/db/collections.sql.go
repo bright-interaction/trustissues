@@ -612,6 +612,50 @@ func (q *Queries) ListCollectionMembers(ctx context.Context, collectionID string
 	return items, nil
 }
 
+const listCollectionVaultEntryNamesSample = `-- name: ListCollectionVaultEntryNamesSample :many
+SELECT id, name FROM vault_entries WHERE collection_id = ? ORDER BY name ASC LIMIT ?
+`
+
+type ListCollectionVaultEntryNamesSampleParams struct {
+	CollectionID sql.NullString `json:"collection_id"`
+	Limit        int64          `json:"limit"`
+}
+
+type ListCollectionVaultEntryNamesSampleRow struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// A bounded sample of the entries a collection holds, read by DeleteCollection
+// right before the FK cascade destroys them, so activity_log can name what was
+// lost instead of just noting that something was. Capped by LIMIT (the caller
+// passes it) rather than returned in full: a collection with hundreds of
+// entries would otherwise write an unbounded blob into the one append-only
+// trail this product has, and the exact count from CountCollectionEntries
+// already sits beside the sample in the log line for anything past the cap.
+func (q *Queries) ListCollectionVaultEntryNamesSample(ctx context.Context, arg ListCollectionVaultEntryNamesSampleParams) ([]ListCollectionVaultEntryNamesSampleRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCollectionVaultEntryNamesSample, arg.CollectionID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCollectionVaultEntryNamesSampleRow{}
+	for rows.Next() {
+		var i ListCollectionVaultEntryNamesSampleRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCollectionsForUser = `-- name: ListCollectionsForUser :many
 SELECT c.id, c.name, c.description, c.created_by, c.created_at, c.updated_at, cm.role
 FROM collections c

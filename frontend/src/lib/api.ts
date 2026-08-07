@@ -373,8 +373,15 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(data),
       }),
-    remove: (id: string) =>
-      request<void>(`/collections/${id}`, { method: 'DELETE' }),
+    // entryCount is the server's own count, read moments earlier via `get`.
+    // The server refuses a non-empty collection unless it matches what it
+    // currently counts, so this is the client proving it knew what it was
+    // about to destroy; a stale value is refused rather than trusted.
+    remove: (id: string, entryCount?: number) =>
+      request<void>(
+        `/collections/${id}${typeof entryCount === 'number' ? `?entry_count=${entryCount}` : ''}`,
+        { method: 'DELETE' }
+      ),
     listMembers: (id: string) =>
       request<CollectionMember[]>(`/collections/${id}/members`),
     // Invites the address (or updates an existing member's role). The response
