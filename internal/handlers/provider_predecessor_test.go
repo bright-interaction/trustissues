@@ -107,7 +107,12 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 		code := commentLine.ReplaceAllString(rot, "")
 		codeRevokes := strings.Contains(code, "deferRevokeOldProviderKey(")
 
-		if fate.Status == fateRevokes && !codeRevokes {
+		// A provider in predecessorDestroysInPlace revokes as an INSEPARABLE part
+		// of its mint call (e.g. Cloudflare's rollToken replaces the token value
+		// under the same id): there is no separate revoke/delete call for this
+		// substring heuristic to find, by design. That claim is checked against
+		// the vendor docs cited in the table's Note instead of against the source.
+		if fate.Status == fateRevokes && !codeRevokes && !predecessorDestroysInPlace[name] {
 			t.Errorf("%s (%s) is declared as revoking its predecessor, but its Rotate does not queue "+
 				"a DEFERRED revoke (deferRevokeOldProviderKey). The table would tell an operator the "+
 				"old key is dead when it is live, or (if some other revoke-shaped call is present) "+

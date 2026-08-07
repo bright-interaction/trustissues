@@ -191,6 +191,25 @@ var predecessorFate = map[string]struct {
 	"resend":    {fateRevokes, ""},
 	"sendgrid":  {fateRevokes, ""},
 	"twilio":    {fateRevokes, ""},
+	// Cloudflare's roll (PUT /user/tokens/{id}/value) replaces the token's value
+	// IN PLACE under the same token id: the roll IS the revoke, there is no
+	// separable revoke step to defer past this vault's own compare-and-swap.
+	// Cloudflare's own docs say verbatim "Rolling your API token into a new one
+	// will invalidate the previous token, but the access and permissions will be
+	// the same as the previous API token" as part of the SAME call, and do not
+	// document the timing (immediate vs a propagation window), so no overlap
+	// with the old value may be assumed.
+	// https://developers.cloudflare.com/fundamentals/api/how-to/roll-token/
+	// See predecessorDestroysInPlace below: because a lost write here is a
+	// credential that exists nowhere (not a recoverable "both keys live"
+	// conflict), both rotation paths refuse this provider rather than mint
+	// against it until a CAS-safe retry/escrow path exists.
+	"cloudflare": {fateRevokes, "rolling the token replaces its value in place under the same token id " +
+		"(the roll IS the revoke, nothing separate to defer past our CAS); Cloudflare does not " +
+		"document the timing, so no overlap with the old value may be assumed. " +
+		"https://developers.cloudflare.com/fundamentals/api/how-to/roll-token/ " +
+		"See predecessorDestroysInPlace: this provider is refused rather than rotated until a " +
+		"CAS-safe retry/escrow path exists."},
 
 	// No upstream key exists, so there is nothing to revoke. Not a gap.
 	"shared-secret":    {fateNotApplicable, "local secret: this server owns the value, there is no upstream key"},
@@ -199,9 +218,9 @@ var predecessorFate = map[string]struct {
 	// Mint a successor and leave the predecessor live. Each needs its vendor API
 	// checked before the status can move to fateLeavesLive (confirmed) or
 	// fateRevokes, which is why they are fateUnknown with a note and not a
-	// silent fateLeavesLive.
+	// silent fateLeavesLive. Cloudflare left this group on 2026-08-07: its docs
+	// confirm the roll invalidates the predecessor, so it is fateRevokes above.
 	"auth0":      {fateUnknown, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
-	"cloudflare": {fateUnknown, "TODO: verify whether token roll replaces the token in place (if so this is correct and the note should say so)"},
 	"datadog":    {fateUnknown, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
 	"fastly":     {fateUnknown, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
 	"forgejo":    {fateUnknown, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
@@ -242,6 +261,30 @@ var requiredProviderMeta = map[string]map[string]string{
 	},
 	"datadog":  {"app_key": "Application Key (separate from the API key stored as the secret)"},
 	"supabase": {"project_ref": "Project ref (subdomain of *.supabase.co)"},
+}
+
+// predecessorDestroysInPlace lists providers whose Rotate mint replaces the
+// predecessor secret IN PLACE, atomically, as an inseparable part of minting
+// the successor: there is no create-then-revoke pair, so the mint call itself
+// already destroys the only other copy of the credential.
+//
+// This is a distinct question from predecessorFate.Revokes above and cannot be
+// folded into it. For every OTHER auto-rotating provider that revokes, the
+// revoke is DEFERRED past persisting the new value (deferRevokeOldProviderKey
+// runs after the CAS in persistRotatedValue succeeds), so a lost write there is
+// recoverable: the predecessor is still live and rotFailConflict's "will be
+// retried" promise is true. A provider listed here gets no such recovery,
+// because by the time persistRotatedValue would run, the OLD value is already
+// dead at the provider and the NEW value exists only in this process's memory.
+// Losing that write is a credential that exists nowhere, not a conflict to
+// retry.
+//
+// Until this vault has a CAS-safe retry/escrow path for that case (see the
+// providerAuto guard in vault.go's Rotate handler and in
+// vault_rotation.go's rotateOneEntry), both rotation paths refuse to even
+// start minting for a provider listed here rather than risk it.
+var predecessorDestroysInPlace = map[string]bool{
+	"cloudflare": true,
 }
 
 func ListProviders() []ProviderInfo {
