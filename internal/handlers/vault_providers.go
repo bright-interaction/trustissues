@@ -76,13 +76,28 @@ type ProviderInfo struct {
 	Name          string `json:"name"`
 	Label         string `json:"label"`
 	CanAutoRotate bool   `json:"can_auto_rotate"`
-	// RevokesPredecessor reports whether rotating this provider also destroys the
-	// key it replaces. False means BOTH keys stay live after a "successful"
-	// rotation, which an operator rotating a compromised credential has to know.
-	RevokesPredecessor bool              `json:"revokes_predecessor"`
-	PredecessorNote    string            `json:"predecessor_note,omitempty"`
-	DashboardURL       string            `json:"dashboard_url"`
-	RequiredMeta       map[string]string `json:"required_meta"`
+	// RevokesPredecessor is kept for existing callers of this endpoint: true only
+	// for the providers predecessorFate has SETTLED as revoking. It intentionally
+	// does NOT distinguish "confirmed does not revoke" from "nobody has checked
+	// yet" - both are false here, which is exactly the ambiguity PredecessorFate
+	// below exists to remove. New code should read PredecessorFate, not this.
+	RevokesPredecessor bool `json:"revokes_predecessor"`
+	// PredecessorFate is the honest three-plus-one-valued answer:
+	//   "revokes"        - confirmed: rotation destroys the key it replaces
+	//   "leaves_live"     - confirmed: rotation mints a successor and the old key
+	//                        keeps authenticating at the vendor
+	//   "not_applicable" - there is no vendor-side key to revoke (a local secret
+	//                        this server generates and owns outright)
+	//   "unknown"         - NOT YET VERIFIED against the vendor's API; PredecessorNote
+	//                        says what is outstanding. This is the state 9 of the
+	//                        11 non-revoking providers were in while the API only
+	//                        ever said `false`, which a caller reasonably reads as
+	//                        a confirmed "no". Render this one as a question mark,
+	//                        never as "both keys stay live" and never as "revoked".
+	PredecessorFate string            `json:"predecessor_fate"`
+	PredecessorNote string            `json:"predecessor_note,omitempty"`
+	DashboardURL    string            `json:"dashboard_url"`
+	RequiredMeta    map[string]string `json:"required_meta"`
 }
 
 var providerLabels = map[string]string{
@@ -122,6 +137,31 @@ var providerLabels = map[string]string{
 	"generated-key-32": "Generated AES-256 Key (32 ASCII chars)",
 }
 
+// predecessorFateStatus is the honest, four-valued answer to "what happens to
+// the key a rotation replaces". It replaces a bare bool specifically because the
+// bool could not distinguish "verified: this vendor leaves the old key live"
+// from "nobody has checked yet", and both printed as `false`. An operator
+// rotating a credential they believe compromised needs to know which one they
+// are looking at; "false" alone told them neither.
+type predecessorFateStatus string
+
+const (
+	// fateRevokes: confirmed, rotation destroys the key it replaces.
+	fateRevokes predecessorFateStatus = "revokes"
+	// fateLeavesLive: confirmed, rotation mints a successor and the old key goes
+	// on authenticating at the vendor. This is a settled fact, not a guess.
+	fateLeavesLive predecessorFateStatus = "leaves_live"
+	// fateNotApplicable: there is no vendor-side key at all (a local secret this
+	// server generates and owns), so "does rotation revoke the predecessor" does
+	// not apply. Distinct from fateLeavesLive: nothing persists anywhere else.
+	fateNotApplicable predecessorFateStatus = "not_applicable"
+	// fateUnknown: NOT yet verified against the vendor's API. The note says what
+	// is outstanding. Nine of the eleven non-revoking providers below are this,
+	// not fateLeavesLive, and rendering them as a confident "both keys stay
+	// live" would assert something nobody has actually checked.
+	fateUnknown predecessorFateStatus = "unknown"
+)
+
 // predecessorFate declares, for every auto-rotating provider, whether rotation also
 // destroys the key it replaces.
 //
@@ -138,34 +178,70 @@ var providerLabels = map[string]string{
 // declare one, and surfaces it through ListProviders so the UI can tell the operator
 // what a rotation of this provider does and does not do.
 //
-// Anything false with a note starting "TODO" is an open question, not a decision.
+// fateUnknown rows are open questions, not decisions: the Note says what to verify
+// against the vendor's API before the status can move to fateRevokes or
+// fateLeavesLive.
 var predecessorFate = map[string]struct {
-	Revokes bool
-	Note    string
+	Status predecessorFateStatus
+	Note   string
 }{
 	// Revoke the predecessor as part of rotation.
-	"backblaze": {true, ""},
-	"neon":      {true, ""},
-	"resend":    {true, ""},
-	"sendgrid":  {true, ""},
-	"twilio":    {true, ""},
+	"backblaze": {fateRevokes, ""},
+	"neon":      {fateRevokes, ""},
+	"resend":    {fateRevokes, ""},
+	"sendgrid":  {fateRevokes, ""},
+	"twilio":    {fateRevokes, ""},
 
 	// No upstream key exists, so there is nothing to revoke. Not a gap.
-	"shared-secret":    {false, "local secret: this server owns the value, there is no upstream key"},
-	"generated-key-32": {false, "local secret: this server owns the value, there is no upstream key"},
+	"shared-secret":    {fateNotApplicable, "local secret: this server owns the value, there is no upstream key"},
+	"generated-key-32": {fateNotApplicable, "local secret: this server owns the value, there is no upstream key"},
 
 	// Mint a successor and leave the predecessor live. Each needs its vendor API
-	// checked before a revoke can be written, which is why they are notes and not
-	// silent omissions.
-	"auth0":      {false, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
-	"cloudflare": {false, "TODO: verify whether token roll replaces the token in place (if so this is correct and the note should say so)"},
-	"datadog":    {false, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
-	"fastly":     {false, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
-	"forgejo":    {false, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
-	"grafana":    {false, "TODO: service-account tokens are additive; the old token id is not recorded so it cannot be deleted"},
-	"linode":     {false, "TODO: the old personal access token is not revoked; needs its id"},
-	"vercel":     {false, "TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded"},
-	"zitadel":    {false, "TODO: the old machine key is not deleted; needs the key id"},
+	// checked before the status can move to fateLeavesLive (confirmed) or
+	// fateRevokes, which is why they are fateUnknown with a note and not a
+	// silent fateLeavesLive.
+	"auth0":      {fateUnknown, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
+	"cloudflare": {fateUnknown, "TODO: verify whether token roll replaces the token in place (if so this is correct and the note should say so)"},
+	"datadog":    {fateUnknown, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
+	"fastly":     {fateUnknown, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
+	"forgejo":    {fateUnknown, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
+	"grafana":    {fateUnknown, "TODO: service-account tokens are additive; the old token id is not recorded so it cannot be deleted"},
+	"linode":     {fateUnknown, "TODO: the old personal access token is not revoked; needs its id"},
+	"vercel":     {fateUnknown, "TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded"},
+	"zitadel":    {fateUnknown, "TODO: the old machine key is not deleted; needs the key id"},
+}
+
+// requiredProviderMeta declares, per provider, the provider_meta fields whose
+// ABSENCE makes Rotate or Validate return an error (grep the two functions for
+// `required in provider_meta` / `X required`; that error string is what a field
+// being listed here means). Fields with a code-side default (key_name,
+// token_name, token_label, sendgrid's scopes, datadog's site) are left out on
+// purpose: the adapter works without them, so forcing an operator to fill one in
+// would be the frontend inventing a requirement the backend does not have.
+//
+// This was ProviderInfo.RequiredMeta's whole reason to exist: the field was
+// declared on the struct and never populated, so GET /api/vault/providers always
+// answered `"required_meta": null` and the only way for a caller to know Twilio
+// needs account_sid was to already have read this file. That is exactly the
+// parallel-list drift this codebase keeps finding: one true source (the adapter
+// code) and a second, silently empty one (the API contract) standing in for it.
+// The map keys must be real ProviderRegistry names:
+// TestRequiredProviderMetaMatchesRegistry checks that.
+var requiredProviderMeta = map[string]map[string]string{
+	"twilio":    {"account_sid": "Account SID"},
+	"backblaze": {"key_id": "Application Key ID", "account_id": "Account ID"},
+	"auth0":     {"tenant": "Tenant (subdomain of *.auth0.com)", "client_id": "Client ID"},
+	"forgejo":   {"instance": "Instance base URL (e.g. https://git.example.com)"},
+	"grafana": {
+		"instance":           "Instance (subdomain of *.grafana.net)",
+		"service_account_id": "Service account ID",
+	},
+	"zitadel": {
+		"instance": "Instance base URL (e.g. https://auth.example.com)",
+		"user_id":  "User ID",
+	},
+	"datadog":  {"app_key": "Application Key (separate from the API key stored as the secret)"},
+	"supabase": {"project_ref": "Project ref (subdomain of *.supabase.co)"},
 }
 
 func ListProviders() []ProviderInfo {
@@ -176,13 +252,27 @@ func ListProviders() []ProviderInfo {
 			label = p.Name()
 		}
 		fate := predecessorFate[p.Name()]
+		status := fate.Status
+		if status == "" {
+			// Not in the table at all (e.g. a validate-only provider that never
+			// mints a successor, so the question does not apply).
+			status = fateNotApplicable
+		}
+		required := requiredProviderMeta[p.Name()]
+		if required == nil {
+			required = map[string]string{}
+		}
 		infos = append(infos, ProviderInfo{
-			Name:               p.Name(),
-			Label:              label,
-			CanAutoRotate:      p.CanAutoRotate(),
-			RevokesPredecessor: fate.Revokes,
+			Name:          p.Name(),
+			Label:         label,
+			CanAutoRotate: p.CanAutoRotate(),
+			// Backward-compat: true only for the settled-revokes rows, byte-for-byte
+			// what this field returned before PredecessorFate existed.
+			RevokesPredecessor: status == fateRevokes,
+			PredecessorFate:    string(status),
 			PredecessorNote:    fate.Note,
 			DashboardURL:       p.DashboardURL(nil),
+			RequiredMeta:       required,
 		})
 	}
 	return infos

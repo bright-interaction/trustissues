@@ -29,15 +29,16 @@ func TestEveryAutoRotatingProviderDeclaresPredecessorFate(t *testing.T) {
 		fate, ok := predecessorFate[name]
 		if !ok {
 			t.Errorf("provider %q auto-rotates but does not declare what happens to the key it "+
-				"replaces. Add it to predecessorFate: true if rotation revokes the predecessor, "+
-				"false with a note saying why not. An undeclared provider silently reports a "+
-				"clean success while both keys stay live.", name)
+				"replaces. Add it to predecessorFate: fateRevokes if rotation destroys the "+
+				"predecessor, fateLeavesLive/fateNotApplicable/fateUnknown with a note otherwise. "+
+				"An undeclared provider silently reports a clean success while both keys stay "+
+				"live.", name)
 			continue
 		}
-		if !fate.Revokes && strings.TrimSpace(fate.Note) == "" {
+		if fate.Status != fateRevokes && strings.TrimSpace(fate.Note) == "" {
 			t.Errorf("provider %q declares it does NOT revoke the predecessor but gives no reason. "+
-				"Either it is a local secret (say so) or it is an open gap (say TODO and what to "+
-				"check).", name)
+				"Either it is a local secret (fateNotApplicable), a confirmed vendor behavior "+
+				"(fateLeavesLive), or an open gap (fateUnknown with a TODO saying what to check).", name)
 		}
 	}
 }
@@ -93,19 +94,19 @@ func TestPredecessorFateMatchesTheCode(t *testing.T) {
 
 		codeRevokes := strings.Contains(rot, "deferRevokeOldProviderKey")
 
-		if fate.Revokes && !codeRevokes {
+		if fate.Status == fateRevokes && !codeRevokes {
 			t.Errorf("%s (%s) is declared as revoking its predecessor, but its Rotate does not queue "+
 				"a DEFERRED revoke (deferRevokeOldProviderKey). The table would tell an operator the "+
 				"old key is dead when it is live, or (if some other revoke-shaped call is present) "+
 				"live only until a CAS conflict destroys it before the new value is ever stored.",
 				name, typ)
 		}
-		if !fate.Revokes && (codeRevokes || strings.Contains(rot, "RevokeOldKey") || strings.Contains(rot, "revokeOldKey")) &&
+		// The RevokeOldKey/revokeOldKey substrings are deliberately still checked HERE, on
+		// the "declared as not revoking" side, even though codeRevokes no longer accepts
+		// them: an adapter that revokes inline is both a mis-declaration AND the CAS bug,
+		// and dropping the substrings here would let it pass this direction silently.
+		if fate.Status != fateRevokes && (codeRevokes || strings.Contains(rot, "RevokeOldKey") || strings.Contains(rot, "revokeOldKey")) &&
 			!strings.Contains(fate.Note, "local secret") {
-			t.Errorf("%s (%s) DOES revoke its predecessor but is declared as not doing so; the UI "+
-				"would understate what rotation achieves.", name, typ)
-		}
-		if !fate.Revokes && codeRevokes && !strings.Contains(fate.Note, "local secret") {
 			t.Errorf("%s (%s) DOES revoke its predecessor but is declared as not doing so; the UI "+
 				"would understate what rotation achieves.", name, typ)
 		}
