@@ -457,6 +457,24 @@ func (s *Session) shieldAnyUnderKey(ctx context.Context, key string, v any) (any
 		if dereferencedURLKeys[key] && looksLikeDereferenceableURL(t) {
 			return t, nil
 		}
+		// A value under an unambiguously name-bearing key IS a name, whatever it
+		// looks like, so it is tokenized whole rather than handed to the pattern
+		// walk that by construction cannot match one. See names.go for why bare
+		// "name" is excluded and what this deliberately does not cover.
+		//
+		// Tokenizing the WHOLE value is the point: "Anna Svensson" has no
+		// sub-span a pattern could anchor on, and a partial redaction that left
+		// the surname is not a redaction. The marker round-trips through
+		// unshieldAny like every other kind, because it is an ordinary marker.
+		if kind, ok := nameKindForKey(key); ok && strings.TrimSpace(t) != "" {
+			// A value that already carries a marker is a second pass over
+			// already-shielded content (history replayed into a new request).
+			// Re-tokenizing would nest a marker inside a marker and the outer
+			// resolve would hand back the inner marker instead of the name.
+			if !MarkerPattern.MatchString(t) {
+				return s.Tokenize(ctx, kind, t, "")
+			}
+		}
 		return s.RedactString(ctx, t)
 	case []any:
 		out := make([]any, len(t))

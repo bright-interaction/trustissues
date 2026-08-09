@@ -220,14 +220,14 @@ var predecessorFate = map[string]struct {
 	// fateRevokes, which is why they are fateUnknown with a note and not a
 	// silent fateLeavesLive. Cloudflare left this group on 2026-08-07: its docs
 	// confirm the roll invalidates the predecessor, so it is fateRevokes above.
-	"auth0":      {fateUnknown, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
-	"datadog":    {fateUnknown, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
-	"fastly":     {fateUnknown, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
-	"forgejo":    {fateUnknown, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
-	"grafana":    {fateUnknown, "TODO: service-account tokens are additive; the old token id is not recorded so it cannot be deleted"},
-	"linode":     {fateUnknown, "TODO: the old personal access token is not revoked; needs its id"},
-	"vercel":     {fateUnknown, "TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded"},
-	"zitadel":    {fateUnknown, "TODO: the old machine key is not deleted; needs the key id"},
+	"auth0":   {fateUnknown, "TODO: verify whether the Management API client-secret rotate replaces in place or creates a second credential"},
+	"datadog": {fateUnknown, "TODO: the old API key is not deleted; confirm Datadog's delete endpoint and required scopes"},
+	"fastly":  {fateUnknown, "TODO: the old token is not revoked; Fastly exposes DELETE /tokens/{id} but the id is not recorded"},
+	"forgejo": {fateUnknown, "TODO: the old access token is not deleted; needs the token id, which is not recorded"},
+	"grafana": {fateUnknown, "TODO: service-account tokens are additive; the old token id is not recorded so it cannot be deleted"},
+	"linode":  {fateUnknown, "TODO: the old personal access token is not revoked; needs its id"},
+	"vercel":  {fateUnknown, "TODO: the old token is not deleted; Vercel exposes DELETE /v3/user/tokens/{id} but the id is not recorded"},
+	"zitadel": {fateUnknown, "TODO: the old machine key is not deleted; needs the key id"},
 }
 
 // requiredProviderMeta declares, per provider, the provider_meta fields whose
