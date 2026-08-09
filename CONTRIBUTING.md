@@ -19,14 +19,17 @@ services to stand up. Migrations are embedded goose files in
 `internal/database/migrations/` and run automatically at boot, so a fresh
 checkout gets a working database on first start.
 
-The frontend lives in `frontend/` (Vite + TypeScript):
+The frontend lives in `frontend/` (Vite + TypeScript). Use **bun**, not npm:
+`Dockerfile` builds it with `oven/bun:1-alpine` and `bun install
+--frozen-lockfile` against `bun.lock`, and installing with npm produces a
+different tree from the one that ships.
 
 ```bash
 cd frontend
-npm install
-npm run dev      # vite dev server
-npm run build    # tsc && vite build
-npm test         # vitest run
+bun install --frozen-lockfile
+bun run dev      # vite dev server
+bun run build    # tsc && vite build
+bun run test     # vitest run
 ```
 
 ## Gates (run before every PR)
