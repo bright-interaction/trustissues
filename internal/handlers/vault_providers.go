@@ -156,7 +156,7 @@ const (
 	// not apply. Distinct from fateLeavesLive: nothing persists anywhere else.
 	fateNotApplicable predecessorFateStatus = "not_applicable"
 	// fateUnknown: NOT yet verified against the vendor's API. The note says what
-	// is outstanding. Nine of the eleven non-revoking providers below are this,
+	// is outstanding. Eight of the ten non-revoking providers below are this,
 	// not fateLeavesLive, and rendering them as a confident "both keys stay
 	// live" would assert something nobody has actually checked.
 	fateUnknown predecessorFateStatus = "unknown"
@@ -165,7 +165,7 @@ const (
 // predecessorFate declares, for every auto-rotating provider, whether rotation also
 // destroys the key it replaces.
 //
-// The product's promise is "the old key is dead and the new one works". Nine adapters
+// The product's promise is "the old key is dead and the new one works". Eight adapters
 // mint a successor and leave the predecessor live, and the rotation is still recorded
 // as a clean success with no alert, because the orchestration layer only knows about a
 // revoke that was QUEUED. An operator rotating a credential they believe is compromised
@@ -668,8 +668,15 @@ func (p *CloudflareTokenProvider) Validate(ctx context.Context, key string, _ ma
 		return false, err
 	}
 	defer resp.Body.Close()
+	// Through readProviderBody like every other read site in this file. This was
+	// the one call that still decoded straight off resp.Body, so the ceiling
+	// readProviderBody exists to impose did not apply to it and the upstream chose
+	// how much this process allocated. cfResponse carries an unbounded []cfError,
+	// each with a string Message, so the decode is not bounded by the struct shape
+	// either.
+	body, _ := readProviderBody(resp)
 	var result cfResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return false, err
 	}
 	return result.Success, nil
@@ -1108,14 +1115,33 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	// Revoke the old key, then record the NEW key's id so the NEXT rotation
 	// revokes THIS key (without the write-back meta["key_id"] stays the old
 	// deleted id and every rotation leaves its predecessor live).
-	newID := fmt.Sprintf("%d", result.ID)
+	//
+	// The `result.ID != 0` guard below used to sit AFTER an unconditional defer,
+	// which inverted its own intent. On a response carrying a usable key but no
+	// id, the predecessor was still queued for deletion while meta["key_id"] kept
+	// naming it, so the rotation destroyed the old key and left the successor with
+	// no recorded id anywhere: no future rotation could ever revoke it, and the
+	// entry was recorded as a clean success. That is the unrevokable-forever state
+	// deferRevokeOldProviderKey's doc is written to avoid, reached by a missing
+	// field instead of by a lost write.
+	//
+	// Unlike Twilio, a missing id does not make the secret unusable here (Neon
+	// authenticates with the key itself, and the id is only needed to revoke), so
+	// refusing the whole rotation would discard a working credential. Keeping both
+	// keys live and saying so is the recoverable choice, and last_revoke_error is
+	// exactly the channel the caller already reads to downgrade the rotation to
+	// partial and alarm on it.
 	oldID := meta["key_id"]
+	if result.ID == 0 {
+		meta["last_revoke_error"] = "neon returned a key with no id; the predecessor was left live " +
+			"because the successor cannot be identified for any future revoke"
+		return result.Key, nil
+	}
+	newID := fmt.Sprintf("%d", result.ID)
 	if oldID != "" && oldID != newID {
 		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID, revokeAuthBearer)
 	}
-	if result.ID != 0 {
-		meta["key_id"] = newID
-	}
+	meta["key_id"] = newID
 	return result.Key, nil
 }
 
@@ -1364,8 +1390,24 @@ func (p *Auth0Provider) Validate(ctx context.Context, key string, meta map[strin
 	if tenant == "" || clientID == "" {
 		return false, fmt.Errorf("tenant and client_id required")
 	}
-	payload := fmt.Sprintf(`{"grant_type":"client_credentials","client_id":"%s","client_secret":"%s","audience":"https://%s.auth0.com/api/v2/"}`, clientID, key, tenant)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+tenant+".auth0.com/oauth/token", strings.NewReader(payload))
+	// json.Marshal, not fmt.Sprintf into a JSON literal. All three interpolated
+	// values reach this line unescaped: `key` is the secret itself, and clientID
+	// and tenant come out of operator-controlled provider_meta. A secret
+	// containing a double quote or a backslash (both legal in an Auth0 client
+	// secret) produced malformed JSON, Auth0 answered 400, and Validate reported
+	// `valid: false` for a credential that was in fact fine - which is the shape
+	// that marks a working key dead and alarms on it. The same interpolation let a
+	// provider_meta value close the string and add fields of its own to the body.
+	payload, err := json.Marshal(map[string]string{
+		"grant_type":    "client_credentials",
+		"client_id":     clientID,
+		"client_secret": key,
+		"audience":      "https://" + tenant + ".auth0.com/api/v2/",
+	})
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+tenant+".auth0.com/oauth/token", strings.NewReader(string(payload)))
 	if err != nil {
 		return false, err
 	}
