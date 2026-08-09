@@ -139,6 +139,8 @@ type RekeyEntryParams struct {
 	EncryptedValue    []byte
 	Nonce             []byte
 	EncryptionVersion sql.NullInt64
+	Name              string
+	NameBidx          string
 	Url               sql.NullString
 	AliasUrl          sql.NullString
 	Username          sql.NullString
@@ -178,6 +180,11 @@ type CreateEntryParams struct {
 	AutoRotate           sql.NullInt64
 	UrlBidx              string
 	AliasUrlBidx         string
+	// NameBidx is the keyed token that carries per-user name uniqueness now that
+	// Name is randomized ciphertext. Leaving it empty does not fail: the unique
+	// index is partial and skips '', so the row is simply created outside the
+	// constraint and a duplicate name goes unnoticed.
+	NameBidx string
 }
 
 // writer builds the generated querier on the caller's own handle.
@@ -295,6 +302,7 @@ func CreateEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Cre
 		AutoRotate:           p.AutoRotate,
 		UrlBidx:              p.UrlBidx,
 		AliasUrlBidx:         p.AliasUrlBidx,
+		NameBidx:             p.NameBidx,
 	})
 }
 
@@ -320,6 +328,7 @@ func RekeyEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Reke
 		EncryptedValue:    p.EncryptedValue,
 		Nonce:             p.Nonce,
 		EncryptionVersion: p.EncryptionVersion,
+		Name:              p.Name,
 		Url:               p.Url,
 		AliasUrl:          p.AliasUrl,
 		Username:          p.Username,
@@ -330,6 +339,7 @@ func RekeyEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Reke
 		CustomFields:      p.CustomFields,
 		UrlBidx:           p.UrlBidx,
 		AliasUrlBidx:      p.AliasUrlBidx,
+		NameBidx:          p.NameBidx,
 		ID:                p.ID,
 	})
 }

@@ -57,7 +57,11 @@ func accessProbes() []accessProbe {
 			}) == nil
 		}},
 		{name: "capability-mint", spend: true, run: func(t *testing.T, e *revocationEnv, u string) bool {
-			ch := &CapabilityHandler{db: e.h.db}
+			// The vault is the name decryptor now: lookupSecretByName matches on
+			// the DECRYPTED name, because the column is ciphertext since 00040.
+			// A handler without one cannot resolve any name at all, which would
+			// make this probe report "no access" for the wrong reason and pass.
+			ch := &CapabilityHandler{db: e.h.db, vault: e.h}
 			_, err := ch.lookupSecretByName(context.Background(), u, e.entryName)
 			return err == nil
 		}},

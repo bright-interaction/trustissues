@@ -70,7 +70,7 @@ func TestManagerCanRenameAnEntryStrandedByItsCreator(t *testing.T) {
 		if hit.Code != http.StatusForbidden {
 			t.Fatalf("want 403 while the creator can rename it themselves, got HTTP %d: %s", hit.Code, hit.Body.String())
 		}
-		if got, _ := queries.GetVaultEntryName(ctx, sharedID); got != "ci-token" {
+		if got := entryNamePlain(t, h, queries, sharedID); got != "ci-token" {
 			t.Fatalf("the entry was renamed anyway: %q", got)
 		}
 	})
@@ -88,9 +88,8 @@ func TestManagerCanRenameAnEntryStrandedByItsCreator(t *testing.T) {
 		if rec.Code != http.StatusOK && rec.Code != http.StatusNoContent {
 			t.Fatalf("manager rename of a stranded entry: HTTP %d: %s", rec.Code, rec.Body.String())
 		}
-		got, err := queries.GetVaultEntryName(ctx, sharedID)
-		if err != nil || got != "ci-token-prod" {
-			t.Fatalf("the rename did not take: name = %q err = %v", got, err)
+		if got := entryNamePlain(t, h, queries, sharedID); got != "ci-token-prod" {
+			t.Fatalf("the rename did not take: name = %q", got)
 		}
 		// Adoption: the manager is now the owner, and the entry stayed in the
 		// collection (moving it out is a different, separately authorized act).
@@ -117,13 +116,13 @@ func TestManagerCanRenameAnEntryStrandedByItsCreator(t *testing.T) {
 			t.Fatalf("renaming to a name the CREATOR holds privately answered HTTP %d: %s\n"+
 				"that answer is a read of their private vault", rec.Code, rec.Body.String())
 		}
-		if got, _ := queries.GetVaultEntryName(ctx, sharedID); got != "Acme prod DB" {
+		if got := entryNamePlain(t, h, queries, sharedID); got != "Acme prod DB" {
 			t.Fatalf("the rename did not take: %q", got)
 		}
 		// And the creator's own entry is untouched: adoption renames the shared
 		// entry, it does not reach into anyone else's vault.
-		if got, err := queries.GetVaultEntryName(ctx, "entry-private"); err != nil || got != "Acme prod DB" {
-			t.Fatalf("the creator's private entry changed: %q err = %v", got, err)
+		if got := entryNamePlain(t, h, queries, "entry-private"); got != "Acme prod DB" {
+			t.Fatalf("the creator's private entry changed: %q", got)
 		}
 	})
 
@@ -153,7 +152,7 @@ func TestManagerCanRenameAnEntryStrandedByItsCreator(t *testing.T) {
 		if access.UserID != creator {
 			t.Errorf("a refused adoption changed the owner to %q", access.UserID)
 		}
-		if got, _ := queries.GetVaultEntryName(ctx, secondID); got != "deploy-key" {
+		if got := entryNamePlain(t, h, queries, secondID); got != "deploy-key" {
 			t.Errorf("a refused adoption changed the name to %q", got)
 		}
 	})

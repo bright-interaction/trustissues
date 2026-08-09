@@ -53,9 +53,26 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 	if name == "" || userID == "" {
 		return none, sql.ErrNoRows
 	}
-	rows, err := h.queries.ResolveVaultReference(ctx, name)
+	all, err := h.queries.ResolveVaultReference(ctx)
 	if err != nil {
 		return none, err
+	}
+
+	// THE NAME MATCH, which SQL used to do. Since 00040 the name column is
+	// randomized ciphertext and the blind index that replaced it for equality is
+	// keyed per user, so there is no one token to look a name up by across the
+	// several users whose entries this caller may legitimately reach. The
+	// comparison is therefore done here, on the decrypted name, and it is exactly
+	// the comparison the WHERE clause performed: byte equality, no folding.
+	//
+	// This narrows only. Every row that survives still goes through
+	// entryCurrentlyUsableBy below, which is where authorization actually happens
+	// and which is deliberately unchanged.
+	var named []db.ResolveVaultReferenceRow
+	for _, row := range all {
+		if h.decryptColumnOrLog(row.Name, "", vaultFieldName) == name {
+			named = append(named, row)
+		}
 	}
 
 	// Keep only entries this user may USE right now. Deliberately not
@@ -63,7 +80,7 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 	// read, and the entry keeps their user_id forever, so gating on it left the
 	// exfiltration wide open. See entryCurrentlyUsableBy.
 	var reachable []db.ResolveVaultReferenceRow
-	for _, row := range rows {
+	for _, row := range named {
 		if h.entryCurrentlyUsableBy(ctx, userID, row.ID) {
 			reachable = append(reachable, row)
 		}

@@ -21,8 +21,8 @@
 -- caught rather than merely discouraged.
 
 -- name: CreateVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, name_bidx, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 
 -- name: TransferVaultEntrySecretOwner :execresult
 -- THE ONLY STATEMENT IN THE MODULE THAT MOVES secret_owner_user_id AFTER
@@ -86,7 +86,7 @@ WHERE id = ? AND destination_patterns = '[]' AND injection_spec = '{}';
 -- an incident, which is the worst possible moment to lose that signal.
 UPDATE vault_entries
 SET encrypted_value = ?, nonce = ?, encryption_version = ?,
-    url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
+    name = ?, url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
     provider_meta = ?, rotation_targets = ?, custom_fields = ?,
-    url_bidx = ?, alias_url_bidx = ?
+    url_bidx = ?, alias_url_bidx = ?, name_bidx = ?
 WHERE id = ?;

@@ -114,6 +114,17 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 	ctx, cancelEntry := context.WithTimeout(context.WithoutCancel(passCtx), 90*time.Second)
 	defer cancelEntry()
 
+	// Opened ONCE, into the local copy, so the 28 places below that use the name
+	// are all correct without each having to remember. entry is a value, so this
+	// changes nothing in the database.
+	//
+	// It is not cosmetic. This name reaches an operator's activity log, the
+	// rotation alert email, and the delivery payload a consuming service
+	// receives, so leaving it as stored since 00040 would have shipped enc:v1:
+	// blobs to all three and made every rotation record unreadable at exactly the
+	// moment somebody needs to read it.
+	entry.Name = vaultHandler.EntryNamePlain(entry.Name)
+
 	defer func() {
 		if rec := recover(); rec != nil {
 			slog.Error("vault rotation: panic while rotating an entry; the sweep continues",

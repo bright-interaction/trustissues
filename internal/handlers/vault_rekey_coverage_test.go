@@ -415,8 +415,11 @@ var notKeyedColumns = map[string]string{
 	// deliberately NOT encrypted, and two of them are worth reading twice.
 	"vault_entries.id":      "surrogate key",
 	"vault_entries.user_id": "FK to users",
-	"vault_entries.name": "entry name, stored in cleartext; encrypting it behind a blind index is " +
-		"designed but deferred (see DEFERRED.md). A leaked backup reveals the inventory, not the secrets.",
+	// vault_entries.name is NOT here any more. It was exempted as "stored in
+	// cleartext; encrypting it behind a blind index is designed but deferred",
+	// and 00040 did it, so it is a registered surface in rekeySurfaces along with
+	// its name_bidx. If a future change drops either registration, this map is
+	// where the guard will tell you to put it back rather than here.
 	"vault_entries.encryption_version":     "derivation version for encrypted_value; rewritten with it by the sweep",
 	"vault_entries.rotation_interval_days": "integer policy",
 	"vault_entries.expires_at":             "timestamp",

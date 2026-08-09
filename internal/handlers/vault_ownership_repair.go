@@ -369,6 +369,10 @@ func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry,
 			&e.RecordedOwnerEmail); sErr != nil {
 			return nil, fmt.Errorf("scan entry with a recorded owner: %w", sErr)
 		}
+		// This report is read by an admin deciding who should own an orphaned
+		// entry, and the name is the only thing that tells them WHICH secret they
+		// are looking at. Encrypted at rest since 00040, so it is opened here.
+		e.Name = h.EntryNamePlain(e.Name)
 		e.CollectionID = collectionID.String
 		e.CreatedAt = createdAt.String
 		e.UpdatedAt = updatedAt.String
@@ -1041,7 +1045,19 @@ func (h *VaultHandler) reindexAfterCustodianChange(r *http.Request, entryID, new
 	scope := bidxScope(newCustodian, collectionID)
 	urlPlain := h.decryptColumnOrLog(meta.Url.String, "", vaultFieldURL)
 	aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", vaultFieldAliasURL)
+	// THE NAME INDEX IS RECOMPUTED HERE, not passed through, and this is the one
+	// caller where that distinction matters. The name index is keyed by the
+	// CUSTODIAN, and this function exists precisely because the custodian just
+	// changed. Carrying the stored token across would leave the departed
+	// custodian's namespace enforcing uniqueness on a row that now belongs to
+	// someone else's, so the new holder could not create an entry under a name
+	// they can plainly see is free, and two entries could collide under the old
+	// holder's. The move path next door does pass it through, correctly, because
+	// a move changes the collection and never the custodian.
+	namePlain := h.decryptColumnOrLog(meta.Name, "", vaultFieldName)
 	if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+		Name:         meta.Name,
+		NameBidx:     h.nameBlindIndex(newCustodian, namePlain),
 		Url:          meta.Url,
 		AliasUrl:     meta.AliasUrl,
 		Username:     meta.Username,

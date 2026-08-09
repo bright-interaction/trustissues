@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -312,8 +313,19 @@ func (h *CollectionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if len(sample) > 0 {
 		names := make([]string, len(sample))
 		for i, e := range sample {
+			// Decrypted: this line exists so an operator reading the activity log
+			// can see WHICH secrets a collection delete destroyed, and a list of
+			// enc:v1: blobs tells them nothing. The names are the point of the
+			// sample. vault is documented nil-safe on this handler, so the stored
+			// form is the fallback rather than a panic on the delete path.
 			names[i] = e.Name
+			if h.vault != nil {
+				names[i] = h.vault.EntryNamePlain(e.Name)
+			}
 		}
+		// Alphabetical, which the query used to provide and cannot any more. The
+		// log line is read by a human reconstructing what a delete destroyed.
+		sort.Strings(names)
 		if int64(len(sample)) < entryCount {
 			detail += fmt.Sprintf("; sample of %d: %v (+%d more not shown)", len(names), names, entryCount-int64(len(names)))
 		} else {

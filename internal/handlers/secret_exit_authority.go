@@ -382,6 +382,12 @@ func hostFromRawURL(raw string) string {
 type entrySecretSource interface {
 	OpenEntrySecret(ciphertext, nonce []byte, encVersion int,
 		o secretexit.Origin) (secretexit.Plaintext, error)
+	// EntryNamePlain opens vault_entries.name, which has been encrypted at rest
+	// since 00040. The capability bridge resolves a secret BY name and then
+	// writes that name into capability_log and into its own response, so it needs
+	// the cleartext for both and holds no vault key of its own. It goes through
+	// the ledger like every other opened column; see vaultFieldName.
+	EntryNamePlain(stored string) string
 }
 
 // SCOPE BOUNDARY, DERIVED RATHER THAN LISTED.

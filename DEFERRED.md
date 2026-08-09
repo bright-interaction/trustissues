@@ -262,7 +262,45 @@ ergonomics, they do not change the security floor.
 
 ## Encrypt `vault_entries.name` behind a blind index
 
-**Status:** designed, not implemented. Found in the round-6 audit (2026-07-28),
+**Status: SHIPPED 2026-08-10, migration 00040.** The design below is kept because
+it is still an accurate description of what the column was load-bearing for, but
+two of its steps were deliberately NOT followed and the reasons matter more than
+the plan did.
+
+**Divergence 1: no table rebuild.** The plan called for the 12-step rebuild of
+the table holding every secret, to swap `UNIQUE(user_id, name)` for
+`UNIQUE(user_id, name_bidx)`. That turned out to be unnecessary. The column
+crypto uses a fresh random nonce per seal, so two equal names encrypt to
+different ciphertext and the inline constraint simply stops firing: it becomes
+vacuous rather than wrong. A separate partial `CREATE UNIQUE INDEX ... WHERE
+name_bidx != ''` carries the real constraint, needs no rebuild, and the partial
+predicate is also what lets the boot backfill fill the column row by row without
+a window where writes are rejected.
+
+**Divergence 2: the index is keyed by USER, not by `bidxScope`.** The plan said
+to reuse `bidxScope(userID, collectionID)` "so the index cannot be correlated
+across users or collections". Following that would have silently changed the
+semantics: this index stands in for `UNIQUE(user_id, name)`, which is per
+CUSTODIAN whether or not the entry sits in a collection, so keying it per
+collection would have made a name legal in one collection and illegal in another
+for the same user. The user id is mixed into the HMAC input, so unlinkability
+across users is preserved without that cost.
+
+**What the plan missed**, both found by the tests rather than by review: the
+by-name capability lookup is raw SQL in `capability.go` (not a sqlc query, so a
+sweep of `internal/db/queries` does not see it), and the entry name is written
+into the rotation delivery payload, the rotation alert email, the collection
+delete log line and the ownership repair report, all of which would have shipped
+`enc:v1:` blobs to an operator or a consuming service.
+
+Remaining residual, unchanged from step 4 below: `capability_log.secret_name` and
+`service_secret_audit.secret_names` still hold cleartext copies. Both tables are
+append-only, so encrypting them would put key-derived material somewhere the
+rekey sweep is not permitted to UPDATE. See THREAT-MODEL.md.
+
+---
+
+*Original entry, for the record:* found in the round-6 audit (2026-07-28),
 confirmed against production.
 
 `name` is the one entry column still stored in cleartext. Every sibling

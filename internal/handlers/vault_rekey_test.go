@@ -132,9 +132,13 @@ func seedUnderKey(t *testing.T, h *VaultHandler, queries *db.Queries) seededStor
 	// egress_fixture_test.go: the fixture cannot skip the ticket, it can only be
 	// honest about acting as a principal who may redirect the secret.
 	if err := createVaultEntryFixture(t, queries, vaultegress.CreateEntryParams{
-		ID:             entryID,
-		UserID:         user.ID,
-		Name:           "prod api token",
+		ID:     entryID,
+		UserID: user.ID,
+		// Encrypted, with its index, exactly as the create path writes it. Seeding
+		// cleartext here would leave the rekey scanner nothing to convert, and the
+		// coverage guard would report the name surface as unreachable.
+		Name:           enc("prod api token"),
+		NameBidx:       h.nameBlindIndex(user.ID, "prod api token"),
 		EncryptedValue: ct,
 		Nonce:          nonce,
 		Url:            toNullString(enc(seedURL)),

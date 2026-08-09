@@ -54,7 +54,14 @@ SELECT COUNT(*) FROM vault_entries WHERE collection_id = ?;
 -- entries would otherwise write an unbounded blob into the one append-only
 -- trail this product has, and the exact count from CountCollectionEntries
 -- already sits beside the sample in the log line for anything past the cap.
-SELECT id, name FROM vault_entries WHERE collection_id = ? ORDER BY name ASC LIMIT ?;
+--
+-- ORDER BY id, not name. name is ciphertext since 00040, so ordering by it
+-- ordered by nonce: WHICH 25 of 30 entries got named in the permanent log was
+-- random per delete, and re-running the same delete would have named a different
+-- set. The caller sorts the DECRYPTED names before writing the line, so the log
+-- still reads alphabetically; only the choice of which rows fall inside the cap
+-- is made here, and it is now stable.
+SELECT id, name FROM vault_entries WHERE collection_id = ? ORDER BY id ASC LIMIT ?;
 
 -- ============================================================================
 -- Membership

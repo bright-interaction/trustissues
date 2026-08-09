@@ -314,8 +314,12 @@ func (h *VaultImportHandler) checkConflicts(ctx context.Context, userID string, 
 		slog.Error("failed to check existing entries", "error", err)
 		return conflicts
 	}
+	// Stored names are ciphertext since 00040, so the map is built from the
+	// DECRYPTED name. Comparing the import's cleartext against ciphertext would
+	// find no conflict ever, and the import would then hit the unique index and
+	// fail row by row instead of reporting the clash up front.
 	for _, name := range names {
-		existing[name] = true
+		existing[h.handler.decryptColumnOrLog(name, "", vaultFieldName)] = true
 	}
 
 	// Check for conflicts

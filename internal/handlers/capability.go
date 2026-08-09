@@ -947,9 +947,20 @@ const accessibleEntriesPredicate = `(
 // lookupSecretByDestination, two functions down, already refused its equivalent
 // ambiguity with a 409. This is the same rule applied to the other lookup.
 func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name string) (capabilityEntryRow, error) {
+	// THE NAME PREDICATE IS GONE FROM THE SQL, and it had to be. Since 00040 the
+	// column holds randomized ciphertext, so `AND name = ?` against the caller's
+	// cleartext matched nothing at all: every mint by name would have returned
+	// "no such secret" while the secret sat right there. The blind index that
+	// replaced equality is keyed per user, and this predicate deliberately spans
+	// users (personal entries plus every accepted collection), so there is no one
+	// token to ask for either.
+	//
+	// The REACHABILITY predicate is untouched, which is the part that authorises
+	// anything. The name is matched below, on the decrypted value, with the same
+	// byte equality SQL was doing.
 	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+` AND name = ?`,
-		userID, userID, userID, name)
+		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate,
+		userID, userID, userID)
 	if err != nil {
 		return capabilityEntryRow{}, err
 	}
@@ -959,6 +970,10 @@ func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name
 		var e capabilityEntryRow
 		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
 			return capabilityEntryRow{}, err
+		}
+		e.Name = h.vault.EntryNamePlain(e.Name)
+		if e.Name != name {
+			continue
 		}
 		matched = append(matched, e)
 	}
@@ -994,6 +1009,11 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 		}
 		patterns := parseDestinationPatterns(e.DestinationPatterns)
 		if destMatches(patterns, host, path) {
+			// This lookup does not match ON the name, but it RETURNS one, and the
+			// caller puts it in capability_log.secret_name and in the mint
+			// response. Leaving it as stored would write ciphertext into the audit
+			// trail an operator reads after a compromise.
+			e.Name = h.vault.EntryNamePlain(e.Name)
 			matched = append(matched, e)
 		}
 	}

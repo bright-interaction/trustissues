@@ -55,7 +55,7 @@ func TestDeleteCollectionRefusesStaleOrMissingEntryCount(t *testing.T) {
 	placeInCollection(t, queries, "entry-cas-1", "coll-cas")
 	placeInCollection(t, queries, "entry-cas-2", "coll-cas")
 
-	ch := &CollectionHandler{queries: queries}
+	ch := &CollectionHandler{queries: queries, vault: vh}
 	del := func(raw string) (int, string) {
 		w := httptest.NewRecorder()
 		ch.Delete(w, deleteCollectionRequest("coll-cas", boss, raw))
@@ -118,11 +118,11 @@ func TestDeleteCollectionRefusesStaleOrMissingEntryCount(t *testing.T) {
 // This also guards against a guard that is too broad: if the CAS check ran
 // even for an empty collection, this would fail.
 func TestDeleteCollectionAllowsEmptyCollectionWithNoConfirmation(t *testing.T) {
-	_, queries := newCollectionAuthzEnv(t)
+	vh, queries := newCollectionAuthzEnv(t)
 	boss := mustUser(t, queries, "delcas-empty@example.com", "user", "")
 	mustCollection(t, queries, "coll-empty", boss, map[string]string{boss: collRoleManager})
 
-	ch := &CollectionHandler{queries: queries}
+	ch := &CollectionHandler{queries: queries, vault: vh}
 	w := httptest.NewRecorder()
 	ch.Delete(w, deleteCollectionRequest("coll-empty", boss, ""))
 	if w.Code != http.StatusNoContent {
@@ -155,7 +155,7 @@ func TestDeleteCollectionLogsNamedDamage(t *testing.T) {
 		placeInCollection(t, queries, id, "coll-log")
 	}
 
-	ch := &CollectionHandler{queries: queries}
+	ch := &CollectionHandler{queries: queries, vault: vh}
 	w := httptest.NewRecorder()
 	ch.Delete(w, deleteCollectionRequest("coll-log", boss, "3"))
 	if w.Code != http.StatusNoContent {
@@ -208,7 +208,7 @@ func TestDeleteCollectionCapsLoggedEntrySample(t *testing.T) {
 		placeInCollection(t, queries, id, "coll-cap")
 	}
 
-	ch := &CollectionHandler{queries: queries}
+	ch := &CollectionHandler{queries: queries, vault: vh}
 	w := httptest.NewRecorder()
 	ch.Delete(w, deleteCollectionRequest("coll-cap", boss, fmt.Sprintf("%d", total)))
 	if w.Code != http.StatusNoContent {

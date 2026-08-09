@@ -54,7 +54,7 @@ func TestIssueRefusesAmbiguousSecretName(t *testing.T) {
 		}
 	}
 
-	capH := setupCapabilityHandler(t, h.db)
+	capH := setupCapabilityHandlerWithVault(t, h)
 	issue := func(userID, secret string) (int, string) {
 		body := `{"agent_id":"a","secret":"` + secret + `","destination":"api.stripe.com/v1/charges","method":"POST"}`
 		r := httptest.NewRequest(http.MethodPost, "/api/secrets/issue", strings.NewReader(body))
@@ -66,7 +66,7 @@ func TestIssueRefusesAmbiguousSecretName(t *testing.T) {
 
 	// Guard the setup: both entries must really be reachable by Carol, or the
 	// refusal below would be proving nothing.
-	ch := &CapabilityHandler{db: h.db}
+	ch := &CapabilityHandler{db: h.db, vault: h}
 	if _, err := ch.lookupSecretByName(ctx, colleague, "stripe"); err != nil {
 		t.Fatalf("ABORT: the colleague cannot even resolve the shared entry: %v", err)
 	}

@@ -39,8 +39,8 @@ func TestRenameConflictIsReportedNotSwallowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if meta.Name != "GCP" {
-		t.Errorf("name changed to %q despite the conflict", meta.Name)
+	if h.EntryNamePlain(meta.Name) != "GCP" {
+		t.Errorf("name changed to %q despite the conflict", h.EntryNamePlain(meta.Name))
 	}
 	// The other field in the same request must NOT have landed: a refused
 	// request has to be all-or-nothing, or the operator is left guessing which
@@ -65,8 +65,8 @@ func TestBlankNameIsRejectedOnUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if meta.Name != "Real name" {
-		t.Errorf("name was blanked to %q", meta.Name)
+	if h.EntryNamePlain(meta.Name) != "Real name" {
+		t.Errorf("name was blanked to %q", h.EntryNamePlain(meta.Name))
 	}
 }
 
@@ -119,8 +119,8 @@ func TestUndecryptableMetadataIsNotOverwritten(t *testing.T) {
 	if meta.Notes.String != string(body) {
 		t.Error("the still-recoverable ciphertext was overwritten; it is unrecoverable now even with the correct key")
 	}
-	if meta.Name != "Damaged" {
-		t.Errorf("the refused request still applied the rename: name = %q", meta.Name)
+	if h.EntryNamePlain(meta.Name) != "Damaged" {
+		t.Errorf("the refused request still applied the rename: name = %q", h.EntryNamePlain(meta.Name))
 	}
 }
 

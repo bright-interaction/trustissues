@@ -92,16 +92,20 @@ the key ever sit in the same place, you have defeated the encryption.
   hash (migration 00030), matching how `api_keys` and `service_identities` have
   always stored their bearer credentials. Any pending invite that predates that
   migration was expired, because its code is already sitting in older backups.
-- **The entry NAME is stored in cleartext, and so is the inventory it implies.**
-  `vault_entries.name` carries the `UNIQUE(user_id, name)` constraint, the
-  by-name capability lookup and every `ORDER BY name`, so it is not encrypted
-  today. A leaked `.db` therefore does reveal the list of services the team keeps
-  entries for ("AWS root account", "Klarna prod DB", and any customer name an
-  operator puts in a title), even though no value decrypts. The same strings are
-  mirrored into `activity_log.detail`, `capability_log.secret_name` and
-  `service_identities.allowed_secrets`. Treat a backup as revealing WHAT you
-  hold, never the secrets themselves. Encrypting it behind a blind index is
-  designed and deferred, see DEFERRED.md.
+- **The entry NAME is encrypted at rest (migration 00040), but three mirrors of
+  it are not.** `vault_entries.name` is now stored as `enc:v1:` ciphertext like
+  every sibling metadata column, with per-user uniqueness carried by a keyed
+  blind index (`name_bidx`) that is unlinkable across users. A leaked `.db` no
+  longer reveals the entry inventory from that table.
+
+  What a leaked `.db` still reveals: the same strings are mirrored, in cleartext,
+  into `activity_log.detail`, `capability_log.secret_name` and
+  `service_secret_audit.secret_names`. Those are append-only audit tables (00003,
+  00039), so they cannot be rewritten in place, and encrypting them going forward
+  would put a key-derived value into a table the rekey sweep is forbidden to
+  UPDATE. That trade has not been made yet, so the honest statement is: the live
+  inventory is protected, the audit history of it is not. Treat a backup as
+  revealing WHAT you have USED, never the secrets themselves.
 - **URL matching for the browser extension uses a keyed blind index, not the
   plaintext URL.** So the extension can ask "do we have an entry for this
   domain?" without the server storing the URL in the clear. The blind index

@@ -95,10 +95,19 @@ func mustEntry(t *testing.T, h *VaultHandler, queries *db.Queries, id, ownerID, 
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
+	// The name is stored the way the real create path stores it: encrypted, with
+	// the keyed index beside it. A fixture that wrote cleartext and left
+	// name_bidx empty produced rows sitting OUTSIDE the partial unique index, so
+	// every duplicate-name test would pass by not being constrained at all.
+	encName, err := h.encryptColumn(name)
+	if err != nil {
+		t.Fatalf("encrypt name: %v", err)
+	}
 	if err := createVaultEntryFixture(t, queries, vaultegress.CreateEntryParams{
 		ID:             id,
 		UserID:         ownerID,
-		Name:           name,
+		Name:           encName,
+		NameBidx:       h.nameBlindIndex(ownerID, name),
 		EncryptedValue: ct,
 		Nonce:          nonce,
 	}); err != nil {
@@ -547,4 +556,20 @@ func TestManualRotateProviderFailureLeavesSecretIntact(t *testing.T) {
 	if len(logEntries) == 0 || logEntries[len(logEntries)-1].Status != "error" {
 		t.Fatalf("rotation_log does not end with an error entry: %+v", logEntries)
 	}
+}
+
+// entryNamePlain reads an entry's name back the way a caller sees it. The column
+// is ciphertext since 00040, so a test that compared queries.GetVaultEntryName
+// to a literal would fail on every rename whether or not the rename worked.
+func entryNamePlain(t *testing.T, h *VaultHandler, queries *db.Queries, entryID string) string {
+	t.Helper()
+	stored, err := queries.GetVaultEntryName(context.Background(), entryID)
+	if err != nil {
+		t.Fatalf("read name for %s: %v", entryID, err)
+	}
+	plain, err := h.decryptColumn(stored, vaultFieldName)
+	if err != nil {
+		t.Fatalf("decrypt name for %s: %v", entryID, err)
+	}
+	return plain
 }

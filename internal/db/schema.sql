@@ -159,6 +159,10 @@ CREATE TABLE vault_entries (
   injection_spec TEXT NOT NULL DEFAULT '{}',
   url_bidx TEXT NOT NULL DEFAULT '',
   alias_url_bidx TEXT NOT NULL DEFAULT '',
+  -- 00040_vault_entry_name_at_rest.sql. name is encrypted at rest like the other
+  -- metadata columns; this keyed HMAC carries the per-user uniqueness the inline
+  -- UNIQUE(user_id, name) below can no longer enforce over randomized ciphertext.
+  name_bidx TEXT NOT NULL DEFAULT '',
   collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
   custom_fields TEXT NOT NULL DEFAULT '[]',
   -- 00034_secret_owner.sql. user_id is the CUSTODIAN (uniqueness scope, listing,
@@ -172,6 +176,8 @@ CREATE TABLE vault_entries (
   UNIQUE(user_id, name)
 );
 
+CREATE UNIQUE INDEX idx_vault_entries_user_name_bidx
+  ON vault_entries(user_id, name_bidx) WHERE name_bidx != '';
 CREATE INDEX idx_vault_entries_url ON vault_entries(url) WHERE url != '';
 CREATE INDEX idx_vault_entries_user ON vault_entries(user_id);
 CREATE INDEX idx_vault_entries_collection ON vault_entries(collection_id) WHERE collection_id IS NOT NULL;
