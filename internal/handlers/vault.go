@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -210,6 +211,65 @@ func blindIndexWith(key [32]byte, scope, raw string) string {
 	mac := hmac.New(sha256.New, key[:])
 	fmt.Fprintf(mac, "%d:%s|%s", len(scope), scope, host)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// nameBlindIndex derives the keyed lookup value for an entry NAME within one
+// user's namespace. It is what enforces per-user name uniqueness now that the
+// name column holds randomized ciphertext that no SQL constraint can compare.
+//
+// Scoped by USER and not by bidxScope, deliberately. The url index is keyed per
+// scope so a shared collection still autofills for every member; this one stands
+// in for UNIQUE(user_id, name), where user_id is the CUSTODIAN (00034) and the
+// constraint is per user whether or not the entry sits in a collection. Keying
+// it by collection would quietly change which renames are legal.
+//
+// THE NAME IS NOT NORMALIZED, and that is a decision rather than an omission.
+// SQLite's default BINARY collation made the old constraint byte-exact, so
+// "GitHub" and "github" are two legal entries today. Case-folding here would
+// make them collide, which turns an upgrade into a backfill that cannot complete
+// on a database that is currently valid. Same reasoning for whitespace.
+func (h *VaultHandler) nameBlindIndex(userID, name string) string {
+	return nameBlindIndexWith(h.bidxKey, userID, name)
+}
+
+// EntryNamePlain opens a stored vault_entries.name. It exists so callers that
+// hold no vault key (the capability bridge) can still resolve and log an entry's
+// name without a second decryption door being opened next to them.
+func (h *VaultHandler) EntryNamePlain(stored string) string {
+	return h.decryptColumnOrLog(stored, "", vaultFieldName)
+}
+
+func nameBlindIndexWith(key [32]byte, userID, name string) string {
+	if userID == "" || name == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, key[:])
+	// Domain-separated from the url index by the leading tag, and
+	// length-prefixed on the user id for the same reason blindIndexWith is: a
+	// crafted id must not be able to collide with another user's by shifting the
+	// separator.
+	fmt.Fprintf(mac, "name:v1|%d:%s|%s", len(userID), userID, name)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// nameBlindIndexCandidates returns every index value that could legitimately be
+// stored for this name, current key first, then the previous key's while a
+// rotation is in flight. Same reason as urlBlindIndexCandidates: an index
+// computed under the old key does not match the new key's value and nothing
+// errors, so a lookup that only asked the current key would report a name as
+// free and let a duplicate through.
+func (h *VaultHandler) nameBlindIndexCandidates(userID, name string) []string {
+	cur := h.nameBlindIndex(userID, name)
+	out := []string{}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	if h.previous != nil {
+		if prev := nameBlindIndexWith(h.previous.bidx, userID, name); prev != "" && prev != cur {
+			out = append(out, prev)
+		}
+	}
+	return out
 }
 
 // urlBlindIndexCandidates returns every index value that could legitimately be
@@ -512,7 +572,8 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			metaColumnNeedsEncrypt(row.AliasUrl.String) ||
 			metaColumnNeedsEncrypt(row.Username.String) ||
 			metaColumnNeedsEncrypt(row.Category.String) ||
-			metaColumnNeedsEncrypt(row.Notes.String)
+			metaColumnNeedsEncrypt(row.Notes.String) ||
+			metaColumnNeedsEncrypt(row.Name)
 
 		// Recover the cleartext host to (re)compute the blind index. decryptColumn
 		// is idempotent on cleartext, so this works whether the column is still
@@ -527,10 +588,20 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			slog.Error("vault: metadata backfill alias_url decrypt failed", "id", row.ID, "error", derr)
 			continue
 		}
+		// The name index is keyed by the CUSTODIAN alone, not by bidxScope: it
+		// stands in for UNIQUE(user_id, name), which is a per-user constraint
+		// regardless of which collection the entry sits in.
+		namePlain, derr := h.decryptColumn(row.Name, vaultFieldName)
+		if derr != nil {
+			slog.Error("vault: metadata backfill name decrypt failed", "id", row.ID, "error", derr)
+			continue
+		}
 		scope := bidxScope(row.UserID, row.CollectionID)
 		wantURLBidx := h.urlBlindIndex(scope, urlPlain)
 		wantAliasBidx := h.urlBlindIndex(scope, aliasPlain)
-		needsBidx := wantURLBidx != row.UrlBidx || wantAliasBidx != row.AliasUrlBidx
+		wantNameBidx := h.nameBlindIndex(row.UserID, namePlain)
+		needsBidx := wantURLBidx != row.UrlBidx || wantAliasBidx != row.AliasUrlBidx ||
+			wantNameBidx != row.NameBidx
 
 		if !needsMeta && !needsBidx {
 			continue
@@ -547,7 +618,12 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 		if encErr != nil {
 			return updated, fmt.Errorf("encrypt metadata for %s: %w", row.ID, encErr)
 		}
+		encName, encErr := h.encryptColumnIfNeeded(row.Name)
+		if encErr != nil {
+			return updated, fmt.Errorf("encrypt name for %s: %w", row.ID, encErr)
+		}
 		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+			Name:         encName,
 			Url:          toNullString(encURL),
 			AliasUrl:     toNullString(encAlias),
 			Username:     toNullString(encUser),
@@ -555,6 +631,7 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			Notes:        toNullString(encNotes),
 			UrlBidx:      wantURLBidx,
 			AliasUrlBidx: wantAliasBidx,
+			NameBidx:     wantNameBidx,
 			ID:           row.ID,
 		}); err != nil {
 			return updated, fmt.Errorf("persist metadata for %s: %w", row.ID, err)
@@ -657,7 +734,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 		// merges the response into its cache moved every shared entry back to
 		// "Personal" on save until it re-read the whole vault.
 		CollectionID:         nullStringPtr(row.CollectionID),
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -685,7 +762,7 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -709,7 +786,7 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -732,7 +809,7 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) vaultEntryMeta {
 	return vaultEntryMeta{
 		ID:                   row.ID,
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -759,7 +836,7 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		ID:                   row.ID,
 		UserID:               row.UserID,
 		CollectionID:         nullStringPtr(row.CollectionID),
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -794,7 +871,7 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		CollectionID:         nullStringPtr(row.CollectionID),
-		Name:                 row.Name,
+		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 		URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 		AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 		Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -1245,7 +1322,30 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Alphabetical by name, which every one of these queries used to get from
+	// ORDER BY name. Since 00040 that column is ciphertext, so ordering it in
+	// SQLite orders by nonce: the list came back in a different random order on
+	// every request, which reads as corruption rather than as a missing sort. The
+	// queries now order by id for determinism and the human-facing order is
+	// applied here, on the decrypted name, once for all three branches.
+	sortEntriesByName(entries)
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// sortEntriesByName orders entries the way the SQL used to, case-insensitively
+// first so "aws" and "AWS" sit together, then by the raw name and finally by id
+// so the order is total and stable across requests.
+func sortEntriesByName(entries []vaultEntryMeta) {
+	sort.Slice(entries, func(i, j int) bool {
+		li, lj := strings.ToLower(entries[i].Name), strings.ToLower(entries[j].Name)
+		if li != lj {
+			return li < lj
+		}
+		if entries[i].Name != entries[j].Name {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries[i].ID < entries[j].ID
+	})
 }
 
 // Create handles POST /api/vault and creates a new vault entry with an encrypted value.
@@ -1356,6 +1456,12 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	encName, err := h.encryptColumn(req.Name)
+	if err != nil {
+		logError(r, "vault.create: name encrypt failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	entryScope := bidxScope(userID, collectionID)
 	urlBidx := h.urlBlindIndex(entryScope, req.URL)
 	aliasBidx := h.urlBlindIndex(entryScope, req.AliasURL)
@@ -1392,7 +1498,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// same value here and diverge only if a collection manager later adopts
 		// the entry, which moves the custodian and not the authority.
 		SecretOwnerUserID:    userID,
-		Name:                 req.Name,
+		Name:                 encName,
 		EncryptedValue:       encrypted,
 		Nonce:                nonce,
 		Url:                  toNullString(encURL),
@@ -1408,6 +1514,11 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		AutoRotate:           sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},
 		UrlBidx:              urlBidx,
 		AliasUrlBidx:         aliasBidx,
+		// Keyed under the creator, who is the custodian at creation time. This is
+		// what the UNIQUE index actually constrains; the inline UNIQUE(user_id,
+		// name) the error below is caught from can no longer fire, because Name is
+		// now randomized ciphertext.
+		NameBidx: h.nameBlindIndex(userID, req.Name),
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -1542,6 +1653,11 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		urlPlain := h.decryptColumnOrLog(meta.Url.String, "", vaultFieldURL)
 		aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", vaultFieldAliasURL)
 		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+			// Passed through untouched. A move changes the collection, not the
+			// custodian, so the name and its user-keyed index are unaffected;
+			// leaving these at their zero value would blank the entry's name.
+			Name:         meta.Name,
+			NameBidx:     meta.NameBidx,
 			Url:          meta.Url,
 			AliasUrl:     meta.AliasUrl,
 			Username:     meta.Username,
@@ -1555,7 +1671,8 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	name, nameErr := h.queries.GetVaultEntryName(ctx, id)
+	storedName, nameErr := h.queries.GetVaultEntryName(ctx, id)
+	name := h.EntryNamePlain(storedName)
 	if nameErr != nil {
 		name = "(unknown)"
 	}
@@ -2078,7 +2195,11 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ownerID := access.UserID
-		currentName, nameErr := qtx.GetVaultEntryName(ctx, id)
+		storedName, nameErr := qtx.GetVaultEntryName(ctx, id)
+		// Stored is ciphertext since 00040. Comparing the caller's cleartext to it
+		// would find every rename to be a change, including a no-op one, and would
+		// then rewrite the row (and its index) on every save.
+		currentName := h.decryptColumnOrLog(storedName, "", vaultFieldName)
 		if nameErr != nil {
 			logError(r, "vault.update: current-name lookup for rename failed", "entry", id, "error", nameErr)
 			writeInternalError(w, r, "internal server error")
@@ -2087,7 +2208,19 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if newName != currentName {
 			switch {
 			case middleware.IsAdmin(ctx) || userID == ownerID:
-				if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{Name: newName, ID: id}); err != nil {
+				// The name stays in the OWNER's namespace on an ordinary rename, so
+				// the index is derived under ownerID rather than under whoever is
+				// making the call: an admin renaming somebody else's entry must not
+				// move it into their own namespace.
+				encName, encErr := h.encryptColumn(newName)
+				if encErr != nil {
+					logError(r, "vault.update: encrypt name failed", "error", encErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{
+					Name: encName, NameBidx: h.nameBlindIndex(ownerID, newName), ID: id,
+				}); err != nil {
 					if strings.Contains(err.Error(), "UNIQUE constraint") {
 						writeConflict(w, r, "a vault entry with that name already exists")
 						return
@@ -2097,8 +2230,19 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case h.managerMayAdoptOrphanedEntry(ctx, userID, ownerID, access.CollectionID):
+				// Adoption moves the custodian, so the index moves with it: derived
+				// under the ADOPTER's id, which is what puts the uniqueness question
+				// in their namespace. Deriving it under ownerID here would keep
+				// enforcing the departed owner's namespace on a row they no longer
+				// hold.
+				encName, encErr := h.encryptColumn(newName)
+				if encErr != nil {
+					logError(r, "vault.update: encrypt name failed", "error", encErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
 				if err := qtx.AdoptAndRenameVaultEntry(ctx, db.AdoptAndRenameVaultEntryParams{
-					UserID: userID, Name: newName, ID: id,
+					UserID: userID, Name: encName, NameBidx: h.nameBlindIndex(userID, newName), ID: id,
 				}); err != nil {
 					if strings.Contains(err.Error(), "UNIQUE constraint") {
 						// The conflict is inside the manager's OWN namespace, so
@@ -2522,7 +2666,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 			vaultEntryMeta: vaultEntryMeta{
 				ID:                   row.ID,
 				CollectionID:         nullStringPtr(row.CollectionID),
-				Name:                 row.Name,
+				Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
 				URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
 				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
 				Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
@@ -3033,8 +3177,11 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	targets := ParseRotationTargets(rawTargets)
 
 	rec := rotationRecord{
-		EntryID:     id,
-		EntryName:   meta.Name,
+		EntryID: id,
+		// Opened, like the scheduled path does. This name goes into the activity
+		// log, the alert email and the delivery payload the consuming service
+		// receives; stored form would be an enc:v1: blob in all three.
+		EntryName:   h.EntryNamePlain(meta.Name),
 		Provider:    providerName,
 		Method:      rotationMethod,
 		UserID:      userID,

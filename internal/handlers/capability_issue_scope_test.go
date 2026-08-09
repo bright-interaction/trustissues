@@ -57,7 +57,7 @@ func TestIssueIsCollectionScoped(t *testing.T) {
 		t.Fatalf("seed ceiling: %v", err)
 	}
 
-	capH := setupCapabilityHandler(t, h.db)
+	capH := setupCapabilityHandlerWithVault(t, h)
 
 	// NOTE: the request field is "secret", not "name". An earlier version of this
 	// test sent "name", which json silently ignored, so every request resolved

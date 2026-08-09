@@ -78,8 +78,8 @@ func TestUpdateDoesNotResetTheRotationClockOnAnUnchangedValue(t *testing.T) {
 		t.Fatalf("re-submitting the SAME secret reset the rotation clock: %v -> %v (an overdue rotation would silently stop being due)",
 			before.LastRotatedAt.Time, after.LastRotatedAt.Time)
 	}
-	if after.Name != "Prod DB renamed" {
-		t.Fatalf("the metadata edit itself did not apply: name = %q", after.Name)
+	if got := h.EntryNamePlain(after.Name); got != "Prod DB renamed" {
+		t.Fatalf("the metadata edit itself did not apply: name = %q", got)
 	}
 
 	// A genuine value change SHOULD stamp it, or manual rotation stops working.

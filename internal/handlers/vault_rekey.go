@@ -145,6 +145,8 @@ type keyedSurface struct {
 var rekeySurfaces = []keyedSurface{
 	{Table: "vault_entries", Column: "encrypted_value", NonceColumn: "nonce", Family: familyVaultValue,
 		Why: "the secret itself"},
+	{Table: "vault_entries", Column: "name", Family: familyVaultColumn, Field: vaultFieldName,
+		Why: "the operator's label for the entry, the column that describes it best"},
 	{Table: "vault_entries", Column: "url", Family: familyVaultColumn, Field: vaultFieldURL,
 		Why: "which site a credential belongs to"},
 	{Table: "vault_entries", Column: "alias_url", Family: familyVaultColumn, Field: vaultFieldAliasURL,
@@ -165,6 +167,9 @@ var rekeySurfaces = []keyedSurface{
 		Why: "autofill lookup token; a stale one matches nothing and reports no error"},
 	{Table: "vault_entries", Column: "alias_url_bidx", Family: familyBlindIndex,
 		Why: "same, for the alias host"},
+	{Table: "vault_entries", Column: "name_bidx", Family: familyBlindIndex,
+		Why: "per-user name uniqueness token; a stale one stops colliding, so a rotation that " +
+			"skipped it would let two entries share a name and neither would be reported"},
 	{Table: "invitations", Column: "code", Family: familyVaultColumn, Field: vaultFieldRekeyInvitationCode,
 		Why: "the pending invite code, kept recoverable so it can be re-sent"},
 	{Table: "users", Column: "totp_secret", Family: familyColumnCrypto, Field: vaultFieldTOTPSecret,
@@ -947,6 +952,7 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 			field  vaultfield.Field
 		}
 		cols := []metaCol{
+			{"name", row.Name, vaultFieldName},
 			{"url", nullStringToString(row.Url), vaultFieldURL},
 			{"alias_url", nullStringToString(row.AliasUrl), vaultFieldAliasURL},
 			{"username", nullStringToString(row.Username), vaultFieldUsername},
@@ -994,6 +1000,19 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		sc.record(sc.surface("vault_entries", "url_bidx", ""), urlBidxAge, "vault_entries", "url_bidx", "", row.ID)
 		sc.record(sc.surface("vault_entries", "alias_url_bidx", ""), aliasBidxAge, "vault_entries", "alias_url_bidx", "", row.ID)
 
+		// The name index, on the same rule and for the same reason, but keyed by
+		// the CUSTODIAN rather than by bidxScope: it stands in for UNIQUE(user_id,
+		// name), which is per user whether or not the entry is in a collection.
+		// A stale one is quieter than a stale url index, because it does not merely
+		// stop matching a lookup: it stops COLLIDING, so two entries silently share
+		// a name and the constraint that was supposed to prevent it reports nothing.
+		wantNameBidx := h.nameBlindIndex(row.UserID, plains["name"])
+		nameBidxAge := h.classifyBlindIndex(row.NameBidx, wantNameBidx, row.UserID, plains["name"])
+		if nameBidxAge == keyAgePrevious || nameBidxAge == keyAgeStale {
+			needsWrite = true
+		}
+		sc.record(sc.surface("vault_entries", "name_bidx", ""), nameBidxAge, "vault_entries", "name_bidx", "", row.ID)
+
 		if !needsWrite {
 			continue
 		}
@@ -1026,8 +1045,10 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 			ProviderMeta:      toNullString(newCols["provider_meta"]),
 			RotationTargets:   toNullString(newCols["rotation_targets"]),
 			CustomFields:      newCols["custom_fields"],
+			Name:              newCols["name"],
 			UrlBidx:           wantURLBidx,
 			AliasUrlBidx:      wantAliasBidx,
+			NameBidx:          wantNameBidx,
 			ID:                row.ID,
 		}})
 	}

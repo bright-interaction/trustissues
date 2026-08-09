@@ -11,13 +11,14 @@ import (
 )
 
 const adoptAndRenameVaultEntry = `-- name: AdoptAndRenameVaultEntry :exec
-UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET user_id = ?, name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type AdoptAndRenameVaultEntryParams struct {
-	UserID string `json:"user_id"`
-	Name   string `json:"name"`
-	ID     string `json:"id"`
+	UserID   string `json:"user_id"`
+	Name     string `json:"name"`
+	NameBidx string `json:"name_bidx"`
+	ID       string `json:"id"`
 }
 
 // Rename an ORPHANED shared entry and take ownership of it in one statement.
@@ -41,8 +42,19 @@ type AdoptAndRenameVaultEntryParams struct {
 // question into the renamer's namespace, which is a NAMESPACE concern. Whose
 // authority governs the plaintext is a different question and lives in a
 // different column, which only internal/vaultegress can write.
+//
+// name_bidx is written here too, and it MUST be derived under the NEW user_id.
+// The index is keyed by the custodian, so an adoption that carried the old
+// owner's token across would enforce the departing owner's namespace on a row
+// that now lives in the adopter's, which is the opposite of what this statement
+// exists to do.
 func (q *Queries) AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error {
-	_, err := q.db.ExecContext(ctx, adoptAndRenameVaultEntry, arg.UserID, arg.Name, arg.ID)
+	_, err := q.db.ExecContext(ctx, adoptAndRenameVaultEntry,
+		arg.UserID,
+		arg.Name,
+		arg.NameBidx,
+		arg.ID,
+	)
 	return err
 }
 
@@ -319,7 +331,7 @@ func (q *Queries) GetVaultEntryForRotation(ctx context.Context, id string) (GetV
 
 const getVaultEntryMeta = `-- name: GetVaultEntryMeta :one
 
-SELECT id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
+SELECT id, collection_id, name, name_bidx, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?
 `
 
@@ -327,6 +339,7 @@ type GetVaultEntryMetaRow struct {
 	ID                   string         `json:"id"`
 	CollectionID         sql.NullString `json:"collection_id"`
 	Name                 string         `json:"name"`
+	NameBidx             string         `json:"name_bidx"`
 	Url                  sql.NullString `json:"url"`
 	AliasUrl             sql.NullString `json:"alias_url"`
 	Username             sql.NullString `json:"username"`
@@ -355,6 +368,13 @@ type GetVaultEntryMetaRow struct {
 // actually in. Clients that merge a write response into a cached entry then
 // moved every shared entry back to "Personal" on save. Adding a column to this
 // projection is cheap; the clients working around its absence was not.
+//
+// name_bidx joins the projection for the same reason: the two callers that
+// rewrite the scope-keyed indexes after a move pass every OTHER column of this
+// row straight back into UpdateVaultEntryMetaAtRest unchanged, and a column they
+// cannot read is a column they would write as empty. A move changes
+// collection_id, never user_id, so the name index is genuinely unchanged and
+// passing it through is the correct thing rather than merely the safe one.
 func (q *Queries) GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error) {
 	row := q.db.QueryRowContext(ctx, getVaultEntryMeta, id)
 	var i GetVaultEntryMetaRow
@@ -362,6 +382,7 @@ func (q *Queries) GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEnt
 		&i.ID,
 		&i.CollectionID,
 		&i.Name,
+		&i.NameBidx,
 		&i.Url,
 		&i.AliasUrl,
 		&i.Username,
@@ -437,8 +458,8 @@ func (q *Queries) GetVaultEntryTargets(ctx context.Context, id string) (sql.Null
 
 const importVaultEntry = `-- name: ImportVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, name_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'))
 `
 
 type ImportVaultEntryParams struct {
@@ -453,6 +474,7 @@ type ImportVaultEntryParams struct {
 	Category          sql.NullString `json:"category"`
 	Notes             sql.NullString `json:"notes"`
 	UrlBidx           string         `json:"url_bidx"`
+	NameBidx          string         `json:"name_bidx"`
 }
 
 // ============================================================================
@@ -479,6 +501,7 @@ func (q *Queries) ImportVaultEntry(ctx context.Context, arg ImportVaultEntryPara
 		arg.Category,
 		arg.Notes,
 		arg.UrlBidx,
+		arg.NameBidx,
 	)
 	return err
 }
@@ -486,7 +509,7 @@ func (q *Queries) ImportVaultEntry(ctx context.Context, arg ImportVaultEntryPara
 const listAllVaultEntries = `-- name: ListAllVaultEntries :many
 
 SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries ORDER BY name ASC
+FROM vault_entries ORDER BY id ASC
 `
 
 type ListAllVaultEntriesRow struct {
@@ -637,7 +660,7 @@ func (q *Queries) ListCollectionVaultEntriesForUser(ctx context.Context, userID 
 
 const listProviderEntries = `-- name: ListProviderEntries :many
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
-FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC
+FROM vault_entries WHERE provider != '' ORDER BY provider ASC, id ASC
 `
 
 type ListProviderEntriesRow struct {
@@ -657,6 +680,9 @@ type ListProviderEntriesRow struct {
 	UpdatedAt            sql.NullTime   `json:"updated_at"`
 }
 
+// ORDER BY id, not name: name is ciphertext since 00040 and sorting it would
+// order rows by nonce, which is random. Callers that present entries to a human
+// sort by the DECRYPTED name in Go (sortEntriesByName).
 func (q *Queries) ListProviderEntries(ctx context.Context) ([]ListProviderEntriesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listProviderEntries)
 	if err != nil {
@@ -697,7 +723,7 @@ func (q *Queries) ListProviderEntries(ctx context.Context) ([]ListProviderEntrie
 
 const listVaultEntriesByUser = `-- name: ListVaultEntriesByUser :many
 SELECT id, user_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? ORDER BY name ASC
+FROM vault_entries WHERE user_id = ? ORDER BY id ASC
 `
 
 type ListVaultEntriesByUserRow struct {
@@ -765,13 +791,14 @@ func (q *Queries) ListVaultEntriesByUser(ctx context.Context, userID string) ([]
 
 const listVaultEntriesForMetaAtRestBackfill = `-- name: ListVaultEntriesForMetaAtRestBackfill :many
 
-SELECT id, user_id, collection_id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries
+SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, url_bidx, alias_url_bidx, name_bidx FROM vault_entries
 `
 
 type ListVaultEntriesForMetaAtRestBackfillRow struct {
 	ID           string         `json:"id"`
 	UserID       string         `json:"user_id"`
 	CollectionID sql.NullString `json:"collection_id"`
+	Name         string         `json:"name"`
 	Url          sql.NullString `json:"url"`
 	AliasUrl     sql.NullString `json:"alias_url"`
 	Username     sql.NullString `json:"username"`
@@ -779,6 +806,7 @@ type ListVaultEntriesForMetaAtRestBackfillRow struct {
 	Notes        sql.NullString `json:"notes"`
 	UrlBidx      string         `json:"url_bidx"`
 	AliasUrlBidx string         `json:"alias_url_bidx"`
+	NameBidx     string         `json:"name_bidx"`
 }
 
 // ============================================================================
@@ -788,7 +816,8 @@ type ListVaultEntriesForMetaAtRestBackfillRow struct {
 // ============================================================================
 // user_id and collection_id are needed because the URL blind index is keyed per
 // SCOPE (personal vs a specific collection), so recomputing it requires knowing
-// which scope the row currently lives in.
+// which scope the row currently lives in. name and name_bidx joined them in
+// 00040: the name index is keyed by user_id alone, which user_id already covers.
 func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error) {
 	rows, err := q.db.QueryContext(ctx, listVaultEntriesForMetaAtRestBackfill)
 	if err != nil {
@@ -802,6 +831,7 @@ func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]
 			&i.ID,
 			&i.UserID,
 			&i.CollectionID,
+			&i.Name,
 			&i.Url,
 			&i.AliasUrl,
 			&i.Username,
@@ -809,6 +839,7 @@ func (q *Queries) ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]
 			&i.Notes,
 			&i.UrlBidx,
 			&i.AliasUrlBidx,
+			&i.NameBidx,
 		); err != nil {
 			return nil, err
 		}
@@ -873,9 +904,9 @@ func (q *Queries) ListVaultEntriesForMetaBackfill(ctx context.Context) ([]ListVa
 const listVaultEntriesForRekey = `-- name: ListVaultEntriesForRekey :many
 
 SELECT id, user_id, collection_id, encrypted_value, nonce, encryption_version,
-       url, alias_url, username, category, notes,
+       name, url, alias_url, username, category, notes,
        provider, provider_meta, rotation_targets, custom_fields,
-       url_bidx, alias_url_bidx
+       url_bidx, alias_url_bidx, name_bidx
 FROM vault_entries
 ORDER BY id
 `
@@ -887,6 +918,7 @@ type ListVaultEntriesForRekeyRow struct {
 	EncryptedValue    []byte         `json:"encrypted_value"`
 	Nonce             []byte         `json:"nonce"`
 	EncryptionVersion sql.NullInt64  `json:"encryption_version"`
+	Name              string         `json:"name"`
 	Url               sql.NullString `json:"url"`
 	AliasUrl          sql.NullString `json:"alias_url"`
 	Username          sql.NullString `json:"username"`
@@ -898,6 +930,7 @@ type ListVaultEntriesForRekeyRow struct {
 	CustomFields      string         `json:"custom_fields"`
 	UrlBidx           string         `json:"url_bidx"`
 	AliasUrlBidx      string         `json:"alias_url_bidx"`
+	NameBidx          string         `json:"name_bidx"`
 }
 
 // ============================================================================
@@ -940,6 +973,7 @@ func (q *Queries) ListVaultEntriesForRekey(ctx context.Context) ([]ListVaultEntr
 			&i.EncryptedValue,
 			&i.Nonce,
 			&i.EncryptionVersion,
+			&i.Name,
 			&i.Url,
 			&i.AliasUrl,
 			&i.Username,
@@ -951,6 +985,7 @@ func (q *Queries) ListVaultEntriesForRekey(ctx context.Context) ([]ListVaultEntr
 			&i.CustomFields,
 			&i.UrlBidx,
 			&i.AliasUrlBidx,
+			&i.NameBidx,
 		); err != nil {
 			return nil, err
 		}
@@ -1164,7 +1199,7 @@ func (q *Queries) ListVaultEntriesWithNoRecordedOwner(ctx context.Context) ([]Li
 
 const listVaultEntriesWithSecrets = `-- name: ListVaultEntriesWithSecrets :many
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at, encrypted_value, nonce
-FROM vault_entries WHERE user_id = ? ORDER BY name ASC
+FROM vault_entries WHERE user_id = ? ORDER BY id ASC
 `
 
 type ListVaultEntriesWithSecretsRow struct {
@@ -1306,7 +1341,7 @@ func (q *Queries) ListVaultEntryTargetsInCollection(ctx context.Context, collect
 const matchVaultEntriesByURL = `-- name: MatchVaultEntriesByURL :many
 
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY name ASC
+FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY id ASC
 `
 
 type MatchVaultEntriesByURLParams struct {
@@ -1421,14 +1456,14 @@ func (q *Queries) RenameVaultEntry(ctx context.Context, arg RenameVaultEntryPara
 
 const resolveVaultReference = `-- name: ResolveVaultReference :many
 
-SELECT id, user_id, collection_id, encrypted_value, nonce FROM vault_entries
-WHERE vault_entries.name = ?
+SELECT id, user_id, collection_id, name, encrypted_value, nonce FROM vault_entries
 `
 
 type ResolveVaultReferenceRow struct {
 	ID             string         `json:"id"`
 	UserID         string         `json:"user_id"`
 	CollectionID   sql.NullString `json:"collection_id"`
+	Name           string         `json:"name"`
 	EncryptedValue []byte         `json:"encrypted_value"`
 	Nonce          []byte         `json:"nonce"`
 }
@@ -1446,8 +1481,20 @@ type ResolveVaultReferenceRow struct {
 //
 // :many, not :one, so an ambiguous name is refused by the caller instead of
 // SQLite silently picking a row.
-func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]ResolveVaultReferenceRow, error) {
-	rows, err := q.db.QueryContext(ctx, resolveVaultReference, name)
+//
+// IT NO LONGER FILTERS BY NAME, and cannot. Since 00040 the name column holds
+// randomized ciphertext, and the blind index that replaced it for equality is
+// keyed per USER, so there is no single token to look a name up by across the
+// users whose entries a caller may legitimately reach through a shared
+// collection. The name comparison therefore moves into Go, against the decrypted
+// name, in resolveVaultReferenceFor.
+//
+// The REACHABILITY filter is untouched and still runs afterwards, which is what
+// keeps seven rounds of scope fixes intact: this statement never authorised
+// anything, it only narrowed. Returning the name lets the caller narrow on
+// exactly what it narrowed on before.
+func (q *Queries) ResolveVaultReference(ctx context.Context) ([]ResolveVaultReferenceRow, error) {
+	rows, err := q.db.QueryContext(ctx, resolveVaultReference)
 	if err != nil {
 		return nil, err
 	}
@@ -1459,6 +1506,7 @@ func (q *Queries) ResolveVaultReference(ctx context.Context, name string) ([]Res
 			&i.ID,
 			&i.UserID,
 			&i.CollectionID,
+			&i.Name,
 			&i.EncryptedValue,
 			&i.Nonce,
 		); err != nil {
@@ -1609,11 +1657,12 @@ func (q *Queries) UpdateVaultEntryExpiresAt(ctx context.Context, arg UpdateVault
 
 const updateVaultEntryMetaAtRest = `-- name: UpdateVaultEntryMetaAtRest :exec
 UPDATE vault_entries
-SET url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?
+SET name = ?, url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?, name_bidx = ?
 WHERE id = ?
 `
 
 type UpdateVaultEntryMetaAtRestParams struct {
+	Name         string         `json:"name"`
 	Url          sql.NullString `json:"url"`
 	AliasUrl     sql.NullString `json:"alias_url"`
 	Username     sql.NullString `json:"username"`
@@ -1621,11 +1670,13 @@ type UpdateVaultEntryMetaAtRestParams struct {
 	Notes        sql.NullString `json:"notes"`
 	UrlBidx      string         `json:"url_bidx"`
 	AliasUrlBidx string         `json:"alias_url_bidx"`
+	NameBidx     string         `json:"name_bidx"`
 	ID           string         `json:"id"`
 }
 
 func (q *Queries) UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaultEntryMetaAtRestParams) error {
 	_, err := q.db.ExecContext(ctx, updateVaultEntryMetaAtRest,
+		arg.Name,
 		arg.Url,
 		arg.AliasUrl,
 		arg.Username,
@@ -1633,6 +1684,7 @@ func (q *Queries) UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaul
 		arg.Notes,
 		arg.UrlBidx,
 		arg.AliasUrlBidx,
+		arg.NameBidx,
 		arg.ID,
 	)
 	return err
@@ -1640,19 +1692,23 @@ func (q *Queries) UpdateVaultEntryMetaAtRest(ctx context.Context, arg UpdateVaul
 
 const updateVaultEntryName = `-- name: UpdateVaultEntryName :exec
 
-UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type UpdateVaultEntryNameParams struct {
-	Name string `json:"name"`
-	ID   string `json:"id"`
+	Name     string `json:"name"`
+	NameBidx string `json:"name_bidx"`
+	ID       string `json:"id"`
 }
 
 // ============================================================================
 // Update entry - individual metadata fields
 // ============================================================================
+// name_bidx moves with name, always. They are one fact in two columns, and a
+// rename that updated only the ciphertext would leave the old name's token
+// enforcing uniqueness and the new name's unconstrained.
 func (q *Queries) UpdateVaultEntryName(ctx context.Context, arg UpdateVaultEntryNameParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryName, arg.Name, arg.ID)
+	_, err := q.db.ExecContext(ctx, updateVaultEntryName, arg.Name, arg.NameBidx, arg.ID)
 	return err
 }
 

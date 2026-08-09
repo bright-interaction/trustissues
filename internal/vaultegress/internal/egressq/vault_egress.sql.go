@@ -12,8 +12,8 @@ import (
 
 const createVaultEntry = `-- name: CreateVaultEntry :exec
 
-INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, name_bidx, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
 `
 
 type CreateVaultEntryParams struct {
@@ -36,6 +36,7 @@ type CreateVaultEntryParams struct {
 	AutoRotate           sql.NullInt64  `json:"auto_rotate"`
 	UrlBidx              string         `json:"url_bidx"`
 	AliasUrlBidx         string         `json:"alias_url_bidx"`
+	NameBidx             string         `json:"name_bidx"`
 }
 
 // EVERY STATEMENT THAT WRITES A HOST-CHOOSING COLUMN OF vault_entries.
@@ -80,6 +81,7 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 		arg.AutoRotate,
 		arg.UrlBidx,
 		arg.AliasUrlBidx,
+		arg.NameBidx,
 	)
 	return err
 }
@@ -87,9 +89,9 @@ func (q *Queries) CreateVaultEntry(ctx context.Context, arg CreateVaultEntryPara
 const rekeyVaultEntry = `-- name: RekeyVaultEntry :exec
 UPDATE vault_entries
 SET encrypted_value = ?, nonce = ?, encryption_version = ?,
-    url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
+    name = ?, url = ?, alias_url = ?, username = ?, category = ?, notes = ?,
     provider_meta = ?, rotation_targets = ?, custom_fields = ?,
-    url_bidx = ?, alias_url_bidx = ?
+    url_bidx = ?, alias_url_bidx = ?, name_bidx = ?
 WHERE id = ?
 `
 
@@ -97,6 +99,7 @@ type RekeyVaultEntryParams struct {
 	EncryptedValue    []byte         `json:"encrypted_value"`
 	Nonce             []byte         `json:"nonce"`
 	EncryptionVersion sql.NullInt64  `json:"encryption_version"`
+	Name              string         `json:"name"`
 	Url               sql.NullString `json:"url"`
 	AliasUrl          sql.NullString `json:"alias_url"`
 	Username          sql.NullString `json:"username"`
@@ -107,6 +110,7 @@ type RekeyVaultEntryParams struct {
 	CustomFields      string         `json:"custom_fields"`
 	UrlBidx           string         `json:"url_bidx"`
 	AliasUrlBidx      string         `json:"alias_url_bidx"`
+	NameBidx          string         `json:"name_bidx"`
 	ID                string         `json:"id"`
 }
 
@@ -132,6 +136,7 @@ func (q *Queries) RekeyVaultEntry(ctx context.Context, arg RekeyVaultEntryParams
 		arg.EncryptedValue,
 		arg.Nonce,
 		arg.EncryptionVersion,
+		arg.Name,
 		arg.Url,
 		arg.AliasUrl,
 		arg.Username,
@@ -142,6 +147,7 @@ func (q *Queries) RekeyVaultEntry(ctx context.Context, arg RekeyVaultEntryParams
 		arg.CustomFields,
 		arg.UrlBidx,
 		arg.AliasUrlBidx,
+		arg.NameBidx,
 		arg.ID,
 	)
 	return err

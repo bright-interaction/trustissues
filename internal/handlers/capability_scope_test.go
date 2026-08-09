@@ -46,7 +46,7 @@ func TestCapabilityLookupIsCollectionScoped(t *testing.T) {
 		t.Fatalf("seed ceiling: %v", err)
 	}
 
-	ch := &CapabilityHandler{db: h.db}
+	ch := &CapabilityHandler{db: h.db, vault: h}
 
 	// Guard the setup: while a member, the creator must resolve. If not, the
 	// post-removal assertion below would pass for the wrong reason.
@@ -119,7 +119,7 @@ func TestPersonalSecretsStillResolve(t *testing.T) {
 		t.Fatalf("seed ceiling: %v", err)
 	}
 
-	ch := &CapabilityHandler{db: h.db}
+	ch := &CapabilityHandler{db: h.db, vault: h}
 	if _, err := ch.lookupSecretByName(ctx, owner, "My key"); err != nil {
 		t.Fatalf("owner cannot mint for their own personal secret: %v", err)
 	}

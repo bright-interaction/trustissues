@@ -203,6 +203,7 @@ type VaultEntry struct {
 	InjectionSpec        string         `json:"injection_spec"`
 	UrlBidx              string         `json:"url_bidx"`
 	AliasUrlBidx         string         `json:"alias_url_bidx"`
+	NameBidx             string         `json:"name_bidx"`
 	CollectionID         sql.NullString `json:"collection_id"`
 	CustomFields         string         `json:"custom_fields"`
 	SecretOwnerUserID    string         `json:"secret_owner_user_id"`

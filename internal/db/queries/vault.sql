@@ -29,11 +29,11 @@ SELECT user_id FROM vault_entries WHERE id = ?;
 
 -- name: ListAllVaultEntries :many
 SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries ORDER BY name ASC;
+FROM vault_entries ORDER BY id ASC;
 
 -- name: ListVaultEntriesByUser :many
 SELECT id, user_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
+FROM vault_entries WHERE user_id = ? ORDER BY id ASC;
 
 -- ============================================================================
 -- Create entry
@@ -46,7 +46,14 @@ FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
 -- actually in. Clients that merge a write response into a cached entry then
 -- moved every shared entry back to "Personal" on save. Adding a column to this
 -- projection is cheap; the clients working around its absence was not.
-SELECT id, collection_id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
+--
+-- name_bidx joins the projection for the same reason: the two callers that
+-- rewrite the scope-keyed indexes after a move pass every OTHER column of this
+-- row straight back into UpdateVaultEntryMetaAtRest unchanged, and a column they
+-- cannot read is a column they would write as empty. A move changes
+-- collection_id, never user_id, so the name index is genuinely unchanged and
+-- passing it through is the correct thing rather than merely the safe one.
+SELECT id, collection_id, name, name_bidx, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at
 FROM vault_entries WHERE id = ?;
 
 -- name: UpdateVaultEntryCustomFields :exec
@@ -64,7 +71,10 @@ UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2,
 -- ============================================================================
 
 -- name: UpdateVaultEntryName :exec
-UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- name_bidx moves with name, always. They are one fact in two columns, and a
+-- rename that updated only the ciphertext would leave the old name's token
+-- enforcing uniqueness and the new name's unconstrained.
+UPDATE vault_entries SET name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: AdoptAndRenameVaultEntry :exec
 -- Rename an ORPHANED shared entry and take ownership of it in one statement.
@@ -88,7 +98,13 @@ UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 -- question into the renamer's namespace, which is a NAMESPACE concern. Whose
 -- authority governs the plaintext is a different question and lives in a
 -- different column, which only internal/vaultegress can write.
-UPDATE vault_entries SET user_id = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+--
+-- name_bidx is written here too, and it MUST be derived under the NEW user_id.
+-- The index is keyed by the custodian, so an adoption that carried the old
+-- owner's token across would enforce the departing owner's namespace on a row
+-- that now lives in the adopter's, which is the opposite of what this statement
+-- exists to do.
+UPDATE vault_entries SET user_id = ?, name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryCategory :exec
 UPDATE vault_entries SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
@@ -133,7 +149,7 @@ SELECT password_hash FROM users WHERE id = ?;
 
 -- name: ListVaultEntriesWithSecrets :many
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, custom_fields, destination_patterns, created_at, updated_at, encrypted_value, nonce
-FROM vault_entries WHERE user_id = ? ORDER BY name ASC;
+FROM vault_entries WHERE user_id = ? ORDER BY id ASC;
 
 -- ============================================================================
 -- Rotate (generate new secret value)
@@ -187,7 +203,7 @@ WHERE id = ?
 -- requested url (see vault.go urlBlindIndex) and matches it against the stored
 -- url_bidx / alias_url_bidx. Both bind params carry the SAME computed index.
 SELECT id, name, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, last_rotated_at, provider, provider_meta, auto_rotate, last_rotation_error, created_at, updated_at
-FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY name ASC;
+FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (alias_url_bidx != '' AND alias_url_bidx = ?)) ORDER BY id ASC;
 
 -- ============================================================================
 -- Resolve {{vault:NAME}} references (scoped to requesting user's vault)
@@ -204,8 +220,19 @@ FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (
 --
 -- :many, not :one, so an ambiguous name is refused by the caller instead of
 -- SQLite silently picking a row.
-SELECT id, user_id, collection_id, encrypted_value, nonce FROM vault_entries
-WHERE vault_entries.name = ?;
+--
+-- IT NO LONGER FILTERS BY NAME, and cannot. Since 00040 the name column holds
+-- randomized ciphertext, and the blind index that replaced it for equality is
+-- keyed per USER, so there is no single token to look a name up by across the
+-- users whose entries a caller may legitimately reach through a shared
+-- collection. The name comparison therefore moves into Go, against the decrypted
+-- name, in resolveVaultReferenceFor.
+--
+-- The REACHABILITY filter is untouched and still runs afterwards, which is what
+-- keeps seven rounds of scope fixes intact: this statement never authorised
+-- anything, it only narrowed. Returning the name lets the caller narrow on
+-- exactly what it narrowed on before.
+SELECT id, user_id, collection_id, name, encrypted_value, nonce FROM vault_entries;
 
 -- ============================================================================
 -- Import - conflict detection
@@ -227,8 +254,8 @@ SELECT name FROM vault_entries WHERE user_id = ?;
 -- default has no owner at all, so mayDirectSecretEgress refuses everyone and the
 -- importer silently loses the ability to configure delivery for what they just
 -- imported. Forgetting must be a red test, not a feature that quietly stops.
-INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, encryption_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, username, category, notes, url_bidx, name_bidx, encryption_version, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, datetime('now'), datetime('now'));
 
 -- ============================================================================
 -- Provider integration (API key rotation)
@@ -250,12 +277,13 @@ SELECT id, provider, provider_meta, rotation_targets FROM vault_entries;
 -- name: ListVaultEntriesForMetaAtRestBackfill :many
 -- user_id and collection_id are needed because the URL blind index is keyed per
 -- SCOPE (personal vs a specific collection), so recomputing it requires knowing
--- which scope the row currently lives in.
-SELECT id, user_id, collection_id, url, alias_url, username, category, notes, url_bidx, alias_url_bidx FROM vault_entries;
+-- which scope the row currently lives in. name and name_bidx joined them in
+-- 00040: the name index is keyed by user_id alone, which user_id already covers.
+SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, url_bidx, alias_url_bidx, name_bidx FROM vault_entries;
 
 -- name: UpdateVaultEntryMetaAtRest :exec
 UPDATE vault_entries
-SET url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?
+SET name = ?, url = ?, alias_url = ?, username = ?, category = ?, notes = ?, url_bidx = ?, alias_url_bidx = ?, name_bidx = ?
 WHERE id = ?;
 
 -- name: UpdateVaultEntryRotationError :exec
@@ -340,7 +368,10 @@ SELECT rotation_targets FROM vault_entries WHERE id = ?;
 
 -- name: ListProviderEntries :many
 SELECT id, user_id, name, provider, provider_meta, auto_rotate, rotation_interval_days, expires_at, last_rotated_at, last_rotation_error, rotation_log, rotation_targets, created_at, updated_at
-FROM vault_entries WHERE provider != '' ORDER BY provider ASC, name ASC;
+-- ORDER BY id, not name: name is ciphertext since 00040 and sorting it would
+-- order rows by nonce, which is random. Callers that present entries to a human
+-- sort by the DECRYPTED name in Go (sortEntriesByName).
+FROM vault_entries WHERE provider != '' ORDER BY provider ASC, id ASC;
 
 -- name: AnyEncryptedVaultEntry :many
 -- Boot-time vault-key probe. Returns EVERY sealed secret, with its version, so
@@ -510,9 +541,9 @@ WHERE action = 'vault.entry_adopted' AND instr(detail, 'Entry ' || sqlc.arg(entr
 -- have to mint its ticket on an empty comparison, which is the shape the
 -- chokepoint guards call decorative.
 SELECT id, user_id, collection_id, encrypted_value, nonce, encryption_version,
-       url, alias_url, username, category, notes,
+       name, url, alias_url, username, category, notes,
        provider, provider_meta, rotation_targets, custom_fields,
-       url_bidx, alias_url_bidx
+       url_bidx, alias_url_bidx, name_bidx
 FROM vault_entries
 ORDER BY id;
 

@@ -45,6 +45,12 @@ type Querier interface {
 	// question into the renamer's namespace, which is a NAMESPACE concern. Whose
 	// authority governs the plaintext is a different question and lives in a
 	// different column, which only internal/vaultegress can write.
+	//
+	// name_bidx is written here too, and it MUST be derived under the NEW user_id.
+	// The index is keyed by the custodian, so an adoption that carried the old
+	// owner's token across would enforce the departing owner's namespace on a row
+	// that now lives in the adopter's, which is the opposite of what this statement
+	// exists to do.
 	AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error
 	// Boot key-gate probe 3: every OTHER columncrypto surface.
 	//
@@ -331,6 +337,13 @@ type Querier interface {
 	// actually in. Clients that merge a write response into a cached entry then
 	// moved every shared entry back to "Personal" on save. Adding a column to this
 	// projection is cheap; the clients working around its absence was not.
+	//
+	// name_bidx joins the projection for the same reason: the two callers that
+	// rewrite the scope-keyed indexes after a move pass every OTHER column of this
+	// row straight back into UpdateVaultEntryMetaAtRest unchanged, and a column they
+	// cannot read is a column they would write as empty. A move changes
+	// collection_id, never user_id, so the name index is genuinely unchanged and
+	// passing it through is the correct thing rather than merely the safe one.
 	GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error)
 	// ============================================================================
 	// Delete entry
@@ -430,6 +443,13 @@ type Querier interface {
 	// entries would otherwise write an unbounded blob into the one append-only
 	// trail this product has, and the exact count from CountCollectionEntries
 	// already sits beside the sample in the log line for anything past the cap.
+	//
+	// ORDER BY id, not name. name is ciphertext since 00040, so ordering by it
+	// ordered by nonce: WHICH 25 of 30 entries got named in the permanent log was
+	// random per delete, and re-running the same delete would have named a different
+	// set. The caller sorts the DECRYPTED names before writing the line, so the log
+	// still reads alphabetically; only the choice of which rows fall inside the cap
+	// is made here, and it is now stable.
 	ListCollectionVaultEntryNamesSample(ctx context.Context, arg ListCollectionVaultEntryNamesSampleParams) ([]ListCollectionVaultEntryNamesSampleRow, error)
 	// Accepted memberships only. A pending invitation must not surface the
 	// collection (or its entries) until the invitee opts in.
@@ -451,6 +471,9 @@ type Querier interface {
 	ListNotificationChannels(ctx context.Context) ([]ListNotificationChannelsRow, error)
 	// Invitations awaiting the user's decision. These grant no access.
 	ListPendingCollectionInvitesForUser(ctx context.Context, userID string) ([]ListPendingCollectionInvitesForUserRow, error)
+	// ORDER BY id, not name: name is ciphertext since 00040 and sorting it would
+	// order rows by nonce, which is random. Callers that present entries to a human
+	// sort by the DECRYPTED name in Go (sortEntriesByName).
 	ListProviderEntries(ctx context.Context) ([]ListProviderEntriesRow, error)
 	ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]LoginAttempt, error)
 	ListRecentServiceSecretAudit(ctx context.Context, limit int64) ([]ServiceSecretAudit, error)
@@ -470,7 +493,8 @@ type Querier interface {
 	// ============================================================================
 	// user_id and collection_id are needed because the URL blind index is keyed per
 	// SCOPE (personal vs a specific collection), so recomputing it requires knowing
-	// which scope the row currently lives in.
+	// which scope the row currently lives in. name and name_bidx joined them in
+	// 00040: the name index is keyed by user_id alone, which user_id already covers.
 	ListVaultEntriesForMetaAtRestBackfill(ctx context.Context) ([]ListVaultEntriesForMetaAtRestBackfillRow, error)
 	// ============================================================================
 	// Provider integration (API key rotation)
@@ -599,7 +623,19 @@ type Querier interface {
 	//
 	// :many, not :one, so an ambiguous name is refused by the caller instead of
 	// SQLite silently picking a row.
-	ResolveVaultReference(ctx context.Context, name string) ([]ResolveVaultReferenceRow, error)
+	//
+	// IT NO LONGER FILTERS BY NAME, and cannot. Since 00040 the name column holds
+	// randomized ciphertext, and the blind index that replaced it for equality is
+	// keyed per USER, so there is no single token to look a name up by across the
+	// users whose entries a caller may legitimately reach through a shared
+	// collection. The name comparison therefore moves into Go, against the decrypted
+	// name, in resolveVaultReferenceFor.
+	//
+	// The REACHABILITY filter is untouched and still runs afterwards, which is what
+	// keeps seven rounds of scope fixes intact: this statement never authorised
+	// anything, it only narrowed. Returning the name lets the caller narrow on
+	// exactly what it narrowed on before.
+	ResolveVaultReference(ctx context.Context) ([]ResolveVaultReferenceRow, error)
 	// Revocation by flag, not by DELETE, so the audit trail survives the incident.
 	// COALESCE keeps the call idempotent: revoking an already-revoked key does not
 	// move its timestamp and still reports a row, so a repeated incident-response
@@ -687,6 +723,9 @@ type Querier interface {
 	// ============================================================================
 	// Update entry - individual metadata fields
 	// ============================================================================
+	// name_bidx moves with name, always. They are one fact in two columns, and a
+	// rename that updated only the ciphertext would leave the old name's token
+	// enforcing uniqueness and the new name's unconstrained.
 	UpdateVaultEntryName(ctx context.Context, arg UpdateVaultEntryNameParams) error
 	UpdateVaultEntryNotes(ctx context.Context, arg UpdateVaultEntryNotesParams) error
 	UpdateVaultEntryRotationError(ctx context.Context, arg UpdateVaultEntryRotationErrorParams) error

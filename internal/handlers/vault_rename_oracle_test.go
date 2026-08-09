@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,7 +30,6 @@ import (
 // editable.
 func TestRenameDoesNotProbeTheOwnersPrivateVault(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
-	ctx := context.Background()
 
 	owner := mustUser(t, queries, "owner@client-b.example", "user", "")
 	attacker := mustUser(t, queries, "editor@client-a.example", "user", "")
@@ -76,9 +74,7 @@ func TestRenameDoesNotProbeTheOwnersPrivateVault(t *testing.T) {
 	}
 
 	// Nothing was renamed by either attempt.
-	if got, err := queries.GetVaultEntryName(ctx, sharedID); err != nil {
-		t.Fatalf("read name back: %v", err)
-	} else if got != "shared-ci-token" {
+	if got := entryNamePlain(t, h, queries, sharedID); got != "shared-ci-token" {
 		t.Fatalf("the entry was renamed anyway: %q", got)
 	}
 
@@ -111,8 +107,8 @@ func TestRenameDoesNotProbeTheOwnersPrivateVault(t *testing.T) {
 		if rec.Code != http.StatusOK && rec.Code != http.StatusNoContent {
 			t.Fatalf("owner rename: HTTP %d: %s", rec.Code, rec.Body.String())
 		}
-		if got, err := queries.GetVaultEntryName(ctx, sharedID); err != nil || got != "shared-ci-token-v2" {
-			t.Fatalf("owner rename did not take: name = %q err = %v", got, err)
+		if got := entryNamePlain(t, h, queries, sharedID); got != "shared-ci-token-v2" {
+			t.Fatalf("owner rename did not take: name = %q", got)
 		}
 	})
 

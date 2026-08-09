@@ -446,6 +446,12 @@ func (stubDecrypter) OpenEntrySecret(ciphertext, nonce []byte, encVersion int,
 	return secretexit.Minted(ciphertext, o, allowAllExitAuthority{}), nil
 }
 
+// EntryNamePlain matches the stub's existing contract: these tests seed
+// vault_entries with plaintext, so the stored name is already cleartext and
+// comes back verbatim. The real decryption is exercised against a real
+// VaultHandler in the vault's own tests.
+func (stubDecrypter) EntryNamePlain(stored string) string { return stored }
+
 // newTestDB returns an in-memory sqlite DB with the schema needed for
 // the capability bridge: vault_entries (with destination_patterns +
 // injection_spec columns) plus capability_log + capability_spent_nonces
@@ -557,6 +563,21 @@ func newTestDB(t *testing.T) *sql.DB {
 func setupCapabilityHandler(t *testing.T, dbConn *sql.DB) *CapabilityHandler {
 	t.Helper()
 	capH, err := NewCapabilityHandler(dbConn, stubDecrypter{}, testCapVaultKey)
+	if err != nil {
+		t.Fatalf("NewCapabilityHandler: %v", err)
+	}
+	return capH
+}
+
+// setupCapabilityHandlerWithVault is for the tests whose fixtures went in
+// through a REAL VaultHandler, so vault_entries.name holds real ciphertext.
+// stubDecrypter returns the stored value verbatim, which is right for the tests
+// that hand-seed cleartext rows and wrong for these: lookupSecretByName matches
+// on the decrypted name, so a stub would compare the caller's "stripe" against
+// an enc:v1: blob and resolve nothing.
+func setupCapabilityHandlerWithVault(t *testing.T, vault *VaultHandler) *CapabilityHandler {
+	t.Helper()
+	capH, err := NewCapabilityHandler(vault.db, vault, testCapVaultKey)
 	if err != nil {
 		t.Fatalf("NewCapabilityHandler: %v", err)
 	}

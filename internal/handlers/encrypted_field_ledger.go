@@ -87,6 +87,15 @@ var vaultFieldCustomFields = vaultfield.Declare(
 // stolen database FILE is not a readable one, not because releasing them is a
 // decision anybody has to make.
 
+var vaultFieldName = vaultfield.Declare(
+	"vault_entries.name", vaultfield.NotACredential, "",
+	"the label the operator gave the entry, and the column that describes it best. It is shown in every "+
+		"list and every picker, so it is not a credential and releasing it is not a decision. It is "+
+		"encrypted at rest for the same reason url and username are: \"Stripe live key\" beside an "+
+		"encrypted value hands a keyless reader the whole inventory, which is most of what the other "+
+		"encrypted columns were meant to withhold. Per-user uniqueness moved to name_bidx when this "+
+		"stopped being comparable in SQL.")
+
 var vaultFieldURL = vaultfield.Declare(
 	"vault_entries.url", vaultfield.NotACredential, "",
 	"the site this login belongs to, for browser-extension autofill matching. Not a secret: the blind "+
