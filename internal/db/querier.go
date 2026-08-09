@@ -325,6 +325,12 @@ type Querier interface {
 	// ============================================================================
 	// Create entry
 	// ============================================================================
+	// collection_id is SELECTed here on purpose. It was missing, so every response
+	// built from this row (PUT /vault/{id}, POST /{id}/rotate, PUT /{id}/schedule)
+	// reported collection_id: null no matter which shared collection the entry was
+	// actually in. Clients that merge a write response into a cached entry then
+	// moved every shared entry back to "Personal" on save. Adding a column to this
+	// projection is cheap; the clients working around its absence was not.
 	GetVaultEntryMeta(ctx context.Context, id string) (GetVaultEntryMetaRow, error)
 	// ============================================================================
 	// Delete entry
