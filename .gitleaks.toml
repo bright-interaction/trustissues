@@ -45,4 +45,15 @@ regexes = [
   '''EXAMPLE''',
   # Documented, deliberately-invalid sample values in .env.example and the docs.
   '''openssl rand -hex 32''',
+  # RFC 6238 appendix B TOTP test vector, base32 of "12345678901234567890"
+  # (internal/totp/totp_test.go). It is printed in the RFC, so it is about as
+  # public as a string can be, and the TOTP implementation cannot be verified
+  # against the standard without it.
+  '''GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ''',
+  # xkcd 936's passphrase, used as the login password in
+  # scripts/live-crossversion-skeptic.sh so the script reads as obviously
+  # synthetic. Allowlisted BY VALUE rather than by adding the script to `paths`:
+  # that file drives a live instance, so it is exactly the wrong place to stop
+  # scanning for real credentials.
+  '''correct-horse-battery-staple''',
 ]
