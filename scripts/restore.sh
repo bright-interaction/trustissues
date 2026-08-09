@@ -45,7 +45,18 @@ if [ ! -f "${SNAPSHOT}" ]; then
 fi
 # A truncated or non-SQLite file restored over a good database is unrecoverable,
 # so refuse anything that is not a SQLite 3 image before touching the target.
-if ! head -c 16 "${SNAPSHOT}" | grep -q "SQLite format 3"; then
+# A plain byte compare, deliberately NOT `head -c 16 | grep -q "SQLite format 3"`.
+# Two independent reasons:
+#   1. pipefail. A short-circuiting grep can hand the pipeline a 141, and the `!`
+#      turned that into "not a SQLite file", refusing a PERFECTLY GOOD snapshot
+#      mid-incident and sending the operator after an older one that was never
+#      the problem.
+#   2. The 16th byte of the header is a NUL, so those bytes are binary input.
+#      GNU grep on the server matches them (verified: grep 3.11 exits 0), but
+#      BSD/macOS grep does NOT and exits 1, so running a restore drill from a
+#      laptop refused every valid snapshot. `grep -a` fixes that, but comparing
+#      the 15 printable bytes needs no grep, no pipeline and no binary rules.
+if [ "$(head -c 15 "${SNAPSHOT}")" != "SQLite format 3" ]; then
   echo "error: ${SNAPSHOT} is not a SQLite 3 database; refusing to restore it" >&2
   exit 1
 fi
@@ -71,8 +82,12 @@ if command -v sqlite3 >/dev/null 2>&1; then
   fi
   # A structurally valid database from a DIFFERENT product would also pass, and
   # restoring one is the same lost-vault outcome.
-  if ! sqlite3 "${SNAPSHOT}" \
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vault_entries';" | grep -q 1; then
+  # Counted for the same reason as the magic-bytes check above: a 141 from a
+  # short-circuited grep would read as "no vault_entries table" and refuse a
+  # valid Trustissues snapshot.
+  VAULT_TABLE="$(sqlite3 "${SNAPSHOT}" \
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vault_entries';" | grep -c 1 || true)"
+  if [ "${VAULT_TABLE:-0}" -eq 0 ]; then
     echo "error: ${SNAPSHOT} has no vault_entries table; this is not a Trustissues database" >&2
     exit 1
   fi
@@ -90,8 +105,18 @@ if [ "${MODE}" = "compose" ]; then
   fi
   # The container MUST be stopped. A running writer would checkpoint its old WAL
   # over the file we are about to replace.
+  #
+  # Counted with `grep -c` (reads all input) rather than tested with `grep -q`
+  # (exits on first match). This file sets `pipefail`, so the -q form made the
+  # guard FAIL OPEN in the one case it exists to catch: when the service was
+  # running, grep matched, exited, SIGPIPE'd `docker compose ps`, and the
+  # pipeline returned 141 -- so the condition read FALSE, the guard did not
+  # fire, and the restore proceeded against a live writer, which is precisely
+  # the corruption the comment above warns about. See the "producer | grep -q"
+  # rule in the repo-root CLAUDE.md.
+  RUNNING_MATCHES="$(docker compose ps --status running "${SERVICE}" 2>/dev/null | grep -c "${SERVICE}" || true)"
   if [ -n "$(docker compose ps -q "${SERVICE}" 2>/dev/null)" ] && \
-     docker compose ps --status running "${SERVICE}" 2>/dev/null | grep -q "${SERVICE}"; then
+     [ "${RUNNING_MATCHES:-0}" -gt 0 ]; then
     echo "error: ${SERVICE} is still running. Run 'docker compose stop ${SERVICE}' first," >&2
     echo "       otherwise the live writer will overwrite the restored file." >&2
     exit 1
