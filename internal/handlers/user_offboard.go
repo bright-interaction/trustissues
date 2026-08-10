@@ -13,6 +13,29 @@ import (
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
+// sealSecretNames seals the entry names this file reports, for the same reason
+// the vault handler's own writers do: those names are the inventory the
+// encrypted columns exist to withhold, and these two lines are the ones that
+// list SEVERAL of them at once.
+//
+// It fails CLOSED when the vault handler is not wired. That is not a
+// hypothetical branch worth being relaxed about: h.vault is optional by
+// construction (SetVault runs after the handler is built), so "the offboard path
+// ran before the wiring did" is a code change away, and the cost of guessing
+// wrong is the names in the clear on the widest line in the product.
+func (h *UserHandler) sealSecretNames(r *http.Request, names []string) []string {
+	if h.vault == nil {
+		slog.Error("offboard: no vault handler wired to seal the secret names in an activity line; " +
+			"recording placeholders instead of cleartext")
+		out := make([]string, len(names))
+		for i := range out {
+			out[i] = activityDetailUnavailable
+		}
+		return out
+	}
+	return h.vault.sealSecretNames(r.Context(), names)
+}
+
 // invalidateCredentials revokes every standing credential a user holds:
 // sessions, API keys, and any service identities they created (plus the
 // rotation delivery targets those identities and their entries reference).
@@ -187,6 +210,32 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 	moved := 0
 	var renamed, failed []string
 	for _, row := range rows {
+		// Opened for the operator-facing lists below. ListCollectionVaultEntriesForUser
+		// returns what is STORED, and 00040 made that ciphertext, so reporting
+		// row.Name directly told the admin which entries were orphaned by naming
+		// them "enc:v1:PT5r..." on the one surface that exists to tell them
+		// exactly which entries need attention.
+		//
+		// The dedup branch below is a SECOND consumer of row.Name and is NOT
+		// fixed by this line. Two defects live there, both introduced by 00040
+		// and both outside what this pass changes:
+		//
+		//  1. dedup concatenates onto the CIPHERTEXT and RenameVaultEntry writes
+		//     it straight back, producing a name column that no key can open.
+		//  2. it is unreachable anyway: the collision it catches was
+		//     UNIQUE(user_id, name), which 00040 made vacuous (a fresh nonce per
+		//     seal means two equal names no longer collide), and the partial
+		//     index that replaced it is keyed by user_id, which
+		//     TransferSecretOwnership changes WITHOUT recomputing name_bidx. So
+		//     re-ownership now silently leaves the new owner holding two entries
+		//     with the same name and a stale token, instead of de-duplicating.
+		//
+		// Fixing those means recomputing name_bidx inside the authority-gated
+		// transfer, which is a vaultegress change and belongs in its own pass.
+		plainName := row.Name
+		if h.vault != nil {
+			plainName = h.vault.EntryNamePlain(row.Name)
+		}
 		proof, pErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
 			EntryID:              row.ID,
 			Actor:                newOwnerID,
@@ -196,7 +245,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		})
 		if pErr != nil {
 			slog.Error("offboard: ownership transfer refused", "entry", row.ID, "error", pErr)
-			failed = append(failed, row.Name)
+			failed = append(failed, plainName)
 			continue
 		}
 		_, uErr := vaultegress.TransferSecretOwnership(r.Context(), h.queries, proof,
@@ -207,7 +256,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		}
 		if !strings.Contains(uErr.Error(), "UNIQUE constraint") {
 			slog.Error("offboard: could not re-own entry", "entry", row.ID, "error", uErr)
-			failed = append(failed, row.Name)
+			failed = append(failed, plainName)
 			continue
 		}
 		// The new owner already has an entry by this name. Keep both.
@@ -216,7 +265,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			Name: dedup, ID: row.ID,
 		}); rErr != nil {
 			slog.Error("offboard: could not de-duplicate entry name", "entry", row.ID, "error", rErr)
-			failed = append(failed, row.Name)
+			failed = append(failed, plainName)
 			continue
 		}
 		retry, retryErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
@@ -228,23 +277,23 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		})
 		if retryErr != nil {
 			slog.Error("offboard: ownership transfer refused after rename", "entry", row.ID, "error", retryErr)
-			failed = append(failed, row.Name)
+			failed = append(failed, plainName)
 			continue
 		}
 		if _, uErr2 := vaultegress.TransferSecretOwnership(r.Context(), h.queries, retry,
 			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID}); uErr2 != nil {
 			slog.Error("offboard: re-own failed after rename", "entry", row.ID, "error", uErr2)
-			failed = append(failed, row.Name)
+			failed = append(failed, plainName)
 			continue
 		}
 		moved++
-		renamed = append(renamed, row.Name+" -> "+dedup)
+		renamed = append(renamed, plainName+" -> "+dedup)
 	}
 
 	if moved > 0 {
 		detail := fmt.Sprintf("Deleting %s: re-owned %d shared collection secret(s) so the team keeps them", email, moved)
 		if len(renamed) > 0 {
-			detail += fmt.Sprintf("; renamed %d to avoid a name clash: %v", len(renamed), renamed)
+			detail += fmt.Sprintf("; renamed %d to avoid a name clash: %v", len(renamed), h.sealSecretNames(r, renamed))
 		}
 		LogActivityFromRequest(h.queries, r, "admin.entries_reassigned", detail)
 	}
@@ -253,7 +302,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 	if len(failed) > 0 {
 		LogActivityFromRequest(h.queries, r, "admin.entries_reassign_failed",
 			fmt.Sprintf("Deleting %s: could NOT re-own %d shared secret(s), they are now orphaned and unreadable: %v",
-				email, len(failed), failed))
+				email, len(failed), h.sealSecretNames(r, failed)))
 		slog.Error("offboard: some collection entries could not be re-owned",
 			"user", targetID, "count", len(failed))
 	}

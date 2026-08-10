@@ -259,15 +259,31 @@ func TestMoveToCollectionRequiresOwnerAdminOrManager(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list activity: %v", err)
 		}
+		// The entry is identified by ID in the STORED row and by NAME only once
+		// the row is opened. That split is load-bearing rather than incidental:
+		// the entry name is sealed at rest (activity_detail_crypto.go) because it
+		// is the inventory a stolen file must not yield, while the id must stay
+		// in cleartext because migrations 00034/00035/00036 match it with SQL
+		// instr(). Asserting both halves here is what keeps either from being
+		// quietly dropped: a change that sealed the whole line would break the
+		// ownership backfill, and one that stopped sealing would put the
+		// inventory back in the file.
 		var found bool
 		for _, row := range rows {
 			d := row.Detail.String
-			if strings.Contains(d, "shared-secret") && strings.Contains(d, "coll-a") && strings.Contains(d, "personal") {
-				found = true
+			if !strings.Contains(d, entryID) || !strings.Contains(d, "coll-a") || !strings.Contains(d, "personal") {
+				continue
 			}
+			if strings.Contains(d, "shared-secret") {
+				t.Fatalf("the stored activity row names the secret in the CLEAR: %q", d)
+			}
+			if opened := h.OpenActivityDetail(context.Background(), d); !strings.Contains(opened, "shared-secret") {
+				t.Fatalf("the opened activity row does not name the entry: %q", opened)
+			}
+			found = true
 		}
 		if !found {
-			t.Fatal("no vault.entry_moved activity naming the entry plus source and destination")
+			t.Fatal("no vault.entry_moved activity naming the entry id plus source and destination")
 		}
 	})
 }

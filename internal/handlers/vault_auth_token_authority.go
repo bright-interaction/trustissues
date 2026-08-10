@@ -145,7 +145,16 @@ func (h *VaultHandler) AuditCrossOwnerAuthTokenTargets(ctx context.Context) []st
 			"error", err)
 		return nil
 	}
-	var report []string
+	// Two reports of the same findings, differing only in whether the referenced
+	// entry NAME is sealed.
+	//
+	// report goes to the container log and to the caller; sealedReport goes to
+	// activity_log, which is a column in the database file this product exists to
+	// make useless when stolen. Sealing one string for both surfaces would have
+	// put enc:v1: blobs in the operator's log at the moment they are reading it
+	// to fix a delivery that is about to fail, which is the mistake
+	// rotateOneEntry documents at its EntryNamePlain call.
+	var report, sealedReport []string
 	for _, row := range rows {
 		raw := strings.TrimSpace(row.RotationTargets.String)
 		if raw == "" {
@@ -156,10 +165,12 @@ func (h *VaultHandler) AuditCrossOwnerAuthTokenTargets(ctx context.Context) []st
 			if refusal.empty() {
 				continue
 			}
-			line := fmt.Sprintf("entry %s: delivery target %q references the vault entry %q, which "+
-				"its configurer may not spend, so this delivery will FAIL at the next rotation. %s",
-				row.ID, refusal.TargetLabel, refusal.AuthToken, refusal.Reason)
-			report = append(report, line)
+			const lineFmt = "entry %s: delivery target %q references the vault entry %q, which " +
+				"its configurer may not spend, so this delivery will FAIL at the next rotation. %s"
+			report = append(report, fmt.Sprintf(lineFmt,
+				row.ID, refusal.TargetLabel, refusal.AuthToken, refusal.Reason))
+			sealedReport = append(sealedReport, fmt.Sprintf(lineFmt,
+				row.ID, refusal.TargetLabel, h.sealSecretName(ctx, refusal.AuthToken), refusal.Reason))
 		}
 	}
 	if len(report) > 0 {
@@ -171,7 +182,7 @@ func (h *VaultHandler) AuditCrossOwnerAuthTokenTargets(ctx context.Context) []st
 		LogActivity(h.queries, nil, "vault.targets_need_reconfiguration",
 			fmt.Sprintf("%d rotation delivery target(s) reference a vault entry their configurer may "+
 				"not send. They will fail at the next rotation: %s",
-				len(report), strings.Join(report, "; ")))
+				len(sealedReport), strings.Join(sealedReport, "; ")))
 	}
 	return report
 }

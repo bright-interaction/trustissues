@@ -303,7 +303,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			})
 			LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf(
 				"Auto-rotated vault secret but NOT delivered: %s (provider: %s, rotation_targets unreadable)",
-				entry.Name, providerName))
+				vaultHandler.sealSecretName(ctx, entry.Name), providerName))
 			return
 		}
 		status, _ := recordRotationOutcome(ctx, deps, rotationRecord{
@@ -320,7 +320,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		})
 
 		// Per-path by design: the sweep has no request to attribute the activity to.
-		LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf("Auto-rotated vault secret: %s (provider: %s, targets: %d, status: %s)", entry.Name, providerName, len(targets), status))
+		LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf("Auto-rotated vault secret: %s (provider: %s, targets: %d, status: %s)", vaultHandler.sealSecretName(ctx, entry.Name), providerName, len(targets), status))
 		slog.Info("vault rotation: rotated", "provider", providerName, "entry", entry.Name, "status", status)
 	}
 }
