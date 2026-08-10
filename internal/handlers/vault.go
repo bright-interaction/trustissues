@@ -50,6 +50,11 @@ type VaultHandler struct {
 	// the store converges on the current key with ordinary use and the sweep only
 	// has to finish the job for rows nobody edits.
 	previous *vaultKeyMaterial
+	// auditKey lazily unwraps the audit-name DEK. See audit_name_crypto.go: it is
+	// NOT derived from the master key, it is a random key WRAPPED by it, so a
+	// master-key rotation rewraps one settings row instead of rewriting audit rows
+	// the append-only triggers forbid touching.
+	auditKey auditNameKey
 	// delivery tracks the detached rotation-delivery goroutines so shutdown can
 	// wait for them. srv.Shutdown only drains in-flight HTTP requests; a manual
 	// rotate returns as soon as the value is stored and finishes delivery in the

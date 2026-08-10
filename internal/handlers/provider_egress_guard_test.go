@@ -35,6 +35,11 @@ var providerEgressRegistry = map[string]string{
 	"ai_gateway.go:AIGatewayHandler.Proxy":  gatedNote,
 	"capability.go:CapabilityHandler.Proxy": gatedNote,
 
+	"audit_name_crypto.go:VaultHandler.auditNameDEK": "no outbound call of any kind. It reads one row " +
+		"from the local settings table, unwraps it, and caches the result. It matches this guard's " +
+		"shape only because it takes a context and can fail; there is no client, no host and no URL " +
+		"anywhere in the file.",
+
 	"mcp.go:MCPHandler.toolUseSecret": "in-process: builds a request for the local Issue handler and calls it " +
 		"directly (no client, no socket), so it egresses nothing on its own. What it mints IS spendable at " +
 		"capability.Proxy, which is gated.",

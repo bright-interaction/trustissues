@@ -180,6 +180,14 @@ var rekeySurfaces = []keyedSurface{
 	{Table: "settings", Column: "value", SettingKey: vaultKeyCheckSetting, Family: familyColumnCrypto,
 		Field: vaultFieldKeySentinel,
 		Why:   "the boot key sentinel; if it stays on the old key the next boot is refused"},
+	{Table: "settings", Column: "value", SettingKey: auditDEKSetting, Family: familyColumnCrypto,
+		Field: vaultFieldAuditDEK,
+		Why: "the WRAPPED audit-name DEK, and the reason this rotation never has to touch an " +
+			"append-only audit row. capability_log.secret_name and service_secret_audit.secret_names " +
+			"are encrypted under this key, not under the master key, so rewrapping this one value is " +
+			"the whole rotation for both of those columns. Orphan it and every recorded secret name " +
+			"in the audit trail becomes unreadable, permanently, because the rows themselves can " +
+			"never be rewritten to fix it"},
 	{Table: "notification_channels", Column: "config", NonceColumn: "config_nonce", Family: familyRawGCM,
 		Why: "channel config, holds webhook URLs and bot tokens"},
 }

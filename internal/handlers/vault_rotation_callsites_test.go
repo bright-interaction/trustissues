@@ -473,6 +473,11 @@ were indexed under the previous key. Use urlBlindIndexCandidates for lookups.`,
 // user rather than an error anyone sees.
 func TestColumnCryptoIsOnlyDecryptedByTheDualKeyReaders(t *testing.T) {
 	allowed := map[string]string{
+		"audit_name_crypto.go": "loadOrCreateAuditDEK unwraps the audit DEK with DecryptStringAny over " +
+			"vaultKeyRing(), which is the current master key then the previous one. This guard caught " +
+			"it doing exactly what the guard exists to prevent: the first version called DecryptString " +
+			"with the current key alone, so between changing the key and finishing the sweep the DEK " +
+			"would not have unwrapped and every audit name would have been written as a placeholder.",
 		"auth.go":          "decryptTOTPSecret + MigrateTOTPSecrets, both pass the keyring",
 		"smtp_password.go": "resolveSMTPPassword, passes the keyring",
 		"vault_keycheck.go": "the boot gate and SentinelOnPreviousKey, which ask WHICH key opens the " +

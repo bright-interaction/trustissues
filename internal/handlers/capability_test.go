@@ -452,6 +452,11 @@ func (stubDecrypter) OpenEntrySecret(ciphertext, nonce []byte, encVersion int,
 // VaultHandler in the vault's own tests.
 func (stubDecrypter) EntryNamePlain(stored string) string { return stored }
 
+// SealAuditName is a passthrough for the same reason: these tests seed and
+// assert on cleartext. The real sealing is exercised against a real
+// VaultHandler in audit_name_crypto_test.go, which is where the property lives.
+func (stubDecrypter) SealAuditName(_ context.Context, plain string) string { return plain }
+
 // newTestDB returns an in-memory sqlite DB with the schema needed for
 // the capability bridge: vault_entries (with destination_patterns +
 // injection_spec columns) plus capability_log + capability_spent_nonces

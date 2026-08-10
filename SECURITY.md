@@ -79,6 +79,14 @@ Rotation is a supported, in-place operation. It has two halves:
   database onto the current key, verifies the result before committing, and
   refuses outright if any stored value opens under neither key.
 
+Two columns are deliberately NOT re-encrypted by that sweep, and they are the
+audit trail: `capability_log.secret_name` and `service_secret_audit.secret_names`
+are sealed under a separate audit key, which is itself stored wrapped under the
+master key. Those tables are append-only, so no sweep can rewrite them; the
+rotation rewraps the audit key instead, and the rows stay exactly as written.
+Nothing extra to do, but if you are auditing the sweep's report, that is why
+those two columns never appear in it.
+
 Take a backup first (see `docs/BACKUP.md`). Then:
 
 1. Generate the new key: `openssl rand -hex 32`.

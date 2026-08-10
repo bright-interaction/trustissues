@@ -246,16 +246,24 @@ var notKeyedColumns = map[string]string{
 	// key via HKDF, but it signs short-lived tokens held in memory; nothing keyed
 	// is stored, so a rotation invalidates in-flight tokens (5 minute TTL) and
 	// needs no data conversion.
-	"capability_grants.agent_id":         "agent identifier, plaintext",
-	"capability_grants.secret_id":        "FK to vault_entries",
-	"capability_grants.granted_by":       "actor id",
-	"capability_grants.granted_at":       "timestamp",
-	"capability_grants.revoked_at":       "timestamp",
-	"capability_grants.notes":            "operator note, plaintext",
-	"capability_log.id":                  "surrogate key",
-	"capability_log.agent_id":            "agent identifier, plaintext",
-	"capability_log.secret_id":           "FK to vault_entries",
-	"capability_log.secret_name":         "entry name, stored in cleartext today (see DEFERRED.md name blind index)",
+	"capability_grants.agent_id":   "agent identifier, plaintext",
+	"capability_grants.secret_id":  "FK to vault_entries",
+	"capability_grants.granted_by": "actor id",
+	"capability_grants.granted_at": "timestamp",
+	"capability_grants.revoked_at": "timestamp",
+	"capability_grants.notes":      "operator note, plaintext",
+	"capability_log.id":            "surrogate key",
+	"capability_log.agent_id":      "agent identifier, plaintext",
+	"capability_log.secret_id":     "FK to vault_entries",
+	// ENCRYPTED, but deliberately NOT a rekey surface. It is sealed under the
+	// audit DEK, and settings.audit_name_dek IS registered, so a master-key
+	// rotation rewraps the key and leaves these rows alone. That indirection is
+	// the point rather than an oversight: 00039 made this table append-only, so a
+	// sweep that had to rewrite it could not, and a trigger carve-out letting the
+	// application rewrite secret_name would reopen the cover-up path 00039 closed.
+	"capability_log.secret_name": "entry name, sealed under the audit DEK (settings.audit_name_dek, " +
+		"which is the registered surface). Rotating the master key rewraps that key; these rows are " +
+		"never rewritten, because they cannot be",
 	"capability_log.destination":         "destination host, plaintext",
 	"capability_log.method":              "HTTP method",
 	"capability_log.event":               "outcome label",
@@ -363,10 +371,13 @@ var notKeyedColumns = map[string]string{
 	"service_secret_audit.service_identity_id": "FK",
 	"service_secret_audit.service_name":        "denormalised name for audit-after-delete, plaintext",
 	"service_secret_audit.event":               "outcome label",
-	"service_secret_audit.secret_names":        "JSON list of entry names, never values",
-	"service_secret_audit.error":               "error text, plaintext",
-	"service_secret_audit.remote_ip":           "plaintext",
-	"service_secret_audit.occurred_at":         "timestamp",
+	"service_secret_audit.secret_names": "JSON list of entry names, never values, sealed as a whole " +
+		"under the audit DEK (settings.audit_name_dek, the registered surface). Same reasoning as " +
+		"capability_log.secret_name: append-only rows cannot be rewritten by a rotation, so the KEY " +
+		"rotates instead of the data",
+	"service_secret_audit.error":       "error text, plaintext",
+	"service_secret_audit.remote_ip":   "plaintext",
+	"service_secret_audit.occurred_at": "timestamp",
 
 	// sessions store only a jti; the bearer is a JWT signed with TRUSTISSUES_JWT_SECRET,
 	// which is a separate secret with its own rotation story (revoke all sessions).
@@ -519,6 +530,11 @@ func TestEveryColumnCryptoWriterIsARegisteredSurface(t *testing.T) {
 		"settings.go":       "settings['smtp_password'] (registered)",
 		"vault_keycheck.go": "settings['vault_keycheck'], the boot sentinel (registered)",
 		"vault_rekey.go":    "the sweep itself, re-sealing the two surfaces above",
+		"audit_name_crypto.go": "settings['audit_name_dek'], the WRAPPED audit DEK (registered). This " +
+			"is the one entry here whose point is what it does NOT write: the audit name columns are " +
+			"sealed under the DEK, not under the master key, so they are not surfaces and the sweep " +
+			"never touches them. Rewrapping this settings row rotates both of those columns at once, " +
+			"which is what lets them live in append-only tables the sweep is forbidden to UPDATE.",
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -580,6 +596,11 @@ func TestRegisteredSettingsKeysAreTheEncryptedOnes(t *testing.T) {
 	want := map[string]bool{
 		"smtp_password":      true,
 		vaultKeyCheckSetting: true,
+		// The wrapped audit-name DEK. Losing this one to a rotation is worse than
+		// losing the others: the sentinel can be rewritten and the SMTP password
+		// re-entered, but the audit rows this key opens are append-only and can
+		// never be re-sealed under a new key.
+		auditDEKSetting: true,
 	}
 	got := map[string]bool{}
 	for _, s := range rekeySurfaces {

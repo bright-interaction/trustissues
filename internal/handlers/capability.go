@@ -1168,7 +1168,12 @@ func (h *CapabilityHandler) logCapabilityEvent(ctx context.Context, agent string
 	if _, err := h.db.ExecContext(ctx,
 		`INSERT INTO capability_log (id, agent_id, secret_id, secret_name, destination, method, event, status_code, error, nonce)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, agent, sid, secretName, dest, method, event, sc, errMsg, nonce); err != nil {
+		// The name is sealed under the audit DEK on the way in. This row records
+		// that a credential was accessed, and it is written on every issue, use
+		// and denial, so in cleartext it rebuilt the inventory 00040 encrypted,
+		// out of the same stolen file. It cannot be sealed under the master key:
+		// 00039 made this table append-only, so a rotation could never rewrite it.
+		id, agent, sid, h.vault.SealAuditName(ctx, secretName), dest, method, event, sc, errMsg, nonce); err != nil {
 		slog.Warn("capability: log event failed", "error", err, "event", event)
 	}
 }
