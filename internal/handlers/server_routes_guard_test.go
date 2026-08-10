@@ -52,6 +52,13 @@ var routeGuardRequirements = []routeGuardRequirement{
 	{"/issue", "", "capabilityLimiter", "single-use tokens: minting is the real budget"},
 	{"/proxy/{host}/*", "", "proxyLimiter", "mounted outside /api and its apiLimiter, so this is its only bound"},
 	{"/settings/ai", "Put", "AdminOnly", "the write that decides which entry is the instance's provider key, and therefore what the egress pin pins"},
+	// The credential access trail. Its rows name WHICH SECRET an agent spent,
+	// which is the inventory that vault_entries.name, the audit tables and
+	// activity_log.detail are all encrypted at rest to withhold. A reader without
+	// this gate would hand any authenticated account, including the vault_only
+	// role a public invite hands out, the list those four passes exist to
+	// protect, in cleartext, over HTTP.
+	{"/capability-log", "Get", "AdminOnly", "the rows name which secret each agent spent, which is the inventory every at-rest encryption pass exists to withhold"},
 }
 
 // routeGuardForbidden is the other direction, and it is what keeps the check

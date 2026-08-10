@@ -10,6 +10,7 @@ import Invite from '@/pages/Invite';
 // Vault.tsx is provided by the vault module; must default-export the page.
 const VaultPage = lazy(() => import('@/pages/Vault'));
 const ActivityPage = lazy(() => import('@/pages/Activity'));
+const CredentialAccessPage = lazy(() => import('@/pages/CredentialAccess'));
 const UsersPage = lazy(() => import('@/pages/Users'));
 const SettingsPage = lazy(() => import('@/pages/Settings'));
 
@@ -57,6 +58,16 @@ export default function App() {
               <AuthGuard>
                 <VaultOnlyRedirect>
                   <ActivityPage />
+                </VaultOnlyRedirect>
+              </AuthGuard>
+            }
+          />
+          <Route
+            path="/credential-access"
+            element={
+              <AuthGuard>
+                <VaultOnlyRedirect>
+                  <CredentialAccessPage />
                 </VaultOnlyRedirect>
               </AuthGuard>
             }

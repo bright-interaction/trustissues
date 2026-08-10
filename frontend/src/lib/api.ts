@@ -4,6 +4,7 @@ import type {
   User,
   ManagedUser,
   ActivityListResponse,
+  CapabilityLogResponse,
   ActivityParams,
   LoginAttempt,
   TOTPSetupResponse,
@@ -195,6 +196,28 @@ export const api = {
         searchParams.set('offset', String(params.offset));
       const qs = searchParams.toString();
       return request<ActivityListResponse>(`/activity${qs ? `?${qs}` : ''}`);
+    },
+  },
+
+  capabilityLog: {
+    list: (params?: {
+      agent_id?: string;
+      event?: string;
+      secret_id?: string;
+      limit?: number;
+      offset?: number;
+    }) => {
+      const searchParams = new URLSearchParams();
+      if (params?.agent_id) searchParams.set('agent_id', params.agent_id);
+      if (params?.event) searchParams.set('event', params.event);
+      if (params?.secret_id) searchParams.set('secret_id', params.secret_id);
+      if (params?.limit) searchParams.set('limit', String(params.limit));
+      if (params?.offset != null)
+        searchParams.set('offset', String(params.offset));
+      const qs = searchParams.toString();
+      return request<CapabilityLogResponse>(
+        `/capability-log${qs ? `?${qs}` : ''}`,
+      );
     },
   },
 

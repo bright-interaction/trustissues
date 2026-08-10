@@ -151,6 +151,9 @@ type Querier interface {
 	CountActivityEntriesByUser(ctx context.Context, userID sql.NullString) (int64, error)
 	CountActivityEntriesFiltered(ctx context.Context, arg CountActivityEntriesFilteredParams) (int64, error)
 	CountAdmins(ctx context.Context) (int64, error)
+	// The same WHERE as ListCapabilityLog. If they ever drift, the pager reports a
+	// total the table cannot show.
+	CountCapabilityLog(ctx context.Context, arg CountCapabilityLogParams) (int64, error)
 	CountCollectionEntries(ctx context.Context, collectionID sql.NullString) (int64, error)
 	// Accepted managers only: a pending invitee cannot be the manager that keeps a
 	// collection from being orphaned.
@@ -426,6 +429,33 @@ type Querier interface {
 	// auto-rotation keeps running on those after the account is disabled.
 	ListAllVaultEntryTargets(ctx context.Context) ([]ListAllVaultEntryTargetsRow, error)
 	ListAuditForServiceIdentity(ctx context.Context, arg ListAuditForServiceIdentityParams) ([]ServiceSecretAudit, error)
+	// ============================================================================
+	// Reading the credential access trail
+	// ============================================================================
+	//
+	// capability_log has recorded every capability token issued, spent and denied
+	// since 00020, and until now NOTHING read it. No query, no route, no page. For a
+	// product whose pitch is that an agent spends a credential it never sees, "which
+	// agent spent which secret, when, and to where" is not a diagnostic detail, it is
+	// the receipt the whole design exists to produce, and it was write-only.
+	//
+	// 00039 made the table append-only and audit_name_crypto.go sealed secret_name
+	// under the audit DEK, so the rows are now both immutable and confidential. Those
+	// two passes protected a trail nobody could look at. This is the half that makes
+	// them worth having.
+	// Filters compose, deliberately, in ONE statement.
+	//
+	// ListActivityEntriesFiltered's own comment records what the alternative cost:
+	// its first cut was a switch whose leading arm won, so choosing a user silently
+	// discarded the action filter and the table and its export disagreed. On an audit
+	// surface two different answers to the same question is worse than one wrong one,
+	// so every filter is ANDed here and the count twin below shares the predicate
+	// verbatim.
+	ListCapabilityLog(ctx context.Context, arg ListCapabilityLogParams) ([]ListCapabilityLogRow, error)
+	// The distinct agents that appear in the trail, so the filter is a CHOSEN value
+	// rather than a typed one. An agent id is an opaque token the operator never
+	// memorises; a free-text box over it returns nothing and reads as "no activity".
+	ListCapabilityLogAgents(ctx context.Context) ([]string, error)
 	ListCollectionInvitations(ctx context.Context, collectionID string) ([]CollectionInvitation, error)
 	// Every seat waiting for one address, read at ACCOUNT CREATION.
 	//

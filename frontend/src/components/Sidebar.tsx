@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import {
   Activity,
   KeyRound,
+  ShieldCheck,
   Lock,
   LogOut,
   Settings,
@@ -22,6 +23,14 @@ const navItems: NavItem[] = [
   // GET /api/activity is wrapped in AdminOnly, so a non-admin who followed this
   // link just got a failing query and an empty page.
   { to: '/activity', icon: Activity, label: 'Activity', adminOnly: true },
+  // GET /api/capability-log is AdminOnly for the same reason /activity is: the
+  // rows name which secret an agent spent, which is the inventory.
+  {
+    to: '/credential-access',
+    icon: ShieldCheck,
+    label: 'Credential Access',
+    adminOnly: true,
+  },
   { to: '/users', icon: Users, label: 'Users', adminOnly: true },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];
