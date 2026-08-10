@@ -174,12 +174,13 @@ func (q *Queries) SeedVaultEntryCapabilityDefaults(ctx context.Context, arg Seed
 }
 
 const transferVaultEntrySecretOwner = `-- name: TransferVaultEntrySecretOwner :execresult
-UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
 
 type TransferVaultEntrySecretOwnerParams struct {
 	UserID            string `json:"user_id"`
 	SecretOwnerUserID string `json:"secret_owner_user_id"`
+	NameBidx          string `json:"name_bidx"`
 	ID                string `json:"id"`
 }
 
@@ -198,8 +199,29 @@ type TransferVaultEntrySecretOwnerParams struct {
 // the team keeps them. An instance admin already holds the widening right on
 // every entry (grantFor row 3), so this hands them nothing they did not have,
 // and the activity log names the transfer.
+//
+// name_bidx MOVES WITH user_id, and this statement is why it has to.
+//
+// 00040 encrypted vault_entries.name, which made the inline UNIQUE(user_id, name)
+// vacuous on purpose (a fresh nonce per seal means two equal names no longer
+// produce equal ciphertext) and moved per-user name uniqueness to the partial
+// unique index over name_bidx. That token is an HMAC keyed by the CUSTODIAN, so
+// an UPDATE that changes user_id and leaves name_bidx alone leaves the row
+// indexed under the PREVIOUS owner: uniqueness stops being enforced for it, and
+// the new owner can silently end up holding two entries with the same name.
+//
+// It also broke the caller's collision handling. Offboarding renames an incoming
+// entry when the new owner already has one by that name, and it detected that
+// case by catching the UNIQUE constraint error. After 00040 the constraint no
+// longer fired, so the rename branch went dead and the duplicates it existed to
+// prevent started landing instead.
 func (q *Queries) TransferVaultEntrySecretOwner(ctx context.Context, arg TransferVaultEntrySecretOwnerParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, transferVaultEntrySecretOwner, arg.UserID, arg.SecretOwnerUserID, arg.ID)
+	return q.db.ExecContext(ctx, transferVaultEntrySecretOwner,
+		arg.UserID,
+		arg.SecretOwnerUserID,
+		arg.NameBidx,
+		arg.ID,
+	)
 }
 
 const updateVaultEntryDestinationPatterns = `-- name: UpdateVaultEntryDestinationPatterns :exec

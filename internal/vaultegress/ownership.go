@@ -236,11 +236,20 @@ func (p TransferProof) authorizes(entryID, newOwner string) error {
 	return nil
 }
 
-// TransferOwnershipParams names the entry and its new owner. Both columns move
-// together; there is no way to spell moving one and not the other.
+// TransferOwnershipParams names the entry and its new owner. Both authority
+// columns move together; there is no way to spell moving one and not the other.
 type TransferOwnershipParams struct {
 	NewOwnerUserID string
 	ID             string
+	// NameBidx is the entry's name blind index recomputed under NewOwnerUserID.
+	//
+	// It is a required field rather than an optional one because the token is
+	// keyed by the custodian: leaving it behind indexes the row under the
+	// PREVIOUS owner, which silently stops per-user name uniqueness being
+	// enforced for it. Callers must derive it from the OPENED name, since 00040
+	// made the stored column ciphertext and an index over ciphertext is an index
+	// over a value that changes on every write.
+	NameBidx string
 }
 
 // TransferSecretOwnership re-owns one entry: the custodian column and the
@@ -257,6 +266,7 @@ func TransferSecretOwnership(ctx context.Context, q *db.Queries, p TransferProof
 	return writer(q).TransferVaultEntrySecretOwner(ctx, egressq.TransferVaultEntrySecretOwnerParams{
 		UserID:            params.NewOwnerUserID,
 		SecretOwnerUserID: params.NewOwnerUserID,
+		NameBidx:          params.NameBidx,
 		ID:                params.ID,
 	})
 }

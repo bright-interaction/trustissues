@@ -52,6 +52,19 @@ type Querier interface {
 	// that now lives in the adopter's, which is the opposite of what this statement
 	// exists to do.
 	AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRenameVaultEntryParams) error
+	// Re-owning ONE entry (so a single name collision cannot block the rest) is
+	// vaultegress.TransferSecretOwnership now. The statement moved to
+	// internal/vaultegress/queries because it writes secret_owner_user_id, the
+	// column the exit resolves "whose secret is this" from, and that column has
+	// exactly one post-creation writer by construction rather than by convention.
+	// RenameVaultEntry is GONE, deliberately.
+	//
+	// It wrote name WITHOUT name_bidx, which 00040 made a contradiction: the two are
+	// one fact in two columns, and a rename that moves only the ciphertext leaves the
+	// OLD name's token enforcing uniqueness and the new name's unconstrained. Its one
+	// caller (the offboard de-duplication) now uses UpdateVaultEntryName, which takes
+	// both. Removed rather than left unused, because the next person to need a rename
+	// would have found a ready-made statement that silently does the wrong half.
 	// Boot key-gate probe 3: every OTHER columncrypto surface.
 	//
 	// Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
@@ -602,14 +615,6 @@ type Querier interface {
 	RekeyInvitationCode(ctx context.Context, arg RekeyInvitationCodeParams) error
 	RekeyNotificationChannelConfig(ctx context.Context, arg RekeyNotificationChannelConfigParams) error
 	RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error)
-	// Re-owning ONE entry (so a single name collision cannot block the rest) is
-	// vaultegress.TransferSecretOwnership now. The statement moved to
-	// internal/vaultegress/queries because it writes secret_owner_user_id, the
-	// column the exit resolves "whose secret is this" from, and that column has
-	// exactly one post-creation writer by construction rather than by convention.
-	// Used only to de-duplicate on re-ownership when the new owner already has an
-	// entry by that name.
-	RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error)
 	// ============================================================================
 	// Resolve {{vault:NAME}} references (scoped to requesting user's vault)
 	// ============================================================================
