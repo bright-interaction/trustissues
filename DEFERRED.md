@@ -293,10 +293,27 @@ into the rotation delivery payload, the rotation alert email, the collection
 delete log line and the ownership repair report, all of which would have shipped
 `enc:v1:` blobs to an operator or a consuming service.
 
-Remaining residual, unchanged from step 4 below: `capability_log.secret_name` and
-`service_secret_audit.secret_names` still hold cleartext copies. Both tables are
-append-only, so encrypting them would put key-derived material somewhere the
-rekey sweep is not permitted to UPDATE. See THREAT-MODEL.md.
+**The audit twins are now done too**, in the same branch.
+`capability_log.secret_name` and `service_secret_audit.secret_names` are sealed
+under a separate audit DEK, wrapped under the master key in
+`settings.audit_name_dek`. Envelope encryption is what resolves the conflict
+step 4 below identified: both tables are append-only, so a rotation can never
+rewrite them, and it no longer needs to. Rewrapping one settings row rotates
+both columns.
+
+Two options were considered and rejected. Storing only the entry id and
+resolving the name at read time loses the property the denormalisation exists
+for, which is that the trail still names what was accessed after the entry is
+deleted; that is precisely the state an attacker creates. Carving an exception
+into the append-only triggers so the sweep could rewrite `secret_name` would
+reopen the cover-up path 00039 closed, because "the application may rewrite this
+column" and "an attacker with application access may rewrite this column" are
+the same permission.
+
+Residual, and it is permanent: audit rows written before this change stay
+cleartext, because append-only means they cannot be converted. A fresh install
+has none. `activity_log.detail` also still names entries in free text and is the
+next surface worth taking.
 
 ---
 

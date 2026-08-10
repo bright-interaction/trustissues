@@ -98,14 +98,27 @@ the key ever sit in the same place, you have defeated the encryption.
   blind index (`name_bidx`) that is unlinkable across users. A leaked `.db` no
   longer reveals the entry inventory from that table.
 
-  What a leaked `.db` still reveals: the same strings are mirrored, in cleartext,
-  into `activity_log.detail`, `capability_log.secret_name` and
-  `service_secret_audit.secret_names`. Those are append-only audit tables (00003,
-  00039), so they cannot be rewritten in place, and encrypting them going forward
-  would put a key-derived value into a table the rekey sweep is forbidden to
-  UPDATE. That trade has not been made yet, so the honest statement is: the live
-  inventory is protected, the audit history of it is not. Treat a backup as
-  revealing WHAT you have USED, never the secrets themselves.
+  The two audit mirrors of that name are encrypted too.
+  `capability_log.secret_name` and `service_secret_audit.secret_names` are sealed
+  under a separate data-encryption key (the audit DEK), which is itself stored
+  wrapped under the master key in `settings.audit_name_dek`. That indirection is
+  what lets them be encrypted at all: both tables are append-only (00003, 00039),
+  so a master-key rotation could never rewrite them, and rotating rewraps the DEK
+  instead. The name stays in the audit row, so the trail still names what was
+  accessed after the entry itself is deleted, which is the case it exists for.
+
+  What a leaked `.db` still reveals, stated plainly:
+
+  1. `activity_log.detail` holds free text that names entries ("Vault entry
+     moved: X", "Collection deleted: ..., 3 entries destroyed: [...]"). It is
+     append-only and unencrypted, and it is the surface a future pass should
+     take next.
+  2. Audit rows written BEFORE this change are cleartext and will stay that way
+     for ever. Append-only means exactly that: they cannot be converted, and a
+     migration that rewrote them would be the tampering the triggers exist to
+     prevent. A fresh install has none; an upgraded one keeps its history.
+
+  Treat a backup as revealing your older audit history, never the secrets.
 - **URL matching for the browser extension uses a keyed blind index, not the
   plaintext URL.** So the extension can ask "do we have an entry for this
   domain?" without the server storing the URL in the clear. The blind index

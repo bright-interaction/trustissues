@@ -198,6 +198,13 @@ func seedUnderKey(t *testing.T, h *VaultHandler, queries *db.Queries) seededStor
 		t.Fatalf("store smtp password: %v", err)
 	}
 
+	// The wrapped audit-name DEK, minted the way a real first audit write mints
+	// it. Seeded through the production path rather than hand-rolled, so the
+	// sweep is converting the same shape production writes.
+	if _, dekErr := h.auditNameDEK(ctx); dekErr != nil {
+		t.Fatalf("mint audit name key: %v", dekErr)
+	}
+
 	chID := seedNotificationChannelThroughTheRealWriter(t, h, queries)
 
 	// The boot sentinel, written the way a real first boot writes it.

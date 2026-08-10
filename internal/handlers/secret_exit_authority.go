@@ -388,6 +388,13 @@ type entrySecretSource interface {
 	// the cleartext for both and holds no vault key of its own. It goes through
 	// the ledger like every other opened column; see vaultFieldName.
 	EntryNamePlain(stored string) string
+	// SealAuditName encrypts a name on its way INTO an append-only audit table,
+	// under the audit DEK rather than the master key. Both callers (the capability
+	// bridge and the service-secrets fetch) hold no key of their own, and both
+	// write a name that would otherwise sit in cleartext beside the encrypted
+	// inventory it describes. See audit_name_crypto.go for why the DEK exists at
+	// all: append-only rows cannot be rewritten by a key rotation.
+	SealAuditName(ctx context.Context, plain string) string
 }
 
 // SCOPE BOUNDARY, DERIVED RATHER THAN LISTED.

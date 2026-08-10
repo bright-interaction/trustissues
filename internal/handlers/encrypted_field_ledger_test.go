@@ -364,6 +364,12 @@ var theVaultKeyHolders = map[string]string{
 		"after boot and a sweep triggered from the admin API later would otherwise read zeroes and " +
 		"report every v1 row unreadable. Everything it opens goes through internal/vaultfield or " +
 		"internal/secretexit with a declared Field; it does no crypto of its own.",
+	"internal/handlers/audit_name_crypto.go": "the audit-name DEK. This file is a holder twice over " +
+		"and both are deliberate: it unwraps the DEK with the MASTER key through columncrypto, and it " +
+		"then holds the DEK itself as a [32]byte to seal and open the audit name columns. The second " +
+		"key exists precisely so a master-key rotation never has to rewrite an append-only audit row: " +
+		"rewrapping the DEK is the whole rotation. It does no crypto of its own; both halves go " +
+		"through internal/vaultfield with a declared Field.",
 	"internal/handlers/auth.go": "TOTP secrets are a vault-key column and are opened through " +
 		"columncrypto with cfg.VaultKey.",
 	"internal/handlers/users.go": "the SMTP relay password is instance-owned configuration under the " +

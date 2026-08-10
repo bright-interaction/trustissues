@@ -580,20 +580,37 @@ func (h *ServiceSecretsHandler) audit(identityID, serviceName, event string, nam
 		return
 	}
 	id := hex.EncodeToString(idBytes)
+	// A nil slice marshals to the literal `null`, not to `[]`, so the existing
+	// guard never fired: every denial with no requested names stored "null" in a
+	// column whose own DEFAULT and doc comment say "[]". Harmless to a reader
+	// that unmarshals into a slice, and wrong to anybody reading the table.
+	if names == nil {
+		names = []string{}
+	}
 	namesJSON, _ := json.Marshal(names)
-	if namesJSON == nil {
+	if len(namesJSON) == 0 {
 		namesJSON = []byte("[]")
 	}
 	var identityIDArg sql.NullString
 	if identityID != "" {
 		identityIDArg = sql.NullString{String: identityID, Valid: true}
 	}
-	if err := h.queries.InsertServiceSecretAudit(context.Background(), db.InsertServiceSecretAuditParams{
+	ctx := context.Background()
+	// The WHOLE JSON array is sealed, not each element. Sealing per element would
+	// leave the array structure in the clear, so a reader still learns how many
+	// secrets a service pulled in one fetch; that count is itself a useful signal
+	// about a deployment. An empty list is left alone: "[]" says a name was never
+	// recorded, which is true and reveals nothing.
+	sealedNames := string(namesJSON)
+	if len(names) > 0 {
+		sealedNames = h.vault.SealAuditName(ctx, sealedNames)
+	}
+	if err := h.queries.InsertServiceSecretAudit(ctx, db.InsertServiceSecretAuditParams{
 		ID:                id,
 		ServiceIdentityID: identityIDArg,
 		ServiceName:       serviceName,
 		Event:             event,
-		SecretNames:       string(namesJSON),
+		SecretNames:       sealedNames,
 		Error:             errMsg,
 		RemoteIp:          remoteIP,
 	}); err != nil {
