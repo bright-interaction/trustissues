@@ -194,6 +194,16 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		slog.Error("offboard: could not list collection entries", "user", targetID, "error", err)
 		return
 	}
+	// Re-owning needs the vault handler for three things it cannot fake: opening
+	// the stored name, sealing the de-duplicated one, and deriving the blind
+	// index under the new custodian. Refusing here leaves the entries with the
+	// departing user, which the caller reports and an admin can repair; guessing
+	// would write rows indexed under the wrong person and a name nobody can read.
+	if h.vault == nil {
+		slog.Error("offboard: no vault handler wired, refusing to re-own collection entries",
+			"user", targetID, "entries", len(rows))
+		return
+	}
 	if len(rows) == 0 {
 		return
 	}
@@ -216,26 +226,19 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		// them "enc:v1:PT5r..." on the one surface that exists to tell them
 		// exactly which entries need attention.
 		//
-		// The dedup branch below is a SECOND consumer of row.Name and is NOT
-		// fixed by this line. Two defects live there, both introduced by 00040
-		// and both outside what this pass changes:
+		// EVERYTHING BELOW WORKS ON THE OPENED NAME.
 		//
-		//  1. dedup concatenates onto the CIPHERTEXT and RenameVaultEntry writes
-		//     it straight back, producing a name column that no key can open.
-		//  2. it is unreachable anyway: the collision it catches was
-		//     UNIQUE(user_id, name), which 00040 made vacuous (a fresh nonce per
-		//     seal means two equal names no longer collide), and the partial
-		//     index that replaced it is keyed by user_id, which
-		//     TransferSecretOwnership changes WITHOUT recomputing name_bidx. So
-		//     re-ownership now silently leaves the new owner holding two entries
-		//     with the same name and a stale token, instead of de-duplicating.
-		//
-		// Fixing those means recomputing name_bidx inside the authority-gated
-		// transfer, which is a vaultegress change and belongs in its own pass.
-		plainName := row.Name
-		if h.vault != nil {
-			plainName = h.vault.EntryNamePlain(row.Name)
-		}
+		// ListCollectionVaultEntriesForUser returns what is STORED, and 00040
+		// made that ciphertext. Three separate things here need the plaintext:
+		// the operator-facing lists, the de-duplicated name this builds, and the
+		// blind index that carries per-user uniqueness across the transfer.
+		// Reading row.Name directly gave all three the wrong value.
+		plainName := h.vault.EntryNamePlain(row.Name)
+		// Recomputed under the NEW custodian, because the token is keyed by
+		// user_id and the transfer is what changes it. Without this the row
+		// stays indexed under the departing user and its name stops being
+		// constrained at all.
+		newBidx := h.vault.nameBlindIndex(newOwnerID, plainName)
 		proof, pErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
 			EntryID:              row.ID,
 			Actor:                newOwnerID,
@@ -249,7 +252,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			continue
 		}
 		_, uErr := vaultegress.TransferSecretOwnership(r.Context(), h.queries, proof,
-			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID})
+			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID, NameBidx: newBidx})
 		if uErr == nil {
 			moved++
 			continue
@@ -260,9 +263,23 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			continue
 		}
 		// The new owner already has an entry by this name. Keep both.
-		dedup := row.Name + " (from " + email + ")"
-		if _, rErr := h.queries.RenameVaultEntry(r.Context(), db.RenameVaultEntryParams{
-			Name: dedup, ID: row.ID,
+		//
+		// Built from the OPENED name and written back sealed, with its index
+		// beside it. The previous version concatenated onto the ciphertext and
+		// stored the result, which produced a name column no key could ever open
+		// again: enc:v1:<base64> with a suffix glued past the end of the base64
+		// is not ciphertext, it is a corrupt row that still looks like one.
+		dedup := plainName + " (from " + email + ")"
+		sealedDedup, encErr := h.vault.encryptColumn(dedup)
+		if encErr != nil {
+			slog.Error("offboard: could not seal the de-duplicated entry name", "entry", row.ID, "error", encErr)
+			failed = append(failed, plainName)
+			continue
+		}
+		if rErr := h.queries.UpdateVaultEntryName(r.Context(), db.UpdateVaultEntryNameParams{
+			Name:     sealedDedup,
+			NameBidx: h.vault.nameBlindIndex(newOwnerID, dedup),
+			ID:       row.ID,
 		}); rErr != nil {
 			slog.Error("offboard: could not de-duplicate entry name", "entry", row.ID, "error", rErr)
 			failed = append(failed, plainName)
@@ -281,7 +298,11 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			continue
 		}
 		if _, uErr2 := vaultegress.TransferSecretOwnership(r.Context(), h.queries, retry,
-			vaultegress.TransferOwnershipParams{NewOwnerUserID: newOwnerID, ID: row.ID}); uErr2 != nil {
+			vaultegress.TransferOwnershipParams{
+				NewOwnerUserID: newOwnerID,
+				ID:             row.ID,
+				NameBidx:       h.vault.nameBlindIndex(newOwnerID, dedup),
+			}); uErr2 != nil {
 			slog.Error("offboard: re-own failed after rename", "entry", row.ID, "error", uErr2)
 			failed = append(failed, plainName)
 			continue

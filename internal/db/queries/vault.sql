@@ -439,10 +439,14 @@ WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != '';
 -- column the exit resolves "whose secret is this" from, and that column has
 -- exactly one post-creation writer by construction rather than by convention.
 
--- name: RenameVaultEntry :execresult
--- Used only to de-duplicate on re-ownership when the new owner already has an
--- entry by that name.
-UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- RenameVaultEntry is GONE, deliberately.
+--
+-- It wrote name WITHOUT name_bidx, which 00040 made a contradiction: the two are
+-- one fact in two columns, and a rename that moves only the ciphertext leaves the
+-- OLD name's token enforcing uniqueness and the new name's unconstrained. Its one
+-- caller (the offboard de-duplication) now uses UpdateVaultEntryName, which takes
+-- both. Removed rather than left unused, because the next person to need a rename
+-- would have found a ready-made statement that silently does the wrong half.
 
 -- name: AnyEncryptedColumnSample :many
 -- Boot key-gate probe 3: every OTHER columncrypto surface.

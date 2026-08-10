@@ -59,6 +59,8 @@ func (q *Queries) AdoptAndRenameVaultEntry(ctx context.Context, arg AdoptAndRena
 }
 
 const anyEncryptedColumnSample = `-- name: AnyEncryptedColumnSample :many
+
+
 SELECT family, blob FROM (SELECT 'columncrypto' AS family, value AS blob FROM settings WHERE key = 'smtp_password' AND value != '' LIMIT 1)
 UNION ALL
 SELECT family, blob FROM (SELECT 'vaultcolumn' AS family, code AS blob FROM invitations WHERE code != '' LIMIT 1)
@@ -71,6 +73,19 @@ type AnyEncryptedColumnSampleRow struct {
 	Blob   string `json:"blob"`
 }
 
+// Re-owning ONE entry (so a single name collision cannot block the rest) is
+// vaultegress.TransferSecretOwnership now. The statement moved to
+// internal/vaultegress/queries because it writes secret_owner_user_id, the
+// column the exit resolves "whose secret is this" from, and that column has
+// exactly one post-creation writer by construction rather than by convention.
+// RenameVaultEntry is GONE, deliberately.
+//
+// It wrote name WITHOUT name_bidx, which 00040 made a contradiction: the two are
+// one fact in two columns, and a rename that moves only the ciphertext leaves the
+// OLD name's token enforcing uniqueness and the new name's unconstrained. Its one
+// caller (the offboard de-duplication) now uses UpdateVaultEntryName, which takes
+// both. Removed rather than left unused, because the next person to need a rename
+// would have found a ready-made statement that silently does the wrong half.
 // Boot key-gate probe 3: every OTHER columncrypto surface.
 //
 // Probes 1 and 2 cover v2 vault secrets and marked TOTP seeds. A database whose
@@ -1431,27 +1446,6 @@ type MigrateVaultEntryEncryptionParams struct {
 func (q *Queries) MigrateVaultEntryEncryption(ctx context.Context, arg MigrateVaultEntryEncryptionParams) error {
 	_, err := q.db.ExecContext(ctx, migrateVaultEntryEncryption, arg.EncryptedValue, arg.Nonce, arg.ID)
 	return err
-}
-
-const renameVaultEntry = `-- name: RenameVaultEntry :execresult
-
-UPDATE vault_entries SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type RenameVaultEntryParams struct {
-	Name string `json:"name"`
-	ID   string `json:"id"`
-}
-
-// Re-owning ONE entry (so a single name collision cannot block the rest) is
-// vaultegress.TransferSecretOwnership now. The statement moved to
-// internal/vaultegress/queries because it writes secret_owner_user_id, the
-// column the exit resolves "whose secret is this" from, and that column has
-// exactly one post-creation writer by construction rather than by convention.
-// Used only to de-duplicate on re-ownership when the new owner already has an
-// entry by that name.
-func (q *Queries) RenameVaultEntry(ctx context.Context, arg RenameVaultEntryParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, renameVaultEntry, arg.Name, arg.ID)
 }
 
 const resolveVaultReference = `-- name: ResolveVaultReference :many
