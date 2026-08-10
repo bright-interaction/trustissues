@@ -610,6 +610,12 @@ func main() {
 			// Activity log + exports (admin only).
 			r.Group(func(r chi.Router) {
 				r.Use(timw.AdminOnly())
+				// The credential access trail. Admin-gated with the activity log
+				// and for the same reason: it names which secret an agent spent,
+				// which is the inventory, and it is the one surface that answers
+				// "who used this credential, when, and to where" after the entry
+				// itself has been deleted.
+				r.Get("/capability-log", capabilityHandler.ListCapabilityLog)
 				r.Get("/activity", activityHandler.List)
 				r.Get("/activity/export/csv", activityHandler.ExportCSV)
 				r.Get("/activity/export/json", activityHandler.ExportJSON)

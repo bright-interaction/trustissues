@@ -69,6 +69,35 @@ export interface ActivityListResponse {
   total: number;
 }
 
+/**
+ * One row of the credential access trail (capability_log).
+ *
+ * secret_name arrives OPENED: it is sealed at rest under the audit DEK, because
+ * in cleartext it rebuilt the encrypted inventory out of a stolen database file.
+ * It is denormalised on purpose, so the row still names the secret after the
+ * entry itself has been deleted, which is exactly the state an attacker who used
+ * a credential and then removed it creates.
+ */
+export interface CapabilityLogEntry {
+  id: string;
+  agent_id: string;
+  secret_id: string | null;
+  secret_name: string;
+  destination: string;
+  method: string;
+  event: string;
+  status_code: number | null;
+  error: string;
+  issued_at: string;
+}
+
+export interface CapabilityLogResponse {
+  entries: CapabilityLogEntry[];
+  total: number;
+  /** Distinct agents seen in the trail, so the filter is chosen and not typed. */
+  agents: string[];
+}
+
 export interface ActivityParams {
   user_id?: string;
   action?: string;

@@ -395,6 +395,14 @@ type entrySecretSource interface {
 	// inventory it describes. See audit_name_crypto.go for why the DEK exists at
 	// all: append-only rows cannot be rewritten by a key rotation.
 	SealAuditName(ctx context.Context, plain string) string
+	// OpenAuditName is SealAuditName's twin, and it is declared here for a
+	// reason worth stating: the seal shipped WITHOUT it, so capability_log spent
+	// its whole life write-only. The bridge sealed a name into an append-only
+	// table three passes hardened, and nothing in the product could read one
+	// back. A one-directional door on an audit trail is not confidentiality, it
+	// is a table nobody can consult. Pairing them in the interface is what makes
+	// the omission a compile error next time.
+	OpenAuditName(ctx context.Context, stored string) string
 }
 
 // SCOPE BOUNDARY, DERIVED RATHER THAN LISTED.

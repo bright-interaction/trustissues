@@ -205,6 +205,12 @@ const auditNameUnavailable = "[unavailable]"
 // is the same reason the rekey sweep keeps keySource around.
 // openAuditName reverses sealAuditName for display. An unprefixed value is
 // returned as-is, so rows written before this existed still read.
+// OpenAuditName is the exported form, used through entrySecretSource by the
+// readers that hold no vault key of their own.
+func (h *VaultHandler) OpenAuditName(ctx context.Context, stored string) string {
+	return h.openAuditName(ctx, stored)
+}
+
 func (h *VaultHandler) openAuditName(ctx context.Context, stored string) string {
 	if stored == "" || !vaultfield.IsSealedColumn(stored) {
 		return stored

@@ -8,6 +8,11 @@ export const queryKeys = {
     list: (params?: Record<string, unknown>) =>
       [...queryKeys.activity.all, 'list', params] as const,
   },
+  capabilityLog: {
+    all: ['capability-log'] as const,
+    list: (params?: Record<string, unknown>) =>
+      [...queryKeys.capabilityLog.all, 'list', params] as const,
+  },
   admin: {
     users: () => ['admin', 'users'] as const,
     invitations: () => ['admin', 'invitations'] as const,
