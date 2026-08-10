@@ -1584,7 +1584,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// belongs to.
 	h.seedCapabilityDefaults(ctx, h.queries, r, entryID, req.Provider, func() bool { return true })
 
-	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", req.Name, userID))
+	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", h.sealSecretName(r.Context(), req.Name), userID))
 
 	writeJSON(w, http.StatusCreated, entry)
 }
@@ -1694,7 +1694,7 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 	// service on one row". It is neither self-inflicted nor one row.
 	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf(
 		"Vault entry moved: %s (id: %s, from: %s, to: %s)",
-		scrubEntryIDLookalikes(name), id, collectionLabel(source), collectionLabel(destination)))
+		h.sealSecretName(r.Context(), scrubEntryIDLookalikes(name)), id, collectionLabel(source), collectionLabel(destination)))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2535,7 +2535,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	entry := h.vaultMetaFromGetRow(ctx, row, userID)
 
-	LogActivityFromRequest(h.queries, r, "vault.entry_updated", fmt.Sprintf("Vault secret updated: %s (user: %s)", entry.Name, userID))
+	LogActivityFromRequest(h.queries, r, "vault.entry_updated", fmt.Sprintf("Vault secret updated: %s (user: %s)", h.sealSecretName(r.Context(), entry.Name), userID))
 
 	writeJSON(w, http.StatusOK, entry)
 }
@@ -2559,6 +2559,12 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	// Opened, because GetVaultEntryName returns what is STORED and 00040 made
+	// that ciphertext. The only consumer here is the activity line below, and an
+	// audit row reading "Vault secret deleted: enc:v1:PT5r..." names nothing at
+	// the one moment the log is the last place the name still exists: after the
+	// row is gone, this line IS the record of what was deleted.
+	name = h.EntryNamePlain(name)
 
 	result, err := h.queries.DeleteVaultEntry(ctx, id)
 	if err != nil {
@@ -2573,7 +2579,7 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	LogActivityFromRequest(h.queries, r, "vault.entry_deleted", fmt.Sprintf("Vault secret deleted: %s (user: %s)", name, userID))
+	LogActivityFromRequest(h.queries, r, "vault.entry_deleted", fmt.Sprintf("Vault secret deleted: %s (user: %s)", h.sealSecretName(r.Context(), name), userID))
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -2781,6 +2787,19 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	// Opened ONCE, into the local copy, for the reason rotateOneEntry states at
+	// its own EntryNamePlain call: the fourteen places below that use this name
+	// are then all correct without each having to remember. meta is a value, so
+	// this changes nothing in the database, and Rotate never writes Name back.
+	//
+	// This was a live regression rather than a precaution. 00040 made the stored
+	// name ciphertext, and the MANUAL rotation path kept reading it raw while the
+	// auto path opened it, so a manual rotation put enc:v1: blobs into the
+	// activity log, into every recordRotationFailure record (which is what the
+	// rotation alert email and the entry's rotation log render), and into the
+	// origin label stamped on the minted secret. The auto path was correct and
+	// the manual twin was not, which is the shape this codebase keeps finding.
+	meta.Name = h.EntryNamePlain(meta.Name)
 
 	// newValue and oldValue are OPAQUE. They are the entry's secret, so they are
 	// the same type a decrypted one is, and neither can be read, logged or sent
@@ -2968,7 +2987,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 				ID:          id,
 			})
 			LogActivityFromRequest(h.queries, r, "vault.rotation_reminder",
-				fmt.Sprintf("Rotation reminder for vault secret: %s (provider: %s cannot rotate automatically)", meta.Name, providerName))
+				fmt.Sprintf("Rotation reminder for vault secret: %s (provider: %s cannot rotate automatically)", h.sealSecretName(r.Context(), meta.Name), providerName))
 			writeError(w, r, http.StatusConflict, "manual_rotation_required",
 				"this provider cannot be rotated automatically; rotate the credential in the provider's own dashboard, then edit this entry and paste the new value. Nothing was changed.")
 			return
@@ -3186,7 +3205,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// Opened, like the scheduled path does. This name goes into the activity
 		// log, the alert email and the delivery payload the consuming service
 		// receives; stored form would be an enc:v1: blob in all three.
-		EntryName:   h.EntryNamePlain(meta.Name),
+		EntryName:   meta.Name, // already opened at the top of Rotate
 		Provider:    providerName,
 		Method:      rotationMethod,
 		UserID:      userID,
@@ -3204,7 +3223,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		recordRotationOutcomeUndeliverable(ctx, deps, rec)
 		LogActivityFromRequest(h.queries, r, "vault.rotated",
 			fmt.Sprintf("Vault secret rotated but NOT delivered (%s/%s): %s (user: %s, rotation_targets unreadable)",
-				rotationMethod, providerName, meta.Name, userID))
+				rotationMethod, providerName, h.sealSecretName(r.Context(), meta.Name), userID))
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		// Re-read so the response carries the outcome we JUST recorded.
@@ -3252,7 +3271,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		}(rec)
 	}
 
-	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, meta.Name, userID, len(targets)))
+	LogActivityFromRequest(h.queries, r, "vault.rotated", fmt.Sprintf("Vault secret rotated (%s/%s): %s (user: %s, targets: %d)", rotationMethod, providerName, h.sealSecretName(r.Context(), meta.Name), userID, len(targets)))
 
 	// The response body is fetched LAST, and a failure here degrades it instead of
 	// aborting.

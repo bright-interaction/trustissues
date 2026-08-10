@@ -19,11 +19,37 @@ import (
 // ActivityHandler handles activity log endpoints.
 type ActivityHandler struct {
 	queries *db.Queries
+	// vault opens the activity lines that name a vault secret, which are sealed
+	// at rest under the audit DEK (see activity_detail_crypto.go). Optional and
+	// wired by SetVault after construction, because the vault handler is built
+	// later; a nil vault degrades the sealed lines to a marker rather than
+	// failing the page, since the rest of every row (who, what action, when,
+	// from where) is unsealed and is most of what the surface is for.
+	vault *VaultHandler
 }
 
 // NewActivityHandler creates a new ActivityHandler.
 func NewActivityHandler(queries *db.Queries) *ActivityHandler {
 	return &ActivityHandler{queries: queries}
+}
+
+// SetVault wires the handler that can open sealed activity lines.
+func (h *ActivityHandler) SetVault(v *VaultHandler) { h.vault = v }
+
+// openDetail reverses the seal for display, on every row of every read path.
+//
+// Applied to ALL rows rather than to a known-sealed subset on purpose: the log
+// is a permanent mixture. Lines that name a secret are sealed, every other
+// action is not, and the rows written before this existed never can be, because
+// activity_log has been append-only since 00003. OpenActivityDetail returns an
+// unsealed value unchanged, so one call covers all three cases and there is no
+// per-action list to keep in sync with the writers.
+func (h *ActivityHandler) openDetail(ctx context.Context, detail sql.NullString) sql.NullString {
+	if !detail.Valid || h.vault == nil {
+		return detail
+	}
+	detail.String = h.vault.OpenActivityDetail(ctx, detail.String)
+	return detail
 }
 
 type activityEntry struct {
@@ -87,7 +113,7 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 			UserID:    nullStringPtr(userID),
 			UserEmail: nullStringPtr(userEmail),
 			Action:    action,
-			Detail:    nullStringPtr(detail),
+			Detail:    nullStringPtr(h.openDetail(ctx, detail)),
 			IPAddress: nullStringPtr(ipAddress),
 			UserAgent: nullStringPtr(userAgent),
 			CreatedAt: nullTimeRFC3339(createdAt),
@@ -173,7 +199,7 @@ func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			csvSafe(nullStringToString(row.UserID)),
 			csvSafe(nullStringToString(row.UserEmail)),
 			csvSafe(row.Action),
-			csvSafe(nullStringToString(row.Detail)),
+			csvSafe(nullStringToString(h.openDetail(r.Context(), row.Detail))),
 			csvSafe(nullStringToString(row.IpAddress)),
 			csvSafe(nullStringToString(row.UserAgent)),
 			nullTimeRFC3339(row.CreatedAt),
@@ -239,7 +265,7 @@ func (h *ActivityHandler) ExportJSON(w http.ResponseWriter, r *http.Request) {
 			UserID:    nullStringPtr(row.UserID),
 			UserEmail: nullStringPtr(row.UserEmail),
 			Action:    row.Action,
-			Detail:    nullStringPtr(row.Detail),
+			Detail:    nullStringPtr(h.openDetail(r.Context(), row.Detail)),
 			IPAddress: nullStringPtr(row.IpAddress),
 			UserAgent: nullStringPtr(row.UserAgent),
 			CreatedAt: nullTimeRFC3339(row.CreatedAt),

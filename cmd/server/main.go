@@ -329,6 +329,12 @@ func main() {
 	// the user handler needs the vault. Wired here because the vault handler is
 	// constructed after it.
 	userHandler.SetVault(vaultHandler)
+	// The activity page and both of its exports render lines that are sealed at
+	// rest whenever they name a vault secret, so the reader needs the same
+	// handler that holds the audit DEK. Without this the page still renders and
+	// every sealed line reads "[unavailable]", which is a silent, plausible
+	// degradation rather than an error, so it is wired next to the other two.
+	activityHandler.SetVault(vaultHandler)
 	// ChangePassword invalidates the caller's own rotation delivery targets as
 	// part of full credential invalidation, same reasoning as userHandler above.
 	authHandler.SetVault(vaultHandler)
