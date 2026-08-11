@@ -324,8 +324,8 @@ mitigation until the code-side fix ships.
 | R6 | ~~Extension API key never shown in the UI.~~ **Resolved.** Settings has an "API keys" tab where any user, including `vault_only`, mints a key, sees it once, and copies it to connect the extension. | Was: users could not self-serve an extension key. Note this table claimed "Resolved" while the router still redirected `vault_only` away from `/settings`, so it was false for the only role that needs it; fixed alongside this row. | None needed; issue keys from Settings. `vault_only` sees an Account and API keys tab only, enforced server-side by `AdminOnly` on every other surface. |
 | R7 | ~~Secrets only length-checked.~~ **Resolved.** The server refuses to boot on a low-entropy or placeholder `TRUSTISSUES_VAULT_KEY`/`JWT_SECRET`, on top of the 32-char minimum. | Was: a lazy operator could run with a known key. | Generate both with `openssl rand -hex 32`. |
 | R8 | ~~`login_attempts` is never purged.~~ **Resolved.** A janitor sweeps rows older than `handlers.LoginAttemptRetention` (24h) hourly and once at boot, so an instance that has been accumulating since before this existed is cleaned on its first boot with it. | Was: unbounded growth of a table of plaintext addresses and IPs, readable from a keyless backup, and the one table an unauthenticated caller can write a row of their choosing into. | None needed. The window is a constant rather than a setting, deliberately: nothing reads a row older than 15 minutes, and `TestLoginAttemptRetentionOutlivesEveryReader` derives every reader's window from the query files and fails if the constant stops exceeding the longest one. The login audit trail is `activity_log`, which is append-only and untouched by the sweep. |
-| R9 | **Only `activity_log` is append-only.** Its `_no_update`/`_no_delete` triggers ABORT tampering (00003, amended by 00027 to allow anonymization). `capability_log` and `service_secret_audit` have no triggers at all. | Someone with direct SQLite access can erase the capability and service-secret trail without tripping anything, while the human-action trail resists it. The trails disagree about how well they are protected. | Direct filesystem access to the DB is already game over for confidentiality (see trust boundaries), so this is about post-incident reconstruction, not prevention. Ship the same triggers on both tables; tracked as DEFERRED (b). |
-| R10 | **Nothing reads `capability_log`.** The table is written on every capability issue and use and there is no endpoint, no UI and no export over it. | The capability trail exists but cannot be reviewed without opening the database by hand, which means in practice it is not reviewed. | `sqlite3 $TRUSTISSUES_DATA_DIR/trustissues.db 'SELECT * FROM capability_log ORDER BY created_at DESC LIMIT 50'` until DEFERRED (c) ships. |
+| R9 | ~~**Only `activity_log` is append-only.**~~ **Resolved (00039).** All three trails now carry `_no_update`/`_no_delete` triggers that ABORT tampering: `activity_log` (00003, amended by 00027 to allow actor anonymization), and `capability_log` plus `service_secret_audit` (00039). | Was: someone with direct SQLite access could erase the capability and service-secret trail without tripping anything, while the human-action trail resisted it. The trails disagreed about how well they were protected. | None needed. Verify on a live store with `sqlite3 $TRUSTISSUES_DATA_DIR/trustissues.db "UPDATE capability_log SET action='x'"`, which must fail with `capability_log is append-only`. Direct filesystem access is still game over for confidentiality (see trust boundaries); these triggers are about post-incident reconstruction, not prevention. |
+| R10 | ~~**Nothing reads `capability_log`.**~~ **Resolved.** `GET /api/capability-log` serves it, paged, and the Credential Access page in the UI renders it. | Was: the capability trail existed but could not be reviewed without opening the database by hand, which meant in practice it was not reviewed. | None needed. The direct query still works if you prefer it: `sqlite3 $TRUSTISSUES_DATA_DIR/trustissues.db 'SELECT * FROM capability_log ORDER BY created_at DESC LIMIT 50'`. |
 | R11 | **Audit actor attribution is lost on user deletion.** `activity_log.user_id` is `ON DELETE SET NULL`. | Deleting a user anonymizes their entire history in the one trail that IS tamper-evident, so "who did this" becomes unanswerable for exactly the person most likely to be under investigation. | Disable accounts instead of deleting them (`disabled = 1` is enforced at every auth path and keeps the rows intact). Tracked as DEFERRED (f). |
 | R12 | **The rename oracle is mitigated, not closed.** `UNIQUE(user_id, name)` is table-level, so a rename still asks a question about the creator's private namespace; the shipped fix bounds who may ask. | A narrow existence oracle over another user's entry names, for the principals still permitted to rename. | None available at the operator level. The complete fix (partial indexes) needs a `vault_entries` rebuild that would cascade-delete `capability_grants`; tracked as DEFERRED (h). |
 
@@ -520,12 +520,17 @@ route around, and it is the part of this system you should trust most.
 
 The following have never been read by any round, and are listed here so nobody
 mistakes nineteen rounds for coverage. This is round 14's own list, minus the
-authentication path, which was read on 2026-08-05.
+authentication path, which was read on 2026-08-05, and minus
+`vault_providers.go`, which was read on 2026-08-10.
 
-- `internal/handlers/vault_providers.go` (1852 lines), the largest unread file.
-  Every rotation finding to date is about the wrapper. The code doing the actual
-  upstream mint and revoke calls, response parsing and per-provider credential
-  shapes has never been read.
+This list is only worth anything if it shrinks when the reading happens, so two
+notes on how to keep it honest. It is maintained BY HAND, which means it goes
+stale the moment a pass reads a file and does not come back here to say so. It
+did exactly that: `vault_providers.go` sat on this list for a day after being
+read end to end. And it is wrong in the direction that flatters us as often as
+the other way, so treat an entry as "verify before believing" rather than as
+fact.
+
 - `internal/alerts/channels.go`, the off-box egress sink. A refuted "teammate
   email leaks in `last_rotation_error`" finding was argued at the caller; nobody
   read what is actually POSTed.

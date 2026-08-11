@@ -269,4 +269,16 @@ echo "Pushing filtered mirror -> $REMOTE_URL main ..."
 # shellcheck source=../../scripts/mirror-push.sh
 . "$ROOT/scripts/mirror-push.sh"
 mirror_force_publish "$CLONE" "$REMOTE_URL"
+
+# Cut the release tag when this product's VERSION file names one that is not
+# published yet. The push above moves main; a tag is a SEPARATE ref and was
+# never pushed at all, which is how reactor shipped every 2026-07-27 audit fix
+# to main while `@latest` still resolved to the vulnerable v0.1.0, and how
+# trustissues repeated it a day later with vault_entries.name cleartext at its
+# only tag. Non-fatal by construction: main is already published by this line,
+# so a tag problem warns and never fails the publish.
+# shellcheck source=../../scripts/mirror-release-tag.sh
+. "$ROOT/scripts/mirror-release-tag.sh"
+mirror_release_tag "$CLONE" "$REMOTE_URL"
+
 echo "Done. Cleanup: git branch -D $SPLIT_BRANCH"
