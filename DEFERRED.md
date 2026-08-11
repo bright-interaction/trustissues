@@ -97,11 +97,20 @@ the current key alone or look an entry up under a single blind index.
 
 ## (b) Append-only / tamper-evident audit tables
 
-**Today.** `activity_log` has append-only triggers that ABORT any UPDATE or
+**Status: SHIPPED 2026-08-10, migration 00039.** `capability_log` and
+`service_secret_audit` now carry the same `_no_update` / `_no_delete` triggers
+`activity_log` has had since 00003, so all three trails resist tampering
+equally. Verified on a live store, not just in the migration: `UPDATE
+capability_log SET action='x'` and the matching DELETE both ABORT with
+`capability_log is append-only`. The rest of this section is the original
+design note, kept because the deferral reasoning is still the right way to
+think about what these triggers do and do not buy.
+
+**Was.** `activity_log` had append-only triggers that ABORT any UPDATE or
 DELETE. The two tables that record automated agent / service secret access,
-`capability_log` and `service_secret_audit`, have no such triggers, so a raw
-`sqlite3` session can `DELETE FROM capability_log` freely. The most sensitive
-trail (which agent used which secret to which destination) is erasable.
+`capability_log` and `service_secret_audit`, had no such triggers, so a raw
+`sqlite3` session could `DELETE FROM capability_log` freely. The most sensitive
+trail (which agent used which secret to which destination) was erasable.
 
 **Design when built.** Add `_no_update` / `_no_delete` BEFORE triggers to both
 tables, copying the pattern already in `00003_activity_log.sql`. This is a
@@ -117,9 +126,15 @@ concern.
 
 ## (c) In-product capability_log read endpoint
 
-**Today.** Nothing reads `FROM capability_log`. Human actions are viewable
-(`GET /api/activity`) and per-identity fetches are viewable
-(`GET /api/service-identities/{id}/audit`), but agent secret-usage is only
+**Status: SHIPPED 2026-08-10.** `GET /api/capability-log` serves the trail,
+paged and filterable by agent and event, and the Credential Access page renders
+it. It shipped together with (b), which was the point of pairing them: what the
+page shows cannot be quietly deleted underneath it. The path is
+`/api/capability-log` rather than the `/api/capability/log` sketched below.
+
+**Was.** Nothing read `FROM capability_log`. Human actions were viewable
+(`GET /api/activity`) and per-identity fetches were viewable
+(`GET /api/service-identities/{id}/audit`), but agent secret-usage was only
 reachable through the sqlite CLI.
 
 **Design when built.** Add an admin-only `GET /api/capability/log` (filter by
