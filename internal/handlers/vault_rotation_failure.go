@@ -83,19 +83,17 @@ func recordRotationFailure(
 		slog.Error("vault rotation: persisting last_rotation_error failed", "entry", entryName, "error", err)
 	}
 
-	updatedLog := AppendRotationLog(existingLog, RotationLogEntry{
+	// existingLog is the CALLER's snapshot and is deliberately not appended to.
+	// On the sweep it is taken at pass start and can be 90 seconds behind, so
+	// writing it back erased a concurrent manual rotation's success entry and
+	// replaced it with this failure. appendRotationLog re-reads under CAS.
+	appendRotationLog(ctx, queries, entryID, entryName, RotationLogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    "error",
 		Provider:  providerName,
 		Error:     reason,
 		Method:    method,
 	})
-	if err := queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-		RotationLog: sql.NullString{String: updatedLog, Valid: true},
-		ID:          entryID,
-	}); err != nil {
-		slog.Error("vault rotation: persisting rotation_log failed", "entry", entryName, "error", err)
-	}
 
 	// A nil actorID (the scheduler) shows as system in the activity list. Only
 	// the secret NAME appears here, never its value.

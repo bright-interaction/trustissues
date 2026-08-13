@@ -200,7 +200,7 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 	// be 90s stale on the sweep, which used to erase a concurrent manual rotation's
 	// history entry and stamp this pass's conflict error over a rotation that had
 	// actually succeeded. See appendRotationLog.
-	appendRotationLog(ctx, deps, rec.EntryID, rec.EntryName, RotationLogEntry{
+	appendRotationLog(ctx, deps.queries, rec.EntryID, rec.EntryName, RotationLogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    status,
 		Provider:  rec.Provider,
@@ -288,7 +288,7 @@ func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, 
 	}); err != nil {
 		slog.Error("vault rotation: persist last_rotation_error failed", "entry", rec.EntryName, "error", err)
 	}
-	appendRotationLog(ctx, deps, rec.EntryID, rec.EntryName, RotationLogEntry{
+	appendRotationLog(ctx, deps.queries, rec.EntryID, rec.EntryName, RotationLogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    "partial",
 		Provider:  rec.Provider,
@@ -316,14 +316,22 @@ const rotationLogCASAttempts = 4
 // audit trail for a rotation that has ALREADY committed, so refusing the caller
 // would be worse than a missing history line. The value, last_rotation_error and the
 // alert are all written elsewhere.
-func appendRotationLog(ctx context.Context, deps rotationDeps, entryID, entryName string, entry RotationLogEntry) {
+//
+// It takes *db.Queries rather than rotationDeps because it is the ONLY writer of
+// rotation_log left, and three of its callers sit outside the rotation-core deps
+// struct: the reminder branch of the scheduled sweep, the reminder branch of the
+// manual handler, and recordRotationFailure. Those three used to call a plain
+// UpdateVaultEntryRotationLog with a caller-supplied snapshot, which is the exact
+// read-modify-write this function exists to prevent; the plain query has been
+// deleted so the mistake is no longer expressible.
+func appendRotationLog(ctx context.Context, queries *db.Queries, entryID, entryName string, entry RotationLogEntry) {
 	for attempt := 0; attempt < rotationLogCASAttempts; attempt++ {
-		current, err := deps.queries.GetVaultEntryRotationLog(ctx, entryID)
+		current, err := queries.GetVaultEntryRotationLog(ctx, entryID)
 		if err != nil {
 			slog.Error("vault rotation: read rotation_log failed", "entry", entryName, "error", err)
 			return
 		}
-		res, err := deps.queries.CASVaultEntryRotationLog(ctx, db.CASVaultEntryRotationLogParams{
+		res, err := queries.CASVaultEntryRotationLog(ctx, db.CASVaultEntryRotationLogParams{
 			RotationLog:   toNullString(AppendRotationLog(current, entry)),
 			ID:            entryID,
 			RotationLog_2: toNullString(current),

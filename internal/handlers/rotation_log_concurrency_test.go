@@ -35,12 +35,12 @@ func TestConcurrentRotationLogAppendsDoNotLoseEachOther(t *testing.T) {
 	}
 
 	// A first append lands (think: the user's manual rotation completing).
-	appendRotationLog(ctx, deps, id, "Race", RotationLogEntry{Timestamp: "t1", Status: "success", Method: "manual"})
+	appendRotationLog(ctx, deps.queries, id, "Race", RotationLogEntry{Timestamp: "t1", Status: "success", Method: "manual"})
 
 	// Now the holder of the stale snapshot appends (the sweep, minutes later). With a
 	// snapshot-based write this overwrites the first entry; with the CAS it must
 	// append on top of it.
-	appendRotationLog(ctx, deps, id, "Race", RotationLogEntry{Timestamp: "t2", Status: "partial", Method: "auto"})
+	appendRotationLog(ctx, deps.queries, id, "Race", RotationLogEntry{Timestamp: "t2", Status: "partial", Method: "auto"})
 
 	row, err := queries.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
@@ -82,7 +82,7 @@ func TestRotationLogAppendKeepsTheTrim(t *testing.T) {
 	mustEntry(t, h, queries, id, owner, "Trim", "V0")
 
 	for i := 0; i < 60; i++ {
-		appendRotationLog(ctx, deps, id, "Trim", RotationLogEntry{
+		appendRotationLog(ctx, deps.queries, id, "Trim", RotationLogEntry{
 			Timestamp: "t", Status: "success", Method: "auto",
 		})
 	}
@@ -98,5 +98,78 @@ func TestRotationLogAppendKeepsTheTrim(t *testing.T) {
 	if len(entries) != 50 {
 		t.Errorf("rotation_log holds %d entries after 60 appends, want the 50-entry cap; "+
 			"an audit column that grows without bound is its own problem", len(entries))
+	}
+}
+
+// TestRecordRotationFailureDoesNotEraseAConcurrentSuccess covers the path the CAS
+// fix originally MISSED.
+//
+// TestConcurrentRotationLogAppendsDoNotLoseEachOther above proves appendRotationLog
+// is safe, and it has been passing since the CAS query was written. It proved
+// nothing about production, because three call sites never went through
+// appendRotationLog: the reminder branch of the scheduled sweep, the reminder branch
+// of the manual handler, and this one, recordRotationFailure. All three took a
+// caller-supplied snapshot and wrote it back with a plain UPDATE, which is the exact
+// lost update the CAS was added to prevent, still live on the majority of paths.
+//
+// recordRotationFailure is the sharpest of the three because its staleness is a
+// PARAMETER: existingLog is handed in by the caller, and the sweep hands in the
+// pass-start snapshot. This test therefore passes a deliberately stale one, which is
+// what the sweep does in production, and asserts the concurrent success survives.
+//
+// The plain query is gone from vault.sql, so a regression here cannot be written:
+// there is no generated method to call. This test is what makes that deletion
+// meaningful rather than cosmetic, by asserting the BEHAVIOUR the deletion buys.
+func TestRecordRotationFailureDoesNotEraseAConcurrentSuccess(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	ctx := context.Background()
+
+	owner := mustUser(t, queries, "failrace@example.com", "user", "")
+	const id = "log-fail-race-entry"
+	mustEntry(t, h, queries, id, owner, "FailRace", "V0")
+
+	// The sweep's snapshot, taken at pass start: empty.
+	stale, err := queries.GetVaultEntryRotationLog(ctx, id)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// The user's manual rotation succeeds while the sweep is still working through
+	// earlier entries.
+	appendRotationLog(ctx, queries, id, "FailRace", RotationLogEntry{
+		Timestamp: "t1", Status: "success", Method: "manual",
+	})
+
+	// Now the sweep records its failure, holding the snapshot from before that.
+	recordRotationFailure(ctx, queries, h, id, "FailRace", "backblaze", stale,
+		"upstream refused the mint", "auto", nil)
+
+	row, err := queries.GetVaultEntryForRotation(ctx, id)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	var entries []RotationLogEntry
+	if err := json.Unmarshal([]byte(row.RotationLog.String), &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("rotation_log holds %d entries, want 2: the failure record was written "+
+			"over the caller's stale snapshot and erased the successful manual rotation "+
+			"that landed in between. Got %+v", len(entries), entries)
+	}
+	var sawSuccess, sawError bool
+	for _, e := range entries {
+		if e.Status == "success" && e.Method == "manual" {
+			sawSuccess = true
+		}
+		if e.Status == "error" && e.Method == "auto" {
+			sawError = true
+		}
+	}
+	if !sawSuccess {
+		t.Error("the successful manual rotation is missing from the history it actually happened in")
+	}
+	if !sawError {
+		t.Error("the sweep's failure was not recorded at all")
 	}
 }

@@ -2976,15 +2976,13 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	if newValue.IsZero() {
 		switch providerRoleFor {
 		case providerReminder:
-			updatedLog := AppendRotationLog(entryRow.RotationLog.String, RotationLogEntry{
+			// Appended through the CAS writer, not over entryRow's snapshot: the
+			// scheduled sweep can be mid-pass on this same entry.
+			appendRotationLog(ctx, h.queries, id, h.decryptColumnOrLog(meta.Name, "", vaultFieldName), RotationLogEntry{
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 				Status:    "reminder",
 				Provider:  providerName,
 				Method:    rotationMethod,
-			})
-			_ = h.queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-				RotationLog: toNullString(updatedLog),
-				ID:          id,
 			})
 			LogActivityFromRequest(h.queries, r, "vault.rotation_reminder",
 				fmt.Sprintf("Rotation reminder for vault secret: %s (provider: %s cannot rotate automatically)", h.sealSecretName(r.Context(), meta.Name), providerName))

@@ -289,14 +289,20 @@ WHERE id = ?;
 -- name: UpdateVaultEntryRotationError :exec
 UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
--- name: UpdateVaultEntryRotationLog :exec
-UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
-
 -- name: GetVaultEntryRotationLog :one
 SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?;
 
 -- name: CASVaultEntryRotationLog :execresult
--- Compare-and-swap on the rotation_log column itself.
+-- Compare-and-swap on the rotation_log column itself. THE ONLY WRITER OF THIS
+-- COLUMN. There is deliberately no unconditional `SET rotation_log = ?` sibling.
+--
+-- There was one, and everything below was already written next to it. Three call
+-- sites used the plain writer anyway (the reminder branch of the sweep, the
+-- reminder branch of the manual handler, and recordRotationFailure), each
+-- appending to a caller-supplied snapshot: precisely the lost update this query
+-- was added to prevent, still live on three of five paths. Deleting the plain
+-- query is what makes appendRotationLog the only reachable writer, because a
+-- future caller cannot name a method sqlc does not generate.
 --
 -- rotation_log is read-modify-written: the caller unmarshals the array, appends one
 -- entry, trims to 50 and writes the whole column back. With a plain UPDATE that is a

@@ -197,7 +197,16 @@ type CASVaultEntryRotationLogParams struct {
 	RotationLog_2 sql.NullString `json:"rotation_log_2"`
 }
 
-// Compare-and-swap on the rotation_log column itself.
+// Compare-and-swap on the rotation_log column itself. THE ONLY WRITER OF THIS
+// COLUMN. There is deliberately no unconditional `SET rotation_log = ?` sibling.
+//
+// There was one, and everything below was already written next to it. Three call
+// sites used the plain writer anyway (the reminder branch of the sweep, the
+// reminder branch of the manual handler, and recordRotationFailure), each
+// appending to a caller-supplied snapshot: precisely the lost update this query
+// was added to prevent, still live on three of five paths. Deleting the plain
+// query is what makes appendRotationLog the only reachable writer, because a
+// future caller cannot name a method sqlc does not generate.
 //
 // rotation_log is read-modify-written: the caller unmarshals the array, appends one
 // entry, trims to 50 and writes the whole column back. With a plain UPDATE that is a
@@ -1745,20 +1754,6 @@ type UpdateVaultEntryRotationIntervalParams struct {
 
 func (q *Queries) UpdateVaultEntryRotationInterval(ctx context.Context, arg UpdateVaultEntryRotationIntervalParams) error {
 	_, err := q.db.ExecContext(ctx, updateVaultEntryRotationInterval, arg.RotationIntervalDays, arg.ID)
-	return err
-}
-
-const updateVaultEntryRotationLog = `-- name: UpdateVaultEntryRotationLog :exec
-UPDATE vault_entries SET rotation_log = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-`
-
-type UpdateVaultEntryRotationLogParams struct {
-	RotationLog sql.NullString `json:"rotation_log"`
-	ID          string         `json:"id"`
-}
-
-func (q *Queries) UpdateVaultEntryRotationLog(ctx context.Context, arg UpdateVaultEntryRotationLogParams) error {
-	_, err := q.db.ExecContext(ctx, updateVaultEntryRotationLog, arg.RotationLog, arg.ID)
 	return err
 }
 

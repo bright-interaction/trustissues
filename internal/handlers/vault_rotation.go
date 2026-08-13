@@ -151,16 +151,14 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		if role == providerReminder {
 			// For reminder-only providers, just log that rotation is due
 			slog.Info("vault rotation: rotation due (reminder-only provider)", "provider", providerName, "entry", entry.Name)
-			logEntry := RotationLogEntry{
+			// entry.RotationLog is the pass-start snapshot and can be 90s stale by
+			// the time this reminder is written, so it is NOT the base to append
+			// to. appendRotationLog re-reads and compare-and-swaps.
+			appendRotationLog(ctx, queries, entry.ID, entry.Name, RotationLogEntry{
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 				Status:    "reminder",
 				Provider:  providerName,
 				Method:    "auto",
-			}
-			updatedLog := AppendRotationLog(entry.RotationLog.String, logEntry)
-			_ = queries.UpdateVaultEntryRotationLog(ctx, db.UpdateVaultEntryRotationLogParams{
-				RotationLog: sql.NullString{String: updatedLog, Valid: true},
-				ID:          entry.ID,
 			})
 			return
 		}

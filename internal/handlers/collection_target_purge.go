@@ -82,7 +82,10 @@ func (h *CollectionHandler) purgeTargetsConfiguredBy(ctx context.Context, collec
 			continue
 		}
 		dropped += removedHere
-		entries = append(entries, row.Name)
+		// Opened for the same reason as the twin in vault_target_purge.go: this
+		// list reaches an operator through logTargetPurge's activity row, and the
+		// stored column has been enc:v1: ciphertext since 00040.
+		entries = append(entries, h.vault.EntryNamePlain(row.Name))
 	}
 
 	if dropped == 0 {

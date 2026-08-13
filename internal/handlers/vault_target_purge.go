@@ -89,7 +89,12 @@ func (h *VaultHandler) PurgeTargetsConfiguredByUser(ctx context.Context, userID 
 			continue
 		}
 		dropped += removedHere
-		entries = append(entries, row.Name)
+		// Opened, not passed through. Since 00040 the stored name is enc:v1:
+		// ciphertext, and this list is read by a human: it goes into the
+		// admin.user_targets_purged activity row, which the Activity page renders
+		// verbatim. The sweep in vault_rotation.go opens the name once for the
+		// same reason; these two purges were the sites that follow-up missed.
+		entries = append(entries, h.EntryNamePlain(row.Name))
 	}
 
 	if dropped == 0 {
