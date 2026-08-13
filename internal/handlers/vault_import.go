@@ -569,6 +569,40 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be encrypted"})
 			continue
 		}
+		// THE NAME GOES THROUGH encryptColumn TOO, and it is the column where
+		// skipping it costs the most.
+		//
+		// The comment above already claimed "imported rows are never stored in
+		// cleartext" while the INSERT below passed entry.Name straight through,
+		// which is worse than not claiming it. Three things were wrong at once
+		// and they are one bug:
+		//
+		//  1. A DECRYPTION ORACLE that reaches the secret VALUE. Seal (used for
+		//     encrypted_value) keeps the nonce in its own column; SealColumn
+		//     (used for the metadata) packs nonce||ciphertext inline behind the
+		//     enc:v1: marker. Both use the same master key and a nil AAD, so the
+		//     two formats are byte interchangeable. An attacker with raw stored
+		//     bytes from a DB file or a backup posts
+		//     "enc:v1:"+base64(nonce||encrypted_value) here as a NAME, and every
+		//     read path opens it and hands back the victim's plaintext. Any
+		//     authenticated principal can do it: confirm sits in the general
+		//     vault group, and the read back is a plain GET of the caller's own
+		//     vault, so secretexit, egressgate, theExitList, owner authority and
+		//     the unlock rate limiter are all bypassed. That is precisely what
+		//     encryptColumn's always-seal rule exists to prevent: a client string
+		//     that already looks like ciphertext must be stored as the
+		//     attacker's own literal bytes.
+		//  2. Imported names were CLEARTEXT AT REST, which is exactly what 00040
+		//     was written for, defeated on the one path that carries a whole
+		//     password manager at a time.
+		//  3. name_bidx was left empty, so per-user name uniqueness went
+		//     unenforced for imports (the unique index is partial and skips '').
+		encName, encErr := h.handler.encryptColumn(entry.Name)
+		if encErr != nil {
+			slog.Error("failed to encrypt entry name", "error", encErr)
+			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be encrypted"})
+			continue
+		}
 
 		err = qtx.ImportVaultEntry(r.Context(), db.ImportVaultEntryParams{
 			ID:     entryID,
@@ -578,7 +612,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			// row would have no owner at all and nobody could configure delivery
 			// for anything they imported.
 			SecretOwnerUserID: userID,
-			Name:              entry.Name,
+			Name:              encName,
 			EncryptedValue:    encrypted,
 			Nonce:             nonce,
 			Url:               toNullString(encURL),
@@ -588,6 +622,17 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			// Imported entries land in the user's PERSONAL vault, so the blind
 			// index is keyed to that scope.
 			UrlBidx: h.handler.urlBlindIndex(bidxScope(userID, sql.NullString{}), entry.URL),
+			// Keyed by the CUSTODIAN alone, not by bidxScope: this index stands
+			// in for UNIQUE(user_id, name), which is per user whatever
+			// collection the entry sits in. Matches Create and migration 00040.
+			//
+			// It is also what stops the import wedging the boot backfill. Left
+			// empty the row sits outside the partial unique index, so a name
+			// already taken by another of this user's entries is accepted here
+			// and only collides later, when BackfillMetadataAtRest recomputes
+			// the index and its UPDATE is refused. Filling it in means the clash
+			// is caught by the INSERT below and reported as an ordinary skip.
+			NameBidx: h.handler.nameBlindIndex(userID, entry.Name),
 		})
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {

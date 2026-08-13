@@ -639,6 +639,26 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			NameBidx:     wantNameBidx,
 			ID:           row.ID,
 		}); err != nil {
+			// A NAME COLLISION IS ONE ROW'S PROBLEM, NOT THE TABLE'S.
+			//
+			// This used to return, which aborts the sweep for every row after
+			// it, on every boot, forever. Rows written before the import path
+			// sealed its names carry cleartext names and an empty name_bidx, so
+			// they sit OUTSIDE the partial unique index: two of a user's entries
+			// can already share a name. The first boot that seals them computes
+			// the same index for both, the second UPDATE is refused, and one
+			// duplicate row stops at-rest encryption for the whole table. That
+			// is a wedge anybody who could reach the import could plant.
+			//
+			// So the row is left as it is, loudly, and the sweep goes on. The
+			// row id is safe to log; the name is not, which is why neither the
+			// name nor the index token appears here.
+			if strings.Contains(err.Error(), "UNIQUE constraint") {
+				slog.Error("vault: metadata backfill skipped a row whose name collides with "+
+					"another entry of the same user; rename one of them and it will be "+
+					"encrypted on the next sweep", "id", row.ID, "user", row.UserID)
+				continue
+			}
 			return updated, fmt.Errorf("persist metadata for %s: %w", row.ID, err)
 		}
 		updated++
