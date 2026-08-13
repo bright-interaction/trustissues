@@ -453,3 +453,19 @@ func isPrivateAlertAddr(addr netip.Addr) bool {
 		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
 		addr.IsInterfaceLocalMulticast() || !addr.IsValid()
 }
+
+// IsNonPublicAddr is the exported form of isPrivateAlertAddr, and it is the
+// SINGLE answer in this module to "is this address inside the operator's own
+// network". Callers must Unmap first, so ::ffff:127.0.0.1 is classified as the
+// IPv4 loopback it actually routes to.
+//
+// It is exported because the same question is asked at two different times, and
+// answering it from two different range tables is how the dial guard drifted
+// from its own copy in the first place. internal/handlers asks it at WRITE
+// time, when an operator sets the capability proxy's destination ceiling, so a
+// non-routable destination is refused before it is stored; internal/alerts asks
+// it at DIAL time, after DNS, which is the only answer that binds. Write time
+// alone is not a boundary (a public name can resolve inward later), and dial
+// time alone lets an operator save a ceiling that can never work. Both call
+// this so the two answers can never disagree.
+func IsNonPublicAddr(addr netip.Addr) bool { return isPrivateAlertAddr(addr) }
