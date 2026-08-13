@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -115,6 +116,12 @@ func NewChannelDispatcher(ctx context.Context, queries *db.Queries, decrypter Co
 // time) so a DNS-rebinding domain that flips to a private/metadata address
 // between save and send is blocked at the request boundary. Every path that
 // POSTs to a user webhook must use this instead of a bare http.Client.
+//
+// It is also the module's ONLY dial-time egress guard. There used to be a
+// second copy in internal/handlers/vault_ssrf.go with the same defect and no
+// production caller, so the SSRF test suite was exercising the copy that never
+// shipped while the copy that did ship had no test at all. The dead twin is
+// gone; TestEveryDialControlFailsClosed refuses a new one.
 func GuardedWebhookClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
@@ -125,14 +132,7 @@ func GuardedWebhookClient(timeout time.Duration) *http.Client {
 			DialContext: (&net.Dialer{
 				Timeout: 5 * time.Second,
 				Control: func(_, address string, _ syscall.RawConn) error {
-					host, _, err := net.SplitHostPort(address)
-					if err != nil {
-						return err
-					}
-					if ip := net.ParseIP(host); ip != nil && isPrivateAlertIP(ip) {
-						return fmt.Errorf("blocked outbound to private address %s", address)
-					}
-					return nil
+					return guardDialAddress(address)
 				},
 			}).DialContext,
 		},
@@ -373,18 +373,99 @@ func eventEnabled(enabledCSV, event string) bool {
 	return false
 }
 
-// isPrivateAlertIP reports whether ip is in a private/loopback/link-local/
+// guardDialAddress is the dial-time SSRF control. It FAILS CLOSED: it allows a
+// connection only when it can positively prove the address it was handed is a
+// public, unzoned unicast IP.
+//
+// It used to read, inline in the Control hook:
+//
+//	if ip := net.ParseIP(host); ip != nil && isPrivateAlertIP(ip) { block }
+//
+// which is fail-OPEN, and an IPv6 zone id walked straight through it.
+// net.ParseIP does not accept a zone, so it returned nil for "::1%1" and the
+// "ip != nil &&" short-circuited to ALLOW while the kernel dialled the loopback
+// perfectly happily. The portable form needs no interface name at all:
+// http://[::1%251]:PORT/ yields the host "::1%1" and connects on any machine,
+// and secretexit.NormalizeHost keeps the zone so the destination receipt still
+// matches. Since a vault_only account holds mayDirectSecretEgress on an entry it
+// created, it could point that entry's webhook_url (or a forgejo/zitadel
+// provider_meta.instance, which is a whole base URL) at an arbitrary internal
+// IPv6 endpoint and have the server POST to it.
+//
+// A net.Dialer Control hook is ALWAYS handed an already-resolved literal, so
+// "this did not parse as an IP" cannot mean "it is some harmless hostname"; it
+// can only mean something unexpected reached the dialer, and that must never
+// mean allow. Every branch below therefore ends in a refusal, and the single
+// return nil at the bottom is the only way out.
+func guardDialAddress(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("blocked outbound to malformed address %q: %w", address, err)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		// netip.ParseAddr, unlike net.ParseIP, DOES parse a zone, so reaching
+		// this branch means the dialer was handed something that is not an IP
+		// literal in any encoding.
+		return fmt.Errorf("blocked outbound to unresolved address %q", address)
+	}
+	// A zone id names a local interface. It is never needed to reach a public
+	// host, and it defeats range matching outright, since ::1%1 is not inside
+	// ::1/128 as far as any parser is concerned. Its presence alone disqualifies.
+	if addr.Zone() != "" {
+		return fmt.Errorf("blocked outbound to zoned address %s", address)
+	}
+	// Unmap first so ::ffff:127.0.0.1 and ::ffff:7f00:1 are classified as the
+	// IPv4 loopback they actually route to.
+	if isPrivateAlertAddr(addr.Unmap()) {
+		return fmt.Errorf("blocked outbound to private address %s", address)
+	}
+	return nil
+}
+
+// privateAlertRanges are the prefixes an outbound notification must never
+// reach: RFC 1918, loopback, link-local (including 169.254.169.254, the cloud
+// metadata address), the unspecified block, CGNAT/Tailscale space, and their
+// IPv6 equivalents.
+var privateAlertRanges = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+}
+
+// isPrivateAlertAddr reports whether addr is in a private/loopback/link-local/
 // metadata range that an outbound notification must never reach (SSRF guard
-// applied at dial time, after DNS resolution).
-func isPrivateAlertIP(ip net.IP) bool {
-	for _, cidr := range []string{
-		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-		"169.254.0.0/16", "0.0.0.0/8", "100.64.0.0/10",
-		"::1/128", "fc00::/7", "fe80::/10",
-	} {
-		if _, network, err := net.ParseCIDR(cidr); err == nil && network.Contains(ip) {
+// applied at dial time, after DNS resolution). Callers must Unmap first.
+func isPrivateAlertAddr(addr netip.Addr) bool {
+	for _, p := range privateAlertRanges {
+		if p.Contains(addr) {
 			return true
 		}
 	}
-	return ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
+	return addr.IsUnspecified() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsInterfaceLocalMulticast() || !addr.IsValid()
 }
+
+// IsNonPublicAddr is the exported form of isPrivateAlertAddr, and it is the
+// SINGLE answer in this module to "is this address inside the operator's own
+// network". Callers must Unmap first, so ::ffff:127.0.0.1 is classified as the
+// IPv4 loopback it actually routes to.
+//
+// It is exported because the same question is asked at two different times, and
+// answering it from two different range tables is how the dial guard drifted
+// from its own copy in the first place. internal/handlers asks it at WRITE
+// time, when an operator sets the capability proxy's destination ceiling, so a
+// non-routable destination is refused before it is stored; internal/alerts asks
+// it at DIAL time, after DNS, which is the only answer that binds. Write time
+// alone is not a boundary (a public name can resolve inward later), and dial
+// time alone lets an operator save a ceiling that can never work. Both call
+// this so the two answers can never disagree.
+func IsNonPublicAddr(addr netip.Addr) bool { return isPrivateAlertAddr(addr) }
