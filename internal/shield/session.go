@@ -442,6 +442,42 @@ func (s *Session) shieldAny(ctx context.Context, v any) (any, error) {
 // provider-dereferenced URLs can be left intact.
 func (s *Session) shieldAnyUnderKey(ctx context.Context, key string, v any) (any, error) {
 	switch t := v.(type) {
+	case json.Number:
+		// A personnummer is only protected here if the exporting system happened
+		// to quote it. decodeJSONExact's comment above says this walk "skips it
+		// the same way it skipped float64", and that was written as a statement
+		// of fact about exactness rather than a decision about PII, so
+		// {"personnummer":198501011234} egressed to the provider verbatim while
+		// {"personnummer":"198501011234"} was tokenized. Swedish systems export
+		// it both ways.
+		//
+		// Exactness still wins when nothing matches: the ORIGINAL json.Number is
+		// handed back, not a reparsed value, so every literal decodeJSONExact
+		// exists to preserve (9007199254740993, 1.0, 1e3) round-trips
+		// byte-for-byte. Only a leaf that actually matched a pattern changes.
+		//
+		// A redacted number necessarily leaves as a STRING, because a marker is
+		// not valid JSON number syntax. That is a real cost: a provider field
+		// with a schema-typed integer will reject the marker. It is the right
+		// trade anyway, since the alternative is sending the personnummer.
+		//
+		// Safe to scan because the numeric patterns are narrowed by validators
+		// rather than by shape alone. Measured against the real pattern bank:
+		// unix seconds (1786655165), unix millis, snowflake ids, 2^53+1, 1.0 and
+		// 1e3 all survive untouched, while 8501011234 and 198501011234 tokenize,
+		// because plausiblePersonnummer (redact.go:638) rejects a month or day
+		// that could not be a date. Without that narrowing this case would
+		// tokenize every 10-digit epoch, which is exactly how a SQLite timestamp
+		// came back as a phone token in atomicsite.
+		lit := t.String()
+		red, err := s.RedactString(ctx, lit)
+		if err != nil {
+			return nil, err
+		}
+		if red == lit {
+			return t, nil
+		}
+		return red, nil
 	case string:
 		// The exemption is for URLs the provider has to FETCH, so it is gated on
 		// the value actually being one. Keying it on the enclosing name alone
