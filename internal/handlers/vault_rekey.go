@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -201,15 +202,19 @@ type RekeySurfaceReport struct {
 	Why        string `json:"why"`
 	// Scanned counts rows examined, including ones with nothing in the column.
 	Scanned int `json:"scanned"`
-	// OnCurrent / OnPrevious / Plaintext / Stale / Unreadable partition the
-	// values that actually hold something.
+	// OnCurrent / OnPrevious / Plaintext / Stale / Collided / Unreadable
+	// partition the values that actually hold something.
 	OnCurrent  int `json:"on_current"`
 	OnPrevious int `json:"on_previous"`
 	Plaintext  int `json:"plaintext"`
 	// Stale counts blind indexes that match no key on the ring. Only
 	// familyBlindIndex can be stale: it is an HMAC recomputed from cleartext, so
 	// unlike ciphertext it can be repaired with no previous key.
-	Stale      int `json:"stale"`
+	Stale int `json:"stale"`
+	// Collided counts blind indexes the sweep CANNOT write because another row
+	// of the same user already holds that token. Only vault_entries.name_bidx
+	// can reach this state. See RekeyReport.NameIndexCollisions.
+	Collided   int `json:"collided"`
 	Unreadable int `json:"unreadable"`
 	// Converted is populated by a sweep, zero by a read-only scan.
 	Converted int `json:"converted"`
@@ -258,9 +263,23 @@ type RekeyReport struct {
 	// index is repaired by recomputing it, which needs no previous key, so a
 	// store whose only problem is stale indexes must NOT be told to go and find
 	// an old key it never lost.
-	ValuesStale      int `json:"values_stale"`
-	ValuesUnreadable int `json:"values_unreadable"`
-	RowsConverted    int `json:"rows_converted"`
+	ValuesStale int `json:"values_stale"`
+	// NameIndexCollisions counts entry name indexes the sweep left alone because
+	// writing them would violate UNIQUE(user_id, name_bidx).
+	//
+	// This is NOT work the sweep can do, which is why it is not folded into
+	// ValuesStale: two of one user's entries genuinely share a name, and the
+	// remedy is an operator renaming one of them, not another sweep. Counting it
+	// as stale would either wedge the verify pass or, once tolerated there, keep
+	// the status page saying "needs rekey" forever for a state no rekey fixes.
+	//
+	// It is a REPORTED number rather than a silent skip because the uniqueness
+	// that index stands in for is not being enforced for that pair until somebody
+	// renames one. The row ids go to the log, never to this struct's siblings that
+	// might carry a name.
+	NameIndexCollisions int `json:"name_index_collisions"`
+	ValuesUnreadable    int `json:"values_unreadable"`
+	RowsConverted       int `json:"rows_converted"`
 
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
@@ -329,6 +348,15 @@ const (
 	// only: an HMAC is recomputed from cleartext rather than decrypted, so this
 	// is repairable with no previous key, unlike keyAgeUnknown ciphertext.
 	keyAgeStale
+	// keyAgeCollided is a blind index the sweep must NOT write, because another
+	// row already holds the token it would have to write. vault_entries.name_bidx
+	// only: it is the one blind index carrying a UNIQUE constraint.
+	//
+	// It is separated from keyAgeStale because the two need opposite handling. A
+	// stale index is work the sweep does; a collided one is work no sweep can do,
+	// and treating it as stale is what let one duplicate name make the whole
+	// rotation impossible. See scanVaultEntries.
+	keyAgeCollided
 	keyAgeUnknown // marked ciphertext that opens under neither
 )
 
@@ -390,6 +418,13 @@ type rekeyEntryWrite struct {
 	// therefore grants it with nothing added and never consults the authority
 	// oracle, which is what a re-encryption pass should look like at the gate.
 	ticket egressgate.Ticket
+	// userID and storedNameBidx exist for the ONE write that can be refused by a
+	// constraint rather than by a bug: the per-user name index. userID is what
+	// the operator needs in the log line, and storedNameBidx is what the retry
+	// puts back so a refused index does not cost the row its re-encryption. See
+	// applyPlan.
+	userID         string
+	storedNameBidx string
 }
 
 func (p *rekeyPlan) rows() int {
@@ -539,6 +574,7 @@ func (h *VaultHandler) RekeyVault(ctx context.Context) (*RekeyReport, error) {
 	slog.Info("vault: master-key re-encrypt sweep complete",
 		"rows_converted", rep.RowsConverted,
 		"values_moved", rep.ValuesOnPrevious,
+		"name_index_collisions", rep.NameIndexCollisions,
 		"current_key_fingerprint", rep.CurrentKeyFingerprint,
 		"duration_ms", rep.DurationMS)
 	if rep.RowsConverted > 0 {
@@ -593,6 +629,9 @@ func (s *scanCtx) record(sr *RekeySurfaceReport, age keyAge, table, column, sett
 	case keyAgeStale:
 		sr.Stale++
 		s.rep.ValuesStale++
+	case keyAgeCollided:
+		sr.Collided++
+		s.rep.NameIndexCollisions++
 	case keyAgeUnknown:
 		s.blocked(sr, table, column, settingKey, rowID,
 			"marked ciphertext that opens under neither the current nor the previous vault key")
@@ -650,7 +689,32 @@ func (h *VaultHandler) scanAndPlan(ctx context.Context, q *db.Queries) (*RekeyRe
 // transaction.
 func (h *VaultHandler) applyPlan(ctx context.Context, q *db.Queries, plan *rekeyPlan) error {
 	for _, e := range plan.entries {
-		if err := vaultegress.RekeyEntry(ctx, q, e.ticket, e.params); err != nil {
+		err := vaultegress.RekeyEntry(ctx, q, e.ticket, e.params)
+		if err != nil && isUniqueConstraintErr(err) && e.params.NameBidx != e.storedNameBidx {
+			// THE SECOND LINE OF DEFENCE ON THE NAME INDEX, and the only one that
+			// does not depend on the planner having been right.
+			//
+			// scanVaultEntries claims every name index before it plans any, so a
+			// refused index should be unreachable here. "Should be" is how the
+			// first version of this shipped, and one duplicate name then made
+			// master-key rotation impossible for the whole store, because the
+			// error aborted the loop and the transaction with it. A constraint on
+			// ONE row must never be able to do that again, however the planner
+			// changes, so the write is retried with the index the row already had
+			// and the row keeps its re-encryption. Only the index is given up, and
+			// only for the row that could not have it.
+			//
+			// SQLite's default ON CONFLICT ABORT rolls back the failed STATEMENT,
+			// not the transaction, so the retry runs on live state.
+			retry := e.params
+			retry.NameBidx = e.storedNameBidx
+			slog.Error("vault: re-encrypt sweep could not write an entry's name index because "+
+				"another entry of the same user holds it; the entry was re-encrypted without it, "+
+				"rename one of the two and the next sweep will seal it",
+				"id", e.params.ID, "user", e.userID)
+			err = vaultegress.RekeyEntry(ctx, q, e.ticket, retry)
+		}
+		if err != nil {
 			return fmt.Errorf("rekey vault entry %s: %w", e.params.ID, err)
 		}
 	}
@@ -899,6 +963,17 @@ func (h *VaultHandler) legacyKeyFor(source string) [32]byte {
 	return sha256.Sum256([]byte(source + ":secrets-vault"))
 }
 
+// isUniqueConstraintErr reports whether a write was refused by a UNIQUE index.
+//
+// Matching on the driver's message is what every caller in this package already
+// does; modernc.org/sqlite does not export a typed constraint error that survives
+// the generated query layer. It is named here rather than inlined because the
+// sweep's use of it is a DECISION (one row's constraint is not the table's
+// problem) and not an error string it happens to look at.
+func isUniqueConstraintErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint")
+}
+
 func zero(b []byte) {
 	for i := range b {
 		b[i] = 0
@@ -916,6 +991,57 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 	if err != nil {
 		return fmt.Errorf("list vault entries for rekey: %w", err)
 	}
+
+	// THE NAME INDEX IS THE ONE SURFACE WITH A CONSTRAINT ON IT, SO IT IS THE ONE
+	// THE SWEEP CAN BE REFUSED AT.
+	//
+	// idx_vault_entries_user_name_bidx is UNIQUE(user_id, name_bidx) WHERE
+	// name_bidx != ''. Rows written before the import path sealed its names carry
+	// a CLEARTEXT name and an EMPTY index, which puts them outside that partial
+	// index: a user can already hold two entries whose names are equal, one
+	// sealed and one not, because the inline UNIQUE(user_id, name) compares
+	// randomized ciphertext against cleartext and never fires.
+	//
+	// The sweep then recomputes the index for the unsealed one from its
+	// cleartext, gets exactly the token the sealed one already stores, and SQLite
+	// refuses the UPDATE. That error used to abort applyPlan, which rolls back
+	// the whole transaction, which means master-key rotation is impossible for
+	// the entire store until somebody finds and renames the pair by hand. Rekey
+	// is the only recovery path there is for a compromised master key, so two
+	// rows sharing a name were a permanent, silent denial of it. The at-rest
+	// backfill was taught this same lesson first (BackfillMetadataAtRest); this
+	// is its twin, and it recomputes the identical index.
+	//
+	// claimedNameBidx is what stops the sweep from planning a write it will be
+	// refused. Every index ALREADY STORED is claimed first, before any row is
+	// planned, so the row that holds a token keeps it and the row that cannot
+	// have it is the one deferred. A row is then deferred rather than skipped:
+	// it keeps the index it arrived with and everything else about it is still
+	// re-keyed, because a name collision must never cost a row its SECRET.
+	claimedNameBidx := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if row.NameBidx != "" {
+			claimedNameBidx[row.UserID+"|"+row.NameBidx] = row.ID
+		}
+	}
+	// WHICH ROW OF A COLLIDING PAIR KEEPS THE INDEX IS NOT A COIN TOSS.
+	//
+	// The row that already HOLDS an index has a working one, just possibly under
+	// the retired key; the row that holds none never had one. If the row holding
+	// none claimed the token first, the sweep would hand it the index and leave
+	// the other row stuck on a token the current key no longer computes: a
+	// working lookup broken BY the rotation, which is the exact failure the blind
+	// index surface was added to the sweep to prevent.
+	//
+	// Rows are therefore planned holders-first, so the holder's recomputed token
+	// is claimed before any empty row can ask for it. Stable, so rows that are
+	// alike keep the store's own order and two runs of the sweep make the same
+	// decision. This is ordering for CORRECTNESS, not for tidiness, and without
+	// it the answer depends on the order ListVaultEntriesForRekey happens to
+	// return, which is by id.
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].NameBidx != "" && rows[j].NameBidx == ""
+	})
 
 	for _, row := range rows {
 		needsWrite := false
@@ -1017,7 +1143,28 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		wantNameBidx := h.nameBlindIndex(row.UserID, plains["name"])
 		nameBidxAge := h.classifyBlindIndex(row.NameBidx, wantNameBidx, row.UserID, plains["name"])
 		if nameBidxAge == keyAgePrevious || nameBidxAge == keyAgeStale {
-			needsWrite = true
+			// The claim, checked against the state the whole sweep is converging
+			// on rather than against the row alone. holder != row.ID is the whole
+			// test: a row that already owns its token is not colliding with
+			// itself, and a row whose token is owned by a DIFFERENT row cannot be
+			// given it, in this sweep or any later one.
+			holder, taken := "", false
+			if wantNameBidx != "" {
+				holder, taken = claimedNameBidx[row.UserID+"|"+wantNameBidx]
+			}
+			if taken && holder != row.ID {
+				nameBidxAge = keyAgeCollided
+				wantNameBidx = row.NameBidx
+				slog.Warn("vault: re-encrypt sweep left an entry's name index alone because another "+
+					"entry of the same user already holds it; rename one of the two and the next "+
+					"sweep will seal it",
+					"id", row.ID, "user", row.UserID, "holder", holder)
+			} else {
+				if wantNameBidx != "" {
+					claimedNameBidx[row.UserID+"|"+wantNameBidx] = row.ID
+				}
+				needsWrite = true
+			}
 		}
 		sc.record(sc.surface("vault_entries", "name_bidx", ""), nameBidxAge, "vault_entries", "name_bidx", "", row.ID)
 
@@ -1041,24 +1188,28 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		if tkErr != nil {
 			return fmt.Errorf("egress decision for the re-encryption of %s: %w", row.ID, tkErr)
 		}
-		plan.entries = append(plan.entries, rekeyEntryWrite{ticket: tk, params: vaultegress.RekeyEntryParams{
-			EncryptedValue:    newValue,
-			Nonce:             newNonce,
-			EncryptionVersion: newVersion,
-			Url:               toNullString(newCols["url"]),
-			AliasUrl:          toNullString(newCols["alias_url"]),
-			Username:          toNullString(newCols["username"]),
-			Category:          toNullString(newCols["category"]),
-			Notes:             toNullString(newCols["notes"]),
-			ProviderMeta:      toNullString(newCols["provider_meta"]),
-			RotationTargets:   toNullString(newCols["rotation_targets"]),
-			CustomFields:      newCols["custom_fields"],
-			Name:              newCols["name"],
-			UrlBidx:           wantURLBidx,
-			AliasUrlBidx:      wantAliasBidx,
-			NameBidx:          wantNameBidx,
-			ID:                row.ID,
-		}})
+		plan.entries = append(plan.entries, rekeyEntryWrite{
+			ticket:         tk,
+			userID:         row.UserID,
+			storedNameBidx: row.NameBidx,
+			params: vaultegress.RekeyEntryParams{
+				EncryptedValue:    newValue,
+				Nonce:             newNonce,
+				EncryptionVersion: newVersion,
+				Url:               toNullString(newCols["url"]),
+				AliasUrl:          toNullString(newCols["alias_url"]),
+				Username:          toNullString(newCols["username"]),
+				Category:          toNullString(newCols["category"]),
+				Notes:             toNullString(newCols["notes"]),
+				ProviderMeta:      toNullString(newCols["provider_meta"]),
+				RotationTargets:   toNullString(newCols["rotation_targets"]),
+				CustomFields:      newCols["custom_fields"],
+				Name:              newCols["name"],
+				UrlBidx:           wantURLBidx,
+				AliasUrlBidx:      wantAliasBidx,
+				NameBidx:          wantNameBidx,
+				ID:                row.ID,
+			}})
 	}
 	return nil
 }
