@@ -11,8 +11,8 @@ frontend/node_modules/
 notes/
 
 # Agent memory and per-project Claude config. Subagents with `memory: project`
-# write here, and the notes are defect analyses of code that is often still
-# unfixed. This subtree publishes to a PUBLIC mirror rebuilt from subtree
+# write here, and the notes are defect analyses of code that often still
+# carries the defect. This subtree publishes to a PUBLIC mirror rebuilt from subtree
 # HISTORY, so a single `git add -A` would carry them into every future publish
 # and only a filter-repo strip could remove them again. Ignored at the source.
 .claude/
