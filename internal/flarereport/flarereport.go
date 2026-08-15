@@ -79,10 +79,31 @@ func InitFlare(service, release string) bool {
 // middleware still renders the 500. Mount it AFTER the recoverer in the chain so
 // it sees the panic first. Safe to mount when InitFlare was a no-op: capture
 // calls on an uninitialized hub do nothing.
+//
+// http.ErrAbortHandler is exempt and passes straight through, matching chi's
+// Recoverer; see the note at the exemption below for why that matters here.
 func FlareRecoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				// http.ErrAbortHandler is net/http's documented "drop this
+				// connection quietly" signal, not a crash. chi's Recoverer
+				// exempts it, but it sits OUTSIDE this middleware, so without
+				// the same exemption here the abort is reported anyway.
+				//
+				// handlers.proxyCapability panics with it deliberately when an
+				// upstream reflects the injected credential past the streaming
+				// hold-back: aborting is the only way left to stop the caller
+				// reading a truncated body as a complete one. That makes it a
+				// routine, remotely-triggerable control action rather than a
+				// bug, and reporting it costs twice: the synchronous Flush
+				// below holds a goroutine and its socket for its full timeout
+				// on every firing, and a working security control files itself
+				// into the shared estate error store as a crash, which is how
+				// a real panic gets triaged as noise.
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				hub := sentry.CurrentHub().Clone()
 				hub.Scope().SetRequest(r)
 				hub.RecoverWithContext(r.Context(), rec)
