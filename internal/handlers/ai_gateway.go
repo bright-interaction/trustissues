@@ -182,9 +182,41 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse the body ONCE, with Shield's parser, and decide everything below on
+	// the value that comes back.
+	//
+	// The streaming guard used to run json.Unmarshal over the raw bytes while
+	// Shield parsed the SAME bytes with a json.Decoder. Those two disagree:
+	// Unmarshal rejects anything after the JSON value, a Decoder reading one
+	// value does not care what follows. So
+	//
+	//	{"model":"gpt-4","stream":true,"messages":[]}x
+	//
+	// failed to Unmarshal (the ignored error left probe.Stream false, so the
+	// guard said "not streaming"), then Shield decoded it happily, dropped the
+	// trailing "x" in its re-marshal, and handed the provider a clean
+	// stream:true. One byte moved the request onto the path the guard exists to
+	// keep it off. A body is now one value to both layers by construction, so
+	// there is no second reading of it to disagree with.
+	//
+	// Fail CLOSED on a body that will not parse. The old code fell open: an
+	// unparseable body sailed past the guard, and with Shield off it went
+	// upstream verbatim. A gate on redaction may not pass what it could not read.
+	// An EMPTY body stays legal, because the allowlisted GET routes
+	// (/v1/models) carry none.
+	var parsedBody any
+	if len(body) > 0 {
+		parsedBody, err = shield.DecodeJSON(body)
+		if err != nil {
+			logError(r, "ai_gateway: refused an unparseable request body", "provider", providerName)
+			writeBadRequest(w, r, "request body must be a single valid JSON value")
+			return
+		}
+	}
+
 	// Streaming responses cannot be reliably tokenized/resolved across chunks, so
 	// v1 supports non-streaming only. Reject stream:true up front.
-	if requestsStreaming(body) {
+	if requestsStreaming(parsedBody) {
 		writeBadRequest(w, r, "the AI gateway supports non-streaming requests only; set \"stream\": false")
 		return
 	}
@@ -199,7 +231,9 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, r, "internal server error")
 			return
 		}
-		shielded, sErr := session.ShieldJSON(ctx, body)
+		// ShieldValue, not ShieldJSON: redact the value the guard just cleared,
+		// not a fresh parse of the bytes.
+		shielded, sErr := session.ShieldValue(ctx, parsedBody)
 		if sErr != nil {
 			// Fail closed: never forward un-tokenized PII when Shield is on.
 			logError(r, "ai_gateway: shield tokenization failed", "error", sErr)
@@ -379,7 +413,6 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	h.logUsage(r, providerName, resp.StatusCode, respBody, writeErr)
 }
 
-// requestsStreaming reports whether the JSON body sets "stream": true.
 // baseURLHost is the host half of a provider baseURL. An unparseable value
 // yields "", which secretexit.Exit refuses, so a malformed table entry stops the
 // key rather than releasing it to nowhere in particular.
@@ -391,12 +424,47 @@ func baseURLHost(raw string) string {
 	return u.Hostname()
 }
 
-func requestsStreaming(body []byte) bool {
-	var probe struct {
-		Stream bool `json:"stream"`
+// requestsStreaming reports whether a request asks the provider to stream.
+//
+// It takes the PARSED body (shield.DecodeJSON's result), never raw bytes. That
+// is the whole point: the value it inspects is the value Shield redacts and
+// re-marshals onto the wire, so the guard cannot be reading a different document
+// from the one that egresses. Handing this function []byte again would reopen
+// the differential it was written to close.
+//
+// It answers "is this provably NOT streaming", and rejects everything else.
+// Absent, null and boolean false are the only non-streaming answers; a string
+// "true", a number, an object, anything at all under a stream key is refused.
+// Those bodies are ill-formed for both providers and would 400 upstream anyway,
+// so the cost of refusing them is nil and the cost of guessing wrong is a
+// chunked response nothing can resolve markers across.
+//
+// The key match is case-insensitive on purpose, and only at the TOP level.
+// Case-insensitive because the previous struct-tag probe matched that way
+// (encoding/json folds case when matching fields) and losing it would be a
+// silent loosening of a security gate; top-level only because that is the sole
+// place either provider reads "stream" from, and a nested one is inert.
+func requestsStreaming(parsed any) bool {
+	obj, ok := parsed.(map[string]any)
+	if !ok {
+		// No body, or not a JSON object: no top-level stream key can exist.
+		return false
 	}
-	_ = json.Unmarshal(body, &probe)
-	return probe.Stream
+	for k, v := range obj {
+		if !strings.EqualFold(k, "stream") {
+			continue
+		}
+		switch t := v.(type) {
+		case nil:
+			continue
+		case bool:
+			if !t {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // logUsage records an attributed, best-effort usage line in the activity log.

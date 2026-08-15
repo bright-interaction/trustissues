@@ -384,6 +384,31 @@ func (s *Session) ShieldJSON(ctx context.Context, raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.ShieldValue(ctx, v)
+}
+
+// DecodeJSON parses one JSON document exactly the way the redaction walk parses
+// it, and is the ONLY parse a caller needs to perform.
+//
+// It exists so that a caller which must DECIDE something about a body before
+// handing it to Shield (the AI gateway's non-streaming guard is the live case)
+// can decide on the very value Shield will redact, rather than on a second,
+// independent parse of the same bytes. Two parsers over one body is a
+// differential-parsing bug waiting to be found: json.Unmarshal refuses trailing
+// bytes and a json.Decoder reading a single value accepts them, so
+//
+//	{"stream":true}x
+//
+// read as "not streaming" through Unmarshal and as stream:true through the
+// Decoder, and the guard that keeps traffic on the redactable path was defeated
+// by one byte. Parse once with this, decide on the result, then redact the
+// result with ShieldValue.
+func DecodeJSON(raw []byte) (any, error) { return decodeJSONExact(raw) }
+
+// ShieldValue redacts an ALREADY-PARSED document and re-marshals it. The value
+// must have come from DecodeJSON, so that whatever a caller decided about the
+// document is a decision about the same value that egresses.
+func (s *Session) ShieldValue(ctx context.Context, v any) ([]byte, error) {
 	redacted, err := s.shieldAny(ctx, v)
 	if err != nil {
 		return nil, err
@@ -409,7 +434,23 @@ func (s *Session) ShieldJSON(ctx context.Context, raw []byte) ([]byte, error) {
 // json.Number keeps the original literal as a string, and json.Marshal writes
 // it back verbatim. It is a distinct type from string, so the redaction walk
 // skips it the same way it skipped float64.
+//
+// The json.Valid check in front of the decode is the second half, and it is
+// about a different failure. A json.Decoder reads ONE value and then stops: it
+// does not care what follows, so `{"a":1}garbage` decoded cleanly and the
+// re-marshal silently dropped "garbage" from a body Shield was only supposed to
+// redact. json.Unmarshal, which is what every other parser in this codebase
+// reaches for, rejects that same input. Two parsers that disagree about which
+// documents exist is how a guard gets defeated by one trailing byte (see
+// DecodeJSON), so this one accepts exactly what json.Unmarshal accepts:
+// json.Valid runs the same scanner over the WHOLE input that Unmarshal runs,
+// allowing only trailing whitespace after the value.
 func decodeJSONExact(raw []byte) (any, error) {
+	if !json.Valid(raw) {
+		// Deliberately not "trailing bytes": the caller must not learn which of
+		// the many ways to be invalid this body chose.
+		return nil, fmt.Errorf("shield: unmarshal: not a single valid JSON value")
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var v any
