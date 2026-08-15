@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   Plus,
   Trash2,
@@ -1323,6 +1323,13 @@ function CollectionManageModal({
   );
 }
 
+// Fully blank shapes for the add/edit secret forms, defined once so the
+// initial useState calls and lockVault's reset (below) can never drift out of
+// sync with each other: two literals that are supposed to be identical are
+// exactly the kind of thing that quietly stops being identical.
+const BLANK_NEW_SECRET = { name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' };
+const BLANK_EDIT_FORM = { name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '', destination_patterns: '' };
+
 export default function Vault() {
   const queryClient = useQueryClient();
 
@@ -1336,10 +1343,18 @@ export default function Vault() {
   const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
   const [showAddSecret, setShowAddSecret] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
-  const [newSecret, setNewSecret] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+  const [newSecret, setNewSecret] = useState(BLANK_NEW_SECRET);
   const [newCustomFields, setNewCustomFields] = useState<CustomField[]>([]);
   const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
   const [rotatedValue, setRotatedValue] = useState<{ id: string; value: string } | null>(null);
+  // Bumped by lockVault, below. A mutation that repopulates decrypted state on
+  // success (unlock, rotate) captures this value when it STARTS (onMutate) and
+  // compares it to the current value when it FINISHES (onSuccess): if a lock
+  // happened in between, the counter has moved and the response is dropped
+  // instead of being written into a UI that is now showing "locked". This is
+  // what stops a slow rotate or unlock from silently re-filling the vault
+  // after the auto-lock timer or the Lock button already fired.
+  const sealEpochRef = useRef(0);
 
   // lockVault is the ONLY way to re-lock, because there are six places that do
   // it and every one of them cleared a different subset of the secret-bearing
@@ -1359,17 +1374,113 @@ export default function Vault() {
   //   unlock without anyone asking for it
   //
   // Any future re-lock site gets all four by construction.
+  //
+  // 2026-08-15 (P1-1/P1-2/P1-3): those four are all COMPONENT STATE, and they
+  // were not the only place a decrypted secret or the account password came to
+  // rest. Three more categories, all now cleared here too:
+  //
+  //   TanStack Query's mutation cache. unlockVaultMutation.data is the full
+  //   decrypted VaultEntry[] from POST /vault/unlock; rotateSecretMutation.data
+  //   is a freshly rotated plaintext value; createSecretMutation and
+  //   updateSecretMutation carry a plaintext secret value in THEIR data/
+  //   variables whenever a value was set. None of that lives in this
+  //   component's state, so clearing vaultEntries never touched it: the
+  //   QueryClient keeps a succeeded mutation's data AND variables around for a
+  //   default gcTime of 5 minutes, reachable from React Query devtools or a
+  //   heap snapshot, until something calls .reset(). Worse than the data:
+  //   unlockVaultMutation's and rotateSecretMutation's `variables` are the
+  //   ACCOUNT PASSWORD the user typed to authorize the call.
+  //
+  //   Typed-password form state. vaultPassword and rotatePassword hold that
+  //   same account password before it is even sent, and nothing was resetting
+  //   them either.
+  //
+  //   Plaintext form/UI-mode state. editForm/editCustomFields (a new value
+  //   mid-edit) and newSecret/newCustomFields (a new value mid-add) stop being
+  //   VISIBLE the instant vaultEntries goes empty, but the values are still
+  //   resident in this component's fiber until something overwrites them.
+  //   editingEntryId/rotatingEntryId/rotationPanelId/showAddSecret are the
+  //   same shape of bug the revealedSecrets fix above already closed once:
+  //   dangling UI-mode state pointing at data that is gone from the screen but
+  //   not from memory, waiting to reappear on the next unlock.
+  //
+  // sealEpochRef (declared above) closes the remaining gap: a rotate or unlock
+  // request that is still in flight when one of the triggers above fires must
+  // not be allowed to call setVaultEntries/setRotatedValue after the fact. See
+  // unlockVaultMutation and rotateSecretMutation below for the onMutate/
+  // onSuccess pair that enforces it.
+  //
+  // What this function does NOT and CANNOT do: scrub the underlying bytes. JS
+  // strings are immutable and there is no memset equivalent, so dropping every
+  // reference below only makes these values GARBAGE-COLLECTABLE -- eligible
+  // for reuse, not guaranteed erased, on a schedule V8 controls. "Locked"
+  // means "nothing this app can still reach points at the plaintext", not
+  // "the plaintext is gone from the process". See THREAT-MODEL.md.
   const lockVault = useCallback(() => {
+    // Bump first. Any mutation whose response is still in flight compares its
+    // captured epoch against this counter before touching state; see
+    // unlockVaultMutation / rotateSecretMutation below.
+    sealEpochRef.current += 1;
+
+    // What renders.
     setVaultUnlocked(false);
     setVaultEntries([]);
     setRevealedSecrets(new Set());
     setRotatedValue(null);
+
+    // The account password, wherever this component was holding it in the
+    // clear before (or instead of) sending it.
+    setVaultPassword('');
+    setRotatePassword('');
+
+    // Plaintext form state and the dangling UI-mode state that pointed at it.
+    setEditingEntryId(null);
+    setEditForm(BLANK_EDIT_FORM);
+    setEditCustomFields([]);
+    setRotatingEntryId(null);
+    setRotationPanelId(null);
+    setShowAddSecret(false);
+    setNewSecret(BLANK_NEW_SECRET);
+    setNewCustomFields([]);
+
+    // The mutation cache -- the part that was actually leaking. This has
+    // TWO parts and both are required; the first alone is not enough, and a
+    // runtime test against the real cache object is what caught that it
+    // wasn't (see vault-lock-seals-secrets.test.tsx).
+    //
+    // .reset() on each hook result detaches ITS OWN observer from the
+    // mutation it is currently tracking, so THIS component's next render
+    // shows idle/no-data. But it does not remove anything from the
+    // QueryClient: the underlying Mutation object -- the thing actually
+    // holding `.state.data` (a decrypted value) and `.state.variables` (for
+    // unlock/rotate, the ACCOUNT PASSWORD) -- stays in the QueryClient's
+    // mutation cache, reachable via queryClient.getMutationCache().getAll(),
+    // React Query Devtools, or a heap snapshot, until its default 5-minute
+    // gcTime elapses. Calling reset() and believing that cleared the cache is
+    // exactly the bug this fix exists to close.
+    unlockVaultMutation.reset();
+    rotateSecretMutation.reset();
+    createSecretMutation.reset();
+    updateSecretMutation.reset();
+
+    // This is what actually evicts them: it empties the QueryClient's whole
+    // mutation cache, so no succeeded (or, for a mutation that resolves AFTER
+    // this line -- see the onSuccess guards on unlock/rotate below -- about
+    // to succeed) mutation anywhere in the app can still be read back. It is
+    // deliberately unscoped rather than removing just the vault-related
+    // mutations above: none of these mutations key off `mutationKey`, so
+    // there is no cheap filter, and a lock is a rare, deliberate,
+    // security-relevant action for which clearing a few unrelated mutations
+    // elsewhere in the app (nobody reads stale mutation-cache data after the
+    // fact; components read the query cache) is a fully acceptable trade
+    // against leaving a filter gap.
+    queryClient.getMutationCache().clear();
   }, []);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [rotatingEntryId, setRotatingEntryId] = useState<string | null>(null);
   const [rotationPanelId, setRotationPanelId] = useState<string | null>(null);
   const [rotatePassword, setRotatePassword] = useState('');
-  const [editForm, setEditForm] = useState({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '', destination_patterns: '' });
+  const [editForm, setEditForm] = useState(BLANK_EDIT_FORM);
   const [editCustomFields, setEditCustomFields] = useState<CustomField[]>([]);
 
   // Collection filter: 'all' | 'personal' | a collection id.
@@ -1411,7 +1522,21 @@ export default function Vault() {
 
   const unlockVaultMutation = useMutation({
     mutationFn: (password: string) => vaultApi.unlock(password),
-    onSuccess: (data: VaultEntry[]) => {
+    // Capture the seal epoch at request time so onSuccess can tell whether a
+    // lock happened while this was in flight (see lockVault/sealEpochRef).
+    onMutate: () => ({ epoch: sealEpochRef.current }),
+    onSuccess: (data: VaultEntry[], _password, context) => {
+      // The vault was locked before this resolved. Applying a decrypted
+      // response now would silently re-fill a UI the user was just shown as
+      // locked, so drop it instead -- and reset again: the mutation's OWN
+      // `.data` was just set to the decrypted response by react-query's own
+      // bookkeeping (that happens before this callback runs, independently
+      // of what we do here), so the first reset() inside lockVault could not
+      // have caught a response that did not exist yet. This one does.
+      if (context?.epoch !== sealEpochRef.current) {
+        unlockVaultMutation.reset();
+        return;
+      }
       setVaultUnlocked(true);
       setVaultEntries(data);
       setVaultPassword('');
@@ -1424,7 +1549,7 @@ export default function Vault() {
     mutationFn: vaultApi.create,
     onSuccess: () => {
       toast.success('Secret added to vault');
-      setNewSecret({ name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' });
+      setNewSecret(BLANK_NEW_SECRET);
       setNewCustomFields([]);
       setShowAddSecret(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
@@ -1445,7 +1570,19 @@ export default function Vault() {
 
   const rotateSecretMutation = useMutation({
     mutationFn: ({ id, password }: { id: string; password: string }) => vaultApi.rotate(id, password),
-    onSuccess: (data) => {
+    // Same race as unlock above: a rotate started before a lock can still
+    // resolve after it. Capture the epoch at request time...
+    onMutate: () => ({ epoch: sealEpochRef.current }),
+    onSuccess: (data, _variables, context) => {
+      // ...and refuse to write the freshly rotated plaintext into vaultEntries
+      // (or show it in the "New Secret Value" banner) if a lock happened
+      // while the request was in flight. Reset again for the same reason as
+      // unlockVaultMutation above: react-query already wrote the rotated
+      // plaintext into this mutation's OWN `.data` before this callback ran.
+      if (context?.epoch !== sealEpochRef.current) {
+        rotateSecretMutation.reset();
+        return;
+      }
       setRotatedValue({ id: data.id, value: data.value ?? '' });
       // A 200 does not mean the rotation was clean.
       //
