@@ -1,0 +1,16 @@
+# Frontend dependency-scan (bun audit) exceptions for Trustissues.
+#
+# Format: one entry per line, whitespace-separated:
+#   <GHSA-id or numeric advisory id>  <expiry YYYY-MM-DD>  <reason...>
+#
+# scripts/ci.sh's frontend_audit_ignore_flags only applies an entry while its expiry
+# is still in the future. Once it passes, the advisory reasserts itself and fails
+# frontend_dep_scan again, so this file cannot quietly protect a finding nobody has
+# looked at in months. Renew an entry only after actually re-checking whether a fix
+# exists yet; do not just push the date out.
+#
+# Empty on purpose: every HIGH/CRITICAL advisory bun audit has found in this tree so
+# far had a same-major fix available (a direct-dependency floor bump, or an
+# `overrides` pin), so nothing has needed an exception. Add a line here only when no
+# fix exists AND the finding has been reviewed for real exploitability in this app,
+# not accepted on faith because "everyone has this transitive dependency".

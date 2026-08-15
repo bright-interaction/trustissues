@@ -180,8 +180,105 @@ vuln_scan() {
   "$bin" ./...
 }
 
-step "secret scan"        secret_scan
-step "vulnerability scan" vuln_scan
+# scripts/frontend-audit-allowlist.txt holds reviewed, time-boxed exceptions:
+# "<GHSA-id or numeric advisory id> <expiry YYYY-MM-DD> <reason...>", one per line.
+# An entry whose expiry has passed is skipped here, so the advisory reasserts itself
+# and fails frontend_dep_scan again until someone actually re-reviews it. Without this,
+# the first advisory that has no fix yet (a patch that does not exist, or only lands in
+# a major nobody has budgeted to migrate to) is exactly the kind of thing that gets
+# someone to delete the whole check instead of triaging it once and moving on.
+#
+# The expiry field is VALIDATED, not trusted: a line with a missing or malformed
+# second field (a typo, a tab where a space belongs, someone pasting only the id) must
+# never resolve to a permanent silent exemption. If "${line#* }" finds nothing to
+# strip, expiry ends up equal to id, and "GHSA-..." sorts before every digit string in
+# a plain string compare, so an unguarded expiry check would treat that entry as
+# never-expiring. Reject the shape instead: on a bad line, print why and signal the
+# caller with a non-zero return so the WHOLE step is treated as did-not-run (99), not
+# as a pass with an unknown, possibly-permanent set of findings suppressed.
+frontend_audit_ignore_flags() {
+  local file="scripts/frontend-audit-allowlist.txt" today line id expiry
+  [ -f "$file" ] || return 0
+  today="$(date +%Y-%m-%d)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    id="${line%% *}"
+    expiry="${line#* }"
+    expiry="${expiry%% *}"
+    if ! [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      echo "frontend audit allowlist: malformed line (need '<id> <YYYY-MM-DD> <reason>'): $line" >&2
+      return 2
+    fi
+    if [[ "$today" > "$expiry" ]]; then
+      echo "frontend audit allowlist: expired, no longer ignored: $line" >&2
+      continue
+    fi
+    printf '%s\n' "--ignore=$id"
+  done < "$file"
+}
+
+# The bun-audit counterpart to vuln_scan above, and the only scanner that ever looks at
+# the half of this app that decrypts and renders plaintext secrets in a browser. bun
+# needs nothing extra installed beyond what frontend_build already requires, but unlike
+# govulncheck's vulndb there is no offline mode: bun audit makes a live registry round
+# trip on EVERY run, a clean pass prints nothing beyond its own banner, and a network
+# failure also exits non-zero with no "N vulnerabilities (" line, so a network failure
+# and a real pass cannot be told apart by exit code alone. They are told apart by
+# content below: a genuine finding always ends in a literal "N vulnerabilities (...)"
+# summary line with a digit immediately before it; a registry failure never produces
+# that shape (a bare substring match on "vulnerabilit" would also fire on an unrelated
+# error message that happens to mention a vulnerability database), and only the first
+# case is a FAIL.
+#
+# --audit-level=high fails the build on HIGH and CRITICAL only, matching the threshold
+# already standardized on this estate's other two Bun frontends (bright-interaction
+# -website, hash/frontend). LOW and MODERATE transitive findings are noise at the rate
+# the npm ecosystem produces them, and gating on every one of them is how a security
+# check gets disabled within a week; run `bun audit` with no level for the full list.
+frontend_dep_scan() {
+  command -v bun >/dev/null 2>&1 || {
+    echo "bun is not installed, so frontend dependencies are not scanned by this run."
+    echo "Install it from https://bun.sh; npm and pnpm are not substitutes here."
+    return 99
+  }
+  [ -f frontend/bun.lock ] || {
+    echo "frontend/bun.lock is missing, so there is no lockfile to audit."
+    return 99
+  }
+  local ignore_output rc out
+  ignore_output="$(frontend_audit_ignore_flags)"; rc=$?
+  if [ "$rc" != "0" ]; then
+    echo "frontend dependency scan cannot run: the advisory allowlist is malformed, so what it exempts is unknown (see above)." >&2
+    return 99
+  fi
+  # Bash < 4.4 (stock /bin/bash on macOS is 3.2) raises "unbound variable" under
+  # set -u when expanding "${arr[@]}" on a zero-element array, so the empty case is
+  # kept on a separate branch rather than always expanding ignore_flags.
+  local -a ignore_flags=()
+  if [ -n "$ignore_output" ]; then
+    while IFS= read -r flag; do ignore_flags+=("$flag"); done <<< "$ignore_output"
+  fi
+  if [ "${#ignore_flags[@]}" -gt 0 ]; then
+    out="$(cd frontend && bun audit --audit-level=high "${ignore_flags[@]}" 2>&1)"; rc=$?
+  else
+    out="$(cd frontend && bun audit --audit-level=high 2>&1)"; rc=$?
+  fi
+  printf '%s\n' "$out"
+  [ "$rc" = "0" ] && return 0
+  case "$out" in
+    *[0-9]" vulnerabilities ("*) return 1 ;;
+    *)
+      echo "bun audit did not complete, most likely no network to the registry; treating as did-not-run, never as a pass." >&2
+      return 99
+      ;;
+  esac
+}
+
+step "secret scan"                secret_scan
+step "vulnerability scan"         vuln_scan
+step "frontend dependency scan"   frontend_dep_scan
 
 printf '\n'
 if [ ${#SKIPPED[@]} -ne 0 ]; then
