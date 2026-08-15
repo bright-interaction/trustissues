@@ -180,8 +180,75 @@ vuln_scan() {
   "$bin" ./...
 }
 
-step "secret scan"        secret_scan
-step "vulnerability scan" vuln_scan
+# scripts/frontend-audit-allowlist.txt holds reviewed, time-boxed exceptions:
+# "<GHSA-id or numeric advisory id> <expiry YYYY-MM-DD> <reason...>", one per line.
+# An entry whose expiry has passed is skipped here, so the advisory reasserts itself
+# and fails frontend_dep_scan again until someone actually re-reviews it. Without this,
+# the first advisory that has no fix yet (a patch that does not exist, or only lands in
+# a major nobody has budgeted to migrate to) is exactly the kind of thing that gets
+# someone to delete the whole check instead of triaging it once and moving on.
+frontend_audit_ignore_flags() {
+  local file="scripts/frontend-audit-allowlist.txt" today line id expiry
+  [ -f "$file" ] || return 0
+  today="$(date +%Y-%m-%d)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    id="${line%% *}"
+    expiry="${line#* }"
+    expiry="${expiry%% *}"
+    if [[ "$today" > "$expiry" ]]; then
+      echo "frontend audit allowlist: expired, no longer ignored: $line" >&2
+      continue
+    fi
+    printf '%s\n' "--ignore=$id"
+  done < "$file"
+}
+
+# The bun-audit counterpart to vuln_scan above, and the only scanner that ever looks at
+# the half of this app that decrypts and renders plaintext secrets in a browser. bun
+# needs nothing extra installed beyond what frontend_build already requires, but unlike
+# govulncheck's vulndb there is no offline mode: bun audit makes a live registry round
+# trip on EVERY run, a clean pass prints nothing beyond its own banner, and a network
+# failure also exits non-zero with no "N vulnerabilities" line, so a network failure and
+# a real pass cannot be told apart by exit code alone. They are told apart by content
+# below: a genuine finding always ends in a "N vulnerabilities (...)" summary line,
+# a registry failure never does, and only the first case is a FAIL.
+#
+# --audit-level=high fails the build on HIGH and CRITICAL only, matching the threshold
+# already standardized on this estate's other two Bun frontends (bright-interaction
+# -website, hash/frontend). LOW and MODERATE transitive findings are noise at the rate
+# the npm ecosystem produces them, and gating on every one of them is how a security
+# check gets disabled within a week; run `bun audit` with no level for the full list.
+frontend_dep_scan() {
+  command -v bun >/dev/null 2>&1 || {
+    echo "bun is not installed, so frontend dependencies are not scanned by this run."
+    echo "Install it from https://bun.sh; npm and pnpm are not substitutes here."
+    return 99
+  }
+  [ -f frontend/bun.lock ] || {
+    echo "frontend/bun.lock is missing, so there is no lockfile to audit."
+    return 99
+  }
+  local out rc
+  local -a ignore_flags=()
+  while IFS= read -r flag; do ignore_flags+=("$flag"); done < <(frontend_audit_ignore_flags)
+  out="$(cd frontend && bun audit --audit-level=high "${ignore_flags[@]}" 2>&1)"; rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" = "0" ] && return 0
+  case "$out" in
+    *vulnerabilit*) return 1 ;;
+    *)
+      echo "bun audit did not complete, most likely no network to the registry; treating as did-not-run, never as a pass." >&2
+      return 99
+      ;;
+  esac
+}
+
+step "secret scan"                secret_scan
+step "vulnerability scan"         vuln_scan
+step "frontend dependency scan"   frontend_dep_scan
 
 printf '\n'
 if [ ${#SKIPPED[@]} -ne 0 ]; then
