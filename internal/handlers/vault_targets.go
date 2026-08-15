@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -417,8 +416,10 @@ func deliverToForgejoSecret(ctx context.Context, vault *VaultHandler, target Rot
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 201 && resp.StatusCode != 204 {
-		body, _ := io.ReadAll(resp.Body)
-		return newUpstreamHTTPError(resp.StatusCode, body)
+		// Bounded, and the read error is not discarded. target.Instance is
+		// operator-supplied, so the host answering here is not a vendor and an
+		// unbounded read let it choose this process's allocation.
+		return upstreamErrorFromResponse(resp)
 	}
 
 	return nil
@@ -469,8 +470,10 @@ func deliverToWebhook(ctx context.Context, target RotationTarget, entryName stri
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return newUpstreamHTTPError(resp.StatusCode, body)
+		// Same ceiling, and for a stronger reason: target.WebhookURL is chosen
+		// outright by whoever configured the target, so this response comes from
+		// a host the product never vetted.
+		return upstreamErrorFromResponse(resp)
 	}
 
 	return nil
