@@ -36,6 +36,23 @@ paths = [
   '''scripts/mirror-secret-allowlist\.txt''',
 ]
 regexes = [
+  # The reflectguard false-positive fixture, as it existed in commit f165f9248
+  # ONLY. Two minutes later f80d7b07d replaced it with the low-entropy
+  # `sk-live/AbCdEf/1234/XyZ`, which is the fix the 2026-08-15 decision called
+  # for, but this gate scans HISTORY and that commit still carries the original.
+  # The two hits are the same 16-hex fixture differing in the last character:
+  # dialects_test.go:137 defines it and :144 embeds a deliberate "one character
+  # off" near-miss, both feeding TestDecodedReadingsDoNotFireOnCleanTraffic,
+  # whose whole job is proving the scanner does NOT fire on clean traffic.
+  # Verified to appear in exactly two monorepo commits and zero working trees.
+  #
+  # Allowlisted BY VALUE and never by path. Adding
+  # `internal/reflectguard/.*_test\.go` to the paths list also clears these two,
+  # and an ablation showed it then reports "no leaks found" over a real secret
+  # planted in that package: a path entry makes this gate structurally unable to
+  # fail over a credential vault's own guard code. Same reasoning as the
+  # correct-horse-battery-staple entry below.
+  '''sk-live-9f3a2b7c8d1e4f5[ab]''',
   '''changeme''',
   '''change[_-]?me''',
   '''your_[a-z0-9_]*''',
