@@ -43,7 +43,41 @@ func Connect(dataDir string) (*sql.DB, error) {
 	// BEGIN IMMEDIATE takes the write lock up front, which is what makes
 	// _busy_timeout cover it. The cost is that transactions serialize; for a
 	// single-team vault with three write paths that is the right trade.
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_txlock=immediate", dbPath)
+	//
+	// _secure_delete=on is a confidentiality control, not a tuning knob either.
+	//
+	// SQLite does not zero what it frees. A deleted row's bytes, and the OLD
+	// bytes of any row an UPDATE rewrote, stay verbatim in the page they used to
+	// occupy; a page that empties out goes on the freelist still holding its
+	// content. Measured on a 2000-row fixture: delete the rows, checkpoint, and
+	// 1176 copies of the cleartext were still greppable in the raw .db file.
+	//
+	// That is the whole point of migration 00040. It encrypted vault entry names
+	// at rest, and the backfill sweep rewrote every row, which freed the old
+	// cleartext rather than overwriting it. The column reads as ciphertext and
+	// the file still holds the plaintext. THREAT-MODEL treats an off-host backup
+	// as a lower-trust location than the host, and the snapshot is a copy of this
+	// file, so sealing the column while leaving the residue seals nothing.
+	//
+	// With this on, SQLite zeroes freed content as it is freed. The cost is extra
+	// page writes on delete and on update-in-place; for a vault whose write
+	// volume is a few saves a day that is not a trade worth thinking about.
+	//
+	// It goes in the DSN rather than in a `PRAGMA secure_delete=ON` after
+	// sql.Open ON PURPOSE. secure_delete is per-connection state, and the pool
+	// below opens up to 10 connections lazily, on whichever goroutine needs one.
+	// A pragma executed once against the pool lands on ONE arbitrary connection
+	// and every other connection frees pages in the clear, silently. The driver
+	// applies DSN pragmas in its own connect path, so every connection the pool
+	// ever opens gets it. TestSecureDeleteIsSetOnEveryPooledConnection pins that.
+	//
+	// This is forward-looking only: it zeroes pages as they are freed from now
+	// on and does nothing about pages that are ALREADY free. The residue that
+	// exists today needs a one-time rebuild of the file, which takes a write lock
+	// and is an operator decision, not something to run on boot. That is
+	// scripts/compact-db.sh. Backups are handled separately: scripts/backup.sh
+	// uses VACUUM INTO, which never copies the freelist.
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_txlock=immediate&_secure_delete=on", dbPath)
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
