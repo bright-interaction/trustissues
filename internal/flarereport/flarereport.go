@@ -25,22 +25,24 @@ import (
 	sentry "github.com/getsentry/sentry-go"
 )
 
-// InitFlare turns on error reporting when FLARE_DSN is set. The DSN is injected
-// by the Hephaestus flare-provision deploy step; without it this is a no-op, so
-// dev runs and self-hosts boot unchanged. Returns whether reporting is live.
-func InitFlare(service, release string) bool {
-	dsn := os.Getenv("FLARE_DSN")
-	if dsn == "" {
-		return false
-	}
-	err := sentry.Init(sentry.ClientOptions{
+// ClientOptions returns the exact sentry configuration InitFlare installs.
+//
+// It is a named, exported function rather than a literal inlined into InitFlare
+// so that a test in another package can build a client with a capturing
+// transport and prove that a panic on a REAL route produces a scrubbed report.
+// A test that re-declared these hooks itself would only prove that a copy of the
+// wiring works, and would keep passing after somebody deleted the real one.
+// Production has exactly one caller: InitFlare, just below.
+func ClientOptions(dsn, service, release string) sentry.ClientOptions {
+	return sentry.ClientOptions{
 		Dsn:        dsn,
 		Release:    release,
 		ServerName: service,
 		// Scrub request context before it crosses the tenant -> shared-store
 		// boundary: query strings carry short-lived OAuth codes/state and reset
-		// tokens, cookies carry the session, headers carry bearer creds and API
-		// keys. Keep method + path for triage.
+		// tokens, cookies carry the session, the buffered body carries whatever
+		// the caller POSTed, and headers carry bearer creds and API keys. Keep
+		// method + path for triage.
 		//
 		// BeforeSend covers error/message events; transaction envelopes route
 		// through BeforeSendTransaction, a SEPARATE hook. Register the same scrub
@@ -52,7 +54,18 @@ func InitFlare(service, release string) bool {
 		BeforeSendTransaction: func(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 			return scrubRequestEvent(event)
 		},
-	})
+	}
+}
+
+// InitFlare turns on error reporting when FLARE_DSN is set. The DSN is injected
+// by the Hephaestus flare-provision deploy step; without it this is a no-op, so
+// dev runs and self-hosts boot unchanged. Returns whether reporting is live.
+func InitFlare(service, release string) bool {
+	dsn := os.Getenv("FLARE_DSN")
+	if dsn == "" {
+		return false
+	}
+	err := sentry.Init(ClientOptions(dsn, service, release))
 	if err != nil {
 		slog.Warn("flare: error reporting disabled (sentry init failed)", "error", err)
 		return false
