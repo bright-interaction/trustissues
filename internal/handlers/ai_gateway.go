@@ -355,7 +355,14 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	guard := reflectguard.New([]byte(key))
 	defer guard.Wipe()
 
-	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+	// Every Content-Encoding value, not just the first. Header.Get reads one
+	// line, so a provider sending "identity" and then "gzip" walked straight
+	// past this refusal -- and past net/http's transparent decompression, which
+	// tests the same first value -- leaving the scan below to look for a
+	// plaintext needle in gzip bytes and report clean. reflectguard owns the
+	// question so this door and the capability bridge's door cannot drift apart
+	// on it again.
+	if ce, unscannable := reflectguard.UnscannableEncoding(resp.Header); unscannable {
 		logError(r, "ai_gateway: provider response is content-encoded and could not be checked for the injected key",
 			"provider", providerName, "content_encoding", ce)
 		LogActivityFromRequest(h.queries, r, "ai.gateway_response_withheld",

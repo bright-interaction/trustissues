@@ -620,7 +620,12 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	// success. Accept-Encoding is no longer forwarded (see forwardableHeaders),
 	// so Go's transport negotiates and transparently decodes gzip itself and
 	// this branch is only reached by an upstream that compressed unbidden.
-	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+	//
+	// EVERY value, not just the first. Header.Get reads one line, so an upstream
+	// that sent "identity" and then "gzip" skipped this refusal -- and skipped
+	// the transport's transparent decompression, which tests the same first
+	// value -- so the guard below scanned compressed bytes and relayed them.
+	if ce, unscannable := reflectguard.UnscannableEncoding(resp.Header); unscannable {
 		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
 			"used", resp.StatusCode, "reflection_unscannable: content-encoding "+ce, tok.Nonce)
 		writeError(w, r, http.StatusBadGateway, "upstream_unscannable",

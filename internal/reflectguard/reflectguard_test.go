@@ -294,3 +294,81 @@ func (w *countingWriter) Write(p []byte) (int, error) { w.n += len(p); return le
 type erroringReader struct{ err error }
 
 func (r *erroringReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestUnscannableEncodingReadsEveryValueNotJustTheFirst is the unit-level
+// statement of a bug that shipped at two call sites at once. Both doors asked
+// resp.Header.Get("Content-Encoding") and refused only when that single string
+// was neither empty nor "identity". Get returns the FIRST value of a repeated
+// header, so "identity" followed by "gzip" read as plain "identity", the
+// refusal was skipped, and -- because net/http's transport makes its
+// transparent-decompression decision off the very same Get -- the body arrived
+// still compressed. The guard then scanned gzip bytes for a plaintext needle,
+// found nothing, and relayed the credential.
+//
+// The repeated-line and single-line-comma forms are the same statement in HTTP.
+// Any answer that treats them differently is wrong.
+func TestUnscannableEncodingReadsEveryValueNotJustTheFirst(t *testing.T) {
+	cases := []struct {
+		name  string
+		value []string
+		want  string // "" means scannable
+	}{
+		{name: "no header at all", value: nil},
+		{name: "identity alone", value: []string{"identity"}},
+		{name: "identity twice on two lines", value: []string{"identity", "identity"}},
+		{name: "identity twice on one line", value: []string{"identity, identity"}},
+		{name: "empty value", value: []string{""}},
+
+		{name: "gzip alone", value: []string{"gzip"}, want: "gzip"},
+		{name: "br alone", value: []string{"br"}, want: "br"},
+		{name: "the comma form", value: []string{"identity, gzip"}, want: "identity, gzip"},
+		{
+			// THE FINDING: two lines, identity first. Semantically identical to
+			// the comma form above and invisible to Header.Get.
+			name:  "two lines, identity first",
+			value: []string{"identity", "gzip"},
+			want:  "identity, gzip",
+		},
+		{
+			// The other order, in case anyone is tempted to special-case the
+			// first element rather than read them all.
+			name:  "two lines, gzip first",
+			value: []string{"gzip", "identity"},
+			want:  "gzip, identity",
+		},
+		{name: "three lines, offender last", value: []string{"identity", "identity", "deflate"}, want: "identity, identity, deflate"},
+		{name: "case and whitespace do not launder it", value: []string{"IDENTITY", "  GZip  "}, want: "IDENTITY,   GZip  "},
+		{name: "an empty part between identities", value: []string{"identity,, gzip"}, want: "identity,, gzip"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := http.Header{}
+			for _, v := range c.value {
+				h.Add("Content-Encoding", v)
+			}
+			got, unscannable := UnscannableEncoding(h)
+			if unscannable != (c.want != "") {
+				t.Fatalf("UnscannableEncoding(%q) = %v, want %v -- a body under %q %s",
+					c.value, unscannable, c.want != "", c.value,
+					map[bool]string{true: "cannot be scanned and must be refused", false: "is plaintext and must be delivered"}[c.want != ""])
+			}
+			if got != c.want {
+				t.Errorf("audit rendering = %q, want %q (the operator has to be able to see what the upstream sent)", got, c.want)
+			}
+		})
+	}
+}
+
+// TestUnscannableEncodingIsIndifferentToHeaderNameCasing guards the lookup
+// itself: http.Header literals built by hand are not canonicalised, and a
+// helper that read the map directly instead of through Values would miss a
+// lower-cased key an HTTP/2 upstream sends.
+func TestUnscannableEncodingIsIndifferentToHeaderNameCasing(t *testing.T) {
+	h := http.Header{}
+	h.Add("content-encoding", "identity")
+	h.Add("CONTENT-ENCODING", "gzip")
+	if got, unscannable := UnscannableEncoding(h); !unscannable || got != "identity, gzip" {
+		t.Fatalf("UnscannableEncoding = (%q, %v), want (\"identity, gzip\", true)", got, unscannable)
+	}
+}

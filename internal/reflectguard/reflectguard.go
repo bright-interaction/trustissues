@@ -399,3 +399,54 @@ func (s *Scanner) Relay(dst io.Writer, src io.Reader, holdBack int, begin func()
 	}
 	return committed, nil
 }
+
+// UnscannableEncoding reports whether an upstream response body arrived under a
+// Content-Encoding this package cannot see through, and returns a rendering of
+// every value the upstream sent for the audit row.
+//
+// It exists as ONE function because there are two doors -- the capability
+// bridge's /proxy and the AI gateway -- and they must answer this question
+// identically. Each used to ask it inline with
+//
+//	resp.Header.Get("Content-Encoding") != "" && !strings.EqualFold(ce, "identity")
+//
+// and http.Header.Get returns only the FIRST value of a repeated header. An
+// upstream that emits two Content-Encoding lines, "identity" and then "gzip",
+// therefore read as plain "identity" and the refusal was skipped. Worse, the
+// two wrong decisions come off the SAME wrong read: net/http's transport also
+// tests only Get("Content-Encoding") before it transparently decompresses, so
+// it too saw "identity" and handed the body up still compressed. The call site
+// was then given gzip bytes, believed they were plaintext, scanned them for a
+// plaintext needle, found nothing, and relayed the credential with the
+// upstream's own status code. Refusing on the first value alone is not
+// refusing.
+//
+// So: every value, split on commas, trimmed, and anything that is not
+// "identity" is unscannable. The single-line comma form ("identity, gzip") and
+// the repeated-line form are the same statement in HTTP and get the same
+// answer. Only an encoding-list that is empty or entirely "identity" is
+// scannable, because only then are the bytes in hand the plaintext bytes.
+func UnscannableEncoding(h http.Header) (encodings string, unscannable bool) {
+	values := h.Values("Content-Encoding")
+	if len(values) == 0 {
+		return "", false
+	}
+	for _, v := range values {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if !strings.EqualFold(part, "identity") {
+				unscannable = true
+			}
+		}
+	}
+	if !unscannable {
+		return "", false
+	}
+	// Report what the upstream actually sent, all of it: an operator reading
+	// "identity, gzip" in the trail can see the shape that caused the refusal,
+	// which "gzip" alone would have hidden.
+	return strings.Join(values, ", "), true
+}

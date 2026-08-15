@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -49,9 +51,13 @@ const (
 // asks, with {auth} substituted for the Authorization header value the proxy
 // actually injected, so the reflection is of the REAL delivered credential
 // rather than of a string the test typed in.
+// header is an http.Header, NOT a map[string]string. The map could not express
+// two values for one header name, which is exactly the shape that carried the
+// Content-Encoding bug past this file: a fixture type that cannot represent the
+// input is a guard that cannot fail.
 type reflectingTransport struct {
 	status  int
-	header  map[string]string
+	header  http.Header
 	body    func(auth string) string
 	sawAuth string
 }
@@ -60,8 +66,10 @@ func (rt *reflectingTransport) RoundTrip(r *http.Request) (*http.Response, error
 	auth := r.Header.Get("Authorization")
 	rt.sawAuth = auth
 	h := http.Header{"Content-Type": []string{"application/json"}}
-	for k, v := range rt.header {
-		h.Set(k, strings.ReplaceAll(v, "{auth}", auth))
+	for k, vs := range rt.header {
+		for _, v := range vs {
+			h.Add(k, strings.ReplaceAll(v, "{auth}", auth))
+		}
 	}
 	body := ""
 	if rt.body != nil {
@@ -132,7 +140,7 @@ func TestProxyRefusesAnUpstreamThatReflectsTheInjectedSecret(t *testing.T) {
 	cases := []struct {
 		name    string
 		status  int
-		header  map[string]string
+		header  http.Header
 		body    func(auth string) string
 		wantAud string
 	}{
@@ -165,13 +173,13 @@ func TestProxyRefusesAnUpstreamThatReflectsTheInjectedSecret(t *testing.T) {
 			// Headers reach the caller before a single byte of body does, so a
 			// body-only guard would have shipped this one intact.
 			name:    "reflected into a response header",
-			header:  map[string]string{"X-Echo-Authorization": "{auth}"},
+			header:  http.Header{"X-Echo-Authorization": {"{auth}"}},
 			body:    func(string) string { return `{"ok":true}` },
 			wantAud: "reflected_secret_blocked: header X-Echo-Authorization (plaintext)",
 		},
 		{
 			name:    "reflected into Set-Cookie",
-			header:  map[string]string{"Set-Cookie": "last_seen_token={auth}; Path=/"},
+			header:  http.Header{"Set-Cookie": {"last_seen_token={auth}; Path=/"}},
 			body:    func(string) string { return `{"ok":true}` },
 			wantAud: "reflected_secret_blocked: header Set-Cookie (plaintext)",
 		},
@@ -238,7 +246,7 @@ func TestProxyRefusesAnUpstreamThatReflectsTheInjectedSecret(t *testing.T) {
 func TestProxyStillDeliversACleanUpstreamResponse(t *testing.T) {
 	const clean = `{"result":{"id":"tok_1","status":"active"},"success":true}`
 	rt := &reflectingTransport{
-		header: map[string]string{"X-Request-Id": "req_abc123"},
+		header: http.Header{"X-Request-Id": {"req_abc123"}},
 		body:   func(string) string { return clean },
 	}
 	env := newReflectEnv(t, rt)
@@ -260,31 +268,157 @@ func TestProxyStillDeliversACleanUpstreamResponse(t *testing.T) {
 	}
 }
 
+// gzipOf is a REAL gzip stream, not a byte string that merely looks like one.
+// It matters: the assertions below decompress what the caller received and look
+// for the credential in the result, which is the only way to show that refusing
+// an unscannable body is protecting something rather than being fussy.
+func gzipOf(t *testing.T, plain string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.String()
+}
+
+// gunzipIfPossible returns the decompressed bytes when b is a gzip stream, and
+// b unchanged otherwise, so a caller-side assertion can be written once and
+// still catch the credential whichever form it arrived in.
+func gunzipIfPossible(b []byte) []byte {
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return b
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		return b
+	}
+	return out
+}
+
 // TestProxyRefusesAContentEncodedResponseItCannotScan. Compressed bytes contain
 // no plaintext needle, so a guard that scanned them would report clean and
 // forward the leak. The refusal is the point: unscannable is not deliverable.
+//
+// The three cases are three ways to say the same thing in HTTP, and until this
+// round only two of them were heard. The guard asked
+// resp.Header.Get("Content-Encoding"), and Get returns only the FIRST value of
+// a repeated header, so an upstream emitting
+//
+//	Content-Encoding: identity
+//	Content-Encoding: gzip
+//
+// read as plain "identity" and walked past the refusal. net/http's transport
+// tests the same first value before it transparently decompresses, so it too
+// declined -- both wrong decisions off one wrong read -- and the guard was
+// handed gzip bytes it believed were plaintext, scanned them for a plaintext
+// needle, found nothing, and relayed the credential.
 func TestProxyRefusesAContentEncodedResponseItCannotScan(t *testing.T) {
-	rt := &reflectingTransport{
-		header: map[string]string{"Content-Encoding": "gzip"},
-		body:   func(string) string { return "\x1f\x8b\x08 pretend this is gzip" },
+	cases := []struct {
+		name    string
+		header  http.Header
+		wantAud string
+	}{
+		{
+			// The plain case, and the control: this one was always refused.
+			name:    "a single gzip Content-Encoding",
+			header:  http.Header{"Content-Encoding": {"gzip"}},
+			wantAud: "reflection_unscannable: content-encoding gzip",
+		},
+		{
+			// Also always refused, because Get returns the whole line here and
+			// the whole line is not "identity". Keep it working: it is the other
+			// control, and it is the SAME statement as the case below.
+			name:    "the single-line comma form",
+			header:  http.Header{"Content-Encoding": {"identity, gzip"}},
+			wantAud: "reflection_unscannable: content-encoding identity, gzip",
+		},
+		{
+			// THE FINDING. Two lines, identity first. Semantically identical to
+			// the comma form above; invisible to Header.Get.
+			name:    "two Content-Encoding lines, identity first",
+			header:  http.Header{"Content-Encoding": {"identity", "gzip"}},
+			wantAud: "reflection_unscannable: content-encoding identity, gzip",
+		},
 	}
-	env := newReflectEnv(t, rt)
 
-	rec := env.spendOnce(t, "gzip-agent")
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("an unscannable response must not be delivered, got %d: %s", rec.Code, rec.Body.String())
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The body is a real gzip stream of a real reflection, so if the
+			// refusal is skipped the caller receives bytes that decompress to
+			// the operator's credential. That is the leak, not a hypothetical.
+			rt := &reflectingTransport{
+				header: c.header,
+				body: func(auth string) string {
+					return gzipOf(t, `{"headers":{"authorization":"`+auth+`"}}`)
+				},
+			}
+			env := newReflectEnv(t, rt)
+
+			rec := env.spendOnce(t, "gzip-agent")
+
+			// THE assertion: what the caller received, decompressed. A guard
+			// that only checked rec.Body for the raw plaintext would pass while
+			// the credential sat one gunzip away.
+			if got := gunzipIfPossible(rec.Body.Bytes()); bytes.Contains(got, []byte(theReflectedKey)) {
+				t.Fatalf("USE-without-SEE broken: the caller received the credential under a content-encoding the guard did not refuse.\ndecoded body: %s", got)
+			}
+
+			// Positive control: the credential really was delivered upstream,
+			// so a pass here is not a pass because nothing was injected.
+			if !strings.Contains(rt.sawAuth, theReflectedKey) {
+				t.Fatalf("ABORT: the proxy never injected the credential (upstream saw %q); this test proves nothing", rt.sawAuth)
+			}
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("an unscannable response must not be delivered, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "upstream_unscannable") {
+				t.Errorf("the caller should be told why, got %s", rec.Body.String())
+			}
+			found := false
+			for _, row := range env.auditRows(t) {
+				if strings.Contains(row, c.wantAud) {
+					found = true
+				}
+				if strings.Contains(row, theReflectedKey) {
+					t.Fatalf("the audit row itself carries the credential: %s", row)
+				}
+			}
+			if !found {
+				t.Fatalf("no audit row for the unscannable refusal.\nwant substring: %s\ngot rows: %v", c.wantAud, env.auditRows(t))
+			}
+		})
 	}
-	if !strings.Contains(rec.Body.String(), "upstream_unscannable") {
-		t.Errorf("the caller should be told why, got %s", rec.Body.String())
-	}
-	found := false
-	for _, row := range env.auditRows(t) {
-		if strings.Contains(row, "reflection_unscannable: content-encoding gzip") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("no audit row for the unscannable refusal: %v", env.auditRows(t))
+}
+
+// TestProxyStillDeliversAnIdentityEncodedResponse is the anti-over-refusal
+// control for the case above. "identity" means "not encoded", including when it
+// is said twice, and refusing it would turn a correct upstream into an outage.
+func TestProxyStillDeliversAnIdentityEncodedResponse(t *testing.T) {
+	const clean = `{"result":{"id":"tok_1"},"success":true}`
+	for _, header := range []http.Header{
+		{"Content-Encoding": {"identity"}},
+		{"Content-Encoding": {"identity", "identity"}},
+		{"Content-Encoding": {"identity, identity"}},
+	} {
+		t.Run(strings.Join(header["Content-Encoding"], "|"), func(t *testing.T) {
+			rt := &reflectingTransport{header: header, body: func(string) string { return clean }}
+			env := newReflectEnv(t, rt)
+
+			rec := env.spendOnce(t, "identity-agent")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("identity is not an encoding and must still be delivered: %d %s", rec.Code, rec.Body.String())
+			}
+			if rec.Body.String() != clean {
+				t.Fatalf("the body was altered.\n got: %s\nwant: %s", rec.Body.String(), clean)
+			}
+		})
 	}
 }
 
