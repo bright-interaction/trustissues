@@ -147,12 +147,41 @@ frontend_build() {
   ( cd frontend && bun install --frozen-lockfile && bun run build )
 }
 
+# THE FRONTEND TESTS, WHICH THIS SCRIPT DID NOT RUN UNTIL NOW.
+#
+# frontend_build above is `tsc && vite build`. It type-checks and it bundles.
+# It does not execute a single test. So every case under frontend/src/test --
+# and that includes vault-lock-seals-secrets.test.tsx, the RUNTIME proof that
+# locking the vault evicts the decrypted values AND the account password from
+# the TanStack Query mutation cache -- passed on the author's laptop and was
+# never once executed by this pipeline. The suite existed, the gate was green,
+# and those two facts had nothing to do with each other.
+#
+# That is the same defect class as run_tests' warning one level further out:
+# there the tests compiled and did not run, here the RUNNER was never invoked.
+# "The gate is green" and "the guards run" are separate claims and only the
+# second one is worth anything.
+#
+# `bun run test` is `vitest run`, which is the non-watch mode; the watch mode
+# would hang a CI job forever. vitest exits non-zero when it matches no test
+# files at all (verified by moving src/test aside: exit 1), so deleting or
+# renaming the suite turns this step RED instead of quietly passing it.
+frontend_tests() {
+  command -v bun >/dev/null 2>&1 || {
+    echo "bun is not installed, so the frontend test suite did NOT run."
+    echo "Install it from https://bun.sh; npm and pnpm are not substitutes here."
+    return 99
+  }
+  ( cd frontend && bun install --frozen-lockfile && bun run test )
+}
+
 step "build"                          go build ./...
 step "vet"                            go vet ./...
 step "gofmt"                          fmt_check
 step "migrations"                     migrations_check
 step "tests (RUN, not just compiled)" run_tests
 step "frontend build + typecheck"     frontend_build
+step "frontend tests (RUN)"           frontend_tests
 
 # .gitleaks.toml allowlists the change-me placeholders in .env.example and the docs, so
 # pass it or the examples trip the scan and everyone learns to ignore the result.
@@ -276,9 +305,54 @@ frontend_dep_scan() {
   esac
 }
 
+# THE BACKUP/RESTORE SUITE, ALSO NEVER RUN BY CI UNTIL NOW.
+#
+# scripts/test-backup-restore.sh is ~50 cases over backup.sh, restore.sh,
+# prune-backups.sh, restore-drill.sh and the systemd units in deploy/. Among
+# them is the byte-level proof that a securely deleted snapshot leaves no
+# plaintext on disk. `go test ./...` cannot reach any of it: it is a shell
+# suite, because the code it guards is shell. Nothing else invoked it, so the
+# only thing standing between that code and a regression was somebody
+# remembering to run it by hand.
+#
+# It is deliberately the LAST step. With docker present it builds a throwaway
+# image and drives real Compose restores, which makes it the slowest check here
+# by an order of magnitude, and every step above it has already reported by the
+# time it starts.
+#
+# A run that SKIPPED cases is reported as did-not-run, not as ok. The suite
+# exits 0 when the Compose cases could not run (no docker) because the ~40
+# cases that did run all passed, and that is a true statement about a narrower
+# claim than this gate is asserting. 99 keeps the distinction: on a runner with
+# docker -- which ubuntu-latest has -- nothing skips and this is a plain pass
+# or fail.
+backup_restore_tests() {
+  [ -f scripts/test-backup-restore.sh ] || {
+    echo "scripts/test-backup-restore.sh is missing; the backup path is unguarded" >&2
+    return 1
+  }
+  command -v sqlite3 >/dev/null 2>&1 || {
+    echo "sqlite3 is not installed, so the backup/restore suite did NOT run."
+    echo "Install it (apt-get install -y sqlite3); the suite builds its fixtures with it."
+    return 99
+  }
+  local log rc
+  log="$(mktemp)"
+  # tee, rather than capturing into a variable, so a suite that takes minutes
+  # prints as it goes instead of going silent and then emitting everything at
+  # once. PIPESTATUS[0] is the suite's status; tee's is not interesting.
+  bash scripts/test-backup-restore.sh 2>&1 | tee "$log"
+  rc="${PIPESTATUS[0]}"
+  if [ "$rc" != "0" ]; then rm -f "$log"; return "$rc"; fi
+  if grep -q "case(s) did not run" "$log"; then rm -f "$log"; return 99; fi
+  rm -f "$log"
+  return 0
+}
+
 step "secret scan"                secret_scan
 step "vulnerability scan"         vuln_scan
 step "frontend dependency scan"   frontend_dep_scan
+step "backup/restore suite"       backup_restore_tests
 
 printf '\n'
 if [ ${#SKIPPED[@]} -ne 0 ]; then
