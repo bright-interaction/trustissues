@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -149,11 +150,34 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Resolve each name -> encrypted entry -> plaintext. Missing names
-	// are silently skipped in the response BUT logged in the audit row
-	// so operators can see "service asked for X but vault has no X".
+	// Resolve each name -> encrypted entry -> plaintext.
+	//
+	// THE NAME IS MATCHED IN GO, NOT IN SQL, and it had to move. Since 00040
+	// vault_entries.name holds randomized AES-GCM ciphertext, so the old
+	// `WHERE name = ?` compared this whitelist's cleartext against a blob and
+	// missed on every row of every fetch. The query below keeps BOTH
+	// authorization predicates (the owning user, and personal entries only) and
+	// drops only the name, which is not one of them.
 	secrets := make(map[string]string, len(allowed))
 	missing := make([]string, 0)
+	rows, qerr := h.queries.ListPersonalVaultEntriesForServiceFetch(
+		r.Context(), identity.CreatedByUserID.String)
+	if qerr != nil {
+		slog.Error("service_secrets: vault lookup failed",
+			"service", identity.Name, "error", qerr)
+		h.audit(identity.ID, identity.Name, "denied", nil, "vault lookup failed: "+qerr.Error(), remoteIP)
+		writeInternalError(w, r, "vault lookup failed")
+		return
+	}
+	// Open every candidate name once, up front, rather than per whitelist
+	// entry. EntryNamePlain returns an UNSEALED value unchanged, which is what
+	// keeps the rows the boot sweep deliberately leaves cleartext with an empty
+	// name_bidx (see the UNIQUE-collision branch in vault.go) resolving here
+	// forever. A name_bidx lookup would strand exactly those rows in silence.
+	plainNames := make([]string, len(rows))
+	for i := range rows {
+		plainNames[i] = h.vault.EntryNamePlain(rows[i].Name)
+	}
 	// The deferred wipe that used to live here is gone, and this note is what
 	// replaces it. It walked a `plaintexts [][]byte` slice that round 7 stopped
 	// appending to when the decrypt started returning an opaque type, so it was a
@@ -166,21 +190,28 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 	// written). What still cannot be wiped is the string copies in `secrets`, and
 	// that was true before too.
 	for _, name := range allowed {
-		row, qerr := h.queries.GetVaultEntryForServiceFetch(r.Context(), db.GetVaultEntryForServiceFetchParams{
-			Name:   name,
-			UserID: identity.CreatedByUserID.String,
-		})
-		if qerr != nil {
-			if qerr == sql.ErrNoRows {
-				missing = append(missing, name)
-				continue
-			}
-			slog.Error("service_secrets: vault lookup failed",
-				"service", identity.Name, "name", name, "error", qerr)
-			h.audit(identity.ID, identity.Name, "denied", nil, "vault lookup failed: "+qerr.Error(), remoteIP)
-			writeInternalError(w, r, "vault lookup failed")
+		idx, ambiguous := matchEntryName(plainNames, name)
+		if ambiguous {
+			// Two of this user's personal entries now open to the same name.
+			// UNIQUE(user_id, name) went vacuous at 00040 (randomized
+			// ciphertext never collides) and the blind index that replaced it
+			// is empty on every row the boot sweep skipped, so this is
+			// reachable. Handing a machine identity "whichever row SQLite
+			// returned first" is the defect lookupSecretByName was changed to
+			// refuse; refuse it here too rather than resolve it by luck.
+			slog.Error("service_secrets: whitelisted name matches more than one personal entry",
+				"service", identity.Name, "owner", identity.CreatedByUserID.String)
+			h.audit(identity.ID, identity.Name, "denied", nil,
+				"ambiguous name: "+name, remoteIP)
+			writeError(w, r, http.StatusConflict, "ambiguous_secret_name",
+				"one of the requested secrets matches more than one entry; rename one of them")
 			return
 		}
+		if idx < 0 {
+			missing = append(missing, name)
+			continue
+		}
+		row := rows[idx]
 
 		// Decrypt. Encryption version handled by DecryptValue (v1 SHA-256
 		// legacy, v2 PBKDF2 current). nonce + encrypted_value are []byte
@@ -217,27 +248,91 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		secrets[name] = value
 	}
 
+	// A MISS IS NOT A SUCCESS.
+	//
+	// This used to skip missing names, answer 200 with whatever it had, and
+	// audit the whole request under "fetch", the SUCCESS verb, with the misses
+	// recorded only in the audit row's error column. Together with the
+	// ciphertext-versus-cleartext lookup fixed above, that meant every fetch
+	// since 00040 returned 200 {"secrets":{}} and wrote a green audit row: the
+	// service container booted with no credentials at all, and neither the
+	// response nor the trail said anything had gone wrong.
+	//
+	// allowed_secrets is the contract an admin wrote for this identity. A name
+	// in it the vault cannot resolve is an unfulfillable boot whether it is one
+	// name or all of them, so the fetch is refused rather than partially
+	// served, and the audit verb is the DENIAL one.
+	//
+	// The missing names go in the audit row, where the operator who can fix the
+	// whitelist looks. They are deliberately not echoed to the caller: the
+	// response now carries no per-name existence information at all, which is
+	// strictly less than the partial map it replaces (whose keys told the
+	// caller exactly which of its names the vault held).
+	if len(missing) > 0 {
+		slog.Error("service_secrets: whitelisted secrets do not resolve; refusing the fetch",
+			"service", identity.Name, "missing_count", len(missing))
+		h.audit(identity.ID, identity.Name, "denied", nil,
+			"missing names: "+strings.Join(missing, ","), remoteIP)
+		writeError(w, r, http.StatusNotFound, "secret_not_found",
+			"one or more of this identity's allowed_secrets does not resolve; "+
+				"the fetch is refused rather than serving a partial set")
+		return
+	}
+
 	// Touch last_used_at (fire-and-forget; failure here is not fatal).
 	if err := h.queries.TouchServiceIdentityLastUsed(r.Context(), identity.ID); err != nil {
 		slog.Warn("service_secrets: last_used_at touch failed",
 			"service", identity.Name, "error", err)
 	}
 
-	// Audit the success with the actual names returned (NOT values).
+	// Audit the success with the actual names returned (NOT values). Reaching
+	// here means every whitelisted name resolved, so "fetch" is honest.
 	returnedNames := make([]string, 0, len(secrets))
 	for n := range secrets {
 		returnedNames = append(returnedNames, n)
 	}
-	auditErr := ""
-	if len(missing) > 0 {
-		auditErr = "missing names: " + strings.Join(missing, ",")
-	}
-	h.audit(identity.ID, identity.Name, "fetch", returnedNames, auditErr, remoteIP)
+	h.audit(identity.ID, identity.Name, "fetch", returnedNames, "", remoteIP)
 
 	writeJSON(w, http.StatusOK, fetchSecretsResponse{
 		Secrets:   secrets,
 		FetchedAt: time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// matchEntryName finds the ONE candidate whose opened name equals want, where
+// candidates are the decrypted names of the rows a scoped query already
+// authorized. It returns the index, or -1 with ambiguous=false for no match.
+//
+// It scans every candidate and never stops at the first hit, and it compares
+// with crypto/subtle rather than ==. A vault entry NAME is secret-adjacent
+// material: 00040 encrypts it precisely so that a keyless reader learns neither
+// the inventory nor its contents, and "Stripe live key" is most of what an
+// attacker wants to know. So the loop must not run for a length that depends on
+// where the match sits, nor on how many leading bytes of a near-miss matched.
+// Name LENGTH is still observable, from the ciphertext length as much as from
+// here, and that is unchanged by this function.
+//
+// It reports ambiguity instead of picking a winner. UNIQUE(user_id, name) went
+// vacuous at 00040 (randomized ciphertext never collides) and the blind index
+// that replaced it is empty on every row the boot sweep skipped, so one user
+// really can hold two personal entries with the same name. Resolving that by
+// row order is how a machine identity silently receives the wrong credential.
+func matchEntryName(candidates []string, want string) (idx int, ambiguous bool) {
+	found := -1
+	hits := 0
+	wantBytes := []byte(want)
+	for i := range candidates {
+		if subtle.ConstantTimeCompare([]byte(candidates[i]), wantBytes) == 1 {
+			hits++
+			if found < 0 {
+				found = i
+			}
+		}
+	}
+	if hits > 1 {
+		return -1, true
+	}
+	return found, false
 }
 
 // ============================================================================

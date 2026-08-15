@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/shield"
+	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 // MCPHandler serves a remote HTTP MCP endpoint (JSON-RPC 2.0 over a single POST)
@@ -182,7 +184,47 @@ func (h *MCPHandler) callTool(w http.ResponseWriter, r *http.Request, req jsonrp
 	h.reply(w, req.ID, mcpToolResult(resultText, isErr))
 }
 
+// nameOpener returns the door that opens vault_entries.name, or nil if this
+// handler has none.
+//
+// It is the SAME door the capability mint path uses (lookupSecretByName reaches
+// h.vault.EntryNamePlain through this very field), deliberately: a second
+// decryption door next to the first is what the vaultfield ledger exists to
+// prevent, and the two paths have to agree on what a name is or list_secrets
+// advertises strings use_secret cannot resolve.
+//
+// It can be nil. NewMCPHandler takes the capability handler as a pointer and
+// tests construct MCPHandler without one, so a bare h.capability.vault
+// dereference panics into chi's Recoverer and answers 500. Every caller has to
+// treat nil as a refusal.
+func (h *MCPHandler) nameOpener() entrySecretSource {
+	if h.capability == nil {
+		return nil
+	}
+	return h.capability.vault
+}
+
 func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string, bool) {
+	// THE DECRYPT DOOR IS FETCHED FIRST, AND ITS ABSENCE FAILS CLOSED.
+	//
+	// vault_entries.name has been randomized AES-GCM ciphertext since 00040.
+	// This tool used to marshal the stored column straight into the tool result,
+	// and a tool result crosses to Anthropic or OpenAI: the model provider
+	// received one "enc:v1:..." blob per entry, and so learned the caller's
+	// exact secret inventory COUNT and each name's exact plaintext length, from
+	// the one product whose whole point is that a keyless third party learns
+	// neither. The blobs were also useless to the agent, since use_secret
+	// matches on the cleartext name and can never be handed one that matches.
+	//
+	// If the door is missing there is no safe degradation, because returning the
+	// stored column IS the bug. The tool refuses instead.
+	opener := h.nameOpener()
+	if opener == nil {
+		slog.Error("mcp: list_secrets has no name-decryption door; refusing rather than " +
+			"returning stored vault_entries.name to the model provider")
+		return "could not list secrets", true
+	}
+
 	// Scope note: the capability minting path (lookupSecretByName) resolves only
 	// the caller's OWN entries, so advertising collection secrets here would list
 	// names the agent can never obtain a token for, and would leak the names of
@@ -191,11 +233,32 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 	// capability bridge will actually mint for. Listing by owner meant a member
 	// removed from a collection still saw the shared entry offered to their agent
 	// (and, before the lookup fix, could still mint for it).
-	names, err := h.queries.ListAccessibleVaultEntryNames(ctx, db.ListAccessibleVaultEntryNamesParams{
+	stored, err := h.queries.ListAccessibleVaultEntryNames(ctx, db.ListAccessibleVaultEntryNamesParams{
 		UserID: userID, UserID_2: userID,
 	})
 	if err != nil {
 		return "could not list secrets", true
+	}
+
+	names := make([]string, 0, len(stored))
+	for _, raw := range stored {
+		// EntryNamePlain returns an UNSEALED value unchanged, which is what
+		// keeps the rows the boot sweep deliberately leaves cleartext with an
+		// empty name_bidx listed here, and it returns "" when a sealed value
+		// will not open under the current key.
+		plain := opener.EntryNamePlain(raw)
+		if plain == "" {
+			continue
+		}
+		// Belt and braces, and not decoration: this is the line that makes "no
+		// ciphertext reaches the model provider" true regardless of what a
+		// future opener decides to do with a value it cannot read. A name the
+		// agent cannot feed back to use_secret is worth nothing to it anyway.
+		if vaultfield.IsSealedColumn(plain) {
+			slog.Error("mcp: list_secrets dropped a name that is still sealed after opening it")
+			continue
+		}
+		names = append(names, plain)
 	}
 	if len(names) == 0 {
 		return "You have no secrets available.", false

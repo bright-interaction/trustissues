@@ -133,55 +133,6 @@ func (q *Queries) GetServiceIdentityByKeyHash(ctx context.Context, keyHash strin
 	return i, err
 }
 
-const getVaultEntryForServiceFetch = `-- name: GetVaultEntryForServiceFetch :one
-
-SELECT id, name, encrypted_value, nonce, encryption_version
-FROM vault_entries
-WHERE name = ? AND user_id = ? AND collection_id IS NULL
-LIMIT 1
-`
-
-type GetVaultEntryForServiceFetchParams struct {
-	Name   string `json:"name"`
-	UserID string `json:"user_id"`
-}
-
-type GetVaultEntryForServiceFetchRow struct {
-	ID                string        `json:"id"`
-	Name              string        `json:"name"`
-	EncryptedValue    []byte        `json:"encrypted_value"`
-	Nonce             []byte        `json:"nonce"`
-	EncryptionVersion sql.NullInt64 `json:"encryption_version"`
-}
-
-// ============================================================================
-// Vault lookup for service-side resolution (owner-scoped, name-keyed)
-// ============================================================================
-// Scoped to the OWNING user: vault_entries.name is unique only per user, so a
-// name-only lookup would return whichever user's same-named secret SQLite
-// returns first and decrypt it (cross-owner plaintext exfil). A service identity
-// may only resolve secrets owned by its creating user.
-//
-// Also restricted to PERSONAL entries (collection_id IS NULL). A service
-// identity's allowed_secrets is a NAME whitelist, and any editor of a shared
-// collection can rewrite the value of an entry that lives in that collection
-// even when the creating user still owns the row. Without this predicate an
-// editor could therefore control what a machine identity fetches (or swap it for
-// a value of their choosing) purely by editing a shared entry. Machine
-// identities resolve only secrets their creator holds privately.
-func (q *Queries) GetVaultEntryForServiceFetch(ctx context.Context, arg GetVaultEntryForServiceFetchParams) (GetVaultEntryForServiceFetchRow, error) {
-	row := q.db.QueryRowContext(ctx, getVaultEntryForServiceFetch, arg.Name, arg.UserID)
-	var i GetVaultEntryForServiceFetchRow
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.EncryptedValue,
-		&i.Nonce,
-		&i.EncryptionVersion,
-	)
-	return i, err
-}
-
 const insertServiceSecretAudit = `-- name: InsertServiceSecretAudit :exec
 
 INSERT INTO service_secret_audit
@@ -247,6 +198,84 @@ func (q *Queries) ListAuditForServiceIdentity(ctx context.Context, arg ListAudit
 			&i.Error,
 			&i.RemoteIp,
 			&i.OccurredAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPersonalVaultEntriesForServiceFetch = `-- name: ListPersonalVaultEntriesForServiceFetch :many
+
+SELECT id, name, encrypted_value, nonce, encryption_version
+FROM vault_entries
+WHERE user_id = ? AND collection_id IS NULL
+`
+
+type ListPersonalVaultEntriesForServiceFetchRow struct {
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	EncryptedValue    []byte        `json:"encrypted_value"`
+	Nonce             []byte        `json:"nonce"`
+	EncryptionVersion sql.NullInt64 `json:"encryption_version"`
+}
+
+// ============================================================================
+// Vault lookup for service-side resolution (owner-scoped)
+// ============================================================================
+// Scoped to the OWNING user: vault_entries.name is unique only per user, so a
+// name-only lookup would return whichever user's same-named secret SQLite
+// returns first and decrypt it (cross-owner plaintext exfil). A service identity
+// may only resolve secrets owned by its creating user.
+//
+// Also restricted to PERSONAL entries (collection_id IS NULL). A service
+// identity's allowed_secrets is a NAME whitelist, and any editor of a shared
+// collection can rewrite the value of an entry that lives in that collection
+// even when the creating user still owns the row. Without this predicate an
+// editor could therefore control what a machine identity fetches (or swap it for
+// a value of their choosing) purely by editing a shared entry. Machine
+// identities resolve only secrets their creator holds privately.
+//
+// THE NAME PREDICATE IS GONE FROM THE SQL, and it had to be. Since 00040 this
+// column holds randomized AES-GCM ciphertext, so `WHERE name = ?` against the
+// whitelist's cleartext matched NOTHING: every service-identity secret fetch
+// missed, and the handler answered 200 with an empty secrets map, so containers
+// booted credential-less believing they had succeeded.
+//
+// It is deliberately NOT replaced with `WHERE name_bidx = ?`. The boot sweep in
+// vault.go leaves a row whose sealed name would collide on UNIQUE(user_id,
+// name_bidx) cleartext with an EMPTY name_bidx, forever, on purpose. A bidx
+// lookup silently strands exactly those rows, which is a worse failure than the
+// one being fixed because it is invisible. The name is matched in Go instead,
+// on the decrypted value, which resolves swept and unswept rows alike.
+//
+// BOTH AUTHORIZATION PREDICATES STAY IN SQL. user_id is what stops a service
+// identity reaching another owner's secret and collection_id IS NULL is what
+// stops a collection editor choosing what a machine identity fetches. Neither
+// may move into the Go filter: a name match that runs after a widened query is
+// not an authorization check.
+func (q *Queries) ListPersonalVaultEntriesForServiceFetch(ctx context.Context, userID string) ([]ListPersonalVaultEntriesForServiceFetchRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPersonalVaultEntriesForServiceFetch, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPersonalVaultEntriesForServiceFetchRow{}
+	for rows.Next() {
+		var i ListPersonalVaultEntriesForServiceFetchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.EncryptedValue,
+			&i.Nonce,
+			&i.EncryptionVersion,
 		); err != nil {
 			return nil, err
 		}

@@ -338,22 +338,6 @@ type Querier interface {
 	// auto-rotating.
 	GetVaultEntryForRotation(ctx context.Context, id string) (GetVaultEntryForRotationRow, error)
 	// ============================================================================
-	// Vault lookup for service-side resolution (owner-scoped, name-keyed)
-	// ============================================================================
-	// Scoped to the OWNING user: vault_entries.name is unique only per user, so a
-	// name-only lookup would return whichever user's same-named secret SQLite
-	// returns first and decrypt it (cross-owner plaintext exfil). A service identity
-	// may only resolve secrets owned by its creating user.
-	//
-	// Also restricted to PERSONAL entries (collection_id IS NULL). A service
-	// identity's allowed_secrets is a NAME whitelist, and any editor of a shared
-	// collection can rewrite the value of an entry that lives in that collection
-	// even when the creating user still owns the row. Without this predicate an
-	// editor could therefore control what a machine identity fetches (or swap it for
-	// a value of their choosing) purely by editing a shared entry. Machine
-	// identities resolve only secrets their creator holds privately.
-	GetVaultEntryForServiceFetch(ctx context.Context, arg GetVaultEntryForServiceFetchParams) (GetVaultEntryForServiceFetchRow, error)
-	// ============================================================================
 	// Create entry
 	// ============================================================================
 	// collection_id is SELECTed here on purpose. It was missing, so every response
@@ -523,6 +507,41 @@ type Querier interface {
 	ListNotificationChannels(ctx context.Context) ([]ListNotificationChannelsRow, error)
 	// Invitations awaiting the user's decision. These grant no access.
 	ListPendingCollectionInvitesForUser(ctx context.Context, userID string) ([]ListPendingCollectionInvitesForUserRow, error)
+	// ============================================================================
+	// Vault lookup for service-side resolution (owner-scoped)
+	// ============================================================================
+	// Scoped to the OWNING user: vault_entries.name is unique only per user, so a
+	// name-only lookup would return whichever user's same-named secret SQLite
+	// returns first and decrypt it (cross-owner plaintext exfil). A service identity
+	// may only resolve secrets owned by its creating user.
+	//
+	// Also restricted to PERSONAL entries (collection_id IS NULL). A service
+	// identity's allowed_secrets is a NAME whitelist, and any editor of a shared
+	// collection can rewrite the value of an entry that lives in that collection
+	// even when the creating user still owns the row. Without this predicate an
+	// editor could therefore control what a machine identity fetches (or swap it for
+	// a value of their choosing) purely by editing a shared entry. Machine
+	// identities resolve only secrets their creator holds privately.
+	//
+	// THE NAME PREDICATE IS GONE FROM THE SQL, and it had to be. Since 00040 this
+	// column holds randomized AES-GCM ciphertext, so `WHERE name = ?` against the
+	// whitelist's cleartext matched NOTHING: every service-identity secret fetch
+	// missed, and the handler answered 200 with an empty secrets map, so containers
+	// booted credential-less believing they had succeeded.
+	//
+	// It is deliberately NOT replaced with `WHERE name_bidx = ?`. The boot sweep in
+	// vault.go leaves a row whose sealed name would collide on UNIQUE(user_id,
+	// name_bidx) cleartext with an EMPTY name_bidx, forever, on purpose. A bidx
+	// lookup silently strands exactly those rows, which is a worse failure than the
+	// one being fixed because it is invisible. The name is matched in Go instead,
+	// on the decrypted value, which resolves swept and unswept rows alike.
+	//
+	// BOTH AUTHORIZATION PREDICATES STAY IN SQL. user_id is what stops a service
+	// identity reaching another owner's secret and collection_id IS NULL is what
+	// stops a collection editor choosing what a machine identity fetches. Neither
+	// may move into the Go filter: a name match that runs after a widened query is
+	// not an authorization check.
+	ListPersonalVaultEntriesForServiceFetch(ctx context.Context, userID string) ([]ListPersonalVaultEntriesForServiceFetchRow, error)
 	// ORDER BY id, not name: name is ciphertext since 00040 and sorting it would
 	// order rows by nonce, which is random. Callers that present entries to a human
 	// sort by the DECRYPTED name in Go (sortEntriesByName).

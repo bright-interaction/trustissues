@@ -63,10 +63,10 @@ WHERE created_by_user_id = ? AND revoked_at IS NULL;
 DELETE FROM service_identities WHERE id = ?;
 
 -- ============================================================================
--- Vault lookup for service-side resolution (owner-scoped, name-keyed)
+-- Vault lookup for service-side resolution (owner-scoped)
 -- ============================================================================
 
--- name: GetVaultEntryForServiceFetch :one
+-- name: ListPersonalVaultEntriesForServiceFetch :many
 -- Scoped to the OWNING user: vault_entries.name is unique only per user, so a
 -- name-only lookup would return whichever user's same-named secret SQLite
 -- returns first and decrypt it (cross-owner plaintext exfil). A service identity
@@ -79,10 +79,28 @@ DELETE FROM service_identities WHERE id = ?;
 -- editor could therefore control what a machine identity fetches (or swap it for
 -- a value of their choosing) purely by editing a shared entry. Machine
 -- identities resolve only secrets their creator holds privately.
+--
+-- THE NAME PREDICATE IS GONE FROM THE SQL, and it had to be. Since 00040 this
+-- column holds randomized AES-GCM ciphertext, so `WHERE name = ?` against the
+-- whitelist's cleartext matched NOTHING: every service-identity secret fetch
+-- missed, and the handler answered 200 with an empty secrets map, so containers
+-- booted credential-less believing they had succeeded.
+--
+-- It is deliberately NOT replaced with `WHERE name_bidx = ?`. The boot sweep in
+-- vault.go leaves a row whose sealed name would collide on UNIQUE(user_id,
+-- name_bidx) cleartext with an EMPTY name_bidx, forever, on purpose. A bidx
+-- lookup silently strands exactly those rows, which is a worse failure than the
+-- one being fixed because it is invisible. The name is matched in Go instead,
+-- on the decrypted value, which resolves swept and unswept rows alike.
+--
+-- BOTH AUTHORIZATION PREDICATES STAY IN SQL. user_id is what stops a service
+-- identity reaching another owner's secret and collection_id IS NULL is what
+-- stops a collection editor choosing what a machine identity fetches. Neither
+-- may move into the Go filter: a name match that runs after a widened query is
+-- not an authorization check.
 SELECT id, name, encrypted_value, nonce, encryption_version
 FROM vault_entries
-WHERE name = ? AND user_id = ? AND collection_id IS NULL
-LIMIT 1;
+WHERE user_id = ? AND collection_id IS NULL;
 
 -- ============================================================================
 -- Audit log

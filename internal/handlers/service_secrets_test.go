@@ -236,15 +236,18 @@ func TestFetchOwnSecrets_CrossOwnerIsolation(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.FetchOwnSecrets(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	// The identity does not own STRIPE_KEY, so the name does not resolve and the
+	// fetch is refused outright. It used to be a 200 with an empty map; the
+	// assertion that matters is the same either way and is made below on the raw
+	// body, so it cannot be satisfied by a decode that quietly returns nothing.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var resp fetchSecretsResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
+	if strings.Contains(rec.Body.String(), "other-user-stripe-secret") {
+		t.Fatalf("cross-owner leak: identity received another user's STRIPE_KEY: %s", rec.Body.String())
 	}
-	if v, ok := resp.Secrets["STRIPE_KEY"]; ok {
-		t.Fatalf("cross-owner leak: identity received another user's STRIPE_KEY = %q", v)
+	if strings.Contains(rec.Body.String(), "\"secrets\"") {
+		t.Fatalf("a refused fetch must not carry a secrets map at all: %s", rec.Body.String())
 	}
 }
 
@@ -357,9 +360,15 @@ func TestFetchOwnSecrets_EmptyWhitelist(t *testing.T) {
 }
 
 func TestFetchOwnSecrets_MissingVaultEntry(t *testing.T) {
-	// Service identity declares a secret name that doesn't exist in the
-	// vault. The fetch should still succeed for the secrets that DO exist;
-	// missing names are silently skipped (audited but not 500'd).
+	// A whitelisted name the vault cannot resolve now REFUSES the whole fetch.
+	//
+	// This test used to assert the opposite: 200, a partial secrets map, and the
+	// missing names recorded only in the audit row, whose event stayed "fetch".
+	// That was the second half of P1-8. allowed_secrets is the contract an admin
+	// wrote for this identity, so a name in it that does not resolve means the
+	// container is about to boot without a credential it was promised, and 200
+	// under the success verb is the one answer that guarantees nobody notices.
+	// Partial is the same failure as total, one credential at a time.
 	h, dbConn := setupServiceHandler(t)
 	seedSecret(t, dbConn, "EXISTS", "real-value")
 	key := seedServiceIdentity(t, dbConn, "partial-svc", []string{"EXISTS", "DOES_NOT_EXIST"})
@@ -368,21 +377,30 @@ func TestFetchOwnSecrets_MissingVaultEntry(t *testing.T) {
 	req.Header.Set("X-Service-Key", key)
 	rec := httptest.NewRecorder()
 	h.FetchOwnSecrets(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 even with one missing entry, got %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when a whitelisted name does not resolve, got %d: %s",
+			rec.Code, rec.Body.String())
 	}
-	var resp fetchSecretsResponse
-	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if _, ok := resp.Secrets["DOES_NOT_EXIST"]; ok {
-		t.Error("missing entry should not appear in response")
-	}
-	if resp.Secrets["EXISTS"] != "real-value" {
-		t.Error("present entry should still resolve")
+	// No partial set, and in particular no value for the name that DID resolve:
+	// a caller that cannot be served completely is served nothing.
+	if strings.Contains(rec.Body.String(), "real-value") {
+		t.Errorf("a refused fetch still shipped a secret value: %s", rec.Body.String())
 	}
 
-	// Audit row error column should record the missing name.
-	var auditErr string
-	_ = dbConn.QueryRow(`SELECT error FROM service_secret_audit ORDER BY occurred_at DESC LIMIT 1`).Scan(&auditErr)
+	// The audit row records the miss AND does not call it a success.
+	var auditEvent, auditErr string
+	if err := dbConn.QueryRow(
+		`SELECT event, error FROM service_secret_audit ORDER BY occurred_at DESC LIMIT 1`,
+	).Scan(&auditEvent, &auditErr); err != nil {
+		t.Fatalf("read audit row: %v", err)
+	}
+	if auditEvent == "fetch" {
+		t.Error("a fetch that resolved nothing was audited under the SUCCESS verb; " +
+			"that is what let a credential-less boot look like a good one")
+	}
+	if auditEvent != "denied" {
+		t.Errorf("audit event = %q, want denied", auditEvent)
+	}
 	if !strings.Contains(auditErr, "DOES_NOT_EXIST") {
 		t.Errorf("audit error should mention DOES_NOT_EXIST: %q", auditErr)
 	}
