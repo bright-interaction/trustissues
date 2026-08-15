@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -193,10 +194,19 @@ func (h *MCPHandler) callTool(w http.ResponseWriter, r *http.Request, req jsonrp
 // prevent, and the two paths have to agree on what a name is or list_secrets
 // advertises strings use_secret cannot resolve.
 //
-// It can be nil. NewMCPHandler takes the capability handler as a pointer and
-// tests construct MCPHandler without one, so a bare h.capability.vault
-// dereference panics into chi's Recoverer and answers 500. Every caller has to
-// treat nil as a refusal.
+// It can be nil, and BOTH callers enforce nil as a refusal. NewMCPHandler takes
+// the capability handler as a pointer and callers do pass nil (the tests do), so
+// a bare h.capability.vault dereference panics into chi's Recoverer and answers
+// a content-free 500. toolListSecrets refuses before it reads a single row;
+// toolUseSecret refuses before it reaches h.capability.Issue, which dereferences
+// that same pointer. That second guard was missing while this comment claimed
+// otherwise, so the sentence is now a statement about code that exists:
+// TestMCPListSecretsFailsClosedWithoutADecryptionDoor and
+// TestMCPUseSecretFailsClosedWithoutACapabilityHandler are what hold it true.
+//
+// Production cannot reach nil (main.go os.Exit(1)s when NewCapabilityHandler
+// fails), which is exactly why the guards are cheap and why the interesting
+// failure is the one below: a door that is PRESENT and cannot open a given row.
 func (h *MCPHandler) nameOpener() entrySecretSource {
 	if h.capability == nil {
 		return nil
@@ -240,7 +250,22 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 		return "could not list secrets", true
 	}
 
+	// A DROPPED NAME IS COUNTED, BECAUSE "I COULD NOT READ IT" AND "YOU DO NOT
+	// HAVE ONE" ARE DIFFERENT ANSWERS AND ONLY ONE OF THEM IS TRUE.
+	//
+	// Both continues below are failures to READ a row that exists. Silently
+	// swallowing them let a partial listing look complete and, in the limit, let
+	// an unreadable inventory answer "You have no secrets available." with
+	// isError:false: a flat, authoritative denial that the caller has any
+	// credentials at all. An agent believing that goes to its fallback, and the
+	// realistic fallback is asking the human to paste the key into the chat,
+	// which puts a live secret into the model provider's transcript. That is a
+	// worse outcome than the refusal thirty lines up, and it is far more likely
+	// to happen: nil is impossible in production (main.go exits if the handler
+	// fails to build) while a name that will not open is not. A row damaged in
+	// place, or a master-key rotation observed mid-sweep, produces exactly this.
 	names := make([]string, 0, len(stored))
+	dropped := 0
 	for _, raw := range stored {
 		// EntryNamePlain returns an UNSEALED value unchanged, which is what
 		// keeps the rows the boot sweep deliberately leaves cleartext with an
@@ -248,6 +273,7 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 		// will not open under the current key.
 		plain := opener.EntryNamePlain(raw)
 		if plain == "" {
+			dropped++
 			continue
 		}
 		// Belt and braces, and not decoration: this is the line that makes "no
@@ -256,14 +282,42 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 		// agent cannot feed back to use_secret is worth nothing to it anyway.
 		if vaultfield.IsSealedColumn(plain) {
 			slog.Error("mcp: list_secrets dropped a name that is still sealed after opening it")
+			dropped++
 			continue
 		}
 		names = append(names, plain)
 	}
+
 	if len(names) == 0 {
+		// Nothing readable. If rows were dropped this is a failure, not an empty
+		// vault, and it fails closed the same way the missing-door branch does.
+		// Only a genuinely empty result set may say the inventory is empty.
+		if dropped > 0 {
+			slog.Error("mcp: list_secrets could not open any accessible name; refusing rather than "+
+				"reporting an empty inventory", "dropped", dropped, "rows", len(stored))
+			return fmt.Sprintf("could not list secrets: %d could not be read. "+
+				"This is NOT an empty vault; do not conclude that no credential exists.", dropped), true
+		}
 		return "You have no secrets available.", false
 	}
-	out, _ := json.Marshal(map[string]any{"secrets": names})
+
+	// Some names opened and some did not. The readable ones are still usable, so
+	// this stays a success, but the incompleteness is stated in the payload
+	// rather than left for the agent to infer. The count only: a name that would
+	// not open must not be described by anything that came out of the column.
+	payload := map[string]any{"secrets": names}
+	if dropped > 0 {
+		slog.Error("mcp: list_secrets returned a partial inventory",
+			"listed", len(names), "dropped", dropped)
+		noun := "secrets"
+		if dropped == 1 {
+			noun = "secret"
+		}
+		payload["omitted"] = dropped
+		payload["warning"] = fmt.Sprintf(
+			"%d %s could not be read and are omitted from this list; it is incomplete.", dropped, noun)
+	}
+	out, _ := json.Marshal(payload)
 	return string(out), false
 }
 
@@ -275,6 +329,16 @@ func (h *MCPHandler) toolUseSecret(r *http.Request, userID string, args json.Raw
 	_ = json.Unmarshal(args, &a)
 	if a.Name == "" {
 		return "the 'name' argument is required", true
+	}
+	// THE DOOR IS CHECKED HERE TOO. h.capability.Issue below dereferences the
+	// same pointer nameOpener guards, and lookupSecretByName inside it reaches
+	// h.vault.EntryNamePlain, so a nil either way is a panic into chi's
+	// Recoverer and a bare 500 rather than a refusal the agent can read. This
+	// costs one comparison and it is what makes nameOpener's contract enforced
+	// instead of merely documented.
+	if h.nameOpener() == nil {
+		slog.Error("mcp: use_secret has no capability handler; refusing rather than panicking")
+		return "could not mint a capability token", true
 	}
 	if !h.mintAllowed(r) {
 		return "rate limited: too many capability tokens minted, try again later", true
