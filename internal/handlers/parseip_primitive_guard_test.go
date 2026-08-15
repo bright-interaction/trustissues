@@ -55,11 +55,34 @@ import (
 // Adding a row here is a security decision. State what nil does, not that it is
 // fine.
 var parseIPAllowlist = map[string]string{
+	"internal/middleware/forwarded.go#peerIsPrivate": "" +
+		"TWO CONSUMERS, AND nil IS NOT STRICT FOR BOTH. Stating it plainly because " +
+		"this row was previously carried over from rate_limit.go#clientIP unchanged, " +
+		"and its old wording described only the first. " +
+		"(1) clientIP: nil leaves private false, so X-Forwarded-For is IGNORED and the " +
+		"socket peer is the client. A zoned RemoteAddr costs the caller the ability to " +
+		"choose its own client IP. Strict. Verified by " +
+		"TestClientIPUnparseableRemoteAddrFailsClosed. " +
+		"(2) ForwardedProtoHTTPS: nil returns false, i.e. 'the client was not on TLS', " +
+		"which OMITS Strict-Transport-Security and emits http:// URLs. That is the " +
+		"weaker direction, not the stricter one. It is accepted here because it is not " +
+		"reachable by an attacker: RemoteAddr is written by the Go runtime from the " +
+		"accepted socket, never by a caller, so triggering nil means OUR OWN reverse " +
+		"proxy is connecting from an address net.ParseIP cannot read (an IPv6 zone id). " +
+		"The result is that we lose a header, not that anyone gains trust. " +
+		"If that ever becomes reachable, switch this to netip.ParseAddr and refuse a " +
+		"non-empty Zone() rather than widening the allowlist.",
+
 	"internal/middleware/rate_limit.go#clientIP": "" +
-		"Fail-CLOSED. nil leaves trustedPeer false, so the socket peer is treated as " +
-		"untrusted and X-Forwarded-For is IGNORED entirely. A zoned RemoteAddr therefore " +
-		"loses the caller the ability to set its own client IP, which is the strict " +
-		"direction. Verified by TestClientIPUnparseableRemoteAddrFailsClosed.",
+		"Fail-CLOSED. This is the VALUE check, not the peer check: the element " +
+		"selected from the forwarding chain must parse as an IP or clientIP falls back " +
+		"to the socket peer. nil therefore costs a caller the ability to put arbitrary " +
+		"text, \"unknown\", a hostname, a host:port, or a newline that forges a log " +
+		"line, into login_attempts.ip_address, activity_log.ip_address and " +
+		"service_secret_audit.remote_ip, all of which sit behind no-update/no-delete " +
+		"triggers so a forged row is permanent. A zone id parsing as nil here only " +
+		"loses an attacker their forged value. Verified by " +
+		"TestClientIPRejectsAValueThatIsNotAnIP.",
 
 	"internal/handlers/smtp.go#isLoopbackSMTPHost": "" +
 		"Fail-CLOSED. The function is permissive-on-TRUE: true is the ONLY thing that " +

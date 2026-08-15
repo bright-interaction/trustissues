@@ -102,15 +102,43 @@ func TestRedactUpstreamError(t *testing.T) {
 	}
 }
 
+// TestProxyBaseURL pins the scheme of the URL handed back to a capability caller.
+//
+// X-Forwarded-Proto is believed only from a TRUSTED PEER now. This test used to
+// set the header on a request whose RemoteAddr is httptest's default 192.0.2.1,
+// a public address, and expect https, which is the permissive behaviour that
+// let any caller on any connection assert its own transport security. The
+// production deploy (nginx -> Caddy -> app, TRUSTED_PROXY_HOPS=2) reaches the
+// server from a private container address, so it still gets https; a caller
+// talking to the port directly no longer does.
 func TestProxyBaseURL(t *testing.T) {
-	r := httptest.NewRequest("POST", "/api/secrets/issue", nil)
-	r.Host = "trustissues.example.com"
-	r.Header.Set("X-Forwarded-Proto", "https")
-	got := proxyBaseURL(r)
-	want := "https://trustissues.example.com/proxy"
-	if got != want {
-		t.Errorf("proxyBaseURL = %q, want %q", got, want)
-	}
+	t.Run("a trusted proxy is believed", func(t *testing.T) {
+		// AT THE PRODUCTION HOP COUNT. This test's comment named hops=2 while the
+		// binary ran at the package default of 1, so it passed for two hours over
+		// a live CRITICAL that only existed at 2. A test that pins production
+		// behaviour has to configure production.
+		middleware.ConfigureProxy(2, false)
+		t.Cleanup(func() { middleware.ConfigureProxy(1, false) })
+		r := httptest.NewRequest("POST", "/api/secrets/issue", nil)
+		r.Host = "trustissues.example.com"
+		r.RemoteAddr = "10.0.0.2:4444" // the reverse proxy, on the container network
+		r.Header.Set("X-Forwarded-Proto", "https")
+		if got, want := proxyBaseURL(r), "https://trustissues.example.com/proxy"; got != want {
+			t.Errorf("proxyBaseURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("an untrusted caller cannot assert the scheme", func(t *testing.T) {
+		middleware.ConfigureProxy(2, false)
+		t.Cleanup(func() { middleware.ConfigureProxy(1, false) })
+		r := httptest.NewRequest("POST", "/api/secrets/issue", nil)
+		r.Host = "trustissues.example.com"
+		r.RemoteAddr = "198.51.100.9:4444" // straight at the port, over plaintext
+		r.Header.Set("X-Forwarded-Proto", "https")
+		if got, want := proxyBaseURL(r), "http://trustissues.example.com/proxy"; got != want {
+			t.Errorf("proxyBaseURL = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestSplitHostPath(t *testing.T) {

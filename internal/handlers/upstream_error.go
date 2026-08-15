@@ -51,6 +51,16 @@ func (e *upstreamHTTPError) LogValue() slog.Value {
 // newUpstreamHTTPError builds the error for a non-2xx upstream response.
 // Callers pass the raw body; it is truncated and kept for logging only.
 func newUpstreamHTTPError(status int, body []byte) error {
+	// A nil body means the read was REFUSED, not that the upstream said nothing.
+	// readProviderBody now returns nil on overflow and on a partial read, and the
+	// thirteen provider sites that build this error pass that nil straight
+	// through, so without a marker the log line for exactly the requests that
+	// failed hardest would carry an empty Body and read like a silent upstream.
+	// The delivery twin (upstreamErrorFromResponse, below) has always said so;
+	// this is the same courtesy on the provider path.
+	if body == nil {
+		return &upstreamHTTPError{Status: status, Body: "<response body not read: refused by the read ceiling>"}
+	}
 	if len(body) > upstreamBodyLogLimit {
 		body = body[:upstreamBodyLogLimit]
 	}

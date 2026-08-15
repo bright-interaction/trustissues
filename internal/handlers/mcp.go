@@ -367,6 +367,13 @@ func (h *MCPHandler) toolUseSecret(r *http.Request, userID string, args json.Raw
 		return "internal error", true
 	}
 	subReq.Host = r.Host
+	// RemoteAddr too, not just the header. This request never touches a socket,
+	// so without it the peer-trust gate behind proxyBaseURL sees an empty
+	// RemoteAddr, refuses to believe any forwarding header, and hands the agent
+	// an http:// proxy URL that it then sends a live capability token to. The
+	// X-Forwarded-Proto set on the next line is only meaningful once the gate
+	// has a peer it can place.
+	subReq.RemoteAddr = r.RemoteAddr
 	subReq.Header.Set("X-Forwarded-Proto", schemeOf(r))
 	cw := &captureWriter{header: http.Header{}}
 	h.capability.Issue(cw, subReq)
@@ -410,7 +417,7 @@ func (h *MCPHandler) mintAllowed(r *http.Request) bool {
 }
 
 func schemeOf(r *http.Request) string {
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+	if middleware.ForwardedProtoHTTPS(r) {
 		return "https"
 	}
 	return "http"

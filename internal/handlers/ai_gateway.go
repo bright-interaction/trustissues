@@ -267,7 +267,10 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	if v := r.Header.Get("anthropic-version"); v != "" {
 		upReq.Header.Set("anthropic-version", v)
 	}
-	if v := r.Header.Get("anthropic-beta"); v != "" {
+	// Values, not Get: anthropic-beta is a comma-separated list and a client may
+	// legally split it across lines. Get would forward the first line and drop
+	// the rest, so a caller asking for two beta features silently got one.
+	if v := strings.Join(r.Header.Values("anthropic-beta"), ", "); v != "" {
 		upReq.Header.Set("anthropic-beta", v)
 	}
 	p.inject(upReq.Header, key)

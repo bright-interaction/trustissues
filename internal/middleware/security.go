@@ -19,7 +19,10 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		// HTTP). Narrowing img-src/connect-src off the previous https:/wss:
 		// wildcards removes a data-exfiltration channel.
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
-		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		// ForwardedProtoHTTPS, not Header.Get: the header is a list, Get reads
+		// only its first line, and an untrusted caller must not be able to assert
+		// the answer. See forwarded.go.
+		if ForwardedProtoHTTPS(r) {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)

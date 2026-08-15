@@ -694,7 +694,7 @@ func extractCapabilityToken(authHeader string) string {
 
 func proxyBaseURL(r *http.Request) string {
 	scheme := "https"
-	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+	if !middleware.ForwardedProtoHTTPS(r) {
 		scheme = "http"
 	}
 	return fmt.Sprintf("%s://%s/proxy", scheme, r.Host)

@@ -617,11 +617,63 @@ const maxProviderBody = 1 << 20
 // all along, reached by exhaustion instead of by logic.
 //
 // The AI gateway already bounds its upstream reads with io.LimitReader; this file
-// simply never adopted it. Errors are deliberately swallowed the way the original
-// io.ReadAll calls were: every caller checks the status code and unmarshals, so a
-// truncated body surfaces as a parse failure rather than as a silent success.
+// simply never adopted it.
+//
+// THE CEILING IS READ ONE BYTE PAST, AND OVERFLOW IS AN ERROR, NOT A SHORTER SLICE.
+//
+// The first version of this helper read exactly maxProviderBody and returned
+// whatever it got, on the reasoning that "a truncated body surfaces as a parse
+// failure rather than as a silent success". That reasoning holds for exactly one
+// body shape and fails for the shapes that matter here:
+//
+//   - A JSON object cut mid-token fails to parse, which is the case the original
+//     comment was written about.
+//   - json.Unmarshal, which all 17 call sites use, also rejects a complete
+//     value followed by padding ("invalid character 'A' after top-level value"),
+//     so TODAY a truncated body does reliably fail. An earlier draft of this
+//     comment claimed the opposite; it was wrong, and it was wrong in the
+//     direction that made the fix sound more urgent than it is.
+//   - But that safety is json.Unmarshal's, not this function's. json.Decoder
+//     .Decode accepts the very same bytes and returns the value, so one call
+//     site switching to a streaming decoder, or adding an `if len(body) > 0`
+//     guard, turns a cut body back into a parsed one with nothing to notice.
+//
+// On a mint or rotate path the difference is not cosmetic. The credential has
+// already been created upstream by the time the body is read; accepting a
+// truncated body means storing a partial or wrong secret against a credential
+// that really exists, which is the stranded-secret state this file keeps closing,
+// reached by silence instead of by exhaustion. An error at least leaves the
+// failure attributable at the call site that made the change.
+//
+// So: read maxProviderBody+1. Anything at or past the ceiling is refused by name.
+// A provider response legitimately larger than 1 MiB does not exist in this file's
+// 17 call sites, the largest is a token list, and if one ever does, it should be
+// a deliberate per-provider ceiling rather than a body nobody noticed was cut.
 func readProviderBody(resp *http.Response) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(resp.Body, maxProviderBody))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProviderBody+1))
+	if err != nil {
+		// NIL, NOT THE PARTIAL READ.
+		//
+		// io.ReadAll returns the bytes it managed to read ALONGSIDE the error, and
+		// the first version of this fix passed both straight through. Since all 17
+		// call sites are `body, _ := readProviderBody(resp)` and then unmarshal,
+		// that handed every one of them a truncated body with the evidence of the
+		// truncation discarded, the exact defect the ceiling below exists to
+		// prevent, on the other branch of the same function.
+		//
+		// It is also the CHEAPER attack of the two. Overflowing the ceiling costs
+		// an upstream 1 MiB; this costs it a Content-Length header, a prefix
+		// containing whatever field the caller reads, and a reset. Several
+		// providers (grafana, zitadel, forgejo, datadog, supabase) point at an
+		// operator-supplied instance URL, so the host on the other end is not
+		// necessarily a vendor.
+		return nil, fmt.Errorf("read provider response: %w", err)
+	}
+	if len(body) > maxProviderBody {
+		return nil, fmt.Errorf("provider response exceeds the %d-byte ceiling: refusing a "+
+			"truncated body rather than parsing part of one", maxProviderBody)
+	}
+	return body, nil
 }
 
 // ─── Cloudflare ─────────────────────────────────────────────────────────────

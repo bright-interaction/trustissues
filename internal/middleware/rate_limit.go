@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -163,30 +162,29 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 func ClientIP(r *http.Request) string { return clientIP(r) }
 
 func clientIP(r *http.Request) string {
-	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		remoteIP = r.RemoteAddr
-	}
-
-	parsed := net.ParseIP(remoteIP)
-	trustedPeer := parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate())
-	if trustedProxyHops <= 0 || !trustedPeer {
+	remoteIP, trusted := peerIsTrustedProxy(r)
+	if !trusted {
 		// Not behind a configured trusted proxy: the socket peer is the client.
 		return remoteIP
 	}
 
 	// X-Real-IP is client-controlled; honor it only when explicitly enabled.
+	// Single-valued by convention, but read through the same flattener so that
+	// a second line cannot hide behind Get returning only the first.
 	if trustXRealIP {
-		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
-			return xri
+		if xri := forwardedChain(r.Header, "X-Real-IP"); len(xri) > 0 {
+			return xri[0]
 		}
 	}
 
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff == "" {
+	// The WHOLE chain, across every X-Forwarded-For line, not just the first
+	// one Get would return. Reading one line let a caller who sent their own
+	// line keep the proxy's appended line out of the count and land the index
+	// on a value they chose; see the header comment in forwarded.go.
+	parts := forwardedChain(r.Header, "X-Forwarded-For")
+	if len(parts) == 0 {
 		return remoteIP
 	}
-	parts := strings.Split(xff, ",")
 	idx := len(parts) - trustedProxyHops
 	if idx < 0 || idx >= len(parts) {
 		// More trusted hops configured than entries present: the chain is
@@ -194,8 +192,18 @@ func clientIP(r *http.Request) string {
 		// direct socket peer, which is never attacker-controlled.
 		return remoteIP
 	}
-	if ip := strings.TrimSpace(parts[idx]); ip != "" {
-		return ip
+	// IT MUST PARSE AS AN IP. The selected element is caller-influenced text,
+	// and it flows verbatim into login_attempts.ip_address, activity_log and
+	// service_secret_audit, all TEXT columns behind no-update/no-delete
+	// triggers, so a forged value is permanent, and into a slog attribute,
+	// where an embedded newline forges a whole log line. Nothing downstream
+	// validates it, so it is validated here.
+	//
+	// This also restores a backstop that dropping empty elements removed: the
+	// old code fell back whenever the selected element was blank, and this
+	// covers that case plus "unknown", "_hidden", host:port forms and hostnames.
+	if net.ParseIP(parts[idx]) == nil {
+		return remoteIP
 	}
-	return remoteIP
+	return parts[idx]
 }
