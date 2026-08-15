@@ -194,6 +194,62 @@ fi
 
 echo "compact-db.sh"
 
+# 2b. THE DRY RUN HAS TO REPORT THE RESIDUE IT IS LOOKING AT.
+#
+#     compact-db.sh measured the freelist with
+#
+#       sqlite3 -readonly "${DB}" 'PRAGMA freelist_count;' 2>/dev/null || echo 0
+#
+#     and a read-only open of a WAL database needs the -shm sidecar, which is
+#     gone the moment nothing has the database open -- i.e. after step 2 of the
+#     procedure the script itself prints, "stop the server". The probe failed,
+#     `|| echo 0` turned that failure into a zero, and the operator was told
+#
+#       free pages:    0 x 4096B = 0 B of unreachable old content
+#       note: the freelist is already empty, so there is no residue to destroy.
+#
+#     on a database carrying thousands of cleartext names. Note that 4096 is
+#     REAL: page_size is answered from the file header during open and survives,
+#     freelist_count needs the pager and does not, so the lie came with a
+#     plausible number attached.
+#
+#     Cases 2c/2d/2e below all passed throughout, because --yes runs VACUUM
+#     whatever the probe said. The defect was entirely in what the tool TELLS
+#     you, and what it told you was not to bother running it.
+DATAB="${WORK}/data-compact-report"; mkdir -p "${DATAB}"
+make_db_with_residue "${DATAB}/trustissues.db"
+# Read the truth through a read-WRITE connection, which can always create the
+# -shm, then put the directory back into the state a stopped server leaves: the
+# database alone, no sidecars. That state is the whole point of the case.
+TRUE_FREE="$(sqlite3 "${DATAB}/trustissues.db" 'PRAGMA freelist_count;')"
+rm -f "${DATAB}/trustissues.db-shm" "${DATAB}/trustissues.db-wal"
+REPORT="$(TRUSTISSUES_DATA_DIR="${DATAB}" "${HERE}/compact-db.sh" 2>&1)" || true
+REPORTED="$(printf '%s\n' "${REPORT}" | sed -n 's/^free pages: *\([0-9][0-9]*\) x.*/\1/p')"
+if [ "${TRUE_FREE}" = "0" ]; then
+  bad "the residue fixture has an empty freelist, so this case would prove nothing"
+elif [ "${REPORTED}" = "${TRUE_FREE}" ]; then
+  ok "the dry run reports the real freelist (${REPORTED} pages) with no -shm present"
+else
+  bad "the dry run reported '${REPORTED:-<no free pages line>}' free pages where the database has ${TRUE_FREE}"
+fi
+
+# 2b-ii. And it must not actively tell the operator to stand down.
+case "${REPORT}" in
+  *"no residue to destroy"*)
+    bad "the dry run said there is no residue to destroy on a database with ${TRUE_FREE} free pages" ;;
+  *)
+    ok "the dry run does not claim an empty freelist on a database that has one" ;;
+esac
+
+# 2b-iii. A dry run must not create sidecars while it looks. It promises to
+#         change nothing, and a root-owned -shm left next to a database the
+#         service user has to open is a change with consequences.
+if [ -e "${DATAB}/trustissues.db-shm" ] || [ -e "${DATAB}/trustissues.db-wal" ]; then
+  bad "the dry run left sidecars behind: $(ls "${DATAB}" | tr '\n' ' ')"
+else
+  ok "the dry run created no -wal/-shm sidecars"
+fi
+
 # 2c. The default is a DRY RUN. This script rewrites the only live copy of the
 #     vault, so running it to see what it says must not change anything.
 DATAC="${WORK}/data-compact"; mkdir -p "${DATAC}"

@@ -182,8 +182,30 @@ available against the free space required, and the size of the freelist, which
 is the residue measured rather than guessed:
 
 ```
-free pages:    71 x 4096B = 284.0 KB of unreachable old content
+free pages:    71 x 4096B = 284.0 KB of unreachable old content (read immutable)
 ```
+
+The trailing note says how that number was obtained, and it is worth
+understanding, because this line used to lie. Reading the freelist of a WAL
+database is not a read-only operation: WAL keeps its index in a `-shm` sidecar,
+a read-only connection cannot create one, and the sidecar is gone as soon as
+nothing has the database open -- which is precisely what step 3 above tells you
+to arrange. The probe therefore failed on a stopped server, the failure was
+swallowed, and the line read `0 x 4096B = 0 B` followed by "the freelist is
+already empty, so there is no residue to destroy" on databases that were full
+of it. The page size was real, which is what made the zero convincing.
+
+It now tries a read-only open, falls back to an immutable one (which needs no
+`-shm`, and is only used when there is no `-wal` sidecar whose contents it would
+have to ignore), and **fails loudly rather than reporting a zero it did not
+measure**. If you see
+
+```
+error: could not read the page counters out of /opt/trustissues/data/trustissues.db.
+```
+
+the database has a `-wal` but no `-shm`, i.e. the writer did not shut down
+cleanly. Start the server once and stop it again, then re-run.
 
 The script checkpoints the WAL before and after the rebuild. Both matter: in WAL
 mode a committed page lives in the `-wal` sidecar until a checkpoint, those

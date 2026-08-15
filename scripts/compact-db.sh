@@ -123,19 +123,160 @@ human() {
 DB_BYTES="$(file_size "${DB_PATH}")"
 WAL_BYTES="$(file_size "${DB_PATH}-wal")"
 
+# READING A WAL DATABASE IS NOT A READ-ONLY OPEN
+#
+# This is the bug that made this script a no-op on every database it mattered
+# on, so it gets the full explanation.
+#
+# WAL mode keeps its index in a -shm shared-memory file, and a connection opened
+# SQLITE_OPEN_READONLY cannot create one. On a cleanly stopped server the -wal
+# and -shm sidecars are gone, so the probe simply fails:
+#
+#   $ sqlite3 -readonly trustissues.db 'PRAGMA freelist_count;'
+#   Error: stepping, unable to open database file (14)
+#
+# Note WHICH pragmas fail, because it is what made the result so convincing.
+# page_size is answered out of the 100-byte file header while the file is being
+# opened and still returns 4096. freelist_count has to step the pager into the
+# WAL machinery, and does not. Every probe here used to end in `|| echo 0`, so
+# that failure printed as
+#
+#   free pages:    0 x 4096B = 0 B of unreachable old content
+#   note: the freelist is already empty, so there is no residue to destroy.
+#
+# A measured-looking zero, with a real page size beside it, from a probe that
+# never opened the database. And it fired hardest exactly where it cost the
+# most: step 2 of the RECOMMENDED ORDER above tells the operator to stop the
+# server, and stopping the server is what removes the -shm. Following the
+# instructions was what guaranteed the wrong answer.
+#
+# db_uri renders a path as a file: URI for the immutable fallback below.
+# Everything after the first '?' is parsed as parameters, so a data directory
+# containing one would otherwise become a truncated filename plus a bogus
+# option -- and '#' ends the path, and a literal '%' starts an escape.
+db_uri() {
+  local p="$1" out="" c i=0
+  case "$p" in /*) ;; *) p="${PWD}/$p" ;; esac
+  while [ "$i" -lt "${#p}" ]; do
+    c="${p:$i:1}"
+    case "$c" in
+      '%') out="${out}%25" ;;
+      '?') out="${out}%3f" ;;
+      '#') out="${out}%23" ;;
+      ' ') out="${out}%20" ;;
+      *)   out="${out}${c}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf 'file:%s' "${out}"
+}
+
+# The journal mode straight out of the file header, which needs no open at all:
+# byte 18 of the header is the write version, 1 for a rollback journal and 2 for
+# WAL. Used when the immutable fallback answered, because an immutable
+# connection reports journal_mode as "delete" whatever the file actually says --
+# true of that connection, and misleading about the database.
+header_journal_mode() {
+  local v
+  v="$(od -An -tu1 -j18 -N1 "$1" 2>/dev/null | tr -d ' ')"
+  case "$v" in
+    1) echo "rollback journal" ;;
+    2) echo "wal" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# probe_counters - print "<page_size> <freelist_count> <journal_mode> <how>",
+# or fail with the reason in PROBE_ERR. All three values come from ONE
+# connection so they cannot disagree with each other.
+PROBE_ERR=""
+probe_counters() {
+  local out
+  if out="$(sqlite3 -readonly "${DB_PATH}" 'PRAGMA page_size; PRAGMA freelist_count; PRAGMA journal_mode;' 2>&1)"; then
+    printf '%s %s %s read-only\n' \
+      "$(printf '%s\n' "${out}" | sed -n 1p)" \
+      "$(printf '%s\n' "${out}" | sed -n 2p)" \
+      "$(printf '%s\n' "${out}" | sed -n 3p)"
+    return 0
+  fi
+  PROBE_ERR="${out}"
+
+  # immutable=1 promises SQLite the file cannot change underneath it, which is
+  # what lets it skip the -shm entirely. That promise is only true when there is
+  # no -wal sidecar holding committed frames this read would then ignore, so it
+  # is gated on the sidecar being absent rather than offered as a general
+  # workaround: reading PAST a populated WAL would under-report the freelist,
+  # which is the same wrong answer in a different disguise.
+  if [ ! -e "${DB_PATH}-wal" ]; then
+    if out="$(sqlite3 -readonly "$(db_uri "${DB_PATH}")?immutable=1" 'PRAGMA page_size; PRAGMA freelist_count;' 2>&1)"; then
+      printf '%s %s %s immutable\n' \
+        "$(printf '%s\n' "${out}" | sed -n 1p)" \
+        "$(printf '%s\n' "${out}" | sed -n 2p)" \
+        "$(header_journal_mode "${DB_PATH}")"
+      return 0
+    fi
+    PROBE_ERR="${PROBE_ERR} | immutable retry: ${out}"
+  fi
+
+  # Last resort, and ONLY when we are already committed to rewriting the file.
+  # A read-write open creates the -wal/-shm sidecars, owned by whoever ran this
+  # script; doing that during a DRY RUN would break the promise on the tin
+  # ("report, change nothing") and can leave root-owned sidecars next to a
+  # database the service user has to open. With --yes we are about to VACUUM
+  # through exactly such a connection anyway, so it costs nothing new.
+  if [ "${APPLY}" = "1" ]; then
+    if out="$(sqlite3 "${DB_PATH}" 'PRAGMA page_size; PRAGMA freelist_count; PRAGMA journal_mode;' 2>&1)"; then
+      printf '%s %s %s read-write\n' \
+        "$(printf '%s\n' "${out}" | sed -n 1p)" \
+        "$(printf '%s\n' "${out}" | sed -n 2p)" \
+        "$(printf '%s\n' "${out}" | sed -n 3p)"
+      return 0
+    fi
+    PROBE_ERR="${PROBE_ERR} | read-write retry: ${out}"
+  fi
+  return 1
+}
+
 # The freelist is the residue, measured rather than guessed. freelist_count is
 # pages currently free; multiplied by page_size that is how many bytes of old
 # content this file is carrying that no query will ever return.
-PAGE_SIZE="$(sqlite3 -readonly "${DB_PATH}" 'PRAGMA page_size;' 2>/dev/null || echo 0)"
-FREE_PAGES="$(sqlite3 -readonly "${DB_PATH}" 'PRAGMA freelist_count;' 2>/dev/null || echo 0)"
-JOURNAL="$(sqlite3 -readonly "${DB_PATH}" 'PRAGMA journal_mode;' 2>/dev/null || echo unknown)"
+if ! COUNTERS="$(probe_counters)"; then
+  echo "error: could not read the page counters out of ${DB_PATH}." >&2
+  echo "       sqlite3 said: ${PROBE_ERR}" >&2
+  echo >&2
+  echo "       This script will not guess. A freelist it could not measure used" >&2
+  echo "       to print as '0 pages', which reads as 'there is no residue to" >&2
+  echo "       destroy' on a database that may be full of it." >&2
+  echo >&2
+  echo "       In WAL mode a read-only open needs the -shm sidecar, which only" >&2
+  echo "       exists while something has the database open. If a -wal file is" >&2
+  echo "       sitting there without a -shm, the server did not shut down" >&2
+  echo "       cleanly: start it once and stop it again, or re-run with --yes," >&2
+  echo "       which may open read-write." >&2
+  exit 1
+fi
+PAGE_SIZE="$(printf '%s' "${COUNTERS}" | cut -d' ' -f1)"
+FREE_PAGES="$(printf '%s' "${COUNTERS}" | cut -d' ' -f2)"
+JOURNAL="$(printf '%s' "${COUNTERS}" | cut -d' ' -f3)"
+PROBE_HOW="$(printf '%s' "${COUNTERS}" | cut -d' ' -f4)"
+
+# A probe that "succeeded" and printed something that is not a number is the
+# same class of failure as one that did not run: refuse it rather than let it
+# reach the arithmetic below, where an empty string is silently zero.
+case "${PAGE_SIZE}" in ''|*[!0-9]*) BAD_COUNTER="page_size=${PAGE_SIZE}" ;; *) BAD_COUNTER="" ;; esac
+case "${FREE_PAGES}" in ''|*[!0-9]*) BAD_COUNTER="${BAD_COUNTER} freelist_count=${FREE_PAGES}" ;; esac
+if [ -n "${BAD_COUNTER}" ]; then
+  echo "error: sqlite3 returned a non-numeric page counter (${BAD_COUNTER})." >&2
+  echo "       Refusing to report a freelist size derived from it." >&2
+  exit 1
+fi
 FREE_BYTES=$(( PAGE_SIZE * FREE_PAGES ))
 
 echo "database:      ${DB_PATH}"
 echo "size:          $(human "${DB_BYTES}")"
 echo "wal sidecar:   $(human "${WAL_BYTES}")"
 echo "journal mode:  ${JOURNAL}"
-echo "free pages:    ${FREE_PAGES} x ${PAGE_SIZE}B = $(human "${FREE_BYTES}") of unreachable old content"
+echo "free pages:    ${FREE_PAGES} x ${PAGE_SIZE}B = $(human "${FREE_BYTES}") of unreachable old content (read ${PROBE_HOW})"
 echo
 
 # Free space, on the filesystem holding the database. VACUUM writes the rebuilt
@@ -248,7 +389,15 @@ if [ "${INTEGRITY}" != "ok" ]; then
 fi
 
 NEW_BYTES="$(file_size "${DB_PATH}")"
-NEW_FREE="$(sqlite3 -readonly "${DB_PATH}" 'PRAGMA freelist_count;' 2>/dev/null || echo '?')"
+# Same probe as before the rebuild, for the same reason: sqlite3 has closed the
+# last connection by now, so the -shm is gone again and a bare read-only open
+# fails exactly as it did above. This one used to fall back to '?', which is at
+# least honest, but it is the number that proves the rebuild worked.
+if NEW_COUNTERS="$(probe_counters)"; then
+  NEW_FREE="$(printf '%s' "${NEW_COUNTERS}" | cut -d' ' -f2)"
+else
+  NEW_FREE="unreadable (${PROBE_ERR})"
+fi
 NEW_WAL="$(file_size "${DB_PATH}-wal")"
 
 echo
