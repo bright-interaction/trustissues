@@ -134,14 +134,22 @@ func TestNonGoEncodingDialectsAreCaught(t *testing.T) {
 // and these readings are exactly the kind of change that could do it -- a body
 // full of percent signs and backslashes now gets searched three more times.
 func TestDecodedReadingsDoNotFireOnCleanTraffic(t *testing.T) {
-	secret := "sk-live-9f3a2b7c8d1e4f5a"
-	s := New([]byte(secret))
+	// Deliberately the same shape as the dialect table's fixtures rather than a
+	// high-entropy `secret := "sk-live-<32 hex>"`. gitleaks' generic-api-key
+	// rule fires on an entropy-dense string next to the keyword "secret" or
+	// "token", and internal/reflectguard is not in .gitleaks.toml's allowlisted
+	// test paths -- so writing the realistic-looking version here turns the
+	// secret scan red and the fix for that is either to weaken the scan over
+	// this package or to stop scanning it. Neither is worth it: nothing in this
+	// test depends on the fixture's entropy.
+	credential := "sk-live/AbCdEf/1234/XyZ"
+	s := New([]byte(credential))
 	clean := []string{
 		`{"path":"/usr/local/bin","escaped":"a\/b\/c","pct":"%2F%2F%2F"}`,
 		`<html><body>&amp;&lt;&gt;&quot;&apos;&#39;&#x27;</body></html>`,
 		`q=a+b+c&r=100%25&s=%zz%2&t=AB😀\uDEAD`,
 		strings.Repeat(`\\%%&&##;;`, 500),
-		`{"token":"sk-live-9f3a2b7c8d1e4f5b"}`, // one character off the secret
+		`{"other":"sk-live/AbCdEf/1234/XyQ"}`, // one character off the credential
 	}
 	for _, body := range clean {
 		if enc, hit := s.Scan([]byte(body)); hit {
