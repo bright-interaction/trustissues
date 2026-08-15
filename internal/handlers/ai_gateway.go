@@ -17,6 +17,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/reflectguard"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/shield"
 	"github.com/go-chi/chi/v5"
@@ -292,6 +293,63 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		if uErr != nil {
 			logError(r, "ai_gateway: some shield markers did not resolve (partial body returned)", "error", uErr)
 		}
+	}
+
+	// ── THE RETURN TRIP ───────────────────────────────────────────────
+	//
+	// One property, two doors, and this is the second one. The capability
+	// bridge's /proxy had exactly this hole: it injected the operator's key and
+	// then relayed the upstream's answer to the caller verbatim, so any upstream
+	// that echoes what it received handed the credential to a principal who is
+	// not entitled to it. This handler's caller is that same kind of principal
+	// (GetConfig withholds even the ENTRY ID from a non-admin, precisely because
+	// it points at the most valuable secret in the vault), and the caller
+	// chooses the endpoint, the query string and the whole request body. A
+	// provider that quotes the offending key back in a 401 is not exotic.
+	//
+	// Scoping one call site and not its sibling is how this class of fix gets
+	// reported as closed and is not, which is the note already written above
+	// about the inference allowlist. So: same guard, same fail-closed posture,
+	// recorded in the activity log rather than silently.
+	//
+	// The bytes scanned are the bytes WRITTEN: after Shield resolution, not
+	// before. This handler builds a fresh outbound header set and never forwards
+	// the caller's Accept-Encoding, so Go's transport negotiates and decodes
+	// gzip itself and respBody is already plaintext; the Content-Encoding branch
+	// is for a provider that compresses unbidden, where scanning would find
+	// nothing and report clean.
+	guard := reflectguard.New([]byte(key))
+	defer guard.Wipe()
+
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+		logError(r, "ai_gateway: provider response is content-encoded and could not be checked for the injected key",
+			"provider", providerName, "content_encoding", ce)
+		LogActivityFromRequest(h.queries, r, "ai.gateway_response_withheld",
+			fmt.Sprintf("AI call withheld: provider=%s status=%d reason=unscannable content-encoding %s",
+				providerName, resp.StatusCode, ce))
+		writeError(w, r, http.StatusBadGateway, "upstream_unscannable",
+			"the provider response is content-encoded and could not be checked for the injected key, so it was not delivered")
+		return
+	}
+	if name, enc, hit := guard.ScanHeader(resp.Header); hit {
+		logError(r, "ai_gateway: the provider reflected the injected key in a response header; response withheld",
+			"provider", providerName, "header", name, "encoding", enc)
+		LogActivityFromRequest(h.queries, r, "ai.gateway_response_withheld",
+			fmt.Sprintf("AI call withheld: provider=%s status=%d reason=reflected key in response header %s (%s)",
+				providerName, resp.StatusCode, name, enc))
+		writeError(w, r, http.StatusBadGateway, "upstream_reflected_secret",
+			"the provider returned the injected key in a response header; the response was not delivered")
+		return
+	}
+	if enc, hit := guard.Scan(respBody); hit {
+		logError(r, "ai_gateway: the provider reflected the injected key in the response body; response withheld",
+			"provider", providerName, "encoding", enc)
+		LogActivityFromRequest(h.queries, r, "ai.gateway_response_withheld",
+			fmt.Sprintf("AI call withheld: provider=%s status=%d reason=reflected key in response body (%s)",
+				providerName, resp.StatusCode, enc))
+		writeError(w, r, http.StatusBadGateway, "upstream_reflected_secret",
+			"the provider returned the injected key in the response body; the response was not delivered")
+		return
 	}
 
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
