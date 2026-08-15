@@ -40,6 +40,22 @@
 //	                     when it is base64'd as PART of a larger blob (an
 //	                     Authorization: Basic user:secret echo, for instance)
 //
+// Those forms are built with GO's encoders, which is not the same thing as
+// covering an encoding. url.QueryEscape emits %2F where half the ecosystem
+// emits %2f; json.Marshal leaves '/' alone where PHP writes '\/' and leaves
+// non-ASCII as UTF-8 where Python writes \u00e9; html.EscapeString writes
+// &#39; where Python writes &#x27; and PHP writes &#039;. Byte-exact matching
+// against one language's spelling is a guard against upstreams written in that
+// language, which is a strange thing to build into a proxy that exists to talk
+// to other people's servers.
+//
+// So Scan ALSO searches the readings produced by undoing each escaping, which
+// is dialect-independent in a way that no set of needles can be: decoders
+// accept every spelling their encoders produce. See unescape.go. The needles
+// above are kept and re-tried against each reading, so escapings that compose
+// (base64, then a JSON encoder escaping the '/' the base64 produced) are caught
+// by the needle for the inner encoding once the outer one is undone.
+//
 // NOT covered, consciously:
 //
 //   - Compressed bodies. Handled at the call site instead, and handled by
@@ -60,6 +76,13 @@
 //     constant time, against whole header values, which is the reflection shape
 //     a short value actually takes.
 //   - Split reflections (the secret returned in two pieces across two fields).
+//   - Base64 that has been LINE-WRAPPED. MIME wrapping at 64 or 76 columns puts
+//     a newline inside the needle, and a secret long enough to produce a needle
+//     that spans a wrap is then missed. Whole classes of tooling emit wrapped
+//     base64 (openssl base64, PEM), but an HTTP error body echoing a credential
+//     is not one of them, and stripping whitespace before scanning would let a
+//     reflection be found in any body that merely contains the right characters
+//     with spaces between them. Listed here rather than half-handled.
 //
 // FAILURE MODE: CLOSED
 //
@@ -125,6 +148,14 @@ type Scanner struct {
 	raw     []byte
 	needles []needle
 	maxLen  int
+	// scratch holds the decoded readings of the window currently being
+	// scanned, one buffer per entry in unescapers, reused across chunks so a
+	// long body does not allocate a fresh pair of buffers per 32 KiB. They hold
+	// RESPONSE BODY bytes, which is to say they hold the secret itself whenever
+	// a reflection is found, so Wipe zeroes them along with the needles. A
+	// Scanner was already single-request and single-goroutine (Wipe mutates it
+	// in place); this makes that non-negotiable.
+	scratch [][]byte
 }
 
 // New builds a scanner for one secret. The secret is copied, so the caller may
@@ -134,6 +165,7 @@ func New(secret []byte) *Scanner {
 	if len(secret) == 0 {
 		return s
 	}
+	s.scratch = make([][]byte, len(unescapers))
 	s.raw = append([]byte(nil), secret...)
 	str := string(secret)
 
@@ -213,13 +245,25 @@ func (s *Scanner) add(label string, b []byte) {
 // minNeedle is armed only for [Scanner.Equals].
 func (s *Scanner) Armed() bool { return len(s.raw) > 0 }
 
+// maxEscapeExpansion is the most bytes any covered escaping can spend on one
+// byte of input: 6 for a JSON \u00XX or an HTML &#x27;, 3 for a percent
+// triplet, and 8 to leave headroom rather than sit exactly on the worst case.
+//
+// It is what makes the overlap below correct now that Scan decodes. Carrying
+// maxLen-1 bytes was right when a match had to appear verbatim; a needle that
+// is only present in ESCAPED form occupies up to this many times more room, and
+// an overlap smaller than that would let a secret split across two chunks
+// escape both readings. That failure would be invisible: it needs a body large
+// enough to chunk, a reflection at the seam, and an escaping upstream.
+const maxEscapeExpansion = 8
+
 // Overlap is how many trailing bytes of an already-scanned window must be
 // carried into the next one so a needle straddling the boundary is still found.
 func (s *Scanner) Overlap() int {
 	if s.maxLen <= 1 {
 		return 0
 	}
-	return s.maxLen - 1
+	return s.maxLen*maxEscapeExpansion - 1
 }
 
 // Wipe zeroes every encoded form. Best effort, same contract as
@@ -233,6 +277,17 @@ func (s *Scanner) Wipe() {
 		for i := range n.b {
 			n.b[i] = 0
 		}
+	}
+	// The decoded readings are response-body bytes, and the reason this package
+	// exists is that a response body can be the credential. Zero the whole
+	// capacity, not just the current length: the previous chunk's plaintext
+	// lives past len() in a buffer that was reused for a shorter one.
+	for i, b := range s.scratch {
+		b = b[:cap(b)]
+		for j := range b {
+			b[j] = 0
+		}
+		s.scratch[i] = b[:0]
 	}
 }
 
@@ -252,10 +307,45 @@ func (s *Scanner) Equals(candidate []byte) bool {
 }
 
 // Scan reports the first encoding of the secret found in b.
+//
+// It searches the bytes as they arrived, and then the readings produced by
+// undoing each escaping dialect-independently (see unescape.go for why that is
+// a decode and not more needles). Every needle is re-tried against every
+// reading, so a secret that was base64'd and THEN JSON-escaped -- PHP turns the
+// base64 alphabet's '/' into '\/' -- is caught by the base64 needle once the
+// JSON reading has undone the escape.
+//
+// The raw pass runs first and unconditionally, so the common case (no
+// reflection, nothing escaped) costs exactly what it did before. Each decode
+// costs a pass over the window and is skipped entirely unless the window
+// contains the one byte that escaping cannot happen without: no '%' means
+// nothing was percent-encoded, no backslash means nothing was JSON-escaped, no
+// '&' means there are no entities.
 func (s *Scanner) Scan(b []byte) (string, bool) {
 	for _, n := range s.needles {
 		if bytes.Contains(b, n.b) {
 			return n.label, true
+		}
+	}
+	for i, u := range unescapers {
+		if i >= len(s.scratch) {
+			break
+		}
+		if bytes.IndexByte(b, u.trigger) < 0 {
+			continue
+		}
+		decoded := u.fn(s.scratch[i][:0], b)
+		s.scratch[i] = decoded
+		if len(decoded) == len(b) {
+			// Nothing actually decoded (the trigger byte was there but was not
+			// part of an escape), so this reading is the raw window, already
+			// scanned above.
+			continue
+		}
+		for _, n := range s.needles {
+			if bytes.Contains(decoded, n.b) {
+				return n.label + " (" + u.label + ")", true
+			}
 		}
 	}
 	return "", false
@@ -310,10 +400,18 @@ func (e *ReflectedError) Error() string {
 // which is what leaves the caller free to send a clean error response instead.
 // The returned committed flag says which of those happened.
 //
-// Memory is bounded by holdBack + chunkSize + Overlap() regardless of how much
-// the upstream sends, so there is no size ceiling to trip over and no body that
-// gets forwarded unscanned because it was too big to buffer. Streaming still
-// works: past the hold-back, chunks are scanned and released one at a time.
+// Memory is bounded regardless of how much the upstream sends, so there is no
+// size ceiling to trip over and no body that gets forwarded unscanned because
+// it was too big to buffer. Streaming still works: past the hold-back, chunks
+// are scanned and released one at a time.
+//
+// The bound is holdBack + chunkSize + Overlap()*(1+len(unescapers)): the
+// hold-back, the chunk being read, the window carried across the seam, and one
+// decoded reading of that window per escaping. Overlap() is a multiple of the
+// secret's length and a stored vault value is capped at 64 KiB
+// (maxEntryValueLen), so the worst case is single-digit megabytes for one
+// in-flight request with an unusually large credential, and a few tens of
+// kilobytes for a normal one.
 //
 // A detection after the commit point returns the ReflectedError with
 // committed=true and stops writing. The bytes already written were scanned and
