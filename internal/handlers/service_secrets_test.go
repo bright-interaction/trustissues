@@ -388,10 +388,10 @@ func TestFetchOwnSecrets_MissingVaultEntry(t *testing.T) {
 	}
 
 	// The audit row records the miss AND does not call it a success.
-	var auditEvent, auditErr string
+	var auditEvent, auditErr, auditNames string
 	if err := dbConn.QueryRow(
-		`SELECT event, error FROM service_secret_audit ORDER BY occurred_at DESC LIMIT 1`,
-	).Scan(&auditEvent, &auditErr); err != nil {
+		`SELECT event, error, secret_names FROM service_secret_audit ORDER BY occurred_at DESC LIMIT 1`,
+	).Scan(&auditEvent, &auditErr, &auditNames); err != nil {
 		t.Fatalf("read audit row: %v", err)
 	}
 	if auditEvent == "fetch" {
@@ -401,8 +401,23 @@ func TestFetchOwnSecrets_MissingVaultEntry(t *testing.T) {
 	if auditEvent != "denied" {
 		t.Errorf("audit event = %q, want denied", auditEvent)
 	}
-	if !strings.Contains(auditErr, "DOES_NOT_EXIST") {
-		t.Errorf("audit error should mention DOES_NOT_EXIST: %q", auditErr)
+	// THE NAME MOVED, and this assertion moved with it. It used to require the
+	// name IN THE ERROR COLUMN, which is the defect: error is sealed by nothing
+	// and 00039 made this table append-only, so that was a permanent cleartext
+	// copy of a vault entry name. The name now goes to secret_names, which
+	// h.audit seals. stubDecrypter's SealAuditName is a passthrough, so what is
+	// asserted here is the ROUTING; that the routed value is really ciphertext
+	// at rest is asserted against a real VaultHandler in
+	// TestServiceAuditDenialNames_SealedAtRestAndReadableByOperator.
+	if strings.Contains(auditErr, "DOES_NOT_EXIST") {
+		t.Errorf("the missing name is in the UNENCRYPTED error column: %q", auditErr)
+	}
+	if !strings.Contains(auditNames, "DOES_NOT_EXIST") {
+		t.Errorf("audit secret_names should record the missing name: %q", auditNames)
+	}
+	if auditErr == "" {
+		t.Errorf("the denial reason was dropped along with the name; the operator still needs to " +
+			"know WHY the row is a denial")
 	}
 }
 

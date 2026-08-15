@@ -201,8 +201,16 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 			// refuse; refuse it here too rather than resolve it by luck.
 			slog.Error("service_secrets: whitelisted name matches more than one personal entry",
 				"service", identity.Name, "owner", identity.CreatedByUserID.String)
-			h.audit(identity.ID, identity.Name, "denied", nil,
-				"ambiguous name: "+name, remoteIP)
+			// THE NAME GOES IN secret_names, WHICH IS SEALED. It used to be
+			// concatenated into the error column, which h.audit does not touch
+			// and 00021 gives no crypto, in an append-only table: a permanent
+			// cleartext copy of an entry name sitting beside the encrypted
+			// inventory it describes, out of the same stolen file
+			// audit_name_crypto.go exists to defend against. secret_names is
+			// documented at 00021:45 as "secrets returned (success) or requested
+			// (denied)", and this denial is exactly the second case.
+			h.audit(identity.ID, identity.Name, "denied", []string{name},
+				"a requested name matches more than one entry", remoteIP)
 			writeError(w, r, http.StatusConflict, "ambiguous_secret_name",
 				"one of the requested secrets matches more than one entry; rename one of them")
 			return
@@ -225,7 +233,7 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		if derr != nil {
 			slog.Error("service_secrets: decrypt failed",
 				"service", identity.Name, "name", name, "error", derr)
-			h.audit(identity.ID, identity.Name, "denied", nil, "decrypt failed for "+name, remoteIP)
+			h.audit(identity.ID, identity.Name, "denied", []string{name}, "decrypt failed", remoteIP)
 			writeInternalError(w, r, "decrypt failed")
 			return
 		}
@@ -240,7 +248,7 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		if exitErr != nil {
 			slog.Error("service_secrets: the entry's owner did not authorise this fetch",
 				"service", identity.Name, "name", name, "error", exitErr)
-			h.audit(identity.ID, identity.Name, "denied", nil, "egress refused for "+name, remoteIP)
+			h.audit(identity.ID, identity.Name, "denied", []string{name}, "egress refused", remoteIP)
 			writeError(w, r, http.StatusForbidden, "destination_not_authorized",
 				"one of the requested secrets is not released to this service identity")
 			return
@@ -263,16 +271,17 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 	// name or all of them, so the fetch is refused rather than partially
 	// served, and the audit verb is the DENIAL one.
 	//
-	// The missing names go in the audit row, where the operator who can fix the
-	// whitelist looks. They are deliberately not echoed to the caller: the
-	// response now carries no per-name existence information at all, which is
-	// strictly less than the partial map it replaces (whose keys told the
+	// The missing names go in the audit row's SEALED secret_names column, where
+	// the operator who can fix the whitelist looks and where a keyless reader of
+	// the database file cannot. They are deliberately not echoed to the caller:
+	// the response now carries no per-name existence information at all, which
+	// is strictly less than the partial map it replaces (whose keys told the
 	// caller exactly which of its names the vault held).
 	if len(missing) > 0 {
 		slog.Error("service_secrets: whitelisted secrets do not resolve; refusing the fetch",
 			"service", identity.Name, "missing_count", len(missing))
-		h.audit(identity.ID, identity.Name, "denied", nil,
-			"missing names: "+strings.Join(missing, ","), remoteIP)
+		h.audit(identity.ID, identity.Name, "denied", missing,
+			"one or more requested names did not resolve", remoteIP)
 		writeError(w, r, http.StatusNotFound, "secret_not_found",
 			"one or more of this identity's allowed_secrets does not resolve; "+
 				"the fetch is refused rather than serving a partial set")
@@ -317,11 +326,38 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 // that replaced it is empty on every row the boot sweep skipped, so one user
 // really can hold two personal entries with the same name. Resolving that by
 // row order is how a machine identity silently receives the wrong credential.
+//
+// AN EMPTY STRING IS NOT A NAME, ON EITHER SIDE, and that is not a style
+// preference. subtle.ConstantTimeCompare returns 1 for TWO ZERO-LENGTH slices:
+// it short-circuits only on a length MISMATCH, so two empty inputs fall through
+// the loop with v still 0 and compare EQUAL. Every candidate here is
+// EntryNamePlain output, and EntryNamePlain returns "" for any row whose name no
+// configured key opens (decryptColumnOrLog's fallback). So a whitelist entry of
+// "" matched the first unopenable row, idx came back >= 0, the miss check never
+// fired, and the handler decrypted and returned THAT row's value under the name
+// "": the service identity received the wrong credential, with a green "fetch"
+// audit row over it and the all-or-nothing 404 contract silently defeated.
+//
+// It gets MORE likely after a master-key rotation, not less: the name column is
+// opened against current+previous only, so any row still sealed under an older
+// key opens to "" here.
 func matchEntryName(candidates []string, want string) (idx int, ambiguous bool) {
+	// Nothing to look for. Refusing here rather than in the loop also means the
+	// caller's "" reaches the miss path and the 404, which is the correct answer
+	// for a whitelist entry that names nothing.
+	if len(want) == 0 {
+		return -1, false
+	}
 	found := -1
 	hits := 0
 	wantBytes := []byte(want)
 	for i := range candidates {
+		// An UNOPENED NAME IS NOT A NAME. Skipping these leaks nothing the
+		// ciphertext length did not already give away, and it is what stops an
+		// undecryptable row from being matchable at all.
+		if len(candidates[i]) == 0 {
+			continue
+		}
 		if subtle.ConstantTimeCompare([]byte(candidates[i]), wantBytes) == 1 {
 			hits++
 			if found < 0 {
@@ -385,6 +421,20 @@ func (h *ServiceSecretsHandler) CreateServiceIdentity(w http.ResponseWriter, r *
 	if len(req.AllowedSecrets) == 0 {
 		writeBadRequest(w, r, "allowed_secrets must not be empty")
 		return
+	}
+	// A NON-EMPTY ARRAY OF EMPTY NAMES IS NOT A WHITELIST. This validated only
+	// the array's length, so `["" ]` minted an identity whose contract named
+	// nothing, and matchEntryName then had to be the thing that refused it. It
+	// does refuse it now, but a name that can never resolve has no business
+	// being written into allowed_secrets in the first place: the fetch path is
+	// the wrong place to discover that an admin's contract was malformed.
+	// Whitespace counts as empty for the same reason it does everywhere a name
+	// is compared: " X" and "X" are different keys here and the same intent.
+	for _, n := range req.AllowedSecrets {
+		if strings.TrimSpace(n) == "" {
+			writeBadRequest(w, r, "allowed_secrets must not contain empty names")
+			return
+		}
 	}
 
 	// Generate ID (16 random bytes -> 32 hex) and key (32 random bytes -> 64 hex).
@@ -646,8 +696,19 @@ func (h *ServiceSecretsHandler) GetServiceIdentityAudit(w http.ResponseWriter, r
 
 	out := make([]auditEntryResponse, 0, len(rows))
 	for _, row := range rows {
-		var names []string
-		_ = json.Unmarshal([]byte(row.SecretNames), &names)
+		// Opened here and nowhere else, exactly as capability_audit_read.go does
+		// for its twin column.
+		//
+		// This used to be a bare json.Unmarshal of the STORED value with the
+		// error discarded into `_`. Since the seal landed the stored value is
+		// `enc:v1:<base64>`, which is not JSON, so the unmarshal failed on every
+		// row of every read and the response shipped "secret_names": null. The
+		// trail was WRITE-ONLY: a name was sealed into an append-only table and
+		// nothing in the product could show it back. That is not
+		// confidentiality, it is a table nobody can consult -- the same defect
+		// capability_log had before OpenAuditName was added to the interface for
+		// precisely this reason.
+		names := decodeAuditSecretNames(h.vault.OpenAuditName(r.Context(), row.SecretNames))
 		out = append(out, auditEntryResponse{
 			ID:          row.ID,
 			Event:       row.Event,
@@ -664,6 +725,43 @@ func (h *ServiceSecretsHandler) GetServiceIdentityAudit(w http.ResponseWriter, r
 // ============================================================================
 // Helpers
 // ============================================================================
+
+// decodeAuditSecretNames turns an OPENED service_secret_audit.secret_names value
+// into the list the operator sees.
+//
+// The column holds the WHOLE JSON array sealed as one value (see h.audit for why
+// it is not sealed per element), so the opened form is the array's JSON text.
+// Three cases, and the marker is why this is a function rather than an inline
+// unmarshal:
+//
+//   - "[unavailable]" is what OpenAuditName returns when the audit DEK cannot be
+//     loaded or the row will not open. It is deliberately NOT the empty string,
+//     because "a name was recorded and this process cannot show it" and "no name
+//     was recorded" are different facts and the operator has to be able to tell
+//     them apart. So it is surfaced as a name rather than swallowed into an
+//     empty list, which is what the discarded-error unmarshal did to every row.
+//   - Anything that will not parse as a JSON array gets the same marker, for the
+//     same reason: silently returning nil here is what made this endpoint claim
+//     for months that no fetch had ever named a secret.
+//   - Otherwise the parsed list, normalised to non-nil so the field marshals as
+//     [] rather than null.
+func decodeAuditSecretNames(opened string) []string {
+	if opened == "" {
+		return []string{}
+	}
+	if opened == auditNameUnavailable {
+		return []string{auditNameUnavailable}
+	}
+	var names []string
+	if err := json.Unmarshal([]byte(opened), &names); err != nil {
+		slog.Warn("service_secrets: audit secret_names did not parse after opening", "error", err)
+		return []string{auditNameUnavailable}
+	}
+	if names == nil {
+		return []string{}
+	}
+	return names
+}
 
 // audit writes a service_secret_audit row. Fire-and-forget; failures
 // are logged but never bubble up to break the caller's flow (the
