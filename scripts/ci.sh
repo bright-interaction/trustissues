@@ -337,7 +337,17 @@ backup_restore_tests() {
     return 99
   }
   local log rc
-  log="$(mktemp)"
+  log="$(mktemp)" || log=""
+  # A temp file we could not create is not a detail to shrug at HERE. Without
+  # it, `tee ""` fails, PIPESTATUS[0] still reports the suite's own status, the
+  # grep below reads an empty path and finds nothing, and a run with skipped
+  # cases comes back as a clean ok. That is this script's own failure mode
+  # wearing a different hat, so it is a did-not-run rather than a pass.
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    echo "could not create a temp file, so a run with SKIPPED cases could not be" >&2
+    echo "told apart from a complete one. Refusing to report either." >&2
+    return 99
+  fi
   # tee, rather than capturing into a variable, so a suite that takes minutes
   # prints as it goes instead of going silent and then emitting everything at
   # once. PIPESTATUS[0] is the suite's status; tee's is not interesting.
