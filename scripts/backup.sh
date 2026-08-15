@@ -4,9 +4,15 @@
 #
 # Trustissues runs SQLite in WAL mode, so a naive `cp trustissues.db` can copy a
 # torn or stale file: recent commits live in the -wal sidecar until a checkpoint.
-# This script uses SQLite's online backup API (via the sqlite3 CLI ".backup"
-# command), which produces a single consistent file even while the server is
-# running, then locks the copy down to mode 0600.
+# This script uses `VACUUM INTO`, which produces a single consistent file even
+# while the server is running, then locks the copy down to mode 0600.
+#
+# It used to use the online backup API (the sqlite3 CLI ".backup" command). That
+# is equally WAL-safe but it copies the database page by page INCLUDING freelist
+# pages, and SQLite does not zero what it frees, so the snapshot inherited every
+# deleted row and every pre-encryption vault entry name still sitting in free
+# space. VACUUM INTO rebuilds instead of copying, so the freelist is not carried
+# over. See the long note at the call site.
 #
 # It backs up ONLY the database. The database holds AES-256-GCM ciphertext; it is
 # useless to a thief without TRUSTISSUES_VAULT_KEY. That is exactly why the key
@@ -161,8 +167,59 @@ DEST_PATH="${DEST_DIR%/}/trustissues-${STAMP}.db"
 PART_PATH="${DEST_PATH}.part"
 trap 'rm -f "${PART_PATH}"' EXIT
 
-# .backup uses the online backup API: a consistent, WAL-safe copy of the live DB.
-if ! sqlite3 "${DB_PATH}" ".backup '${PART_PATH}'"; then
+# VACUUM INTO, not .backup, and the reason is confidentiality rather than speed.
+#
+# Both are WAL-safe and both run against a live server, so for a long time these
+# looked interchangeable and docs/BACKUP.md said as much. They are not.
+#
+# .backup drives the online backup API, which copies the database PAGE BY PAGE.
+# It copies every page, including pages sitting on the freelist, and SQLite does
+# not zero what it frees: a deleted row's bytes and the pre-UPDATE bytes of a
+# rewritten row stay verbatim in the page they used to live in. So .backup
+# faithfully reproduces the residue too. Measured on a 2000-row fixture whose
+# rows were deleted and whose survivors were re-encrypted: the live file held
+# 1176 greppable copies of the cleartext and the .backup snapshot held the same
+# 1176, in a file of exactly the same size.
+#
+# This is not academic here. Migration 00040 encrypted vault entry names at rest
+# and its backfill rewrote every row, which FREED the old cleartext instead of
+# overwriting it. Every snapshot taken since then carries entry names that the
+# column itself no longer shows. THREAT-MODEL.md treats off-host storage as a
+# lower-trust location than the host, and the whole reason this file is safe to
+# ship off-box is that it is ciphertext. Cleartext in the freelist voids that.
+#
+# VACUUM INTO writes a freshly built database instead of a page copy: it walks
+# the live tables and writes them out compactly, so the freelist is not carried
+# over and there is nothing to copy. On the same fixture it produced an 8KB file
+# with zero residue where .backup produced 258KB carrying all of it.
+#
+# What it costs: nothing that matters here. It runs inside a read transaction, so
+# like .backup it needs no downtime and takes no write lock on the live database
+# (this is NOT the in-place `VACUUM` that rebuilds the live file and locks out
+# writers; that one is scripts/compact-db.sh and is deliberately manual). It
+# needs SQLite 3.27+ (2019). The output is smaller than the source, so a
+# destination that fit yesterday's .backup fits this.
+#
+# What it does NOT do: clean the LIVE file. From here on the server sets
+# _secure_delete=on so new frees are zeroed at the source, but the residue
+# already in the live database stays there until an operator runs
+# scripts/compact-db.sh. This script only guarantees the SNAPSHOT is clean.
+#
+# rm -f first: VACUUM INTO refuses to write to a path that already exists, and a
+# previous run killed between creating the .part and the trap firing (SIGKILL,
+# power cut, OOM) leaves one behind. Without this, one crashed run would wedge
+# every subsequent backup with "output file already exists" until a human
+# noticed, which on a nightly timer means noticing during a restore.
+#
+# The doubled-quote escape is because VACUUM INTO is real SQL where .backup was a
+# dot-command. `.backup '<path>'` parses the path with the CLI's own tokenizer, so
+# a stray apostrophe in a directory name was a broken filename at worst. In SQL a
+# bare ' ENDS the string literal and the rest of the operator-supplied path is
+# parsed as statement text. Doubling it is the SQL-standard escape and keeps this
+# change from adding a surface the line it replaced did not have.
+PART_SQL="${PART_PATH//\'/\'\'}"
+rm -f "${PART_PATH}"
+if ! sqlite3 "${DB_PATH}" "VACUUM INTO '${PART_SQL}'"; then
   echo "error: sqlite backup failed" >&2
   exit 2
 fi

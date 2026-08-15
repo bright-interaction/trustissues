@@ -61,18 +61,39 @@ in the container (host source
 this script host-side against that path needs root and a host `sqlite3`; the
 in-container command in the next section is the normal route.
 
-It runs SQLite's online backup API under the hood:
+It runs `VACUUM INTO` under the hood:
 
 ```bash
 sqlite3 "$TRUSTISSUES_DATA_DIR/trustissues.db" \
-  ".backup '/secure/backups/trustissues-$(date -u +%Y%m%dT%H%M%SZ).db'"
+  "VACUUM INTO '/secure/backups/trustissues-$(date -u +%Y%m%dT%H%M%SZ).db'"
 chmod 600 /secure/backups/trustissues-*.db
 ```
 
-`.backup` produces a consistent single-file snapshot while the server keeps
-running. `VACUUM INTO '<dest>'` is an equally valid WAL-safe alternative and also
-compacts the file. Do not improvise with `cp`, `rsync`, or a volume tar of a live
-database.
+This produces a consistent single-file snapshot while the server keeps running.
+Do not improvise with `cp`, `rsync`, or a volume tar of a live database.
+
+**Use `VACUUM INTO`, not `.backup`.** These were described here as
+interchangeable and they are not. Both are WAL-safe, but `.backup` drives the
+online backup API, which copies the database *page by page* including pages on
+the freelist. SQLite does not zero what it frees, so a deleted row's bytes and
+the pre-`UPDATE` bytes of a rewritten row sit in those free pages verbatim, and
+`.backup` copies them faithfully into the snapshot. On a fixture whose rows were
+deleted and whose survivors were re-encrypted, the `.backup` snapshot held 1176
+greppable copies of the cleartext; `VACUUM INTO` held zero, because it rebuilds
+the file from the live tables instead of copying pages.
+
+That matters most for exactly the data this product encrypts. Migration 00040
+sealed vault entry names at rest by rewriting every row, which *freed* the old
+cleartext rather than overwriting it. Snapshots are the artifact that leaves the
+host, and `THREAT-MODEL.md` treats off-host storage as less trusted than the
+host, so a snapshot carrying cleartext in its freelist cancels the sealing it was
+supposed to be protected by.
+
+`VACUUM INTO` costs nothing to switch to: it also needs no downtime and takes no
+write lock (it runs in a read transaction), the output is smaller than the
+source, and it needs SQLite 3.27+ (2019). It is not the same thing as a bare
+`VACUUM`, which rebuilds the *live* file in place and does block writers; see
+[Compacting the live database](#compacting-the-live-database).
 
 ### Docker Compose deploy
 
@@ -81,12 +102,16 @@ the same backup inside the container:
 
 ```bash
 docker compose exec trustissues \
-  sqlite3 /app/data/trustissues.db ".backup '/app/data/backup.db'"
+  sqlite3 /app/data/trustissues.db "VACUUM INTO '/app/data/backup.db'"
 docker compose cp trustissues:/app/data/backup.db \
   "/secure/backups/trustissues-$(date -u +%Y%m%dT%H%M%SZ).db"
 docker compose exec trustissues rm -f /app/data/backup.db
 chmod 600 /secure/backups/trustissues-*.db
 ```
+
+(`VACUUM INTO` here for the same reason as above, and note it refuses to write to
+a path that already exists: if a previous run died before the `rm -f`, clear
+`/app/data/backup.db` first.)
 
 Alternatively stop the container first (`docker compose stop`), then tar the
 volume: with the writer stopped the on-disk file is consistent. The online
@@ -107,6 +132,78 @@ Note that `scripts/prune-backups.sh` will not touch a file wrapped like this:
 retention only ever deletes files named exactly
 `trustissues-YYYYMMDDTHHMMSSZ.db`. If you wrap snapshots for off-site storage,
 you are responsible for expiring the wrapped copies.
+
+## Compacting the live database
+
+**This is a one-time operator action on any database that predates migration
+00040, and nothing runs it for you.**
+
+Switching backups to `VACUUM INTO` makes every *new snapshot* clean, and the
+server now opens the database with `PRAGMA secure_delete=ON` so that pages are
+zeroed *as they are freed* from that point on. Neither of those touches bytes
+that were already free when they shipped. `secure_delete` is forward-looking by
+definition, and a snapshot being clean says nothing about the file it was taken
+from. On an instance that has been running since before 00040, the live
+`trustissues.db` still holds pre-encryption vault entry names in its free pages
+until something rebuilds the file.
+
+Rebuilding it is `VACUUM`, and unlike `VACUUM INTO` it is a real production
+operation:
+
+- it takes a write lock and blocks writers for the whole rebuild,
+- it needs roughly **2x the database size** in free space, because SQLite builds
+  the new file before dropping the old one,
+- it cannot run inside a transaction.
+
+So it ships as a script you run deliberately, in a window, rather than as
+something the server does at boot. **Do not put it on a timer.**
+
+```bash
+# 1. See what is there. This is the DEFAULT: it reports and changes nothing.
+TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/compact-db.sh
+
+# 2. Take a snapshot first.
+TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/backup.sh /secure/backups
+
+# 3. Stop the writer. Strongly recommended, not enforced: a VACUUM against a
+#    running server works, it just blocks every write until it finishes.
+systemctl stop trustissues        # or: docker compose stop
+
+# 4. Rebuild.
+TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/compact-db.sh --yes
+
+# 5. Start it again, then reveal one secret in the UI. That is the only thing
+#    that proves the vault key still decrypts what came out the other side.
+systemctl start trustissues
+```
+
+The dry run prints the database size, the journal mode, the free space
+available against the free space required, and the size of the freelist, which
+is the residue measured rather than guessed:
+
+```
+free pages:    71 x 4096B = 284.0 KB of unreachable old content
+```
+
+The script checkpoints the WAL before and after the rebuild. Both matter: in WAL
+mode a committed page lives in the `-wal` sidecar until a checkpoint, those
+frames are page images, and a frame written before 00040 can still hold a
+cleartext name. The post-`VACUUM` checkpoint truncates the sidecar to zero
+length so the rebuild is not undone by the file sitting next to it. If it warns
+that a checkpoint did not complete, a clean shutdown also checkpoints; stop the
+server and run it again.
+
+Two things the compaction does **not** do, and the script says so on the way
+out:
+
+- **Snapshots taken before it still contain the cleartext.** They were page
+  copies of the old file. Expire them with `scripts/prune-backups.sh`, and if
+  they were replicated off-host, expire them there too. Nothing here can reach
+  them.
+- **The freed bytes are unlinked, not shredded, at the filesystem layer.** On a
+  normal disk that is the end of it. If your threat model includes someone
+  imaging the raw block device, that is a full-disk-encryption question and this
+  script is not the answer to it.
 
 ## Where the backups go
 

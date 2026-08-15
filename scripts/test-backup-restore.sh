@@ -119,6 +119,117 @@ else
   bad "the snapshot is not a readable copy of the source"
 fi
 
+# A database carrying CLEARTEXT RESIDUE, the way every pre-00040 vault does.
+#
+# SQLite does not zero what it frees. These rows are inserted in the clear,
+# deleted, and the survivors re-encrypted, which is exactly what migration
+# 00040's backfill did to vault entry names. Afterwards no live row contains the
+# marker and the raw file is full of it.
+RESIDUE_MARKER="CLEARTEXT-VAULT-NAME-MARKER"
+make_db_with_residue() {
+  rm -f "$1" "$1-wal" "$1-shm"
+  sqlite3 "$1" "PRAGMA journal_mode=WAL;
+                CREATE TABLE vault_entries (id TEXT PRIMARY KEY, name TEXT);
+                WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<2000)
+                  INSERT INTO vault_entries(id,name)
+                  SELECT 'e'||i, '${RESIDUE_MARKER}-' || i || '-' || hex(randomblob(40)) FROM c;
+                DELETE FROM vault_entries WHERE id <> 'e1';
+                UPDATE vault_entries SET name='prod db password';
+                PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null
+}
+
+# How many times the marker appears in the RAW BYTES of a file. Not a query: the
+# point is to read it the way someone holding a stolen backup would.
+#
+# The trailing `|| true` is load bearing. grep exits 1 when it finds nothing, and
+# finding nothing is the ANSWER this helper exists to report, not a failure. This
+# suite runs under `set -euo pipefail`, so without the guard the command
+# substitution inherits grep's 1, the assignment fails, and `set -e` kills the
+# entire run at exactly the moment a case was about to PASS. That is how it
+# first showed up: the suite died silently right after the compaction case
+# cleaned the file, which reads like a crash rather than like a pass.
+residue_hits() {
+  LC_ALL=C grep -a -o "${RESIDUE_MARKER}" "$1" 2>/dev/null | wc -l | tr -d ' ' || true
+}
+
+# 2a. THE FINDING. A snapshot must not carry cleartext that the live database
+#     freed but never zeroed.
+#
+#     backup.sh used to use `.backup`, the online backup API, which copies the
+#     database PAGE BY PAGE including freelist pages. It is WAL-safe and it is
+#     also a faithful reproduction of every deleted row. Since the snapshot is
+#     the artifact that goes off-host, into storage THREAT-MODEL.md trusts less
+#     than the host, that cancels the at-rest encryption it was relying on.
+#     `VACUUM INTO` rebuilds instead of copying, so there is no freelist to
+#     carry. Measured here rather than asserted.
+DATAR="${WORK}/data-residue"; mkdir -p "${DATAR}"
+make_db_with_residue "${DATAR}/trustissues.db"
+LIVE_HITS="$(residue_hits "${DATAR}/trustissues.db")"
+if [ "${LIVE_HITS}" -gt 0 ]; then
+  ok "fixture: the live database really does carry ${LIVE_HITS} copies of freed cleartext"
+else
+  bad "fixture is broken: no residue in the live file, so the next case proves nothing"
+fi
+
+DESTR="${WORK}/backups-residue"
+TRUSTISSUES_DATA_DIR="${DATAR}" "${HERE}/backup.sh" "${DESTR}" >/dev/null 2>&1
+SNAPR="$(find "${DESTR}" -name 'trustissues-*.db' ! -name '*.part' | head -1)"
+if [ -z "${SNAPR}" ]; then
+  bad "no snapshot was produced from the residue fixture"
+elif [ "$(residue_hits "${SNAPR}")" = "0" ]; then
+  ok "the snapshot carries NONE of the ${LIVE_HITS} freed-cleartext copies"
+else
+  bad "the snapshot carries $(residue_hits "${SNAPR}") copies of freed cleartext off-host"
+fi
+
+# 2b. Compacting away the residue must not cost any live data. A backup that is
+#     clean and empty would pass 2a and lose the vault.
+if [ -n "${SNAPR}" ] \
+   && [ "$(sqlite3 "${SNAPR}" 'PRAGMA integrity_check;')" = "ok" ] \
+   && [ "$(sqlite3 "${SNAPR}" "SELECT name FROM vault_entries WHERE id='e1';")" = "prod db password" ]; then
+  ok "the residue-free snapshot still restores and still carries the live row"
+else
+  bad "the snapshot lost data while dropping the freelist"
+fi
+
+echo "compact-db.sh"
+
+# 2c. The default is a DRY RUN. This script rewrites the only live copy of the
+#     vault, so running it to see what it says must not change anything.
+DATAC="${WORK}/data-compact"; mkdir -p "${DATAC}"
+make_db_with_residue "${DATAC}/trustissues.db"
+BEFORE_HITS="$(residue_hits "${DATAC}/trustissues.db")"
+TRUSTISSUES_DATA_DIR="${DATAC}" "${HERE}/compact-db.sh" >/dev/null 2>&1 || true
+if [ "$(residue_hits "${DATAC}/trustissues.db")" = "${BEFORE_HITS}" ]; then
+  ok "a dry run changes nothing (residue still ${BEFORE_HITS})"
+else
+  bad "the dry run modified the live database"
+fi
+
+# 2d. With --yes it destroys the residue in the LIVE file. This is the half that
+#     _secure_delete cannot do: the pragma only zeroes pages as they are freed
+#     from that point on, so a database that accumulated free pages before it was
+#     turned on keeps every one of them until something rebuilds the file.
+if TRUSTISSUES_DATA_DIR="${DATAC}" "${HERE}/compact-db.sh" --yes >/dev/null 2>&1; then
+  REMAIN="$(residue_hits "${DATAC}/trustissues.db")"
+  WAL_REMAIN="$(residue_hits "${DATAC}/trustissues.db-wal")"
+  if [ "${REMAIN}" = "0" ] && [ "${WAL_REMAIN}" = "0" ]; then
+    ok "--yes destroyed all ${BEFORE_HITS} copies in the live file and its -wal"
+  else
+    bad "after compaction the live file still holds ${REMAIN} copies (${WAL_REMAIN} in -wal)"
+  fi
+else
+  bad "compact-db.sh --yes failed on a valid database"
+fi
+
+# 2e. Compaction must not eat the vault either.
+if [ "$(sqlite3 "${DATAC}/trustissues.db" 'PRAGMA integrity_check;')" = "ok" ] \
+   && [ "$(sqlite3 "${DATAC}/trustissues.db" "SELECT name FROM vault_entries WHERE id='e1';")" = "prod db password" ]; then
+  ok "the compacted live database passes integrity_check and kept its rows"
+else
+  bad "compaction damaged the live database"
+fi
+
 echo "restore.sh"
 
 # 3. A truncated snapshot must be refused. It keeps a valid 16-byte header, so
