@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/capability"
 	dbpkg "github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/reflectguard"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
@@ -593,9 +594,79 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	copyResponseHeaders(resp.Header, w.Header())
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// ── THE RETURN TRIP ───────────────────────────────────────────────
+	//
+	// Injecting the secret is only half of USE-without-SEE. This response goes
+	// back to a caller who, by construction, is not allowed to hold the
+	// credential, and until this guard existed it went back VERBATIM: headers
+	// copied, body io.Copy'd. Any upstream that echoes what it received handed
+	// the plaintext straight to them with a 200 -- a debug endpoint, a
+	// validation error quoting the token, a 401 body repeating what was sent,
+	// an X-Echo-* header. None of that requires a hostile upstream, and the
+	// destination allow-list is a column a collection editor has a hand in.
+	// THREAT-MODEL.md promises the opposite ("never see the secret, in use or
+	// at rest"), so the code has to hold the promise up.
+	//
+	// Fail CLOSED, and AUDIT. Redact-and-forward was rejected: on a chunked
+	// body it means deciding what to do about a needle straddling a chunk
+	// boundary, and getting that wrong ships the tail of a credential rather
+	// than none of it. A refused response is a broken integration the operator
+	// can see in the trail; a mis-redacted one is a leaked key nobody sees.
+	guard := reflectguard.New(value)
+	defer guard.Wipe()
+
+	// Compressed bodies are refused, not scanned. Scanning gzip bytes for a
+	// plaintext needle finds nothing, which is the failure mode that reads as
+	// success. Accept-Encoding is no longer forwarded (see forwardableHeaders),
+	// so Go's transport negotiates and transparently decodes gzip itself and
+	// this branch is only reached by an upstream that compressed unbidden.
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"used", resp.StatusCode, "reflection_unscannable: content-encoding "+ce, tok.Nonce)
+		writeError(w, r, http.StatusBadGateway, "upstream_unscannable",
+			"the upstream response is content-encoded and could not be checked for the injected credential, so it was not delivered")
+		return
+	}
+
+	if name, enc, hit := guard.ScanHeader(resp.Header); hit {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"used", resp.StatusCode, "reflected_secret_blocked: header "+name+" ("+enc+")", tok.Nonce)
+		writeError(w, r, http.StatusBadGateway, "upstream_reflected_secret",
+			"the upstream returned the injected credential in a response header; the response was not delivered")
+		return
+	}
+
+	committed, relayErr := guard.Relay(w, resp.Body, reflectguard.DefaultHoldBack, func() {
+		copyResponseHeaders(resp.Header, w.Header())
+		w.WriteHeader(resp.StatusCode)
+	})
+
+	var reflected *reflectguard.ReflectedError
+	if errors.As(relayErr, &reflected) {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"used", resp.StatusCode, "reflected_secret_blocked: body ("+reflected.Encoding+")", tok.Nonce)
+		if !committed {
+			writeError(w, r, http.StatusBadGateway, "upstream_reflected_secret",
+				"the upstream returned the injected credential in the response body; the response was not delivered")
+			return
+		}
+		// Past the hold-back the status line is already on the wire, so there
+		// is no error body left to send. Abort the connection rather than
+		// return: returning would close a chunked response cleanly and the
+		// caller would read a truncated body as a complete one. Every byte
+		// already written was scanned and carries no part of the secret.
+		slog.Error("capability.proxy: upstream reflected the injected secret past the hold-back; connection aborted",
+			"secret_id", tok.SecretID, "agent", tok.Agent, "encoding", reflected.Encoding)
+		panic(http.ErrAbortHandler)
+	}
+	if relayErr != nil {
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"used", resp.StatusCode, "upstream_error: "+redactUpstreamError(relayErr), tok.Nonce)
+		if !committed {
+			writeError(w, r, http.StatusBadGateway, "upstream_error", "upstream response could not be read")
+		}
+		return
+	}
 
 	h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "used", resp.StatusCode, "", tok.Nonce)
 }
@@ -640,9 +711,17 @@ var forwardableHeaders = map[string]struct{}{
 	"Content-Type":    {},
 	"Accept":          {},
 	"Accept-Language": {},
-	"Accept-Encoding": {},
 	"User-Agent":      {},
 	"Idempotency-Key": {},
+	// Accept-Encoding is DELIBERATELY absent, and its absence is a security
+	// control rather than an oversight. The response is scanned for the
+	// injected secret before it reaches the caller (see reflectguard), and a
+	// gzip or brotli body defeats that scan completely: the needle is not in
+	// the compressed bytes, so the guard reports clean and forwards the leak.
+	// Dropping the header lets Go's transport add its own Accept-Encoding and
+	// transparently decode the response, so the bytes we scan are the bytes the
+	// caller gets. A caller that wants compression loses it; a caller that
+	// wanted the credential does not get it.
 	// Provider protocol selectors. Required by the upstream API, never a
 	// credential, and never meaningful to Trustissues itself.
 	"Anthropic-Version":    {},
