@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,13 +38,35 @@ type visitor struct {
 	windowAt time.Time
 }
 
+// maxVisitors hard-caps the number of distinct IPs a RateLimiter tracks at
+// once. allow() creates a visitor entry unconditionally for every never-seen
+// IP, and cleanup() only reclaims entries whose window ended more than
+// 2*window ago (time-gated, not size-gated), so without a cap a sufficiently
+// distributed flood of unique source IPs (botnet, IPv6 rotation) could grow
+// the map without bound between cleanup ticks on this public-facing service.
+// At ~150-250 bytes per entry (visitor struct + sync.Map overhead + IP key),
+// 50,000 entries bounds one RateLimiter to roughly 10MB in the worst case,
+// which is generous for legitimate distinct-visitor traffic within a single
+// cleanup window.
+const maxVisitors = 50_000
+
+// evictSampleSize is how many entries evictOldestSample inspects before
+// dropping the oldest of the sample. A full scan for the true oldest entry
+// would make every insert at the cap cost O(n), the same quadratic shape as
+// gating a periodic sweep on "the map is full" (see the estate's rate
+// limiter gotcha on this exact tradeoff). Sampling bounds eviction cost to a
+// constant regardless of map size.
+const evictSampleSize = 8
+
 // RateLimiter implements a simple in-memory per-IP rate limiter. Each IP is
 // allowed maxRequests within a sliding window. Once the window expires the
-// counter resets automatically.
+// counter resets automatically. The number of distinct IPs tracked is capped
+// at maxVisitors; see allow() for the eviction policy once at capacity.
 type RateLimiter struct {
 	maxRequests int
 	window      time.Duration
-	visitors    sync.Map // map[string]*visitor
+	visitors    sync.Map     // map[string]*visitor
+	numVisitors atomic.Int64 // live entry count; sync.Map has no O(1) len
 }
 
 // NewRateLimiter creates a rate limiter that allows maxRequests per IP within
@@ -67,14 +90,30 @@ func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
 func (rl *RateLimiter) allow(ip string) bool {
 	now := time.Now()
 
-	val, loaded := rl.visitors.LoadOrStore(ip, &visitor{
-		count:    1,
-		windowAt: now,
-	})
+	val, ok := rl.visitors.Load(ip)
+	if !ok {
+		// Genuinely new-looking IP. Bound the map before adding an entry: at
+		// capacity, evict the oldest of a small sample rather than either
+		// denying the request (an attacker floods the map with throwaway
+		// source IPs and the limiter starts rejecting real visitors, turning
+		// the control into the outage it exists to prevent) or letting the
+		// new IP bypass tracking (fail-open defeats the limit entirely).
+		if rl.numVisitors.Load() >= maxVisitors {
+			rl.evictOldestSample()
+		}
 
-	if !loaded {
-		// New visitor, first request is always allowed.
-		return true
+		var loaded bool
+		val, loaded = rl.visitors.LoadOrStore(ip, &visitor{
+			count:    1,
+			windowAt: now,
+		})
+		if !loaded {
+			rl.numVisitors.Add(1)
+			// New visitor, first request is always allowed.
+			return true
+		}
+		// Lost the race: another goroutine stored this IP first. Fall
+		// through and apply the normal increment/expire logic to its entry.
 	}
 
 	v := val.(*visitor)
@@ -93,6 +132,35 @@ func (rl *RateLimiter) allow(ip string) bool {
 	return v.count <= rl.maxRequests
 }
 
+// evictOldestSample removes the oldest visitor among a small random sample
+// of currently tracked IPs. Called only when allow() is about to insert a
+// new entry at the cap, so its cost is bounded by evictSampleSize regardless
+// of map size, unlike a full scan for the true oldest entry.
+func (rl *RateLimiter) evictOldestSample() {
+	var oldestKey any
+	var oldestAt time.Time
+	sampled := 0
+
+	rl.visitors.Range(func(key, value any) bool {
+		v := value.(*visitor)
+		v.mu.Lock()
+		at := v.windowAt
+		v.mu.Unlock()
+
+		if oldestKey == nil || at.Before(oldestAt) {
+			oldestKey, oldestAt = key, at
+		}
+		sampled++
+		return sampled < evictSampleSize
+	})
+
+	if oldestKey != nil {
+		if _, deleted := rl.visitors.LoadAndDelete(oldestKey); deleted {
+			rl.numVisitors.Add(-1)
+		}
+	}
+}
+
 // cleanup runs every window duration and removes visitors whose windows have
 // fully expired. This prevents memory from growing without bound.
 func (rl *RateLimiter) cleanup() {
@@ -107,7 +175,9 @@ func (rl *RateLimiter) cleanup() {
 			expired := now.Sub(v.windowAt) > rl.window*2
 			v.mu.Unlock()
 			if expired {
-				rl.visitors.Delete(key)
+				if _, deleted := rl.visitors.LoadAndDelete(key); deleted {
+					rl.numVisitors.Add(-1)
+				}
 			}
 			return true
 		})
