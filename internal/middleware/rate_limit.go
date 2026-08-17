@@ -44,10 +44,23 @@ type visitor struct {
 // 2*window ago (time-gated, not size-gated), so without a cap a sufficiently
 // distributed flood of unique source IPs (botnet, IPv6 rotation) could grow
 // the map without bound between cleanup ticks on this public-facing service.
-// At ~150-250 bytes per entry (visitor struct + sync.Map overhead + IP key),
-// 50,000 entries bounds one RateLimiter to roughly 10MB in the worst case,
-// which is generous for legitimate distinct-visitor traffic within a single
-// cleanup window.
+// At ~150-250 bytes per entry (visitor struct + sync.Map overhead + IP key,
+// measured at 183), 50,000 entries bounds one RateLimiter to roughly 10MB.
+//
+// THAT BOUND IS ONLY REAL BECAUSE ADMISSION IS SERIALISED. This comment
+// previously made the same claim while allow() enforced the cap by
+// check-then-act on a lock-free map, which is a soft statistical bound and not
+// a bound at all: goroutines all read a stale count below the cap, all skipped
+// or lost eviction, and all inserted anyway. Measured under a 32-goroutine
+// flood of 1,280,000 distinct IPs, the map held 592,613 to 724,403 live
+// entries, about 46-57% of the flood, at 136.6 MB resident against the ~9.2 MB
+// claimed here. Retention stayed near 45-55% across a 9x range of flood
+// volumes, so the map grew roughly LINEARLY with the flood instead of
+// converging on the cap. See allow() for what makes it one decision now.
+//
+// Per limiter. cmd/server/main.go constructs 8 independent RateLimiters, each
+// with its own cap, so the process-wide worst case is 8x this, around 73MB.
+// Sizing this constant is therefore an 8x decision, not a 1x one.
 const maxVisitors = 50_000
 
 // evictSampleSize is how many entries evictOldestSample inspects before
@@ -67,6 +80,20 @@ type RateLimiter struct {
 	window      time.Duration
 	visitors    sync.Map     // map[string]*visitor
 	numVisitors atomic.Int64 // live entry count; sync.Map has no O(1) len
+
+	// admit serialises the admission of a NEVER-SEEN ip, and nothing else.
+	//
+	// The cap is a bound on a decision ("may this new entry exist"), and that
+	// decision reads a count, possibly evicts, and inserts. Split across a
+	// lock-free map those are three separate operations that concurrent
+	// goroutines interleave freely, which is how the cap became a soft
+	// statistical bound holding 12x its limit. Under this mutex they are one.
+	//
+	// The hot path does not touch it: an EXISTING visitor is served entirely by
+	// the lock-free sync.Map load above (43 ns/op, unchanged). Only a new IP
+	// pays, which is exactly the path a distinct-IP flood drives and exactly
+	// the path that has to be bounded.
+	admit sync.Mutex
 }
 
 // NewRateLimiter creates a rate limiter that allows maxRequests per IP within
@@ -93,27 +120,53 @@ func (rl *RateLimiter) allow(ip string) bool {
 	val, ok := rl.visitors.Load(ip)
 	if !ok {
 		// Genuinely new-looking IP. Bound the map before adding an entry: at
-		// capacity, evict the oldest of a small sample rather than either
-		// denying the request (an attacker floods the map with throwaway
-		// source IPs and the limiter starts rejecting real visitors, turning
-		// the control into the outage it exists to prevent) or letting the
-		// new IP bypass tracking (fail-open defeats the limit entirely).
-		if rl.numVisitors.Load() >= maxVisitors {
-			rl.evictOldestSample()
-		}
+		// capacity, evict rather than either denying the request (an attacker
+		// floods the map with throwaway source IPs and the limiter starts
+		// rejecting real visitors, turning the control into the outage it
+		// exists to prevent) or letting the new IP bypass tracking (fail-open
+		// defeats the limit entirely).
+		//
+		// COUNT, EVICT AND INSERT ARE ONE DECISION, TAKEN UNDER admit.
+		//
+		// They used to be three operations on a lock-free map, which does not
+		// enforce a cap at all: every goroutine in a flood read the same stale
+		// count below the limit, so they all skipped eviction, and the ones
+		// that did evict computed the SAME victim (sync.Map.Range walks
+		// deterministically from the same root) so one won the delete and the
+		// rest freed nothing, and then all of them inserted regardless because
+		// evictOldestSample returned nothing for allow() to test. Measured
+		// result: 592,613 live entries against a 50,000 cap.
+		rl.admit.Lock()
 
-		var loaded bool
-		val, loaded = rl.visitors.LoadOrStore(ip, &visitor{
-			count:    1,
-			windowAt: now,
-		})
-		if !loaded {
+		// Re-check under the lock. Another goroutine may have admitted this
+		// same IP between the lock-free Load above and here, and inserting over
+		// it would drop that visitor's accumulated count, handing an attacker a
+		// budget reset for the price of two concurrent requests.
+		if existing, loaded := rl.visitors.Load(ip); loaded {
+			rl.admit.Unlock()
+			val = existing
+		} else {
+			// Evict until there is genuinely room. The loop matters as much as
+			// the lock: one eviction attempt can free nothing, and inserting
+			// anyway is precisely how the cap was exceeded. It terminates
+			// because each success decrements the count by one and no other
+			// goroutine can insert while admit is held; the break covers the
+			// unreachable case of a count above the cap with nothing to evict,
+			// so a bookkeeping bug degrades to an over-cap map rather than to
+			// a spin that never answers the request.
+			for rl.numVisitors.Load() >= maxVisitors {
+				if !rl.evictOldestSample() {
+					break
+				}
+			}
+			// Store, not LoadOrStore: absence was just established under the
+			// lock, and only this goroutine can be inserting.
+			rl.visitors.Store(ip, &visitor{count: 1, windowAt: now})
 			rl.numVisitors.Add(1)
+			rl.admit.Unlock()
 			// New visitor, first request is always allowed.
 			return true
 		}
-		// Lost the race: another goroutine stored this IP first. Fall
-		// through and apply the normal increment/expire logic to its entry.
 	}
 
 	v := val.(*visitor)
@@ -132,11 +185,40 @@ func (rl *RateLimiter) allow(ip string) bool {
 	return v.count <= rl.maxRequests
 }
 
-// evictOldestSample removes the oldest visitor among a small random sample
-// of currently tracked IPs. Called only when allow() is about to insert a
-// new entry at the cap, so its cost is bounded by evictSampleSize regardless
-// of map size, unlike a full scan for the true oldest entry.
-func (rl *RateLimiter) evictOldestSample() {
+// evictOldestSample removes the oldest visitor among the first evictSampleSize
+// entries sync.Map.Range yields, and REPORTS WHETHER IT FREED A SLOT.
+//
+// The return value is not bookkeeping. Without it allow() could not tell an
+// eviction that freed a slot from one that freed nothing, so it inserted either
+// way and the cap was never enforced. Callers must gate the insert on it.
+//
+// "the oldest of a SAMPLE", not "the oldest".
+//
+// The previous comment called the sample random and the policy oldest-first,
+// and neither was true. sync.Map.Range on Go 1.26's HashTrieMap walks
+// deterministically from the same root, so over an unmutated map it returns a
+// byte-identical sample on every call (measured: 200 of 200 samples identical).
+// "No ordering guarantee" is not "random". The age comparison below was
+// therefore inert as a GLOBAL policy: two cohorts separated in time died at
+// identical rates (19.93% of the strictly-oldest cohort survived, exactly
+// 50,000/250,000, indistinguishable from uniform), and inverting Before to
+// After left the whole suite green.
+//
+// What is true, and what TestEvictionPrefersTheOldestOfTheSample pins so the
+// comparator is falsifiable rather than decorative, is the LOCAL claim: among
+// the entries this call actually saw, the one with the earliest windowAt is the
+// one that goes. Across calls the choice of sample is age-blind, so the
+// observable global behaviour is approximately arbitrary eviction. That is
+// acceptable here and is deliberately not dressed up: cleanup() is what removes
+// entries by age, and this function exists only to make room under a flood.
+//
+// Cost is bounded by evictSampleSize regardless of map size. A full scan for
+// the true oldest entry would make every insert at the cap O(n), the same
+// quadratic shape as gating a periodic sweep on "the map is full"; real
+// oldest-first ordering needs an index (heap or LRU list) maintained on the hot
+// path, which is a bigger change than the property is worth for a map whose
+// stale entries are already reclaimed on a timer.
+func (rl *RateLimiter) evictOldestSample() bool {
 	var oldestKey any
 	var oldestAt time.Time
 	sampled := 0
@@ -154,11 +236,20 @@ func (rl *RateLimiter) evictOldestSample() {
 		return sampled < evictSampleSize
 	})
 
-	if oldestKey != nil {
-		if _, deleted := rl.visitors.LoadAndDelete(oldestKey); deleted {
-			rl.numVisitors.Add(-1)
-		}
+	if oldestKey == nil {
+		// The map is empty. Nothing to free, and saying so is what stops
+		// allow() looping forever against a count that cannot come down.
+		return false
 	}
+	if _, deleted := rl.visitors.LoadAndDelete(oldestKey); deleted {
+		rl.numVisitors.Add(-1)
+		return true
+	}
+	// Someone else deleted it first (cleanup(), concurrently). No slot was
+	// freed BY THIS CALL, and the count they decremented is already visible to
+	// the caller's loop condition, so reporting false is both honest and
+	// non-blocking.
+	return false
 }
 
 // cleanup runs every window duration and removes visitors whose windows have

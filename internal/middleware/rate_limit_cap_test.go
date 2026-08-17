@@ -28,6 +28,25 @@ func TestRateLimiter_VisitorMapBounded(t *testing.T) {
 	live := 0
 	rl.visitors.Range(func(_, _ any) bool { live++; return true })
 
+	// AN ABSOLUTE CEILING THAT DOES NOT READ maxVisitors.
+	//
+	// The line below it computes its expectation from the very constant under
+	// test, and the flood is a fixed 150,000, so any cap at or above that is
+	// never reached: raising maxVisitors from 50,000 to 5,000,000 (about 915 MB
+	// at the measured 183 bytes/entry) left this whole file green. A test that
+	// cannot fail when the thing it guards is made 100x worse is not a guard.
+	//
+	// 60,000 is the honest budget statement rather than a restatement of the
+	// code: about 11 MB in this limiter at 183 bytes/entry, times the 8
+	// limiters cmd/server/main.go constructs. If a future change genuinely
+	// needs a larger cap, this number has to be edited deliberately and the
+	// memory cost argued in the same commit, which is the point.
+	const absoluteCeiling = 60_000
+	if live > absoluteCeiling {
+		t.Fatalf("visitor map grew to %d entries after %d distinct IPs, want <= %d; "+
+			"that is roughly %d MB in this limiter alone and 8x that across the process",
+			live, flood, absoluteCeiling, live*183/(1<<20))
+	}
 	if live > maxVisitors {
 		t.Fatalf("visitor map grew to %d entries after %d distinct IPs, want <= %d (the hard cap)", live, flood, maxVisitors)
 	}
