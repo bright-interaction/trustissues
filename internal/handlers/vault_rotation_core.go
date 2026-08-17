@@ -48,14 +48,73 @@ type rotationDeps struct {
 	vault   *VaultHandler
 }
 
+// retryOutstandingRevokeBeforeMint consumes a pending revoke left by an EARLIER
+// rotation, before this rotation's mint overwrites its coordinates.
+//
+// THIS IS THE CONSUMER THAT MAKES PRESERVING THE COORDINATES WORTH ANYTHING.
+//
+// Preserving them on a failed revoke is only useful if something later acts on
+// them, and the only thing that reads them is performPendingRevoke, which runs
+// AFTER the mint. deferRevokeOldProviderKey overwrites all three unconditionally
+// during that mint, so a stranded key's coordinates were destroyed one rotation
+// later without ever being retried: the exact outcome the deferral exists to
+// prevent, delayed by a cycle rather than avoided.
+//
+// Retrying first also removes the other half of it. A marker that survived
+// because THIS rotation did not defer (every call site is guarded by
+// oldID != "" && oldID != newID) would otherwise still be sitting in the map
+// when performPendingRevoke runs post-mint, firing a previous rotation's
+// coordinates with a freshly minted secret and, if the provider has changed
+// since, sticking the entry in permanent partial-rotation behind an egress
+// refusal.
+//
+// Authenticating with the entry's CURRENT value is correct: the pending revoke
+// targets a key older than that value, and the current one is live by
+// definition. It is the same claim performPendingRevoke already makes post-mint,
+// made one step earlier.
+//
+// It never fails the rotation. A failed retry leaves the markers in place (see
+// performPendingRevoke) and returns a warning, so the caller can tell the
+// operator that an older key is still live upstream and is about to lose its
+// retry record, instead of that record vanishing in silence.
+func retryOutstandingRevokeBeforeMint(ctx context.Context, meta map[string]string,
+	entryName, provider string, current secretexit.Plaintext) string {
+
+	if meta == nil || meta[pendingRevokeURL] == "" {
+		return ""
+	}
+	// Cleared so the outcome read below is THIS attempt's and not a stale flag
+	// from the rotation that recorded the markers.
+	delete(meta, "last_revoke_error")
+
+	performPendingRevoke(ctx, meta, provider, current)
+
+	warn := meta["last_revoke_error"]
+	delete(meta, "last_revoke_error")
+	if warn != "" {
+		slog.Error("vault rotation: an earlier failed revoke could not be retried; the predecessor "+
+			"key is still live upstream and this rotation is about to overwrite its retry record",
+			"entry", entryName, "provider", provider, "detail", warn)
+		return "an earlier key could not be revoked on retry: " + warn
+	}
+	slog.Info("vault rotation: an earlier failed revoke succeeded on retry",
+		"entry", entryName, "provider", provider)
+	return ""
+}
+
 // revokeOldKeyAndPersistMeta destroys the predecessor key upstream and then writes
 // provider_meta exactly ONCE. It returns the revoke warning, if any, for the
 // caller to pass to recordRotationOutcome.
 //
-// Order matters and is the whole point of the function. performPendingRevoke
-// strips the transient pending_revoke_* markers from the map, so writing meta
-// afterwards is what keeps them out of the database. The manual path used to write
-// meta first, with the markers still in the map, and clean up afterwards.
+// Order matters and is the whole point of the function. The manual path used to
+// write meta first and clean up afterwards, so the markers reached the column on
+// the success path too.
+//
+// performPendingRevoke clears the pending_revoke_* markers ONLY on a confirmed
+// success. On failure it deliberately leaves them, because they are the only
+// record of what to revoke and how, so this function persists them; see
+// reservedProviderMetaKeys for the surfaces that had to move when that stopped
+// being impossible.
 //
 // Call only after the value is durably stored: revoking earlier means a failure in
 // the encrypt/persist window leaves the old credential dead upstream and the new

@@ -210,6 +210,11 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 		oldValueCopy := plaintext // carried to delivery still opaque
+
+		// Consume any revoke left outstanding by an earlier rotation BEFORE
+		// Rotate overwrites its coordinates. See retryOutstandingRevokeBeforeMint.
+		staleRevokeWarn := retryOutstandingRevokeBeforeMint(rotateCtx, meta, entry.Name, providerName, plaintext)
+
 		rotated, err := provider.Rotate(rotateCtx, oldPlain, meta)
 		newValue := vaultHandler.MintedEntrySecret([]byte(rotated), entry.ID, entry.Name)
 
@@ -278,6 +283,13 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// how the two drifted on five separate behaviours.
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
 		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, providerName, meta, newValue)
+		// A predecessor that could not be revoked on retry is still live
+		// upstream, so it belongs in the rotation's own outcome rather than
+		// only in a log line. This rotation's revoke warning wins when both
+		// fired, because it names the key that was just replaced.
+		if revokeWarn == "" {
+			revokeWarn = staleRevokeWarn
+		}
 
 		// Same distinction the manual path makes: an undecryptable target list is
 		// not "no targets". Degrading to "[]" recorded a clean success while every

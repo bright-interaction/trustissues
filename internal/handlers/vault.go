@@ -2938,6 +2938,10 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// rotateCtx carries the exit receipt for the provider spend, so the deferred
 	// revoke after the CAS runs under the same authorisation the Rotate call did.
 	rotateCtx := ctx
+	// Set if an EARLIER rotation's revoke was retried before this mint and failed
+	// again; that predecessor is still live upstream, so it has to reach the
+	// rotation outcome and not just a log line.
+	var staleRevokeWarn string
 	{
 		if providerRoleFor == providerAuto {
 			// A provider that destroys its predecessor IN PLACE (see
@@ -2975,6 +2979,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			rotateCtx = spendCtx
+
+			// Consume any revoke left outstanding by an earlier rotation BEFORE
+			// Rotate overwrites its coordinates. See
+			// retryOutstandingRevokeBeforeMint.
+			staleRevokeWarn = retryOutstandingRevokeBeforeMint(rotateCtx, providerMeta, meta.Name, providerName, oldValue)
+
 			rotatedValue, rotErr := provider.Rotate(rotateCtx, oldPlain, providerMeta)
 			if rotErr != nil {
 				// Do NOT fall through to a locally generated value. The upstream
@@ -3251,6 +3261,13 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerName,
 		providerMeta, newValue); warn != "" {
 		revokeWarn = warn
+	}
+	// A predecessor that could not be revoked on retry is still live upstream,
+	// so it belongs in the rotation's own outcome rather than only in a log
+	// line. This rotation's revoke warning wins when both fired, because it
+	// names the key that was just replaced.
+	if revokeWarn == "" {
+		revokeWarn = staleRevokeWarn
 	}
 
 	// Record the rotation outcome. The TRUE status depends on whether each

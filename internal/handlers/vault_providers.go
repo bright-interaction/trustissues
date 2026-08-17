@@ -509,10 +509,13 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 	}
 
 	// revokeOldProviderKey and backblazeRevokeOldKey always leave
-	// last_revoke_error in a definite state for THIS attempt (set on failure,
-	// deleted on success, a 404 counts as success per revokeOldProviderKey's
-	// doc), so it is a reliable signal here. Only a confirmed success may
-	// discard the coordinates a retry would need.
+	// last_revoke_error in a definite state for THIS attempt: set on failure,
+	// deleted on success, with a 404 counting as already-revoked in BOTH. That
+	// last clause was written here before it was true of backblazeRevokeOldKey,
+	// which had no 404 exemption and recorded an already-gone key as a permanent
+	// failure; it has one now, and TestRevokeTreats404AsAlreadyRevoked holds the
+	// two arms together. So this is a reliable signal, and only a confirmed
+	// success may discard the coordinates a retry would need.
 	if meta["last_revoke_error"] == "" {
 		delete(meta, pendingRevokeMethod)
 		delete(meta, pendingRevokeURL)
@@ -1686,7 +1689,17 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 	}
 	defer dr.Body.Close()
 	_, _ = io.Copy(io.Discard, dr.Body)
-	if dr.StatusCode/100 != 2 {
+	// A 404 is already-revoked, exactly as in revokeOldProviderKey.
+	//
+	// This arm did not have the exemption its twin has, and the asymmetry was
+	// not harmless: a key already gone upstream (revoked by hand, or by a
+	// previous attempt whose response was lost) was recorded as a FAILED revoke
+	// forever. The pending_revoke_* markers are preserved on failure, so the
+	// entry sat in permanent partial rotation retrying a key that does not
+	// exist, and retryOutstandingRevokeBeforeMint now re-attempts it on every
+	// subsequent rotation. "The key is not there" is the state a revoke is
+	// trying to reach.
+	if dr.StatusCode/100 != 2 && dr.StatusCode != http.StatusNotFound {
 		meta["last_revoke_error"] = fmt.Sprintf("b2 delete key: HTTP %d", dr.StatusCode)
 		return
 	}
