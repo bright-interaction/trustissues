@@ -105,6 +105,17 @@ type rotationCase struct {
 	// broken CAS token (a NULL updated_at would instead make the due query fail
 	// its scan and abort the sweep driver, testing nothing).
 	failPersist bool
+	// revokeSucceeds points the fake provider's deferred revoke at a sink that
+	// answers 200, so the rotation completes CLEANLY with a real revoke behind
+	// it.
+	//
+	// It exists to give the "no version may carry the markers" branch of the
+	// metaWrites assertion a live subject. Every other case that sets
+	// metaWrites > 0 also sets metaWriteKeepsRevokeMarkers, so that branch was
+	// unreachable: a table-driven forbid gated behind an opt-out flag that every
+	// qualifying case sets is dead code, and the assertion it guards had never
+	// once run.
+	revokeSucceeds bool
 	// callerDiesAfterCAS cancels the caller's context at the moment the rotation
 	// has already committed. Everything after that point must still complete: the
 	// revoke, the meta write, and the outcome record.
@@ -297,6 +308,29 @@ func rotationCases() []rotationCase {
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
 				metaWrites: 1, metaWriteKeepsRevokeMarkers: true,
+			},
+		},
+		{
+			// THE LIVE SUBJECT FOR THE FORBID BRANCH.
+			//
+			// The same deferring provider as the two rows above, with a revoke
+			// that actually succeeds. It is the only case in this table that
+			// asserts the markers are ABSENT from the single write, which is
+			// what vault_providers.go documents and what nothing checked: both
+			// other metaWrites rows are revoke FAILURES and set
+			// metaWriteKeepsRevokeMarkers, so the branch forbidding a persisted
+			// marker had no case that entered it.
+			//
+			// It is also the clean-path counterpart of the deferral itself: one
+			// write, no markers in it, no error, no alert.
+			name:             "old key revoke succeeds, nothing transient is persisted",
+			provider:         revokeFailProvider,
+			sweepApplicable:  true,
+			revokeSucceeds:   true,
+			wantManualStatus: http.StatusOK,
+			want: rotationOutcome{
+				valueChanged: true, errorRecorded: false, logStatus: "success",
+				metaWrites: 1, metaWriteKeepsRevokeMarkers: false,
 			},
 		},
 	}
@@ -538,6 +572,20 @@ func newRotationEnv(t *testing.T, tc rotationCase) *rotationEnv {
 	}
 
 	env := &rotationEnv{h: h, queries: queries, owner: owner, entryID: entryID, before: before, alerts: rec}
+
+	if tc.revokeSucceeds {
+		sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(sink.Close)
+		revokeTargetURL = sink.URL + "/keys/old"
+
+		// The guarded client blocks loopback at dial time, correct in production
+		// and useless for reaching a test server.
+		prevHTTP := providerHTTP
+		providerHTTP = &http.Client{}
+		t.Cleanup(func() { providerHTTP = prevHTTP })
+	}
 
 	if tc.callerDiesAfterCAS || tc.deleteDuringPostCAS {
 		// The revoke runs FIRST in the post-CAS phase, so a sink that cancels the

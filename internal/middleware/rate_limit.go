@@ -351,6 +351,20 @@ func clientIP(r *http.Request) string {
 		// More trusted hops configured than entries present: the chain is
 		// shorter than expected (misconfig or spoof attempt). Fall back to the
 		// direct socket peer, which is never attacker-controlled.
+		//
+		// The FALLBACK is correct and stays; what was missing is that it is
+		// silent. A 2026-08-17 review read this branch as an attacker landing on
+		// their own value, and a verifier refuted it: production ingress really
+		// is two appending hops, and a client sending one entry yields
+		// len(parts)=1, idx=-1, and this fallback rather than their value. But a
+		// chain persistently shorter than TRUSTED_PROXY_HOPS means every request
+		// is being attributed to the proxy's socket peer, so per-IP limiting has
+		// silently collapsed to per-proxy limiting, and nothing said so. Debug
+		// level would be invisible in exactly the deployment that needs it.
+		slog.Warn("rate limit: X-Forwarded-For is shorter than TRUSTED_PROXY_HOPS, "+
+			"falling back to the socket peer; if this repeats, the configured hop count does not "+
+			"match the real ingress chain and per-IP limits are being applied per-proxy",
+			"chain_entries", len(parts), "trusted_hops", trustedProxyHops)
 		return remoteIP
 	}
 	// IT MUST PARSE AS AN IP. The selected element is caller-influenced text,
