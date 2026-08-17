@@ -61,6 +61,20 @@ type rotationOutcome struct {
 	// read is clean with the bug fully present. Only counting the writes, and
 	// inspecting each version, can see it.
 	metaWrites int
+	// metaWriteKeepsRevokeMarkers is whether the ONE write above is required to
+	// still carry pending_revoke_method/url/auth, for a case where the deferred
+	// revoke genuinely failed.
+	//
+	// performPendingRevoke used to strip those markers unconditionally, before the
+	// revoke attempt even started, so a FAILED attempt's write came out looking as
+	// clean as a successful one: last_revoke_error was set, but the coordinates a
+	// retry would need to act on were already gone, with nothing left recording
+	// what to revoke or how. Fixed by clearing the markers only once the attempt is
+	// a confirmed success. This is distinct from d226c7306's crash-between-two-
+	// writes bug (a stale write from an aliased map, now structurally impossible
+	// since there is only one write): this field is about the one write a genuine
+	// revoke failure produces, which must show the markers, not hide them.
+	metaWriteKeepsRevokeMarkers bool
 	// rowDeleted means the entry is gone by assert time, so the DB-derived
 	// post-conditions cannot be read. Only the out-of-band ones (the alert) are
 	// checked, and the alert assertion is what keeps the row from being vacuous.
@@ -204,7 +218,7 @@ func rotationCases() []rotationCase {
 			wantManualStatus:   http.StatusOK,
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
-				metaWrites: 1,
+				metaWrites: 1, metaWriteKeepsRevokeMarkers: true,
 			},
 		},
 		{
@@ -282,7 +296,7 @@ func rotationCases() []rotationCase {
 			wantManualStatus: http.StatusOK,
 			want: rotationOutcome{
 				valueChanged: true, errorRecorded: true, logStatus: "partial", alertWanted: true,
-				metaWrites: 1,
+				metaWrites: 1, metaWriteKeepsRevokeMarkers: true,
 			},
 		},
 	}
@@ -696,17 +710,33 @@ func (e *rotationEnv) assertOutcome(t *testing.T, path string, want rotationOutc
 				"markers were persisted and then cleaned up, and it bumps updated_at twice.",
 				path, len(versions), want.metaWrites)
 		}
-		// No version, at any point, may have carried the pending-revoke markers.
-		// vault_providers.go documents them as never reaching the database.
+		// A version may carry the pending-revoke markers ONLY when the case says
+		// the revoke genuinely failed (metaWriteKeepsRevokeMarkers): the markers
+		// are then the only surviving record of what to revoke and how, and
+		// performPendingRevoke must have left them for a retry. Otherwise, no
+		// version may carry them: vault_providers.go documents them as cleared
+		// once the revoke is a confirmed success.
 		for i, v := range versions {
 			plain := e.h.decryptColumnOrLog(v, "{}", vaultFieldProviderMeta)
 			for _, marker := range []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth} {
-				if strings.Contains(plain, marker) {
+				has := strings.Contains(plain, marker)
+				if want.metaWriteKeepsRevokeMarkers {
+					if !has {
+						t.Errorf("%s: provider_meta write #%d dropped the transient marker %q on a "+
+							"failed revoke\n  value: %s\n"+
+							"A failed revoke must leave pending_revoke_method/url/auth in place: they "+
+							"are the only record of what to revoke and how, and stripping them here "+
+							"strands the old key at the provider with no way to retry.",
+							path, i+1, marker, plain)
+					}
+					continue
+				}
+				if has {
 					t.Errorf("%s: provider_meta write #%d persisted the transient marker %q\n"+
 						"  value: %s\n"+
-						"These are stripped by performPendingRevoke and must never be stored: a crash "+
-						"or a dead context between the two writes leaves them behind, and the next "+
-						"revoke then targets a key id that is already gone.",
+						"These are stripped by performPendingRevoke once the revoke is a confirmed "+
+						"success; a crash between the mint and the single write must never leave them "+
+						"behind on a write that was not a failed revoke.",
 						path, i+1, marker, plain)
 				}
 			}
