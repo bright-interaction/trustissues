@@ -59,8 +59,13 @@ type visitor struct {
 // converging on the cap. See allow() for what makes it one decision now.
 //
 // Per limiter. cmd/server/main.go constructs 8 independent RateLimiters, each
-// with its own cap, so the process-wide worst case is 8x this, around 73MB.
-// Sizing this constant is therefore an 8x decision, not a 1x one.
+// with its own cap, so the process-wide figure is 8x this, around 73MB of LIVE
+// ENTRIES. Sizing this constant is therefore an 8x decision, not a 1x one.
+//
+// Live bytes are not footprint: measured under the flood that actually produces
+// the bound, 8 full limiters were 71.9MB of heapAlloc but 210MB heapInuse and
+// 229MB RSS, because the allocation churn that fills the maps is itself the peak.
+// Budget for roughly 3x the number above when sizing a container.
 const maxVisitors = 50_000
 
 // evictSampleSize is how many entries evictOldestSample inspects before
@@ -136,37 +141,14 @@ func (rl *RateLimiter) allow(ip string) bool {
 		// rest freed nothing, and then all of them inserted regardless because
 		// evictOldestSample returned nothing for allow() to test. Measured
 		// result: 592,613 live entries against a 50,000 cap.
-		rl.admit.Lock()
-
-		// Re-check under the lock. Another goroutine may have admitted this
-		// same IP between the lock-free Load above and here, and inserting over
-		// it would drop that visitor's accumulated count, handing an attacker a
-		// budget reset for the price of two concurrent requests.
-		if existing, loaded := rl.visitors.Load(ip); loaded {
-			rl.admit.Unlock()
-			val = existing
-		} else {
-			// Evict until there is genuinely room. The loop matters as much as
-			// the lock: one eviction attempt can free nothing, and inserting
-			// anyway is precisely how the cap was exceeded. It terminates
-			// because each success decrements the count by one and no other
-			// goroutine can insert while admit is held; the break covers the
-			// unreachable case of a count above the cap with nothing to evict,
-			// so a bookkeeping bug degrades to an over-cap map rather than to
-			// a spin that never answers the request.
-			for rl.numVisitors.Load() >= maxVisitors {
-				if !rl.evictOldestSample() {
-					break
-				}
-			}
-			// Store, not LoadOrStore: absence was just established under the
-			// lock, and only this goroutine can be inserting.
-			rl.visitors.Store(ip, &visitor{count: 1, windowAt: now})
-			rl.numVisitors.Add(1)
-			rl.admit.Unlock()
+		admitted, existing := rl.admitNewVisitor(ip, now)
+		if admitted {
 			// New visitor, first request is always allowed.
 			return true
 		}
+		// Lost the race: another goroutine stored this IP first. Fall through
+		// and apply the normal increment/expire logic to its entry.
+		val = existing
 	}
 
 	v := val.(*visitor)
@@ -361,10 +343,25 @@ func clientIP(r *http.Request) string {
 		// is being attributed to the proxy's socket peer, so per-IP limiting has
 		// silently collapsed to per-proxy limiting, and nothing said so. Debug
 		// level would be invisible in exactly the deployment that needs it.
-		slog.Warn("rate limit: X-Forwarded-For is shorter than TRUSTED_PROXY_HOPS, "+
-			"falling back to the socket peer; if this repeats, the configured hop count does not "+
-			"match the real ingress chain and per-IP limits are being applied per-proxy",
-			"chain_entries", len(parts), "trusted_hops", trustedProxyHops)
+		// ONCE PER PROCESS.
+		//
+		// This is a CONFIGURATION fact, not a request fact: it reports that the
+		// deployed hop count does not match the real ingress chain, which is
+		// either true for every request or none. Logged per request it fired
+		// 2-4 times per request (clientIP runs once per limiter in the chain
+		// plus once per handler-side ClientIP call), measured at 2.1 lines per
+		// request on a two-limiter route: about 9 million lines and 2.8 GB a day
+		// at a modest 50 req/s. The message even said "if this repeats" while
+		// doing nothing about it, and every line after the first carried no
+		// distinguishing field, so they were pure duplicates. An operator
+		// misconfiguration must not also be a log-volume incident.
+		shortChainWarnOnce.Do(func() {
+			slog.Warn("rate limit: X-Forwarded-For is shorter than TRUSTED_PROXY_HOPS, "+
+				"falling back to the socket peer. Logged once per process: if the chain is "+
+				"persistently short, the configured hop count does not match the real ingress "+
+				"chain and per-IP limits are being applied per-proxy",
+				"chain_entries", len(parts), "trusted_hops", trustedProxyHops)
+		})
 		return remoteIP
 	}
 	// IT MUST PARSE AS AN IP. The selected element is caller-influenced text,
@@ -381,4 +378,93 @@ func clientIP(r *http.Request) string {
 		return remoteIP
 	}
 	return parts[idx]
+}
+
+// shortChainWarnOnce keeps the forwarding-chain misconfiguration warning to one
+// line per process. See clientIP.
+var shortChainWarnOnce sync.Once
+
+// resyncVisitorCount recounts the live entries and stores the result.
+//
+// Only reachable from allow()'s at-cap path, with admit held, and only when
+// eviction reported that it could free nothing while the counter claimed the map
+// was full. That combination should be impossible: every increment happens under
+// admit immediately after a Store whose absence was established under the same
+// lock, and both decrements are gated on LoadAndDelete reporting a deletion.
+//
+// It exists because the consequence of being wrong is a silent outage of the
+// rate limiter rather than a memory overrun. A counter stuck above the cap makes
+// every admission drain the map and insert anyway, so the limiter ends up
+// tracking almost nobody and allowing almost everything. Recounting is O(live),
+// runs at most once per admission in a state that should never occur, and
+// restores the invariant instead of logging about it.
+func (rl *RateLimiter) resyncVisitorCount() {
+	var live int64
+	rl.visitors.Range(func(_, _ any) bool { live++; return true })
+	rl.numVisitors.Store(live)
+	slog.Warn("rate limit: visitor counter disagreed with the map at capacity; resynced",
+		"counted", live, "cap", maxVisitors)
+}
+
+// admitNewVisitor performs the whole at-capacity admission decision for an IP
+// the caller just failed to find, under admit, and reports whether it inserted.
+//
+// Extracted so the critical section is bounded by ONE defer rather than by two
+// hand-placed Unlock calls. Both were correct, but the blast radius of getting
+// it wrong is total and silent: a panic or an early return added inside the
+// section by a later edit (a metrics counter, a log line, a helper call) leaves
+// admit held forever, and then EVERY never-seen IP on that limiter blocks
+// permanently while the existing-visitor hot path keeps serving, so the process
+// looks healthy. No test would see it. A defer costs about a nanosecond on a
+// path that already costs ~570.
+//
+// Returns (true, nil) when it inserted, or (false, entry) when another goroutine
+// admitted the same IP first and the caller should fall through to the normal
+// increment/expire logic on that entry.
+func (rl *RateLimiter) admitNewVisitor(ip string, now time.Time) (bool, any) {
+	rl.admit.Lock()
+	defer rl.admit.Unlock()
+
+	// Re-check under the lock. Another goroutine may have admitted this same IP
+	// between the caller's lock-free Load and here, and inserting over it would
+	// drop that visitor's accumulated count, handing an attacker a budget reset
+	// for the price of two concurrent requests.
+	if existing, loaded := rl.visitors.Load(ip); loaded {
+		return false, existing
+	}
+	// Evict until there is genuinely room. One eviction attempt can
+	// free nothing (the sampled key may be deleted concurrently by
+	// cleanup), and inserting anyway is precisely how the cap was
+	// exceeded before. It terminates because each success decrements
+	// the count by one and no other goroutine can insert while admit is
+	// held.
+	//
+	// THE break IS AN UNREACHABLE-STATE ESCAPE, AND ITS DEGRADATION IS
+	// FAIL-OPEN, NOT OVER-CAP. An earlier version of this comment said a
+	// bookkeeping bug here "degrades to an over-cap map"; that is
+	// backwards and was reassuring in the wrong direction. If the
+	// counter ever sat above the cap while the map held fewer entries,
+	// every admission would drain the map and then insert, so the steady
+	// state is a nearly EMPTY map with the counter stuck high, every
+	// request read as never-seen, and the rate limit effectively gone.
+	// That is a control outage rather than a memory problem, which is
+	// why the resync below exists instead of a bare break: the counter
+	// is authoritative for the cap, so if it disagrees with the map it
+	// is the counter that gets corrected.
+	for rl.numVisitors.Load() >= maxVisitors {
+		if rl.evictOldestSample() {
+			continue
+		}
+		// Nothing could be freed while the counter says we are at
+		// capacity. Recount and believe the map, then stop; a second
+		// pass cannot do better because the map is not growing under
+		// this lock.
+		rl.resyncVisitorCount()
+		break
+	}
+	// Store, not LoadOrStore: absence was just established under the
+	// lock, and only this goroutine can be inserting.
+	rl.visitors.Store(ip, &visitor{count: 1, windowAt: now})
+	rl.numVisitors.Add(1)
+	return true, nil
 }

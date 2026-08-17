@@ -188,36 +188,52 @@ func TestEvictionReportsWhetherItFreedASlot(t *testing.T) {
 // the local claim: among the entries one call actually samples, the earliest
 // windowAt is the one that goes. Inverting the comparator turns this red.
 func TestEvictionPrefersTheOldestOfTheSample(t *testing.T) {
-	rl := NewRateLimiter(100, time.Hour)
-
-	// Fewer entries than evictSampleSize, so the sample IS the whole map and
-	// "oldest of the sample" and "oldest" coincide. That is what makes the
-	// assertion decidable without depending on Range's walk order.
+	// Fatalf, not Skipf. Behind a Skip this whole guard silently disappeared
+	// when evictSampleSize was tuned to 1, so a one-line constant change
+	// disarmed the only test of the comparator with no signal at all.
 	if evictSampleSize < 3 {
-		t.Skipf("evictSampleSize is %d; this test needs at least 3", evictSampleSize)
-	}
-	base := time.Now()
-	ages := map[string]time.Duration{
-		"192.0.2.10": -30 * time.Minute, // the oldest, must be evicted
-		"192.0.2.11": -20 * time.Minute,
-		"192.0.2.12": -10 * time.Minute,
-	}
-	for ip, age := range ages {
-		rl.visitors.Store(ip, &visitor{count: 1, windowAt: base.Add(age)})
-		rl.numVisitors.Add(1)
+		t.Fatalf("evictSampleSize is %d; the comparator guard needs at least 3. "+
+			"Lowering it disarms this test rather than failing it, so it fails here instead.", evictSampleSize)
 	}
 
-	if !rl.evictOldestSample() {
-		t.Fatal("eviction reported that it freed nothing from a three-entry map")
-	}
-	if _, ok := rl.visitors.Load("192.0.2.10"); ok {
-		var survived []string
-		rl.visitors.Range(func(k, _ any) bool { survived = append(survived, k.(string)); return true })
-		t.Errorf("the oldest entry survived; the map still holds %v. The comparator is inert "+
-			"or inverted: it must evict the earliest windowAt among the entries it sampled", survived)
-	}
-	if got := rl.numVisitors.Load(); got != 2 {
-		t.Errorf("counter is %d after one eviction from three entries, want 2", got)
+	// THIRTY FRESH LIMITERS, NOT ONE.
+	//
+	// sync.Map's HashTrieMap seeds its hash PER MAP INSTANCE: Range order is
+	// stable within one map (200 of 200 calls return an identical sample) but
+	// varies across maps. With three entries the oldest is Range-first about a
+	// third of the time, so a single-map version of this test let "delete the
+	// comparator entirely" escape in 14 of 40 runs. Repeating over independent
+	// maps drops that to (1/3)^30.
+	for round := 0; round < 30; round++ {
+		rl := NewRateLimiter(100, time.Hour)
+
+		// Fewer entries than evictSampleSize, so the sample IS the whole map and
+		// "oldest of the sample" and "oldest" coincide. That is what makes the
+		// assertion decidable without depending on Range's walk order.
+		base := time.Now()
+		ages := map[string]time.Duration{
+			"192.0.2.10": -30 * time.Minute, // the oldest, must be evicted
+			"192.0.2.11": -20 * time.Minute,
+			"192.0.2.12": -10 * time.Minute,
+		}
+		for ip, age := range ages {
+			rl.visitors.Store(ip, &visitor{count: 1, windowAt: base.Add(age)})
+			rl.numVisitors.Add(1)
+		}
+
+		if !rl.evictOldestSample() {
+			t.Fatalf("round %d: eviction reported that it freed nothing from a three-entry map", round)
+		}
+		if _, ok := rl.visitors.Load("192.0.2.10"); ok {
+			var survived []string
+			rl.visitors.Range(func(k, _ any) bool { survived = append(survived, k.(string)); return true })
+			t.Fatalf("round %d: the oldest entry survived; the map still holds %v. The comparator is "+
+				"inert, inverted or deleted: it must evict the earliest windowAt among the entries "+
+				"it sampled", round, survived)
+		}
+		if got := rl.numVisitors.Load(); got != 2 {
+			t.Fatalf("round %d: counter is %d after one eviction from three entries, want 2", round, got)
+		}
 	}
 }
 

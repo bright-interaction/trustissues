@@ -1463,6 +1463,29 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if providerMeta == "" {
 		providerMeta = "{}"
 	}
+	// THE SAME REFUSAL Update MAKES, ON THE OTHER WRITE SURFACE.
+	//
+	// rejectReservedProviderMetaKeys had exactly one call site, in Update, while
+	// Create took the identical client field and encrypted it straight to the
+	// column. So the control reservedProviderMetaKeys describes as load-bearing
+	// ("refusing the WRITE keeps the attempt out of the row entirely") did not
+	// exist on the path a client controls most directly: POST /api/vault with
+	// pending_revoke_url in the body returned 201 with the marker on disk.
+	//
+	// The read-path redaction then made it invisible in every later response,
+	// and the carry-across preserved it across every same-provider Save, so the
+	// creator ended up with an entry that fires a stale revoke on each rotation
+	// and cannot be inspected or cleared through the product. providerDo still
+	// refuses any host outside the provider's declared set, so this was never an
+	// egress escape; it was the defence-in-depth layer missing from one of two
+	// doors.
+	if bad, found := rejectReservedProviderMetaKeys(ParseProviderMeta(providerMeta)); found {
+		logError(r, "vault.create: refused a client-supplied server-owned provider_meta key",
+			"user", userID, "key", bad)
+		writeValidationError(w, r,
+			"provider_meta may not contain "+bad+": that key is written by the rotation engine itself")
+		return
+	}
 	if enc, encErr := h.encryptColumn(providerMeta); encErr == nil {
 		providerMeta = enc
 	} else {
@@ -2460,14 +2483,26 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				// The structural alternative is a server-only column, which would
 				// make this impossible rather than merely handled. It is a schema
 				// migration and is not what these markers cost today.
-				if provider == current.Provider.String {
-					for _, k := range reservedProviderMetaKeys {
-						if v, ok := beforeMeta[k]; ok {
-							afterMeta[k] = v
-						}
-					}
-				}
 			}
+			// RECONCILED WHETHER OR NOT THE REQUEST CARRIED provider_meta.
+			//
+			// This block used to live inside the `if req.ProviderMeta != nil`
+			// above, which meant the guard it implements was bypassed by the
+			// SIMPLER request: a PUT carrying only `provider` never entered the
+			// block, and the persist below then wrote the stored column back
+			// verbatim, so the markers survived a provider change intact. That
+			// is the exact state the drop exists to prevent, reached by sending
+			// one field fewer, and the frontend has a one-click path into it.
+			storedRaw := h.decryptColumnOrLog(current.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+			metaSource := storedRaw
+			if req.ProviderMeta != nil {
+				metaSource = *req.ProviderMeta
+			}
+			metaToStore, metaReconciled := reconcileProviderMetaForStorage(
+				metaSource, beforeMeta, provider == current.Provider.String)
+			// afterMeta is what the egress gate reasons over, so it has to agree
+			// with what is about to be written.
+			afterMeta = ParseProviderMeta(metaToStore)
 			// One decision, one ticket, and the ticket is what the write demands.
 			// authorityForEgressChange still computes the resulting host set for
 			// the pin loop below; the AUTHORITY half now goes through the same
@@ -2525,42 +2560,35 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// provider_meta at rest. The two cases are kept explicitly apart:
-			// client-supplied meta is ALWAYS encrypted, while an untouched column
-			// is carried forward exactly as stored. Never decide by content
-			// (a passthrough of client input that already looks encrypted is a
-			// decryption oracle; see vaultColumnEncPrefix).
+			// a value this request produced is ALWAYS encrypted, while a column
+			// nothing touched is carried forward exactly as stored. Never decide
+			// by content (a passthrough of client input that already looks
+			// encrypted is a decryption oracle; see vaultColumnEncPrefix).
 			encMeta := providerMeta // untouched: already-stored value, verbatim
-			if req.ProviderMeta != nil {
-				// WHAT IS STORED IS afterMeta, THE MAP THE EGRESS GATE JUST
-				// DECIDED ON, not the client's bytes.
+			if req.ProviderMeta != nil || metaReconciled {
+				// WHAT IS STORED IS metaToStore, THE BYTES THE EGRESS GATE JUST
+				// DECIDED ON, not the client's request verbatim.
 				//
 				// This used to encrypt *req.ProviderMeta directly, which made the
 				// evaluated value and the persisted value two different things.
-				// Harmless while they could not disagree; not harmless once
-				// afterMeta carries the server-owned pending_revoke_* markers
-				// across the write (see above), because storing the raw request
-				// instead dropped every one of them on an ordinary Save and
-				// stranded the old upstream key with no record of how to revoke
-				// it. Marshalling afterMeta is what makes that carry-across real.
+				// Harmless while they could not disagree; not harmless once the
+				// server-owned pending_revoke_* markers have to survive a write
+				// that is a FULL COLUMN REPLACE, because the client is handed the
+				// column with those keys redacted and echoes the redacted map
+				// back. Storing the request verbatim therefore dropped every
+				// marker on an ordinary untouched Save and stranded the old
+				// upstream key with no record of how to revoke it.
 				//
-				// Nothing else is lost by it: ParseProviderMeta is already the
-				// lens the validator and the gate both look through, so a
-				// non-string value it drops was invisible to every server-side
-				// consumer before this line and to RotationManager's own parse
-				// after it. Storing the parse makes stored state equal to
-				// evaluated state.
+				// metaReconciled is why this also fires with no provider_meta in
+				// the request at all: a provider change has to strip the previous
+				// provider's coordinates out of the stored column, and that write
+				// has no client input behind it.
 				//
-				// Still ALWAYS encrypted on the client-supplied branch, and now
-				// re-encoded from a server-built map rather than passed through,
-				// so the decryption-oracle hazard the two-branch split exists for
-				// is further away, not closer.
-				metaJSON, mErr := json.Marshal(afterMeta)
-				if mErr != nil {
-					logError(r, "vault.update: provider_meta marshal failed", "error", mErr)
-					writeInternalError(w, r, "internal server error")
-					return
-				}
-				enc, encErr := h.encryptColumn(string(metaJSON))
+				// Still always encrypted on this branch, and now re-encoded from
+				// server-reconciled bytes rather than passed through, so the
+				// decryption-oracle hazard the two-branch split exists for is
+				// further away, not closer.
+				enc, encErr := h.encryptColumn(metaToStore)
 				if encErr != nil {
 					logError(r, "vault.update: provider_meta encrypt failed", "error", encErr)
 					writeInternalError(w, r, "internal server error")
@@ -3262,13 +3290,18 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		providerMeta, newValue); warn != "" {
 		revokeWarn = warn
 	}
-	// A predecessor that could not be revoked on retry is still live upstream,
-	// so it belongs in the rotation's own outcome rather than only in a log
-	// line. This rotation's revoke warning wins when both fired, because it
-	// names the key that was just replaced.
-	if revokeWarn == "" {
-		revokeWarn = staleRevokeWarn
-	}
+	// BOTH warnings, not the newer one.
+	//
+	// This chose revokeWarn and fell back to staleRevokeWarn only when it
+	// was empty, which suppressed the retry's warning in exactly the case
+	// it exists for. The two failures are CORRELATED: the reason a retry
+	// fails is usually that the provider is down or rejecting, which is
+	// the same reason this rotation's own revoke fails moments later. So
+	// in the dominant failure mode the operator heard about the key just
+	// replaced and never about the older one, whose coordinates
+	// deferRevokeOldProviderKey had just overwritten. The irreversible
+	// fact lost to the recoverable one.
+	revokeWarn = combineRevokeWarnings(revokeWarn, staleRevokeWarn)
 
 	// Record the rotation outcome. The TRUE status depends on whether each
 	// configured target applied + verified the new key, so with targets we

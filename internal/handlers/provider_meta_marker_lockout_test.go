@@ -291,40 +291,88 @@ func TestEveryClientFacingProviderMetaIsRedacted(t *testing.T) {
 		if pErr != nil {
 			t.Fatalf("parse %s: %v", path, pErr)
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			lit, ok := n.(*ast.CompositeLit)
+		// redacted reports whether an expression is the redaction call itself.
+		redacted := func(e ast.Expr) bool {
+			call, ok := e.(*ast.CallExpr)
 			if !ok {
-				return true
+				return false
 			}
-			// Only literals of vaultEntryMeta. A db params struct also has a
-			// ProviderMeta field and that one is a WRITE, which must keep the
-			// markers.
-			name, ok := lit.Type.(*ast.Ident)
-			if !ok || name.Name != "vaultEntryMeta" {
-				return true
+			fn, ok := call.Fun.(*ast.Ident)
+			return ok && fn.Name == "redactReservedProviderMetaKeys"
+		}
+		record := func(at ast.Node, val ast.Expr) {
+			found++
+			if redacted(val) {
+				return
 			}
-			for _, el := range lit.Elts {
-				kv, ok := el.(*ast.KeyValueExpr)
-				if !ok {
-					continue
+			lo := fset.Position(val.Pos()).Offset
+			hi := fset.Position(val.End()).Offset
+			unredacted = append(unredacted, site{
+				pos:  fset.Position(at.Pos()).String(),
+				expr: string(src[lo:hi]),
+			})
+		}
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CompositeLit:
+				// Only literals of vaultEntryMeta. A db params struct also has a
+				// ProviderMeta field and that one is a WRITE, which must keep
+				// the markers.
+				//
+				// A nil Type is an ELIDED element type, as in
+				// []vaultEntryMeta{{...}}. Skipping those on the old
+				// `lit.Type.(*ast.Ident)` type assertion was a hole: the elided
+				// spelling leaked, and `found` merely dropped by one so the
+				// ABORT below did not fire either. Elided literals are followed
+				// by the outer literal's own case, so they are not missed; what
+				// must not happen is treating one as "not vaultEntryMeta".
+				if node.Type == nil {
+					return true
 				}
-				key, ok := kv.Key.(*ast.Ident)
-				if !ok || key.Name != "ProviderMeta" {
-					continue
+				name, ok := node.Type.(*ast.Ident)
+				if !ok || name.Name != "vaultEntryMeta" {
+					return true
 				}
-				found++
-				call, ok := kv.Value.(*ast.CallExpr)
-				if ok {
-					if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "redactReservedProviderMetaKeys" {
+				for _, el := range node.Elts {
+					kv, ok := el.(*ast.KeyValueExpr)
+					if !ok {
 						continue
 					}
+					if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "ProviderMeta" {
+						record(kv, kv.Value)
+					}
 				}
-				lo := fset.Position(kv.Value.Pos()).Offset
-				hi := fset.Position(kv.Value.End()).Offset
-				unredacted = append(unredacted, site{
-					pos:  fset.Position(kv.Pos()).String(),
-					expr: string(src[lo:hi]),
-				})
+			case *ast.AssignStmt:
+				// POST-CONSTRUCTION ASSIGNMENT, e.ProviderMeta = ...
+				//
+				// The guard originally saw composite literals only, and this is
+				// not a hypothetical spelling in this package: vault.go builds
+				// `e := vaultEntryMeta{...}` and then assigns e.RotationStatus,
+				// e.CollectionID and e.UserID on the very next lines. The eighth
+				// read path the doc comment above anticipates would most
+				// naturally be written this way, and the guard would have said
+				// nothing while the operator lockout shipped back.
+				//
+				// Matched on the field name rather than the receiver's type,
+				// because the type is not resolvable from a single-file parse.
+				// The only ProviderMeta fields in the package are this response
+				// struct's and the db params structs', and a db params
+				// assignment is a WRITE that legitimately keeps the markers, so
+				// it must not be flagged. Writes are all built as composite
+				// literals today, so requiring redaction here is correct now;
+				// if a params struct ever gains a field assignment this guard
+				// will fail loudly and the exclusion belongs here, spelled out.
+				for i, lhs := range node.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "ProviderMeta" {
+						continue
+					}
+					if i >= len(node.Rhs) {
+						continue // n:1 assignment from a call; nothing to inspect
+					}
+					record(sel, node.Rhs[i])
+				}
 			}
 			return true
 		})

@@ -447,3 +447,22 @@ func hasNotifyTarget(targets []RotationTarget) bool {
 	}
 	return false
 }
+
+// combineRevokeWarnings merges this rotation's revoke warning with one left by
+// retryOutstandingRevokeBeforeMint, keeping both.
+//
+// The two name DIFFERENT keys and both are true. Choosing between them, which
+// is what an `if revokeWarn == "" ` fallback does, silently drops one, and it
+// drops the wrong one: the retry's warning is about a key whose coordinates
+// this rotation's mint has already overwritten, so it is the fact that is about
+// to become unrecoverable. The rotation's own warning names a key that still has
+// its coordinates on the row and will be retried again next time.
+func combineRevokeWarnings(thisRotation, staleRetry string) string {
+	switch {
+	case thisRotation == "":
+		return staleRetry
+	case staleRetry == "":
+		return thisRotation
+	}
+	return thisRotation + "; also: " + staleRetry
+}

@@ -132,17 +132,24 @@ func TestRetryBeforeMintIsANoOpWithNothingOutstanding(t *testing.T) {
 	}
 }
 
-// TestRevokeTreats404AsAlreadyRevokedInBothArms holds the two revoke arms to one
-// rule.
+// TestRevokeTreats404ByWhereTheKeyIdTRAVELS holds each revoke arm to the rule its
+// own request shape justifies, and pins that the two are NOT twins on this point.
 //
-// revokeOldProviderKey has always exempted 404: the key being gone is the state
-// a revoke is trying to reach. backblazeRevokeOldKey did not, so a B2 key
-// already deleted upstream was recorded as a permanently failed revoke, the
-// markers were preserved forever, and the entry sat in partial rotation
-// retrying a key that does not exist. The doc comment in performPendingRevoke
-// asserted the property for both arms while only one had it.
-func TestRevokeTreats404AsAlreadyRevokedInBothArms(t *testing.T) {
-	t.Run("bearer arm", func(t *testing.T) {
+// A previous pass "fixed" an asymmetry that was correct. revokeOldProviderKey
+// issues DELETE https://vendor/api-keys/{id}: the key id is IN THE URL, so a 404
+// genuinely names the key and already-revoked is a sound reading.
+// backblazeRevokeOldKey POSTs applicationKeyId in the BODY to a fixed
+// /b2api/v3/b2_delete_key endpoint on a host read from the authorize response,
+// so a 404 there names the PATH and says nothing about the key. Backblaze
+// documents 200/400/401 for that call and no 404 at all.
+//
+// Unifying them imported a false success into the one place it is dangerous: an
+// endpoint 404 cleared last_revoke_error, performPendingRevoke deleted all three
+// markers, the rotation recorded a clean success with no alert, and the old key
+// stayed live at Backblaze with its only surviving identifier erased from the
+// row. A loud wrong state became a silent one.
+func TestRevokeTreats404ByWhereTheKeyIdTravels(t *testing.T) {
+	t.Run("bearer arm: the id is in the URL, so 404 is already-revoked", func(t *testing.T) {
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		})
@@ -151,16 +158,16 @@ func TestRevokeTreats404AsAlreadyRevokedInBothArms(t *testing.T) {
 		performPendingRevoke(context.Background(), meta, "resend", testPlaintext("re_NEW"))
 
 		if e := meta["last_revoke_error"]; e != "" {
-			t.Errorf("a 404 was recorded as a failure: %q", e)
+			t.Errorf("a 404 naming the key was recorded as a failure: %q", e)
 		}
 		if _, ok := meta[pendingRevokeURL]; ok {
-			t.Errorf("a 404 left the coordinates behind, so this key is retried forever: %+v", meta)
+			t.Errorf("a 404 naming the key left the coordinates behind, so it is retried forever: %+v", meta)
 		}
 	})
 
-	t.Run("b2 arm", func(t *testing.T) {
+	t.Run("b2 arm: the id is in the BODY, so 404 is a FAILURE", func(t *testing.T) {
 		// The authorize round trip succeeds; b2_delete_key answers 404 because
-		// the key is already gone.
+		// that host does not serve the path. The key is untouched and still live.
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "b2_delete_key") {
 				w.WriteHeader(http.StatusNotFound)
@@ -170,14 +177,35 @@ func TestRevokeTreats404AsAlreadyRevokedInBothArms(t *testing.T) {
 			_, _ = w.Write([]byte(`{"authorizationToken":"tok","apiInfo":{"storageApi":{"apiUrl":"https://api.backblazeb2.com"}}}`))
 		})
 		meta := map[string]string{"key_id": "0021new"}
+		deferRevokeOldProviderKey(meta, "DELETE", "0021STILL_LIVE", revokeAuthB2)
+		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
+
+		if meta["last_revoke_error"] == "" {
+			t.Error("a b2 endpoint 404 was recorded as a successful revoke. The key id travels in the " +
+				"request BODY, so a 404 cannot mean the key is gone, and treating it as success " +
+				"deletes the only record of a key that is still live upstream")
+		}
+		if meta[pendingRevokeURL] != "0021STILL_LIVE" {
+			t.Errorf("a b2 endpoint 404 discarded the coordinates of a live key: %+v", meta)
+		}
+	})
+
+	t.Run("b2 arm: a real 2xx still clears the coordinates", func(t *testing.T) {
+		// The positive control. Without it, "b2 never succeeds" would satisfy
+		// the subtest above.
+		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"authorizationToken":"tok","apiInfo":{"storageApi":{"apiUrl":"https://api.backblazeb2.com"}}}`))
+		})
+		meta := map[string]string{"key_id": "0021new"}
 		deferRevokeOldProviderKey(meta, "DELETE", "0021gone", revokeAuthB2)
 		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 
 		if e := meta["last_revoke_error"]; e != "" {
-			t.Errorf("a b2 404 was recorded as a failure: %q; the twin arm treats it as already-revoked", e)
+			t.Errorf("a successful b2 revoke recorded an error: %q", e)
 		}
 		if _, ok := meta[pendingRevokeURL]; ok {
-			t.Errorf("a b2 404 left the coordinates behind, so this key is retried forever: %+v", meta)
+			t.Errorf("a successful b2 revoke left the coordinates behind: %+v", meta)
 		}
 	})
 }

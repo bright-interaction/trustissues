@@ -338,8 +338,16 @@ func ListProviders() []ProviderInfo {
 var providerHTTP = alerts.GuardedWebhookClient(15 * time.Second)
 
 // Transient meta keys describing a revoke that has been DEFERRED until the new
-// value is safely persisted. Like last_revoke_error they are stripped before
-// provider_meta is written, so they never reach the database.
+// value is safely persisted.
+//
+// THEY DO REACH THE DATABASE, on the failure path. This comment used to end
+// "so they never reach the database", and that absolute stopped being true when
+// a failed revoke was allowed to keep its retry coordinates: performPendingRevoke
+// clears them only on a confirmed success, and the caller persists meta straight
+// afterwards. Three surfaces were built on the old absolute and had to move with
+// it; reservedProviderMetaKeys in egress_authority.go carries the full account and
+// is the canonical statement. Do not write a fourth surface that assumes a
+// reserved key cannot be in a stored row.
 const (
 	pendingRevokeMethod = "pending_revoke_method"
 	pendingRevokeURL    = "pending_revoke_url"
@@ -510,12 +518,17 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 
 	// revokeOldProviderKey and backblazeRevokeOldKey always leave
 	// last_revoke_error in a definite state for THIS attempt: set on failure,
-	// deleted on success, with a 404 counting as already-revoked in BOTH. That
-	// last clause was written here before it was true of backblazeRevokeOldKey,
-	// which had no 404 exemption and recorded an already-gone key as a permanent
-	// failure; it has one now, and TestRevokeTreats404AsAlreadyRevoked holds the
-	// two arms together. So this is a reliable signal, and only a confirmed
+	// deleted on success. So it is a reliable signal here, and only a confirmed
 	// success may discard the coordinates a retry would need.
+	//
+	// The two arms deliberately DISAGREE on 404 and neither is the twin of the
+	// other on that point. revokeOldProviderKey carries the key id in the URL,
+	// so a 404 names the key and counts as already-revoked. backblazeRevokeOldKey
+	// carries it in the request body against a fixed endpoint, so a 404 names the
+	// PATH and says nothing about the key; it is a failure there. An earlier
+	// draft of this comment asserted the exemption for both, and a later pass
+	// then "fixed" backblaze to match the comment, which silently discarded the
+	// coordinates of live keys. See backblazeRevokeOldKey for the full argument.
 	if meta["last_revoke_error"] == "" {
 		delete(meta, pendingRevokeMethod)
 		delete(meta, pendingRevokeURL)
@@ -1689,17 +1702,32 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 	}
 	defer dr.Body.Close()
 	_, _ = io.Copy(io.Discard, dr.Body)
-	// A 404 is already-revoked, exactly as in revokeOldProviderKey.
+	// NO 404 EXEMPTION HERE, AND THAT ASYMMETRY WITH revokeOldProviderKey IS
+	// CORRECT RATHER THAN AN OVERSIGHT.
 	//
-	// This arm did not have the exemption its twin has, and the asymmetry was
-	// not harmless: a key already gone upstream (revoked by hand, or by a
-	// previous attempt whose response was lost) was recorded as a FAILED revoke
-	// forever. The pending_revoke_* markers are preserved on failure, so the
-	// entry sat in permanent partial rotation retrying a key that does not
-	// exist, and retryOutstandingRevokeBeforeMint now re-attempts it on every
-	// subsequent rotation. "The key is not there" is the state a revoke is
-	// trying to reach.
-	if dr.StatusCode/100 != 2 && dr.StatusCode != http.StatusNotFound {
+	// A previous pass added `&& dr.StatusCode != http.StatusNotFound` to match
+	// the twin. That was wrong, and wrong in the dangerous direction. The twin
+	// issues DELETE https://vendor/api-keys/{id}: the key id is IN THE URL, so a
+	// 404 genuinely names the key and "already gone" is a sound reading. This
+	// call is a different shape entirely, visible three lines above: the id
+	// travels in the JSON BODY as applicationKeyId, and the URL names only the
+	// fixed /b2api/v3/b2_delete_key endpoint. A 404 here can therefore never
+	// mean "that key does not exist"; it can only mean "that host does not serve
+	// that path". apiUrl is not a constant either, it is read out of the
+	// b2_authorize_account response and varies by account and region, so a
+	// regional or version-shifted host answering 404 is a live possibility.
+	// Backblaze documents 200/400/401 for this call and no 404 at all; an
+	// already-deleted key comes back 400.
+	//
+	// With the exemption, that endpoint 404 cleared last_revoke_error, which let
+	// performPendingRevoke delete all three pending_revoke_* markers, record the
+	// rotation as a clean success, and fire no alert, while the old key stayed
+	// live at Backblaze with full write/delete scope and its only surviving
+	// identifier erased from the row. Without the exemption the same response is
+	// a loud partial rotation that keeps the coordinates. Refusing to guess is
+	// the whole point: this arm cannot tell the two 404s apart, so it treats
+	// neither as success.
+	if dr.StatusCode/100 != 2 {
 		meta["last_revoke_error"] = fmt.Sprintf("b2 delete key: HTTP %d", dr.StatusCode)
 		return
 	}

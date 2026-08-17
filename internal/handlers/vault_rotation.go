@@ -283,13 +283,18 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// how the two drifted on five separate behaviours.
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
 		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, providerName, meta, newValue)
-		// A predecessor that could not be revoked on retry is still live
-		// upstream, so it belongs in the rotation's own outcome rather than
-		// only in a log line. This rotation's revoke warning wins when both
-		// fired, because it names the key that was just replaced.
-		if revokeWarn == "" {
-			revokeWarn = staleRevokeWarn
-		}
+		// BOTH warnings, not the newer one.
+		//
+		// This chose revokeWarn and fell back to staleRevokeWarn only when it
+		// was empty, which suppressed the retry's warning in exactly the case
+		// it exists for. The two failures are CORRELATED: the reason a retry
+		// fails is usually that the provider is down or rejecting, which is
+		// the same reason this rotation's own revoke fails moments later. So
+		// in the dominant failure mode the operator heard about the key just
+		// replaced and never about the older one, whose coordinates
+		// deferRevokeOldProviderKey had just overwritten. The irreversible
+		// fact lost to the recoverable one.
+		revokeWarn = combineRevokeWarnings(revokeWarn, staleRevokeWarn)
 
 		// Same distinction the manual path makes: an undecryptable target list is
 		// not "no targets". Degrading to "[]" recorded a clean success while every

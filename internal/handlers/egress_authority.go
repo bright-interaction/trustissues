@@ -586,6 +586,70 @@ func rejectReservedProviderMetaKeys(meta map[string]string) (string, bool) {
 // not a JSON object of strings therefore returns unchanged: it carries no
 // reserved key that either side can act on, and the read path's job is to
 // render what is there, not to repair it.
+// reconcileProviderMetaForStorage produces the provider_meta bytes to persist:
+// raw with the server-owned keys removed, then re-added from stored when keep
+// is true. It reports whether anything actually changed.
+//
+// IT PRESERVES VALUE TYPES, WHICH IS WHY IT DOES NOT USE ParseProviderMeta.
+//
+// The first version of this write marshalled the map[string]string the egress
+// gate reasons over. That looked equivalent and is not: json.Unmarshal into a
+// map[string]string does NOT drop a non-string value, it records a type error,
+// discards it, and leaves the key present holding "". So an API client storing
+// {"account_id":"a","port":8080} and PUTting its own map back had 8080 silently
+// rewritten to "" on disk, permanently, with a 200 and no diagnostic, on an
+// entry with no markers and nothing to do with the bug being fixed. The React
+// app never saw it because RotationManager already keeps only string values.
+//
+// Decoding to json.RawMessage keeps every value byte-exact and still lets the
+// four reserved keys be removed and re-inserted, which is all the carry-across
+// ever needed. The gate keeps reading map[string]string; only the bytes written
+// come from here.
+//
+// keep is the provider-unchanged case. The coordinates name a host and a key id
+// at ONE provider, so carrying them onto a different provider is how a later
+// rotation fires a stale marker with a freshly minted secret.
+//
+// A raw that is not a JSON object is returned unchanged with changed=false: it
+// carries no reserved key either side can act on, and rewriting it would be
+// repair, not reconciliation.
+func reconcileProviderMetaForStorage(raw string, stored map[string]string, keep bool) (string, bool) {
+	fields := map[string]json.RawMessage{}
+	if raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+			return raw, false
+		}
+	}
+	changed := false
+	for _, k := range reservedProviderMetaKeys {
+		if _, ok := fields[k]; ok {
+			delete(fields, k)
+			changed = true
+		}
+		if !keep {
+			continue
+		}
+		v, ok := stored[k]
+		if !ok {
+			continue
+		}
+		enc, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		fields[k] = enc
+		changed = true
+	}
+	if !changed {
+		return raw, false
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return raw, false
+	}
+	return string(out), true
+}
+
 func redactReservedProviderMetaKeys(raw string) string {
 	meta := ParseProviderMeta(raw)
 	if len(meta) == 0 {
