@@ -34,9 +34,9 @@ import (
 // Version is stamped at build time via -ldflags "-X main.Version=...".
 var Version = "dev"
 
-// Request body limits. The global cap is 1 MB; CSV vault imports and the
-// capability proxy get larger budgets (the proxy handler additionally caps
-// forwarded bodies at 16 MiB internally).
+// Request body limits. The global cap is 1 MB; CSV vault imports, the
+// capability proxy, and the AI gateway get larger budgets (the proxy handler
+// additionally caps forwarded bodies at 16 MiB internally).
 const (
 	defaultBodyLimit = int64(1 << 20)
 	importBodyLimit  = int64(10 << 20)
@@ -55,6 +55,11 @@ func bodyLimits(next http.Handler) http.Handler {
 			limit = importBodyLimit
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
 			limit = proxyBodyLimit
+		case strings.HasPrefix(r.URL.Path, "/api/ai/"):
+			// Must match handlers.MaxAIBody: ai_gateway.go's own
+			// http.MaxBytesReader wrap is dead code otherwise, since wrappers
+			// compose to the smallest limit and this one wraps r.Body first.
+			limit = int64(handlers.MaxAIBody)
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)

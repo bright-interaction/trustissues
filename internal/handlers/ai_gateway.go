@@ -23,8 +23,11 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// maxAIBody caps the request body forwarded to an LLM provider.
-const maxAIBody = 5 << 20 // 5 MB
+// MaxAIBody caps the request body forwarded to an LLM provider. Exported so
+// cmd/server's bodyLimits middleware can wrap the request at the same budget
+// this handler enforces; the two must agree or one becomes dead code (see
+// bodyLimits' doc comment).
+const MaxAIBody = 5 << 20 // 5 MB
 
 // aiProvider describes one upstream LLM API the gateway can proxy to. The set is
 // a fixed allowlist (no user-controlled host), so there is no SSRF surface.
@@ -176,8 +179,18 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAIBody))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxAIBody))
 	if err != nil {
+		// http.MaxBytesReader reports an oversized body as *http.MaxBytesError.
+		// That is a 413 Payload Too Large, matching how the capability proxy
+		// (the other route with its own internal body-size ceiling) reports
+		// the same condition; a genuinely unreadable body is a 400.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large",
+				fmt.Sprintf("request body exceeds %d bytes", MaxAIBody))
+			return
+		}
 		writeBadRequest(w, r, "request body too large or unreadable")
 		return
 	}
@@ -296,21 +309,21 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 	// Read ONE byte past the ceiling so truncation is detectable.
 	//
 	// io.LimitReader stops silently at the limit, so a provider response over
-	// maxAIBody was cut mid-JSON and then handed to the caller as a completed
+	// MaxAIBody was cut mid-JSON and then handed to the caller as a completed
 	// request: status 200, delivered, with a body that will not parse or, worse,
 	// that parses into a partial answer. The caller has no way to tell that from
 	// a genuine short response. A gateway may refuse to carry an oversized
 	// payload, but it must not report success for something it truncated.
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIBody+1))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxAIBody+1))
 	if err != nil {
 		writeError(w, r, http.StatusBadGateway, "upstream_error", "could not read the provider response")
 		return
 	}
-	if int64(len(respBody)) > maxAIBody {
+	if int64(len(respBody)) > MaxAIBody {
 		logError(r, "ai_gateway: provider response exceeded the ceiling", "provider", providerName,
-			"limit_bytes", maxAIBody)
+			"limit_bytes", MaxAIBody)
 		writeError(w, r, http.StatusBadGateway, "upstream_response_too_large",
-			fmt.Sprintf("the AI provider returned more than %d bytes; the response was not delivered", maxAIBody))
+			fmt.Sprintf("the AI provider returned more than %d bytes; the response was not delivered", MaxAIBody))
 		return
 	}
 

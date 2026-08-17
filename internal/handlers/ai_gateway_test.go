@@ -213,6 +213,32 @@ func TestAIGatewayRejectsStreaming(t *testing.T) {
 	}
 }
 
+// TestAIGatewayOversizedBodyReturns413 proves an over-budget request body is
+// reported as 413 Payload Too Large (via the *http.MaxBytesError branch),
+// matching how the capability proxy reports the same condition, rather than
+// the generic 400 every other unreadable-body case gets.
+func TestAIGatewayOversizedBodyReturns413(t *testing.T) {
+	conn := aiGatewayTestDB(t)
+	queries := db.New(conn)
+	cfg := &config.Config{VaultKey: "test-vault-key"}
+	vh := NewVaultHandler(conn, queries, cfg)
+	seedProviderKey(t, conn, vh, "ai_key_anthropic", "sk-ant-REALKEY-123")
+	h := NewAIGatewayHandler(queries, cfg, vh, nil)
+
+	oversized := strings.Repeat("a", MaxAIBody+1)
+	req := httptest.NewRequest(http.MethodPost, "/api/ai/anthropic/v1/messages", strings.NewReader(oversized))
+	req.ContentLength = int64(len(oversized))
+	rr := httptest.NewRecorder()
+	gatewayRouter(h).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 (body: %s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "body_too_large") {
+		t.Errorf("expected the body_too_large error code, got %s", rr.Body.String())
+	}
+}
+
 func TestAIGatewayUnknownProvider(t *testing.T) {
 	conn := aiGatewayTestDB(t)
 	queries := db.New(conn)
