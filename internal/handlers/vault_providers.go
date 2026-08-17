@@ -446,11 +446,15 @@ func deferRevokeOldProviderKey(meta map[string]string, method, url, authScheme s
 
 // performPendingRevoke runs a revoke recorded by deferRevokeOldProviderKey,
 // authenticating with the NEW key THE WAY THE PROVIDER ACTUALLY ACCEPTS, and
-// clears the transient markers.
+// clears the transient markers ONLY once the attempt is confirmed successful.
 //
 // Call it only after the new value is durably stored. A failure sets
 // meta["last_revoke_error"], which downgrades the rotation to partial and
-// alarms, exactly as an inline failure used to.
+// alarms, exactly as an inline failure used to. The markers must survive that
+// failure: they are the only record of what to revoke and how, and the caller
+// persists meta right after this returns. Deleting them before the attempt (or
+// on a failed attempt) means a failed revoke strands the old key at the
+// provider forever, with nothing left recording where to retry it.
 //
 // newKey is opaque. The revoke sends it, authenticated per pendingRevokeAuth, to
 // a method and URL taken out of provider_meta (or, for scheme "b2", derived from
@@ -461,9 +465,6 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 	newKey secretexit.Plaintext) {
 
 	method, url, scheme := meta[pendingRevokeMethod], meta[pendingRevokeURL], meta[pendingRevokeAuth]
-	delete(meta, pendingRevokeMethod)
-	delete(meta, pendingRevokeURL)
-	delete(meta, pendingRevokeAuth)
 	if url == "" {
 		return
 	}
@@ -505,6 +506,17 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 		revokeOldProviderKey(ctx, meta, method, url, auth)
 	default: // revokeAuthBearer, and an unset/unrecognised scheme as a safe default
 		revokeOldProviderKey(ctx, meta, method, url, "Bearer "+plain)
+	}
+
+	// revokeOldProviderKey and backblazeRevokeOldKey always leave
+	// last_revoke_error in a definite state for THIS attempt (set on failure,
+	// deleted on success, a 404 counts as success per revokeOldProviderKey's
+	// doc), so it is a reliable signal here. Only a confirmed success may
+	// discard the coordinates a retry would need.
+	if meta["last_revoke_error"] == "" {
+		delete(meta, pendingRevokeMethod)
+		delete(meta, pendingRevokeURL)
+		delete(meta, pendingRevokeAuth)
 	}
 }
 
