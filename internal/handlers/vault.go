@@ -770,7 +770,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),
@@ -798,7 +798,7 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -822,7 +822,7 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -845,7 +845,7 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -872,7 +872,7 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -907,7 +907,7 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -2432,6 +2432,41 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 						"provider_meta may not contain "+bad+": that key is written by the rotation engine itself")
 					return
 				}
+				// THE WRITE IS A FULL COLUMN REPLACE, SO THE SERVER'S OWN KEYS
+				// MUST BE CARRIED ACROSS IT EXPLICITLY.
+				//
+				// This is the third surface that had encoded "the markers never
+				// reach the database". While that held, replacing the column
+				// wholesale with the client's map lost nothing, because there was
+				// never anything of the server's in it. Now a failed deferred
+				// revoke deliberately leaves its retry coordinates here, and the
+				// client is handed the column with them REDACTED
+				// (redactReservedProviderMetaKeys) so it cannot be locked out by
+				// echoing them back. Those two facts together mean an ordinary
+				// untouched Save would silently wipe the only record of what to
+				// revoke and how: the exact stranded-key outcome the deferral
+				// exists to prevent, reached through the UI instead of through a
+				// second rotation.
+				//
+				// Preserved only when the provider is UNCHANGED. The coordinates
+				// name a host and a key id at ONE provider; carrying them onto a
+				// different provider would let a later rotation that did not
+				// defer inherit a stale marker and fire it with a freshly minted
+				// secret. Changing the provider is the operator deliberately
+				// abandoning the old configuration, and the old provider's
+				// pending revoke goes with it. last_revoke_error is a warning
+				// about that same abandoned configuration and is dropped with it.
+				//
+				// The structural alternative is a server-only column, which would
+				// make this impossible rather than merely handled. It is a schema
+				// migration and is not what these markers cost today.
+				if provider == current.Provider.String {
+					for _, k := range reservedProviderMetaKeys {
+						if v, ok := beforeMeta[k]; ok {
+							afterMeta[k] = v
+						}
+					}
+				}
 			}
 			// One decision, one ticket, and the ticket is what the write demands.
 			// authorityForEgressChange still computes the resulting host set for
@@ -2496,7 +2531,36 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			// decryption oracle; see vaultColumnEncPrefix).
 			encMeta := providerMeta // untouched: already-stored value, verbatim
 			if req.ProviderMeta != nil {
-				enc, encErr := h.encryptColumn(*req.ProviderMeta)
+				// WHAT IS STORED IS afterMeta, THE MAP THE EGRESS GATE JUST
+				// DECIDED ON, not the client's bytes.
+				//
+				// This used to encrypt *req.ProviderMeta directly, which made the
+				// evaluated value and the persisted value two different things.
+				// Harmless while they could not disagree; not harmless once
+				// afterMeta carries the server-owned pending_revoke_* markers
+				// across the write (see above), because storing the raw request
+				// instead dropped every one of them on an ordinary Save and
+				// stranded the old upstream key with no record of how to revoke
+				// it. Marshalling afterMeta is what makes that carry-across real.
+				//
+				// Nothing else is lost by it: ParseProviderMeta is already the
+				// lens the validator and the gate both look through, so a
+				// non-string value it drops was invisible to every server-side
+				// consumer before this line and to RotationManager's own parse
+				// after it. Storing the parse makes stored state equal to
+				// evaluated state.
+				//
+				// Still ALWAYS encrypted on the client-supplied branch, and now
+				// re-encoded from a server-built map rather than passed through,
+				// so the decryption-oracle hazard the two-branch split exists for
+				// is further away, not closer.
+				metaJSON, mErr := json.Marshal(afterMeta)
+				if mErr != nil {
+					logError(r, "vault.update: provider_meta marshal failed", "error", mErr)
+					writeInternalError(w, r, "internal server error")
+					return
+				}
+				enc, encErr := h.encryptColumn(string(metaJSON))
 				if encErr != nil {
 					logError(r, "vault.update: provider_meta encrypt failed", "error", encErr)
 					writeInternalError(w, r, "internal server error")
@@ -2708,7 +2772,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				ExpiresAt:            nullTimePtr(row.ExpiresAt),
 				LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 				Provider:             row.Provider.String,
-				ProviderMeta:         h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta),
+				ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
 				// Through the exit, like the entry's own value below. A

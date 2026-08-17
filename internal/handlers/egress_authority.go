@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -498,10 +499,24 @@ func egressInfluencingMetaKeys() []string {
 	return out
 }
 
-// reservedProviderMetaKeys are provider_meta keys the SERVER owns. They are
-// transient markers written by an adapter mid-rotation and stripped before the
-// column is persisted (see deferRevokeOldProviderKey's doc), so a client
+// reservedProviderMetaKeys are provider_meta keys the SERVER owns. A client
 // sending one is either confused or aiming a request.
+//
+// THEY DO REACH THE DATABASE. This comment used to say they were "stripped
+// before the column is persisted, so they never reach the database", and every
+// other surface was built on that absolute. It stopped being true the moment a
+// failed deferred revoke was allowed to keep its retry coordinates: the markers
+// are now the ONLY record of what to revoke and how, so performPendingRevoke
+// deletes them on a confirmed success and deliberately preserves them on
+// failure, and the caller persists meta right afterwards.
+//
+// Relaxing that invariant is a migration, not an edit. Three surfaces encoded
+// the old absolute and had to move with it: this list's own write-path
+// validator below (which still rejects client-supplied markers, and must),
+// redactReservedProviderMetaKeys (new, because the read path handed the markers
+// to a client that PUTs the whole map back), and the doc comments in
+// vault_providers.go and vault_rotation_core.go. Anything added here that
+// assumes a reserved key cannot be in a stored row is wrong.
 //
 // pending_revoke_url is the sharpest of them: performPendingRevoke issues
 // method+URL straight out of the map, authenticated per pending_revoke_auth. A
@@ -526,4 +541,72 @@ func rejectReservedProviderMetaKeys(meta map[string]string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// redactReservedProviderMetaKeys removes the server-owned keys from a
+// provider_meta JSON object on its way OUT to a client, and returns the object
+// re-encoded.
+//
+// THE VALIDATOR ABOVE AND THIS FUNCTION ARE ONE MECHANISM, NOT TWO.
+//
+// Once a failed revoke was allowed to persist its coordinates, the write-path
+// validator alone became an operator lockout. The read path returned the whole
+// decrypted column verbatim; RotationManager.tsx copies every string key into
+// form state (they render no input, so nothing is visible on screen) and PUTs
+// the entire map back on save. So the ordinary recovery flow (a revoke fails
+// with a 503, the operator opens the rotation panel to correct the provider
+// config that caused it, and clicks Save) resubmitted the markers the server
+// had just written and was refused:
+//
+//	400 provider_meta may not contain pending_revoke_method: that key is
+//	    written by the rotation engine itself
+//
+// The check is gated on the field being PRESENT, not CHANGED, and the Save
+// button has no dirty-check, so an untouched resubmit tripped the same 400 as a
+// hostile one. The live-but-unrevokable upstream key stayed live and the
+// product's own remediation path was shut; recovery needed a hand-crafted PUT
+// omitting the three keys, because the write is a full column replace.
+//
+// Redacting on the way out fixes that without weakening the validator: a client
+// never learns the keys exist, so it cannot echo them back, and one that sends
+// them anyway is still doing something it was never handed and is still
+// refused. The alternative, tolerating a value byte-identical to what is
+// stored, keeps a client-supplied marker on the accepted path and was rejected
+// for that reason.
+//
+// last_revoke_error is redacted too, and loses nothing: the rotation responses
+// lift it out and report it separately (vault.go and vault_rotation_core.go
+// both read it, delete it, and surface it as a partial-rotation warning), and
+// no frontend surface reads it off provider_meta.
+//
+// It reads the column through ParseProviderMeta, the SAME parse the validator
+// uses, and that symmetry is the correctness argument rather than an accident:
+// a key this function cannot see is a key rejectReservedProviderMetaKeys cannot
+// see either, so it can never be the cause of the 400 above. A column that is
+// not a JSON object of strings therefore returns unchanged: it carries no
+// reserved key that either side can act on, and the read path's job is to
+// render what is there, not to repair it.
+func redactReservedProviderMetaKeys(raw string) string {
+	meta := ParseProviderMeta(raw)
+	if len(meta) == 0 {
+		return raw
+	}
+	found := false
+	for _, k := range reservedProviderMetaKeys {
+		if _, ok := meta[k]; ok {
+			delete(meta, k)
+			found = true
+		}
+	}
+	if !found {
+		return raw
+	}
+	out, err := json.Marshal(meta)
+	if err != nil {
+		// Unreachable for map[string]string, and the safe direction if it ever
+		// is reached: an empty object leaks nothing, where returning raw would
+		// hand back the markers this function exists to remove.
+		return "{}"
+	}
+	return string(out)
 }
