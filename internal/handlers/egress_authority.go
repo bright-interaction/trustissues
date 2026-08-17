@@ -512,11 +512,16 @@ func egressInfluencingMetaKeys() []string {
 //
 // Relaxing that invariant is a migration, not an edit. Three surfaces encoded
 // the old absolute and had to move with it: this list's own write-path
-// validator below (which still rejects client-supplied markers, and must),
-// redactReservedProviderMetaKeys (new, because the read path handed the markers
-// to a client that PUTs the whole map back), and the doc comments in
-// vault_providers.go and vault_rotation_core.go. Anything added here that
-// assumes a reserved key cannot be in a stored row is wrong.
+// validator below, which still rejects client-supplied markers and must, and
+// which now runs on BOTH write doors after Create was found accepting them;
+// redactReservedProviderMetaKeys and reconcileProviderMetaForStorage, because
+// the read path handed the markers to a client that PUTs the whole map back and
+// the write is a full column replace; and the doc comments on the marker
+// constants in vault_providers.go, on the rotation write-back in vault.go, and
+// in vault_rotation_core.go. Every one of those was found asserting the old
+// absolute AFTER this comment first claimed the sweep was complete, which is
+// the argument for grepping the PHRASE and not just the identifiers. Anything
+// added here that assumes a reserved key cannot be in a stored row is wrong.
 //
 // pending_revoke_url is the sharpest of them: performPendingRevoke issues
 // method+URL straight out of the map, authenticated per pending_revoke_auth. A

@@ -77,6 +77,22 @@ type rotationDeps struct {
 // performPendingRevoke) and returns a warning, so the caller can tell the
 // operator that an older key is still live upstream and is about to lose its
 // retry record, instead of that record vanishing in silence.
+//
+// KNOWN COVERAGE HOLE: THIS ONLY RUNS WHEN A ROTATION RUNS.
+//
+// Both rotation paths call it, so a scheduled entry retries on every sweep and
+// any entry retries when an operator clicks Rotate. But an ON-DEMAND entry
+// (auto_rotate = 0) is never picked up by the sweep, so if nobody rotates it
+// again its stranded key is never retried once, and nothing anywhere surfaces
+// that. The coordinates sit on the row indefinitely, correct and unread.
+//
+// That is the cost of choosing the cheapest consumer. Closing it properly needs
+// a consumer that does not ride on a rotation: a background reconciler over rows
+// carrying pending_revoke_url, or an operator-visible "an older key at this
+// provider is still live, retry the revoke" affordance on the entry itself. The
+// second is the smaller build and the more honest one, because it also answers
+// the terminal case where the revoke can never succeed and the only current
+// escape is changing the provider.
 func retryOutstandingRevokeBeforeMint(ctx context.Context, meta map[string]string,
 	entryName, provider string, current secretexit.Plaintext) string {
 

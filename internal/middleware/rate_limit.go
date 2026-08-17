@@ -98,6 +98,26 @@ type RateLimiter struct {
 	// the lock-free sync.Map load above (43 ns/op, unchanged). Only a new IP
 	// pays, which is exactly the path a distinct-IP flood drives and exactly
 	// the path that has to be bounded.
+	//
+	// THIS LOCK IS LOAD-BEARING FOR THE CAP, AND ONLY A BARRIER TEST SEES IT.
+	//
+	// A review measured the mutex removed and the cap still exact under a
+	// 32-goroutine, 1,280,000-IP flood, and concluded the fix was
+	// over-determined. That measurement reproduces; the conclusion does not
+	// follow. A distributed flood spreads arrival times, so admitters almost
+	// never sit at the cap boundary at the same instant and the check-then-act
+	// window is barely entered. Concentrate them instead, which is what
+	// TestVisitorCapHoldsWhenAdmittersArriveTogether does by filling to cap-1
+	// and releasing hundreds of goroutines off one barrier: without this mutex
+	// they all read the same under-cap count, all skip eviction, and all insert.
+	//
+	// A flood benchmark is therefore not evidence that this lock is redundant,
+	// whatever it measures. The barrier test is the one that can see it.
+	//
+	// The eviction loop and the insert gate ARE largely redundant with each
+	// other, and all three are kept because the redundancy costs nanoseconds on
+	// a cold path. This lock is redundant with nothing. Do not delete it on the
+	// strength of a flood benchmark.
 	admit sync.Mutex
 }
 

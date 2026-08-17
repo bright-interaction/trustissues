@@ -3064,9 +3064,14 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 			// already recorded in the Provider field.
 			// Rotate mutated providerMeta with the NEW provider-side key id;
 			// persist it (encrypted) so the NEXT rotation revokes THIS key
-			// instead of a stale predecessor id. Strip the transient revoke
-			// flag first (never persisted); a failed old-key revoke is
-			// surfaced as a rotation error.
+			// instead of a stale predecessor id. Strip last_revoke_error
+			// first: that ONE flag is never persisted, and a failed old-key
+			// revoke is surfaced as a rotation error instead. The
+			// pending_revoke_* markers are a DIFFERENT case and DO reach the
+			// column on the failure path, deliberately, because they are the
+			// only record of what to revoke and how; see
+			// reservedProviderMetaKeys for the surfaces that moved when that
+			// stopped being impossible.
 			// Held in memory until AFTER the CAS, deliberately.
 			//
 			// Writing provider_meta here bumps updated_at, which is the exact

@@ -277,3 +277,66 @@ func TestCleanupDecrementsTheCounter(t *testing.T) {
 			counted, counted)
 	}
 }
+
+// TestVisitorCapHoldsWhenAdmittersArriveTogether is the test that can actually
+// see what the admit mutex does.
+//
+// The flood tests above cannot. A review removed the mutex entirely, ran a
+// 32-goroutine 1,280,000-IP flood, measured the cap still exact, and concluded
+// the lock was redundant. The measurement is reproducible and the conclusion is
+// wrong: a distributed flood spreads arrival times, so admitters are almost
+// never at the cap boundary simultaneously and the check-then-act window is
+// never entered. Every one of those tests would stay green while HIGH-2 was
+// reopened.
+//
+// This concentrates them instead. Fill to exactly cap-1, then release many
+// goroutines off one barrier so they all evaluate the cap in the same instant
+// on a map that has room for exactly one. With admission serialised, one wins
+// the slot and the rest evict-then-insert, so the count lands on the cap. Split
+// across a lock-free map they all read the same under-cap count, all skip
+// eviction, and all insert.
+func TestVisitorCapHoldsWhenAdmittersArriveTogether(t *testing.T) {
+	const (
+		admitters = 512
+		rounds    = 8
+	)
+
+	for round := 0; round < rounds; round++ {
+		rl := NewRateLimiter(100, time.Hour)
+
+		// Fill to cap-1 so there is room for exactly one more.
+		for i := 0; i < maxVisitors-1; i++ {
+			rl.allow(fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff))
+		}
+		if got := rl.numVisitors.Load(); got != maxVisitors-1 {
+			t.Fatalf("round %d: setup left %d entries, want %d", round, got, maxVisitors-1)
+		}
+
+		var ready, start, done sync.WaitGroup
+		ready.Add(admitters)
+		done.Add(admitters)
+		start.Add(1)
+		for w := 0; w < admitters; w++ {
+			go func(w int) {
+				defer done.Done()
+				ready.Done()
+				start.Wait() // every admitter evaluates the cap together
+				rl.allow(fmt.Sprintf("172.16.%d.%d", (w>>8)&0xff, w&0xff))
+			}(w)
+		}
+		ready.Wait()
+		start.Done()
+		done.Wait()
+
+		live := 0
+		rl.visitors.Range(func(_, _ any) bool { live++; return true })
+		if live > maxVisitors {
+			t.Fatalf("round %d: %d admitters released together left %d live entries against a cap of %d. "+
+				"Admission is not one decision: they all read the same under-cap count, all skipped "+
+				"eviction, and all inserted", round, admitters, live, maxVisitors)
+		}
+		if counted := rl.numVisitors.Load(); counted != int64(live) {
+			t.Fatalf("round %d: numVisitors %d drifted from the real live count %d", round, counted, live)
+		}
+	}
+}
