@@ -8,12 +8,20 @@ COPY frontend/ ./
 RUN bun run build
 
 # Stage 2: Build Go binary
-# Pinned to the patch, not the floating 1.26 minor. The floating tag happens
-# to resolve to 1.26.6 today, so this is not a behaviour change; it is the
-# difference between shipping a stdlib we chose and one we inherited on the
-# day the layer cache missed. 1.26.6 is the version measured to clear all
-# five reachable stdlib advisories -- keep in lockstep with
-# ciGoToolchainTrustissues in hephaestus/userworkflows/ci_go.go.
+# Pinned to the patch, not the floating 1.26 minor.
+#
+# The floating tag resolved forward at build time, so which stdlib a given
+# image shipped depended on whether the base layer happened to be evicted
+# before that build -- decidable only by reading the binary afterwards, and
+# recorded nowhere. This makes it a property of the repository instead.
+# 1.26.6 is the version measured to clear every stdlib advisory govulncheck
+# reports as reachable from this module.
+#
+# Held in lockstep with go.mod's `go` directive -- NOT a `toolchain` line,
+# which this module deliberately no longer carries because it is inert under
+# the GOTOOLCHAIN=local that every official golang image bakes in -- and with
+# the go-version pin in .github/workflows/ci.yml. internal/buildpins asserts
+# all three agree and refuses if any drifts.
 FROM golang:1.26.6-alpine AS builder
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 WORKDIR /app
