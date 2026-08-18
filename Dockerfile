@@ -8,7 +8,13 @@ COPY frontend/ ./
 RUN bun run build
 
 # Stage 2: Build Go binary
-FROM golang:1.26-alpine AS builder
+# Pinned to the patch, not the floating 1.26 minor. The floating tag happens
+# to resolve to 1.26.6 today, so this is not a behaviour change; it is the
+# difference between shipping a stdlib we chose and one we inherited on the
+# day the layer cache missed. 1.26.6 is the version measured to clear all
+# five reachable stdlib advisories -- keep in lockstep with
+# ciGoToolchainTrustissues in hephaestus/userworkflows/ci_go.go.
+FROM golang:1.26.6-alpine AS builder
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 WORKDIR /app
 COPY go.mod go.sum ./

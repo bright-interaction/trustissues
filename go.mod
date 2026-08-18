@@ -2,7 +2,7 @@ module github.com/bright-interaction/trustissues
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/getsentry/sentry-go v0.47.0

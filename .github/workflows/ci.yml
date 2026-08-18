@@ -42,7 +42,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # A literal pin, NOT go-version-file. setup-go@v5 parses only the
+          # `go` directive out of go.mod and stops -- it has no `toolchain`
+          # support -- so go-version-file resolved `go 1.26` to whatever the
+          # newest 1.26.x happened to be that morning and never once looked
+          # at the toolchain line below it. Keep in lockstep with the
+          # Dockerfile's FROM tag and go.mod's toolchain directive.
+          go-version: "1.26.6"
           cache: true
 
       - uses: oven-sh/setup-bun@v2
