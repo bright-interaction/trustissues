@@ -2727,15 +2727,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				"committing (very likely a concurrent rotation recorded a failure); leaving it as found "+
 				"rather than clearing a newer alarm", "entry", id)
 		default:
-			if cleared := withoutRevokeStillLive(metaRow.LastRotationError.String); cleared != metaRow.LastRotationError.String {
-				if uErr := h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-					LastRotationError: toNullString(cleared),
-					ID:                id,
-				}); uErr != nil {
-					logError(r, "vault.update: could not clear the revoke half of last_rotation_error "+
-						"after a provider change discarded the marker", "entry", id, "error", uErr)
-				}
-			}
+			// The same CAS'd clear the retry/resolve endpoints use. The re-read
+			// above is a fast path and a diagnostic; clearRevokeHalfOfRotationError
+			// compares the column again inside the UPDATE, so an alarm that lands
+			// between this re-read and the write is preserved, not erased. This is
+			// the third and last clearer, so the unconditional writer now has no
+			// caller outside the three outcome recorders.
+			h.clearRevokeHalfOfRotationError(ctx, r, id, metaRow.LastRotationError.String)
 		}
 	}
 

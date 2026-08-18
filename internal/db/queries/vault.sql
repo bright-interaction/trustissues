@@ -303,6 +303,35 @@ WHERE id = ?;
 -- name: UpdateVaultEntryRotationError :exec
 UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: CASVaultEntryRotationError :execresult
+-- Compare-and-swap sibling of UpdateVaultEntryRotationError, for the CLEARERS
+-- ONLY: the pending-revoke retry/resolve endpoints and the provider-change
+-- discard. Each strips just the revoke half of last_rotation_error and writes
+-- the remainder back, and each re-reads the column first -- but a re-read is not
+-- atomic with the write, so a rotation that records a failure in that window
+-- (recordRotationFailure writes this column WITHOUT touching provider_meta, so
+-- no provider_meta CAS covers it) would be clobbered by an unconditional UPDATE.
+-- Worse durably: a MANUAL rotation does not re-run to re-record the alarm, so
+-- the entry then reports clean while a key is live upstream. The compare closes
+-- that residual window.
+--
+-- The three OUTCOME recorders (recordRotationOutcome, recordRotationOutcome-
+-- Undeliverable, recordRotationFailure) deliberately do NOT use this: each
+-- writes an ABSOLUTE verdict about the attempt it just made and owns the value,
+-- so a CAS there would DROP a real alarm on a spurious mismatch. That split is
+-- pinned by rotation_error_writer_guard_test.go.
+--
+-- A lost CAS here is NOT retried (unlike appendRotationLog, whose retry is safe
+-- only because an append is additive): on a miss the stored value is a newer,
+-- truer alarm about a different attempt, and re-deriving the clear on top of it
+-- is exactly the erasure the compare exists to prevent. The caller leaves it.
+--
+-- Comparing the column (via COALESCE so NULL and the empty string are one
+-- value) rather than updated_at is deliberate, same as CASVaultEntryRotationLog:
+-- updated_at is bumped by every neighbouring write and would spuriously fail.
+UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND COALESCE(last_rotation_error, '') = ?;
+
 -- name: GetVaultEntryRotationLog :one
 SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?;
 
