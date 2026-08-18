@@ -537,7 +537,8 @@ func egressInfluencingMetaKeys() []string {
 // the new secret, "b2" drives a whole authorize-then-delete flow), so a client
 // that could plant it could redirect what gets authenticated where, same as the
 // method/URL pair.
-var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth, "last_revoke_error"}
+var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth,
+	pendingRevokeKeyID, "last_revoke_error"}
 
 // rejectReservedProviderMetaKeys reports the first server-owned key found in a
 // client-supplied provider_meta, if any.
@@ -791,6 +792,15 @@ func pendingRevokeStatusFrom(raw string) *pendingRevokeStatus {
 	v := meta[pendingRevokeURL]
 	if v == "" {
 		return nil
+	}
+	// THE RECORDED ID WINS. deferRevokeOldProviderKey now writes the
+	// predecessor id it already had in hand, so the whole class of bugs below
+	// (punctuation from path.Base, a path COMPONENT when the path is
+	// truncated, Twilio's real "SK..." rendered as "SK....json") does not
+	// arise for any row written after that change. Everything from here down
+	// is the fallback for rows written before it.
+	if id := meta[pendingRevokeKeyID]; conservativeKeyIDPattern.MatchString(id) {
+		return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: id}
 	}
 	if u, err := url.Parse(v); err == nil && u.Host != "" {
 		// path.Base is total but not injective: it maps "" to "." and "/" to

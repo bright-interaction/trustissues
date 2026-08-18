@@ -40,7 +40,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		})
 
 		meta := map[string]string{}
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old-id", revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old-id", revokeAuthBearer, "old-id")
 
 		performPendingRevoke(context.Background(), meta, "resend", testPlaintext("NEW-SECRET-VALUE"))
 
@@ -70,8 +70,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		// key's sid) by the time a defer runs; performPendingRevoke's basic-auth
 		// arm reads it back to build the username half of the pair.
 		meta := map[string]string{"key_sid": "SKnew123"}
-		deferRevokeOldProviderKey(meta, "DELETE",
-			"https://api.twilio.com/2010-04-01/Accounts/ACaccount/Keys/SKold.json", revokeAuthBasic)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.twilio.com/2010-04-01/Accounts/ACaccount/Keys/SKold.json", revokeAuthBasic, "SKold.json")
 
 		performPendingRevoke(context.Background(), meta, "twilio", testPlaintext("newsecret456"))
 
@@ -102,8 +101,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		// upstream, a hand-edited fixture, an older schema) must not send
 		// "Basic <base64 of ':secret'>" as if that were a real credential pair.
 		meta := map[string]string{}
-		deferRevokeOldProviderKey(meta, "DELETE",
-			"https://api.twilio.com/2010-04-01/Accounts/ACaccount/Keys/SKold.json", revokeAuthBasic)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.twilio.com/2010-04-01/Accounts/ACaccount/Keys/SKold.json", revokeAuthBasic, "SKold.json")
 
 		performPendingRevoke(context.Background(), meta, "twilio", testPlaintext("newsecret456"))
 
@@ -157,7 +155,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		// url carries the OLD key id (see deferRevokeOldProviderKey's doc), not a
 		// URL: b2_delete_key's real URL is only known after the authorize round
 		// trip below.
-		deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2)
+		deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2, "0021old")
 
 		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 
@@ -190,7 +188,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		})
 
 		meta := map[string]string{} // no key_id
-		deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2)
+		deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2, "0021old")
 
 		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 

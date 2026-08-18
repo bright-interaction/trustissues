@@ -2492,6 +2492,30 @@ export default function Vault() {
                               {entry.rotation_status === 'expired' && 'Expired'}
                               {entry.rotation_status === 'error' && 'Rotation failed'}
                             </span>
+                            {/* The same "Predecessor key live" signal the LOCKED
+                                table carries. It was only in the locked view, so
+                                the alarm vanished the moment the operator
+                                unlocked, and a manual rotate performed while
+                                already unlocked can newly strand a key with a
+                                "Secret rotated" success toast and nothing else
+                                to see. FRONTEND-CONTRACT.md requires this
+                                wherever rotation_status is shown, and
+                                rotation_status is shown immediately above.
+                                Independent of rotation_status by design: an
+                                entry reads "Fresh" and still carries one. */}
+                            {entry.pending_revoke?.outstanding && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700"
+                                title={
+                                  entry.pending_revoke.predecessor_key_id
+                                    ? `Key ${entry.pending_revoke.predecessor_key_id} could not be deleted at the provider and may still authenticate. Open Manage rotation delivery to retry or acknowledge it.`
+                                    : 'An older key could not be deleted at the provider and may still authenticate. Open Manage rotation delivery to retry or acknowledge it.'
+                                }
+                              >
+                                <AlertCircle className="h-3 w-3" />
+                                Predecessor key live
+                              </span>
+                            )}
                             {entry.provider && entry.provider !== 'manual' && (
                               <span
                                 className="rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700"

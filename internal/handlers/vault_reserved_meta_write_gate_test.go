@@ -69,6 +69,9 @@ func TestReservedProviderMetaKeysAreRefusedOnBothWriteDoors(t *testing.T) {
 		"pending_revoke_method": true,
 		"pending_revoke_url":    true,
 		"pending_revoke_auth":   true,
+		// Server-owned: written by deferRevokeOldProviderKey from the id the
+		// provider adapter already holds, never supplied by a client.
+		"pending_revoke_key_id": true,
 		"last_revoke_error":     true,
 	}
 	got := map[string]bool{}

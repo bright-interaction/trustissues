@@ -50,7 +50,8 @@ func TestPersistRotatedValueAuthoritativeSurvivesASingleConflict(t *testing.T) {
 			// just captured, the same mechanism TestSweepStillDetectsARealConflict
 			// uses.
 			if _, err := h.db.Exec(
-				`UPDATE vault_entries SET updated_at = datetime('now', '+1 second') WHERE id = ?`, entryID); err != nil {
+				`UPDATE vault_entries SET updated_at = datetime('now', '+1 second'), encrypted_value = ? WHERE id = ?`,
+				[]byte("a-genuinely-different-ciphertext"), entryID); err != nil {
 				t.Fatalf("inject conflict: %v", err)
 			}
 		}

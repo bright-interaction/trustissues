@@ -76,8 +76,18 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 			// lands here, in production driven by an unrelated request or a
 			// second rotation; here, driven by the upstream itself so the test
 			// needs no goroutines to force the window.
+			// A REAL conflict now means the VALUE moved: updated_at alone is no
+			// longer part of the CAS predicate, because comparing it made every
+			// unrelated column write fail a rotation that had already minted
+			// upstream. So this writes a genuinely different, genuinely
+			// decryptable value, which is the lost-update the guard exists for.
+			concCipher, concNonce, encErr := h.encrypt([]byte("K0concurrent"))
+			if encErr != nil {
+				t.Errorf("encrypt concurrent value: %v", encErr)
+			}
 			if _, execErr := h.db.Exec(
-				`UPDATE vault_entries SET updated_at = datetime('now','+1 second') WHERE id = ?`, entryID); execErr != nil {
+				`UPDATE vault_entries SET updated_at = datetime('now','+1 second'), encrypted_value = ?, nonce = ? WHERE id = ?`,
+				concCipher, concNonce, entryID); execErr != nil {
 				t.Errorf("concurrent edit: %v", execErr)
 			}
 			w.WriteHeader(http.StatusOK)
@@ -138,9 +148,13 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if !plain.EqualsString("K0old") {
-		t.Error("the stored value changed even though the rotate request reported a conflict; the " +
-			"entry now holds neither the old key (which this test proved must stay live) nor a value " +
-			"anyone was told about")
+	// The CONCURRENT save's value is what must survive: the rotation lost its
+	// CAS, so its freshly minted "K0new" must not have landed. (Before the
+	// updated_at predicate was dropped this read "K0old", because the simulated
+	// conflict only bumped a timestamp and never actually saved anything.)
+	if !plain.EqualsString("K0concurrent") {
+		t.Error("the rotation's value landed even though the rotate request reported a conflict, so " +
+			"it overwrote the value the concurrent save had just stored; the entry now holds neither " +
+			"what the saver wrote nor a value anyone was told about")
 	}
 }

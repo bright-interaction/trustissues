@@ -175,9 +175,7 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 	work, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL,
 		providerMetaRaw, providerMeta, casToken, func(m map[string]string) {
 			if revoked {
-				delete(m, pendingRevokeMethod)
-				delete(m, pendingRevokeURL)
-				delete(m, pendingRevokeAuth)
+				deletePendingRevokeMarkers(m)
 			}
 		})
 	if persistErr != nil {
@@ -314,9 +312,7 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 	// key are untouched.
 	_, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL, raw, meta, casToken,
 		func(m map[string]string) {
-			delete(m, pendingRevokeMethod)
-			delete(m, pendingRevokeURL)
-			delete(m, pendingRevokeAuth)
+			deletePendingRevokeMarkers(m)
 		})
 	if persistErr != nil {
 		logError(r, "vault.pending_revoke.resolve: could not persist", "entry", id, "error", persistErr)

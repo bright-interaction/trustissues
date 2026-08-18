@@ -39,7 +39,7 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 	meta := map[string]string{"key_id": "old-key-id"}
 
 	// Step 1: defer. Nothing may be destroyed upstream yet.
-	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old-key-id", revokeAuthBearer)
+	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old-key-id", revokeAuthBearer, "old-key-id")
 
 	if meta[pendingRevokeMethod] != "DELETE" || meta[pendingRevokeURL] == "" {
 		t.Fatal("the pending revoke was not recorded: the old key would stay live at the provider forever")
@@ -53,7 +53,10 @@ func TestRevokeIsDeferredUntilAfterPersist(t *testing.T) {
 	// Deferring must not have touched the network, so no outcome is known yet.
 	// Guard the setup: if the markers were absent the assertions below would
 	// pass against a no-op.
-	if len(meta) != 4 {
+	if len(meta) != 5 {
+		// key_id plus the four pending_revoke_* markers. The fourth,
+		// pending_revoke_key_id, is the predecessor id recorded at the producer
+		// so nothing downstream has to re-derive it from the URL.
 		t.Fatalf("unexpected meta after defer: %+v", meta)
 	}
 
@@ -112,7 +115,7 @@ func TestDeferredRevokeFailureIsNeverSilent(t *testing.T) {
 	})
 
 	meta := map[string]string{"key_id": "old"}
-	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old", revokeAuthBearer)
+	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/old", revokeAuthBearer, "old")
 
 	performPendingRevoke(context.Background(), meta, "resend", testPlaintext("NEW-SECRET-VALUE"))
 
@@ -157,7 +160,7 @@ func TestB2RevokeFailureKeepsPendingMarkers(t *testing.T) {
 	// meta["key_id"] already holds the NEW key id, same as backblaze's Rotate
 	// writes before deferring.
 	meta := map[string]string{"key_id": "0021new"}
-	deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2)
+	deferRevokeOldProviderKey(meta, "DELETE", "0021old", revokeAuthB2, "0021old")
 
 	performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 
@@ -238,7 +241,7 @@ func TestNoProviderRevokesBeforeReturning(t *testing.T) {
 	// Backblaze specifically must have moved to the deferred path: this is the
 	// fix this test exists to lock, named explicitly so a revert reads as a
 	// revert rather than a mysterious new failure.
-	if !strings.Contains(src, `deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2)`) {
+	if !strings.Contains(src, `deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2, keyID)`) {
 		t.Error("backblaze no longer defers its revoke via the b2 scheme; it may have reverted to " +
 			"an inline call")
 	}

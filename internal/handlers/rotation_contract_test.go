@@ -364,7 +364,7 @@ func (p *revokeFailingProvider) Rotate(_ context.Context, _ string, meta map[str
 	// Mint a successor, then register the revoke of the predecessor exactly the
 	// way resend/sendgrid/neon do.
 	meta["key_id"] = "new-" + randomHex(4)
-	deferRevokeOldProviderKey(meta, "DELETE", revokeTargetURL, revokeAuthBearer)
+	deferRevokeOldProviderKey(meta, "DELETE", revokeTargetURL, revokeAuthBearer, "stranded-key")
 	return "ROTATED-" + randomHex(8), nil
 }
 

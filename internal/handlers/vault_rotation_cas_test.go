@@ -119,7 +119,8 @@ func TestSweepStillDetectsARealConflict(t *testing.T) {
 
 	// Someone saves the entry during the pass, moving updated_at.
 	if _, err := h.db.Exec(
-		`UPDATE vault_entries SET updated_at = datetime('now','+1 second') WHERE id = ?`, entryID); err != nil {
+		`UPDATE vault_entries SET updated_at = datetime('now','+1 second'), encrypted_value = ? WHERE id = ?`,
+		[]byte("a-genuinely-different-ciphertext"), entryID); err != nil {
 		t.Fatalf("concurrent save: %v", err)
 	}
 

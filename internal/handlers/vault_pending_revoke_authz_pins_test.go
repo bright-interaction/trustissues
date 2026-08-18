@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
@@ -121,5 +124,68 @@ func TestPendingRevokeTakesTheEntryIDFromTheURLOnly(t *testing.T) {
 	if rec.Code == http.StatusOK {
 		t.Errorf("resolve returned 200 while acknowledging a key id that belongs to a DIFFERENT entry: %v",
 			resolveBody)
+	}
+}
+
+// TestProviderChangeRecordsTheDiscardedPredecessor pins the audit and the
+// reconciliation on the silent discharge path.
+//
+// ResolvePendingRevoke demands the operator type the predecessor key id back
+// and writes an activity row naming it. Changing the provider on a PUT dropped
+// the same markers with neither, and left last_rotation_error still saying
+// "old key not revoked (still live at provider)" after the marker that
+// explained it and the affordance that could act on it were both gone: an
+// alarm nothing in the product could clear or explain.
+func TestProviderChangeRecordsTheDiscardedPredecessor(t *testing.T) {
+	h, queries := newCollectionAuthzEnv(t)
+	owner := mustUser(t, queries, "discard-"+randomHex(6)+"@example.com", "user", "")
+	entryID := "discard-" + randomHex(6)
+	mustEntry(t, h, queries, entryID, owner, "Entry "+entryID, "V")
+	forceProviderConfig(t, h, entryID, "resend",
+		`{"key_id":"k2","pending_revoke_method":"DELETE","pending_revoke_key_id":"key_old_1",`+
+			`"pending_revoke_url":"https://api.resend.com/api-keys/key_old_1","pending_revoke_auth":"bearer"}`)
+	if err := queries.UpdateVaultEntryRotationError(context.Background(), db.UpdateVaultEntryRotationErrorParams{
+		LastRotationError: toNullString("webhook delivery failed: HTTP 500; " + revokeStillLiveMsg),
+		ID:                entryID,
+	}); err != nil {
+		t.Fatalf("seed error: %v", err)
+	}
+
+	rec := putVault(t, h, owner, "user", entryID, map[string]any{
+		"name": "Entry " + entryID, "provider": "sendgrid",
+	})
+	if rec.Code >= 400 {
+		t.Fatalf("ABORT: the provider change was refused (HTTP %d): %s", rec.Code, rec.Body.String())
+	}
+	if got := entryMetaMap(t, h, queries, entryID); got[pendingRevokeURL] != "" {
+		t.Fatalf("ABORT: the provider change did not drop the markers, so this test proves nothing: %+v", got)
+	}
+
+	// The audit trail must name what was abandoned.
+	var found int
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM activity_log WHERE action = 'vault.pending_revoke_discarded'`).
+		Scan(&found); err != nil {
+		t.Fatalf("activity query: %v", err)
+	}
+	if found == 0 {
+		t.Errorf("a provider change discarded a stranded key's only record and wrote no activity row. " +
+			"The resolve endpoint demands a typed acknowledgement for exactly this decision; the silent " +
+			"path must at least leave a trail.")
+	}
+
+	// And the row must not contradict itself afterwards.
+	row, err := queries.GetVaultEntryMeta(context.Background(), entryID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if strings.Contains(row.LastRotationError.String, revokeStillLiveMsg) {
+		t.Errorf("last_rotation_error still says the old key is live (%q) after the marker that "+
+			"explained it was discarded, and nothing in the product can clear it now",
+			row.LastRotationError.String)
+	}
+	if !strings.Contains(row.LastRotationError.String, "webhook delivery failed") {
+		t.Errorf("clearing the revoke half also erased an unrelated delivery failure: %q",
+			row.LastRotationError.String)
 	}
 }

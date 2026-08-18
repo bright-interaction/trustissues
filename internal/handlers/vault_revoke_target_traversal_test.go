@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -79,7 +80,7 @@ func TestDeferredRevokeTargetRefusesATraversingPath(t *testing.T) {
 func TestDeferRevokeRecordsAnErrorRatherThanQueueingATraversingRevoke(t *testing.T) {
 	t.Run("a traversing target queues nothing and says so", func(t *testing.T) {
 		meta := map[string]string{"key_id": "../domains/dom_victim"}
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/../domains/dom_victim", revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/../domains/dom_victim", revokeAuthBearer, "../domains/dom_victim")
 
 		if got, ok := meta[pendingRevokeURL]; ok {
 			t.Errorf("a traversing revoke was queued: %q. It would be issued with the entry's live "+
@@ -96,7 +97,7 @@ func TestDeferRevokeRecordsAnErrorRatherThanQueueingATraversingRevoke(t *testing
 
 	t.Run("positive control: an ordinary target is still queued in full", func(t *testing.T) {
 		meta := map[string]string{"key_id": "key_old_1"}
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key_old_1", revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key_old_1", revokeAuthBearer, "key_old_1")
 
 		if meta[pendingRevokeURL] != "https://api.resend.com/api-keys/key_old_1" {
 			t.Fatalf("a legitimate revoke was not queued: %+v. The refusals above prove nothing if "+
@@ -107,6 +108,72 @@ func TestDeferRevokeRecordsAnErrorRatherThanQueueingATraversingRevoke(t *testing
 		}
 		if meta["last_revoke_error"] != "" {
 			t.Errorf("a legitimate defer recorded an error: %q", meta["last_revoke_error"])
+		}
+	})
+}
+
+// TestPredecessorKeyIDIsRecordedNotReDerived pins the fix for the Twilio
+// acknowledgement break.
+//
+// pendingRevokeStatusFrom used to reverse-engineer the predecessor id out of
+// the marker URL with path.Base. That is guesswork about a string this package
+// built itself, and it was wrong for the one registered provider whose revoke
+// URL does not end in a bare id: Twilio's is ".../Keys/<sid>.json", so the
+// operator was shown "SK....json", ResolvePendingRevoke demanded they type
+// that back, and the SID copied from Twilio's own console was refused with a
+// 400. The producer knows the id exactly, so it records it.
+func TestPredecessorKeyIDIsRecordedNotReDerived(t *testing.T) {
+	const twilioSID = "SK_EXAMPLE_NOT_A_REAL_SID"
+
+	t.Run("twilio: the operator sees the real SID, not <sid>.json", func(t *testing.T) {
+		meta := map[string]string{}
+		deferRevokeOldProviderKey(meta, "DELETE",
+			"https://api.twilio.com/2010-04-01/Accounts/AC123/Keys/"+twilioSID+".json",
+			revokeAuthBasic, twilioSID)
+
+		raw, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		got := pendingRevokeStatusFrom(string(raw))
+		if got == nil || !got.Outstanding {
+			t.Fatalf("no status derived: %+v", got)
+		}
+		if got.PredecessorKeyID != twilioSID {
+			t.Errorf("PredecessorKeyID = %q, want %q. The operator is asked to type this exact "+
+				"string back to acknowledge the stranded key, and the value in Twilio's console "+
+				"is the bare SID.", got.PredecessorKeyID, twilioSID)
+		}
+	})
+
+	t.Run("legacy rows with no recorded id still derive from the URL", func(t *testing.T) {
+		// Rows written before this change carry no pending_revoke_key_id. They
+		// must keep working, or every already-stranded key becomes unresolvable.
+		raw := `{"pending_revoke_url":"https://api.resend.com/api-keys/key_old_1"}`
+		got := pendingRevokeStatusFrom(raw)
+		if got == nil || got.PredecessorKeyID != "key_old_1" {
+			t.Errorf("legacy fallback broke: %+v", got)
+		}
+	})
+
+	t.Run("a confirmed revoke clears the recorded id too", func(t *testing.T) {
+		// A marker set that empties partially is worse than one that does not
+		// empty at all: a leftover pending_revoke_key_id with no URL would read
+		// as a stranded key nothing can revoke.
+		meta := map[string]string{"key_id": "keep-me"}
+		deferRevokeOldProviderKey(meta, "DELETE",
+			"https://api.resend.com/api-keys/key_old_1", revokeAuthBearer, "key_old_1")
+		if meta[pendingRevokeKeyID] != "key_old_1" {
+			t.Fatalf("ABORT: the id was not recorded: %+v", meta)
+		}
+		deletePendingRevokeMarkers(meta)
+		for _, k := range pendingRevokeMarkerKeys {
+			if _, left := meta[k]; left {
+				t.Errorf("%s survived the marker deletion: %+v", k, meta)
+			}
+		}
+		if meta["key_id"] != "keep-me" {
+			t.Errorf("deletion clobbered an unrelated key: %+v", meta)
 		}
 	})
 }

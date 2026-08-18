@@ -1530,7 +1530,6 @@ const rotateVaultEntryValueUnchecked = `-- name: RotateVaultEntryValueUnchecked 
 
 UPDATE vault_entries SET encrypted_value = ?, nonce = ?, encryption_version = 2, last_rotated_at = CURRENT_TIMESTAMP, last_rotation_error = NULL, updated_at = CURRENT_TIMESTAMP
 WHERE id = ?
-  AND CAST(updated_at AS TEXT) = CAST(? AS TEXT)
   AND encrypted_value = ?
 `
 
@@ -1538,7 +1537,6 @@ type RotateVaultEntryValueUncheckedParams struct {
 	EncryptedValue     []byte `json:"encrypted_value"`
 	Nonce              []byte `json:"nonce"`
 	ID                 string `json:"id"`
-	UpdatedAtText      string `json:"updated_at_text"`
 	PrevEncryptedValue []byte `json:"prev_encrypted_value"`
 }
 
@@ -1577,12 +1575,26 @@ type RotateVaultEntryValueUncheckedParams struct {
 // loss matters here: a concurrent name or schedule edit touches other columns and
 // is not lost by this statement. Comparing it makes the guard independent of clock
 // granularity.
+//
+// AND updated_at IS NO LONGER COMPARED, deliberately. It was the ORIGINAL guard;
+// encrypted_value was added because a timestamp cannot see a same-second write,
+// and once it was there the timestamp stopped carrying any safety this statement
+// needs. Keeping both did not make the CAS stricter in a useful direction, it
+// made it lose to writes that are none of its business: EVERY update to this row
+// bumps updated_at, so a concurrent name edit, a schedule edit, or the
+// pending-revoke endpoints persisting provider_meta all made a rotation's value
+// CAS miss -- AFTER that rotation had already minted the replacement credential
+// upstream. The new key is then discarded, it is live at the provider, and its
+// id lived only in the map being thrown away (RotationLogEntry has no field for
+// it), so the failure mode of the extra predicate was an orphaned live key with
+// no record of its identity. The sentence three lines up claimed unrelated edits
+// were already safe; it was describing the intent of encrypted_value while
+// updated_at was still quietly ANDed in.
 func (q *Queries) RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, rotateVaultEntryValueUnchecked,
 		arg.EncryptedValue,
 		arg.Nonce,
 		arg.ID,
-		arg.UpdatedAtText,
 		arg.PrevEncryptedValue,
 	)
 }

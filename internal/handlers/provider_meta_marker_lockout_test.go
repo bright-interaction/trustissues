@@ -93,6 +93,7 @@ func TestAFailedRevokeDoesNotLockTheOwnerOutOfTheirOwnRotationConfig(t *testing.
 		"pending_revoke_url":    "https://api.resend.com/api-keys/old-key-id",
 		"pending_revoke_auth":   revokeAuthBearer,
 		"last_revoke_error":     "revoke old key: HTTP 503",
+		"pending_revoke_key_id": "old-key-id",
 		"key_id":                "new-key-id",
 	}
 	rawStored, err := json.Marshal(stored)

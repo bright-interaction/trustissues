@@ -363,6 +363,15 @@ const (
 	// orphaned key was never a revoke candidate again and a compromised Twilio
 	// credential had no remaining path to be killed.
 	pendingRevokeAuth = "pending_revoke_auth"
+	// pendingRevokeKeyID is the predecessor key's id, RECORDED rather than
+	// re-derived. pendingRevokeStatusFrom used to reverse-engineer the id out
+	// of pendingRevokeURL with path.Base, which is guesswork about a string
+	// this package built itself: Twilio's revoke URL ends "/Keys/<sid>.json",
+	// so the operator was shown "SK....json" and ResolvePendingRevoke demanded
+	// they type that back, while the id in Twilio's own console is "SK...".
+	// Typing the real SID was refused with a 400. The producer knows the id
+	// exactly; nothing downstream should have to infer it.
+	pendingRevokeKeyID = "pending_revoke_key_id"
 )
 
 // The values pendingRevokeAuth may hold. An empty/unrecognised value falls
@@ -448,7 +457,7 @@ func successorScopes(meta map[string]string, metaKey string, fallback, required 
 // only known after an authorize round trip performed with the NEW credentials,
 // so there is nothing fixed to store at defer time. It carries the OLD key id
 // to delete instead; performPendingRevoke's b2 arm does the round trip itself.
-func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authScheme string) {
+func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authScheme, predecessorID string) {
 	// FAIL CLOSED ON A PREDECESSOR ID THIS SERVER CANNOT NAME.
 	//
 	// Every caller builds rawURL by concatenating a provider-specific base with
@@ -487,6 +496,34 @@ func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authSchem
 	meta[pendingRevokeMethod] = method
 	meta[pendingRevokeURL] = rawURL
 	meta[pendingRevokeAuth] = authScheme
+	// Recorded only when it is something we are willing to show and to accept
+	// back as an acknowledgement. Every registered adapter's id passes; an id
+	// that does not is simply absent, and pendingRevokeStatusFrom falls back to
+	// the legacy path.Base derivation rather than showing junk.
+	if conservativeKeyIDPattern.MatchString(predecessorID) {
+		meta[pendingRevokeKeyID] = predecessorID
+	}
+}
+
+// deletePendingRevokeMarkers removes every pending-revoke marker from a
+// provider_meta map.
+//
+// It exists so the set lives in ONE place. Adding pendingRevokeKeyID meant
+// finding three hand-written three-delete blocks, which is precisely the
+// incomplete-migration shape this estate keeps paying for: a fourth marker
+// added later with one site missed leaves a partial marker on the row, and a
+// partial marker is indistinguishable from a real stranded key.
+func deletePendingRevokeMarkers(m map[string]string) {
+	for _, k := range pendingRevokeMarkerKeys {
+		delete(m, k)
+	}
+}
+
+// pendingRevokeMarkerKeys is the transient set a confirmed revoke discards.
+// It is a strict subset of reservedProviderMetaKeys, which also carries
+// last_revoke_error (a warning that outlives the markers).
+var pendingRevokeMarkerKeys = []string{
+	pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth, pendingRevokeKeyID,
 }
 
 // revokeTargetIsNameable reports whether a deferred revoke target is one this
@@ -614,9 +651,7 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 	// then "fixed" backblaze to match the comment, which silently discarded the
 	// coordinates of live keys. See backblazeRevokeOldKey for the full argument.
 	if meta["last_revoke_error"] == "" {
-		delete(meta, pendingRevokeMethod)
-		delete(meta, pendingRevokeURL)
-		delete(meta, pendingRevokeAuth)
+		deletePendingRevokeMarkers(meta)
 	}
 }
 
@@ -998,7 +1033,7 @@ func (p *ResendProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// old (now-deleted) id and every rotation leaves its immediate predecessor live.
 	oldID := meta["key_id"]
 	if oldID != "" && oldID != result.ID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/"+oldID, revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/"+oldID, revokeAuthBearer, oldID)
 	}
 	meta["key_id"] = result.ID
 	return result.Token, nil
@@ -1061,7 +1096,7 @@ func (p *SendGridProvider) Rotate(ctx context.Context, currentKey string, meta m
 	// deleted id and every rotation leaves its predecessor live).
 	oldID := meta["api_key_id"]
 	if oldID != "" && oldID != result.APIKeyID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID, revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.sendgrid.com/v3/api_keys/"+oldID, revokeAuthBearer, oldID)
 	}
 	meta["api_key_id"] = result.APIKeyID
 	return result.APIKey, nil
@@ -1148,7 +1183,8 @@ func (p *TwilioProvider) Rotate(ctx context.Context, currentKey string, meta map
 	// the first rotation.
 	if oldSid != "" && oldSid != result.Sid {
 		deferRevokeOldProviderKey(meta, "DELETE",
-			"https://api.twilio.com/2010-04-01/Accounts/"+accountSid+"/Keys/"+oldSid+".json", revokeAuthBasic)
+			"https://api.twilio.com/2010-04-01/Accounts/"+accountSid+"/Keys/"+oldSid+".json",
+			revokeAuthBasic, oldSid)
 	}
 	return result.Secret, nil
 }
@@ -1303,7 +1339,7 @@ func (p *NeonProvider) Rotate(ctx context.Context, currentKey string, meta map[s
 	}
 	newID := fmt.Sprintf("%d", result.ID)
 	if oldID != "" && oldID != newID {
-		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID, revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://console.neon.tech/api/v2/api_keys/"+oldID, revokeAuthBearer, oldID)
 	}
 	meta["key_id"] = newID
 	return result.Key, nil
@@ -1725,7 +1761,7 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 	// arm does that round trip itself, once the caller says the new value is
 	// durably stored.
 	if result.ApplicationKeyID != "" && keyID != result.ApplicationKeyID {
-		deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2)
+		deferRevokeOldProviderKey(meta, "DELETE", keyID, revokeAuthB2, keyID)
 	}
 	return result.ApplicationKey, nil
 }

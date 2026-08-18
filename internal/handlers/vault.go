@@ -2432,6 +2432,11 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Set when this Save silently discharges a stranded predecessor, i.e. the
+	// operator changed the provider while a pending revoke was outstanding.
+	// Recorded after the commit, because a discard that rolled back is not a
+	// discard. See the block below for why it is not merely cosmetic.
+	discardedPredecessorKey := ""
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
 		// Fetch current values for fields not being updated
 		current, fetchErr := qtx.GetVaultEntryMeta(ctx, id)
@@ -2519,8 +2524,29 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			if req.ProviderMeta != nil {
 				metaSource = *req.ProviderMeta
 			}
+			keepMarkers := provider == current.Provider.String
+			if !keepMarkers && beforeMeta[pendingRevokeURL] != "" {
+				// CHANGING THE PROVIDER DISCARDS A LIVE KEY'S ONLY RECORD.
+				//
+				// That the markers go is deliberate and documented above: they
+				// describe the configuration being abandoned. What was NOT
+				// deliberate is that it happened with no acknowledgement and no
+				// audit row, while ResolvePendingRevoke -- the path built for
+				// exactly this decision -- demands the operator type the key id
+				// back and writes an activity row naming it. The endpoint that
+				// asks permission was the only one that refused; the silent
+				// path worked. Record what was abandoned, so the two surfaces
+				// leave the same trail.
+				if st := pendingRevokeStatusFrom(h.decryptColumnOrLog(
+					current.ProviderMeta.String, "{}", vaultFieldProviderMeta)); st != nil {
+					discardedPredecessorKey = st.PredecessorKeyID
+					if discardedPredecessorKey == "" {
+						discardedPredecessorKey = "(id unavailable)"
+					}
+				}
+			}
 			metaToStore, metaReconciled := reconcileProviderMetaForStorage(
-				metaSource, beforeMeta, provider == current.Provider.String)
+				metaSource, beforeMeta, keepMarkers)
 			// afterMeta is what the egress gate reasons over, so it has to agree
 			// with what is about to be written.
 			afterMeta = ParseProviderMeta(metaToStore)
@@ -2669,6 +2695,30 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	entry := h.vaultMetaFromGetRow(ctx, row, userID)
 
 	LogActivityFromRequest(h.queries, r, "vault.entry_updated", fmt.Sprintf("Vault secret updated: %s (user: %s)", h.sealSecretName(r.Context(), entry.Name), userID))
+	if discardedPredecessorKey != "" {
+		LogActivityFromRequest(h.queries, r, "vault.pending_revoke_discarded",
+			fmt.Sprintf("Provider changed while a revoke was outstanding, so the record of predecessor "+
+				"key %s was discarded without being revoked: %s (user: %s)",
+				discardedPredecessorKey, h.sealSecretName(r.Context(), entry.Name), userID))
+		// And do not leave the row contradicting itself. last_rotation_error is
+		// a SEPARATE column that reconcileProviderMetaForStorage never touches,
+		// so it kept saying "old key not revoked (still live at provider)" long
+		// after the marker that explained it, and the affordance that could act
+		// on it, were both gone. Nothing can revoke that key through this
+		// product any more, so the honest state is the alarm cleared and the
+		// discard on the audit trail.
+		if metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr == nil {
+			if cleared := withoutRevokeStillLive(metaRow.LastRotationError.String); cleared != metaRow.LastRotationError.String {
+				if uErr := h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
+					LastRotationError: toNullString(cleared),
+					ID:                id,
+				}); uErr != nil {
+					logError(r, "vault.update: could not clear the revoke half of last_rotation_error "+
+						"after a provider change discarded the marker", "entry", id, "error", uErr)
+				}
+			}
+		}
+	}
 
 	writeJSON(w, http.StatusOK, entry)
 }

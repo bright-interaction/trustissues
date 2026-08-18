@@ -109,13 +109,21 @@ func snapshotFromRotationRow(id, updatedAtText string, prevCiphertext []byte) ro
 // key has usually already been minted upstream by then, so a silent skip strands
 // a live credential.
 //
-// IMPORTANT for callers: nothing may write to this row between taking the
-// snapshot and calling this. Any UPDATE on vault_entries bumps updated_at, which
-// is the column being compared, so a caller that persists provider_meta first
-// invalidates its own swap. That is not a hypothetical; it is how manual rotate
-// stayed dead for a third round.
+// IMPORTANT for callers: nothing may write THE VALUE of this row between taking
+// the snapshot and calling this.
+//
+// That used to be the much stronger "nothing may write to this row at all",
+// because updated_at was compared too and every UPDATE bumps it -- so a caller
+// that persisted provider_meta first invalidated its own swap, which is how
+// manual rotate stayed dead for a third round. The timestamp is no longer part
+// of the predicate (see the query's comment): it was the original guard,
+// encrypted_value superseded it, and keeping both meant unrelated column writes
+// -- a name edit, a schedule edit, the pending-revoke endpoints persisting
+// provider_meta -- made a rotation lose its CAS after it had already minted the
+// replacement upstream, orphaning a live key whose id existed only in the map
+// then discarded.
 func persistRotatedValue(ctx context.Context, q *db.Queries, snap rotationSnapshot, ciphertext, nonce []byte) (applied bool, err error) {
-	if snap.EntryID == "" || snap.UpdatedAtText == "" || len(snap.PrevCiphertext) == 0 {
+	if snap.EntryID == "" || len(snap.PrevCiphertext) == 0 {
 		// An empty PrevCiphertext would make the ciphertext half of the predicate
 		// match only rows whose value is empty, i.e. nothing, so a missing token
 		// has to be an error rather than a silently-never-applying update.
@@ -125,7 +133,6 @@ func persistRotatedValue(ctx context.Context, q *db.Queries, snap rotationSnapsh
 		EncryptedValue:     ciphertext,
 		Nonce:              nonce,
 		ID:                 snap.EntryID,
-		UpdatedAtText:      snap.UpdatedAtText,
 		PrevEncryptedValue: snap.PrevCiphertext,
 	})
 	if err != nil {

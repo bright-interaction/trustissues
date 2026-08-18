@@ -61,6 +61,7 @@ const retryMock = vi.fn();
 const resolveMock = vi.fn();
 const vaultListMock = vi.fn();
 const vaultUpdateMock = vi.fn();
+const vaultUnlockMock = vi.fn();
 
 vi.mock('@/lib/vault-types', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/vault-types')>();
@@ -74,6 +75,7 @@ vi.mock('@/lib/vault-types', async (importOriginal) => {
       pendingRevokeResolve: (id: string, acknowledgedKeyId: string) => resolveMock(id, acknowledgedKeyId),
       list: () => vaultListMock(),
       update: (id: string, patch: unknown) => vaultUpdateMock(id, patch),
+      unlock: (password: string) => vaultUnlockMock(password),
     },
   };
 });
@@ -160,6 +162,7 @@ beforeEach(() => {
   resolveMock.mockReset();
   vaultListMock.mockReset().mockResolvedValue([]);
   vaultUpdateMock.mockReset();
+  vaultUnlockMock.mockReset();
   toastErrorMock.mockReset();
   toastSuccessMock.mockReset();
   collectionsListMock.mockReset().mockResolvedValue([]);
@@ -437,5 +440,73 @@ describe('a provider save must not invent an all-clear the server did not give',
         screen.queryByText('An older key at this provider is still live.')
       ).not.toBeInTheDocument()
     );
+  });
+});
+
+describe('the stranded-key alarm must survive unlocking', () => {
+  // The chip lived ONLY in the locked table, so the single signal an
+  // on-demand entry has disappeared the moment the operator unlocked, which is
+  // exactly when they are working on their secrets. FRONTEND-CONTRACT.md ties
+  // the requirement to "wherever rotation_status is already shown", and the
+  // unlocked row shows rotation_status.
+  const stranded = () =>
+    entry({
+      username: 'admin',
+      rotation_status: 'fresh',
+      last_rotation_error: '',
+      pending_revoke: { outstanding: true, predecessor_key_id: PREDECESSOR_KEY_ID },
+    });
+
+  async function renderAndUnlock() {
+    const user = userEvent.setup();
+    vaultListMock.mockResolvedValue([stranded()]);
+    vaultUnlockMock.mockResolvedValue([stranded()]);
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <MemoryRouter>
+          <Vault />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await screen.findByText('Stripe secret key');
+    await user.type(await screen.findByPlaceholderText('Enter your password'), 'hunter2');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    // The username column exists only in the unlocked view, so this is the
+    // discriminator that we really left the locked table.
+    await screen.findByText('admin');
+  }
+
+  it('still shows "Predecessor key live" after unlocking', async () => {
+    await renderAndUnlock();
+    expect(screen.getByText('Predecessor key live')).toBeInTheDocument();
+  });
+
+  it('shows it even when rotation_status is Fresh and there is no rotation error', async () => {
+    // The two are independent: an entry can read Fresh and still carry a live
+    // orphaned predecessor. Folding them into one badge would hide exactly the
+    // on-demand entry this feature exists for.
+    await renderAndUnlock();
+    expect(screen.getByText('Fresh')).toBeInTheDocument();
+    expect(screen.queryByText('Rotation failed')).not.toBeInTheDocument();
+    expect(screen.getByText('Predecessor key live')).toBeInTheDocument();
+  });
+
+  it('positive control: an entry with no pending_revoke shows no chip once unlocked', async () => {
+    const user = userEvent.setup();
+    const clean = entry({ username: 'admin', pending_revoke: null });
+    vaultListMock.mockResolvedValue([clean]);
+    vaultUnlockMock.mockResolvedValue([clean]);
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <MemoryRouter>
+          <Vault />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await screen.findByText('Stripe secret key');
+    await user.type(await screen.findByPlaceholderText('Enter your password'), 'hunter2');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    await screen.findByText('admin');
+    expect(screen.queryByText('Predecessor key live')).not.toBeInTheDocument();
   });
 });

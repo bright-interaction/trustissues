@@ -32,7 +32,7 @@ func TestOutstandingRevokeIsRetriedBeforeTheNextMint(t *testing.T) {
 	_ = failing
 
 	meta := map[string]string{"key_id": "key-2"}
-	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key-1", revokeAuthBearer)
+	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key-1", revokeAuthBearer, "key-1")
 	performPendingRevoke(context.Background(), meta, "resend", testPlaintext("re_SECOND"))
 
 	if meta["last_revoke_error"] == "" {
@@ -80,7 +80,7 @@ func TestAFailedRetryKeepsTheCoordinatesAndWarns(t *testing.T) {
 	})
 
 	meta := map[string]string{"key_id": "key-2"}
-	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key-1", revokeAuthBearer)
+	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key-1", revokeAuthBearer, "key-1")
 
 	warn := retryOutstandingRevoke(context.Background(), meta, "the-entry", "resend",
 		testPlaintext("re_SECOND"))
@@ -154,7 +154,7 @@ func TestRevokeTreats404ByWhereTheKeyIdTravels(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		})
 		meta := map[string]string{"key_id": "new"}
-		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/gone", revokeAuthBearer)
+		deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/gone", revokeAuthBearer, "gone")
 		performPendingRevoke(context.Background(), meta, "resend", testPlaintext("re_NEW"))
 
 		if e := meta["last_revoke_error"]; e != "" {
@@ -177,7 +177,7 @@ func TestRevokeTreats404ByWhereTheKeyIdTravels(t *testing.T) {
 			_, _ = w.Write([]byte(`{"authorizationToken":"tok","apiInfo":{"storageApi":{"apiUrl":"https://api.backblazeb2.com"}}}`))
 		})
 		meta := map[string]string{"key_id": "0021new"}
-		deferRevokeOldProviderKey(meta, "DELETE", "0021STILL_LIVE", revokeAuthB2)
+		deferRevokeOldProviderKey(meta, "DELETE", "0021STILL_LIVE", revokeAuthB2, "0021STILL_LIVE")
 		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 
 		if meta["last_revoke_error"] == "" {
@@ -198,7 +198,7 @@ func TestRevokeTreats404ByWhereTheKeyIdTravels(t *testing.T) {
 			_, _ = w.Write([]byte(`{"authorizationToken":"tok","apiInfo":{"storageApi":{"apiUrl":"https://api.backblazeb2.com"}}}`))
 		})
 		meta := map[string]string{"key_id": "0021new"}
-		deferRevokeOldProviderKey(meta, "DELETE", "0021gone", revokeAuthB2)
+		deferRevokeOldProviderKey(meta, "DELETE", "0021gone", revokeAuthB2, "0021gone")
 		performPendingRevoke(context.Background(), meta, "backblaze", testPlaintext("K0newSecret"))
 
 		if e := meta["last_revoke_error"]; e != "" {
