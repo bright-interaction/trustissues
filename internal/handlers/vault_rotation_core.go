@@ -200,14 +200,62 @@ func persistProviderMetaAfterRevoke(ctx context.Context, deps rotationDeps, entr
 			"entry", entryName, "error", rErr)
 		return rErr
 	}
+	// THE PROVIDER MOVED UNDER US: WRITE NOTHING.
+	//
+	// providerMeta describes the provider this pass started against. A
+	// concurrent PUT can change the entry's provider during the mint-then-write
+	// window -- which is a real window, it spans a network round trip to the
+	// upstream -- and reconcileProviderMetaForStorage deliberately strips the
+	// pending-revoke markers when that happens. Writing this map back then
+	// resurrects markers naming a predecessor at a provider the entry no longer
+	// targets, and pendingRevokeStatusFrom never cross-checks the provider
+	// column, so they read back as a live stranded key and falsify the
+	// vault.pending_revoke_discarded activity row the provider change wrote.
+	// Nothing here is salvageable once the configuration it describes is gone.
+	if row.Provider.String != provider {
+		slog.Warn("vault rotation: the entry's provider changed during this rotation, so the "+
+			"provider_meta write-back was skipped rather than restoring the previous provider's state",
+			"entry", entryName, "rotated_as", provider, "now", row.Provider.String)
+		return nil
+	}
+
 	beforeRaw := deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	beforeMeta = ParseProviderMeta(beforeRaw)
 
+	// MERGE ONTO WHAT IS STORED NOW; DO NOT REPLACE IT.
+	//
+	// providerMeta is a PASS-START snapshot that this rotation has been mutating
+	// in memory, and the value CAS upstream guards only encrypted_value -- by
+	// design, because comparing updated_at made unrelated writes fail a rotation
+	// that had already minted. So a metadata-only edit by the operator neither
+	// blocks this write nor appears in this map, and treating the map as the
+	// target state deletes it: measured, an operator key added mid-rotation
+	// vanished and the rotation still reported success.
+	//
+	// A rotation only ever ADDS or UPDATES ordinary keys (key_id and its
+	// per-provider twins) and CLEARS its own server-owned ones. So take the
+	// stored row as the base, let this pass's values win where it has an
+	// opinion, and honour a deletion only for the reserved keys it owns.
+	// Anything the operator wrote that this pass never knew about survives.
+	next := make(map[string]string, len(beforeMeta)+len(providerMeta))
+	for k, v := range beforeMeta {
+		next[k] = v
+	}
+	for k, v := range providerMeta {
+		next[k] = v
+	}
+	for _, k := range reservedProviderMetaKeys {
+		if _, stillSet := providerMeta[k]; !stillSet {
+			delete(next, k)
+		}
+	}
+
+	// Decided on what is actually about to be written, not on the pass-start map.
 	tk, tkErr := egressgate.Decide(egressgate.Request{
 		EntryID: entryID,
 		What:    egressFieldProviderMeta,
 		Before:  providerDestinations(provider, beforeMeta),
-		After:   providerDestinations(provider, providerMeta),
+		After:   providerDestinations(provider, next),
 		Covers:  providerDestinationCovers,
 	})
 	if tkErr != nil {
@@ -232,7 +280,7 @@ func persistProviderMetaAfterRevoke(ctx context.Context, deps rotationDeps, entr
 	// same pass -- still on the plain marshal. Whoever adds a fourth writer:
 	// take the values from the stored bytes and only the KEY changes from your
 	// map, the way this does.
-	metaJSON, mErr := providerMetaBytesPreservingTypes(beforeRaw, beforeMeta, providerMeta)
+	metaJSON, mErr := providerMetaBytesPreservingTypes(beforeRaw, beforeMeta, next)
 	if mErr != nil {
 		slog.Error("vault rotation: marshal provider_meta failed", "entry", entryName, "error", mErr)
 		return mErr
