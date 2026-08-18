@@ -680,7 +680,7 @@ func reconcileProviderMetaForStorage(raw string, stored map[string]string, keep 
 //
 // Decoding to json.RawMessage, the way reconcileProviderMetaForStorage's own
 // doc comment already argues for on the write side, keeps every OTHER value
-// byte-exact while still letting the four reserved keys be deleted, which is
+// byte-exact while still letting the reserved keys be deleted, which is
 // all a redaction ever needed to do.
 func redactReservedProviderMetaKeys(raw string) string {
 	if raw == "" || raw == "{}" {
@@ -778,9 +778,9 @@ type pendingRevokeStatus struct {
 //   - a real request URL (every scheme except b2): parsed with net/url, and
 //     if it has a host, reduced to path.Base(u.Path) ONLY. Query and fragment
 //     are dropped, and the host itself is never returned; a client learns
-//     which key, never where it lives. A Base that is pure punctuation ("."
-//     for an empty path, "/" for a bare root) is not a key id and is withheld
-//     like the b2 charset failure below.
+//     which key, never where it lives. A Base that names nothing (".", ".."
+//     or "/") is not a key id and is withheld, like the b2 charset failure
+//     below.
 //   - the b2 scheme, where pending_revoke_url holds the bare OLD key id
 //     rather than a URL at all (see deferRevokeOldProviderKey's doc,
 //     vault_providers.go:449-452): returned as-is only when it matches
@@ -811,15 +811,18 @@ func pendingRevokeStatusFrom(raw string) *pendingRevokeStatus {
 		// unrepresentable case the contract already defines (outstanding stays
 		// true, the id is withheld, and the UI offers retry but not resolve)
 		// rather than inventing an id out of punctuation.
-		// POSITIVE TEST, not a hand-listed set of punctuation. The first version
-		// of this filtered out ".", "/" and "" -- three of the four things
-		// path.Base can hand back that are not key ids. It missed "..", which
-		// path.Base returns for a path ending in a dot-dot segment, so a
-		// stranded-key alarm could still name ".." as the predecessor and
-		// ResolvePendingRevoke would demand the operator type it back.
-		// Enumerating what to reject loses to enumerating what to accept: this
-		// is the same charset the b2 arm below already requires, so both arms
-		// now agree and any future path.Base surprise is closed by default.
+		// A REJECT-LIST of path.Base's non-name outputs, and deliberately NOT
+		// the charset check the b2 arm below uses. An earlier revision of this
+		// comment claimed the opposite ("positive test... the same charset the
+		// b2 arm requires") because that IS what the first version did -- and
+		// it was wrong twice over: the charset excludes "." so it read as a
+		// fix, while it also excludes Twilio's legitimate "<sid>.json", which
+		// withheld a real id and made ResolvePendingRevoke unusable for that
+		// provider. Legitimate predecessor ids are provider-shaped, not
+		// uniform, so only the values that name NOTHING can be enumerated
+		// safely here. This path is now the legacy fallback anyway: rows
+		// written after deferRevokeOldProviderKey started recording the id
+		// never reach it.
 		if seg := path.Base(u.Path); !isNonNamePathBase(seg) {
 			return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: seg}
 		}

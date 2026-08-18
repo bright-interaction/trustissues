@@ -55,7 +55,7 @@ type rotationDeps struct {
 //
 // Preserving them on a failed revoke is only useful if something later acts on
 // them, and the only thing that reads them is performPendingRevoke, which runs
-// AFTER the mint. deferRevokeOldProviderKey overwrites all three unconditionally
+// AFTER the mint. deferRevokeOldProviderKey overwrites the marker set (four keys now, and pending_revoke_key_id is deleted rather than skipped when it cannot be recorded, so no stale half survives a re-defer)
 // during that mint, so a stranded key's coordinates were destroyed one rotation
 // later without ever being retried: the exact outcome the deferral exists to
 // prevent, delayed by a cycle rather than avoided.

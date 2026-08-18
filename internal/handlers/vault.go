@@ -2437,6 +2437,10 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Recorded after the commit, because a discard that rolled back is not a
 	// discard. See the block below for why it is not merely cosmetic.
 	discardedPredecessorKey := ""
+	// The last_rotation_error this decision was made from, so the clear below
+	// can refuse to act on a newer alarm. Same discipline as the two clearers
+	// in vault_pending_revoke.go.
+	discardedFromRotationError := ""
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
 		// Fetch current values for fields not being updated
 		current, fetchErr := qtx.GetVaultEntryMeta(ctx, id)
@@ -2537,6 +2541,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				// asks permission was the only one that refused; the silent
 				// path worked. Record what was abandoned, so the two surfaces
 				// leave the same trail.
+				discardedFromRotationError = current.LastRotationError.String
 				if st := pendingRevokeStatusFrom(h.decryptColumnOrLog(
 					current.ProviderMeta.String, "{}", vaultFieldProviderMeta)); st != nil {
 					discardedPredecessorKey = st.PredecessorKeyID
@@ -2707,7 +2712,21 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// on it, were both gone. Nothing can revoke that key through this
 		// product any more, so the honest state is the alarm cleared and the
 		// discard on the audit trail.
-		if metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr == nil {
+		//
+		// RE-READ AND COMPARE, the same discipline the other two clearers
+		// follow. This runs AFTER tx.Commit, so a rotation can land in the
+		// window between the decision and this write; clearing whatever is
+		// there would erase an alarm about a key THIS path knows nothing
+		// about, and for a manual rotation nothing re-records it.
+		switch metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); {
+		case mErr != nil:
+			logError(r, "vault.update: could not re-read last_rotation_error after a provider change "+
+				"discarded the marker, so the row may still claim the old key is live", "entry", id, "error", mErr)
+		case metaRow.LastRotationError.String != discardedFromRotationError:
+			logError(r, "vault.update: last_rotation_error changed while the provider change was "+
+				"committing (very likely a concurrent rotation recorded a failure); leaving it as found "+
+				"rather than clearing a newer alarm", "entry", id)
+		default:
 			if cleared := withoutRevokeStillLive(metaRow.LastRotationError.String); cleared != metaRow.LastRotationError.String {
 				if uErr := h.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
 					LastRotationError: toNullString(cleared),

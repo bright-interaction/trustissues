@@ -502,6 +502,19 @@ func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authSchem
 	// the legacy path.Base derivation rather than showing junk.
 	if conservativeKeyIDPattern.MatchString(predecessorID) {
 		meta[pendingRevokeKeyID] = predecessorID
+	} else {
+		// DELETE, do not merely skip. This is the one marker written
+		// conditionally, and the map handed in is frequently a SURVIVING
+		// marker set: a failed revoke leaves all four in place, and the next
+		// rotation defers over them. Skipping the write then advances
+		// url/method/auth to the new predecessor while pending_revoke_key_id
+		// still names the previous one, and every reader trusts the recorded
+		// id first -- so the chip and the resolve dialog name K1 while Retry
+		// fires a DELETE at K2, and typing K1 to acknowledge discards K2's
+		// only coordinates and writes an activity row naming the wrong key.
+		// An id that cannot be recorded must leave no id at all, which drops
+		// this row back to the legacy URL derivation.
+		delete(meta, pendingRevokeKeyID)
 	}
 }
 

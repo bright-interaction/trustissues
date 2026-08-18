@@ -177,3 +177,60 @@ func TestPredecessorKeyIDIsRecordedNotReDerived(t *testing.T) {
 		}
 	})
 }
+
+// TestARedeferNeverLeavesAStaleRecordedKeyID pins the one marker that is
+// written conditionally.
+//
+// deferRevokeOldProviderKey is routinely handed a map that ALREADY carries a
+// full marker set: a failed revoke leaves all four in place and the next
+// rotation defers over them. pending_revoke_key_id is recorded only when the id
+// is charset-clean, so merely skipping the write on a dirty id advances
+// url/method/auth to the new predecessor while the recorded id still names the
+// previous one. Every reader trusts the recorded id first, so the chip and the
+// resolve dialog would name K1 while Retry fires a DELETE at K2, and an
+// operator typing K1 to acknowledge would discard K2's only coordinates and log
+// the wrong key.
+func TestARedeferNeverLeavesAStaleRecordedKeyID(t *testing.T) {
+	// Rotation N: a clean id, revoke fails, so the whole set survives.
+	meta := map[string]string{"key_id": "key.2"}
+	deferRevokeOldProviderKey(meta, "DELETE",
+		"https://api.resend.com/api-keys/K1", revokeAuthBearer, "K1")
+	if meta[pendingRevokeKeyID] != "K1" {
+		t.Fatalf("ABORT: the clean id was not recorded: %+v", meta)
+	}
+
+	// Rotation N+1 defers over the survivors with an id the charset refuses
+	// (a dot: legal in the URL by design, for Twilio, but not recordable).
+	deferRevokeOldProviderKey(meta, "DELETE",
+		"https://api.resend.com/api-keys/key.2", revokeAuthBearer, "key.2")
+
+	if got := meta[pendingRevokeKeyID]; got == "K1" {
+		t.Errorf("the recorded predecessor id is STALE (%q) while the coordinates advanced to %q. "+
+			"The operator is shown %q, Retry fires at the other key, and acknowledging %q discards "+
+			"the live key's only coordinates.", got, meta[pendingRevokeURL], got, got)
+	} else if got != "" {
+		t.Errorf("pending_revoke_key_id = %q, want it absent so the reader falls back to the URL", got)
+	}
+
+	// The fallback must then name the CURRENT predecessor, not the old one.
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	st := pendingRevokeStatusFrom(string(raw))
+	if st == nil || !st.Outstanding {
+		t.Fatalf("no status derived after the re-defer: %+v", st)
+	}
+	if st.PredecessorKeyID == "K1" {
+		t.Errorf("the derived status still names the PREVIOUS predecessor %q", st.PredecessorKeyID)
+	}
+
+	t.Run("positive control: a clean re-defer still records the new id", func(t *testing.T) {
+		m := map[string]string{}
+		deferRevokeOldProviderKey(m, "DELETE", "https://api.resend.com/api-keys/K1", revokeAuthBearer, "K1")
+		deferRevokeOldProviderKey(m, "DELETE", "https://api.resend.com/api-keys/K2", revokeAuthBearer, "K2")
+		if m[pendingRevokeKeyID] != "K2" {
+			t.Errorf("a clean re-defer did not advance the recorded id: %+v", m)
+		}
+	})
+}
