@@ -2696,10 +2696,19 @@ export default function Vault() {
                           // happened. Clear it locally too: otherwise the banner
                           // this whole feature adds would survive its own cure,
                           // pointing at a provider the entry no longer targets.
+                          // NOT hardcoded null. The comment above used to argue
+                          // that "the response to a provider save is not a full
+                          // VaultEntry, so nothing here tells us that happened".
+                          // That premise was false: Update returns the same
+                          // vaultEntryMeta every other entry-returning endpoint
+                          // does, pending_revoke included and never omitted. So
+                          // a save that leaves the provider UNCHANGED, which the
+                          // server treats as "keep the markers", was reported to
+                          // this state as all-clear, and a close-then-reopen of
+                          // the panel showed no alarm for a key still live at the
+                          // provider. Take the server's answer instead of guessing.
                           setVaultEntries((prev) =>
-                            prev.map((e) =>
-                              e.id === entry.id ? { ...e, ...patch, pending_revoke: null } : e
-                            )
+                            prev.map((e) => (e.id === entry.id ? { ...e, ...patch } : e))
                           );
                         }}
                         onPendingRevokeChanged={(patch) => {

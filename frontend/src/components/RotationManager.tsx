@@ -111,7 +111,15 @@ export default function RotationManager({
   onScheduleSaved?: (patch: { rotation_interval_days: number | null; auto_rotate: boolean }) => void;
   // Same reason as onScheduleSaved: patches the caller's in-memory entry after
   // a provider save so the badge and this panel agree without a full reload.
-  onProviderSaved?: (patch: { provider: string; provider_meta: string }) => void;
+  onProviderSaved?: (patch: {
+    provider: string;
+    provider_meta: string;
+    // The SERVER's answer for this exact save, not a guess. Update returns
+    // a full vaultEntryMeta and pending_revoke is always present on it (no
+    // omitempty, deliberately, so a client can tell "checked, nothing
+    // outstanding" from "this response does not carry the fact").
+    pending_revoke: VaultEntry['pending_revoke'];
+  }) => void;
   // Same reason again: retry/resolve below run entirely inside this panel, so
   // without this callback a close-then-reopen re-seeds pendingRevoke from the
   // parent's now-stale `entry.pending_revoke` and the banner comes back after
@@ -236,9 +244,17 @@ export default function RotationManager({
       }),
     onSuccess: (updated) => {
       toast.success(providerName ? `Rotation provider set to ${selectedProvider?.label ?? providerName}` : 'Rotation provider cleared');
+      // Forward what the server ACTUALLY said rather than assuming a save
+      // clears the markers. It drops them only when the PROVIDER CHANGED
+      // (reconcileProviderMetaForStorage's `keep` is literally
+      // provider == current.Provider) and preserves them otherwise, so an
+      // unchanged-provider save used to be reported to the parent as
+      // all-clear for a key still live at the provider.
+      applyPendingRevoke(updated.pending_revoke ?? null);
       onProviderSaved?.({
         provider: updated.provider ?? providerName,
         provider_meta: updated.provider_meta ?? JSON.stringify(providerMeta),
+        pending_revoke: updated.pending_revoke ?? null,
       });
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
     },

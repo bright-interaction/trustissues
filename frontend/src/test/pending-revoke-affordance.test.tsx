@@ -60,6 +60,7 @@ const getTargetsMock = vi.fn();
 const retryMock = vi.fn();
 const resolveMock = vi.fn();
 const vaultListMock = vi.fn();
+const vaultUpdateMock = vi.fn();
 
 vi.mock('@/lib/vault-types', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/vault-types')>();
@@ -72,6 +73,7 @@ vi.mock('@/lib/vault-types', async (importOriginal) => {
       pendingRevokeRetry: (id: string, password: string) => retryMock(id, password),
       pendingRevokeResolve: (id: string, acknowledgedKeyId: string) => resolveMock(id, acknowledgedKeyId),
       list: () => vaultListMock(),
+      update: (id: string, patch: unknown) => vaultUpdateMock(id, patch),
     },
   };
 });
@@ -157,6 +159,7 @@ beforeEach(() => {
   retryMock.mockReset();
   resolveMock.mockReset();
   vaultListMock.mockReset().mockResolvedValue([]);
+  vaultUpdateMock.mockReset();
   toastErrorMock.mockReset();
   toastSuccessMock.mockReset();
   collectionsListMock.mockReset().mockResolvedValue([]);
@@ -361,5 +364,78 @@ describe('a predecessor id the backend could not characterize', () => {
     expect(
       screen.getByRole('button', { name: 'I deleted it myself' })
     ).toBeInTheDocument();
+  });
+});
+
+describe('a provider save must not invent an all-clear the server did not give', () => {
+  it('forwards the server\'s pending_revoke instead of hardcoding null', async () => {
+    // The server drops the stranded-key markers ONLY when the provider
+    // actually changed (reconcileProviderMetaForStorage's `keep` is literally
+    // provider == current.Provider). On an unchanged-provider save it keeps
+    // them, and says so: Update returns a full entry with pending_revoke
+    // always present. The client used to overwrite that with a hardcoded
+    // null, on the stated but false premise that "the response to a provider
+    // save is not a full VaultEntry" -- so the alarm for a key still live at
+    // the provider read as resolved.
+    const user = userEvent.setup();
+    const stillOutstanding = { outstanding: true, predecessor_key_id: PREDECESSOR_KEY_ID };
+    vaultUpdateMock.mockResolvedValue({
+      ...entry(),
+      provider: 'stripe',
+      provider_meta: '{}',
+      pending_revoke: stillOutstanding,
+    });
+
+    const saved: unknown[] = [];
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <RotationManager entry={entry()} onProviderSaved={(patch) => saved.push(patch)} />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText('An older key at this provider is still live.');
+    await user.click(await screen.findByRole('button', { name: 'Save provider' }));
+
+    await waitFor(() => expect(vaultUpdateMock).toHaveBeenCalled());
+    await waitFor(() => expect(saved).toHaveLength(1));
+
+    expect(saved[0]).toMatchObject({ pending_revoke: stillOutstanding });
+
+    // And the panel itself must still show the alarm.
+    expect(
+      screen.getByText('An older key at this provider is still live.')
+    ).toBeInTheDocument();
+  });
+
+  it('positive control: when the server DOES clear it, the banner goes', async () => {
+    // Without this the test above passes against a component that simply never
+    // updates pending_revoke on save.
+    const user = userEvent.setup();
+    vaultUpdateMock.mockResolvedValue({
+      ...entry(),
+      provider: 'sendgrid',
+      provider_meta: '{}',
+      pending_revoke: null,
+    });
+
+    const saved: unknown[] = [];
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <RotationManager entry={entry()} onProviderSaved={(patch) => saved.push(patch)} />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText('An older key at this provider is still live.');
+    await user.click(await screen.findByRole('button', { name: 'Save provider' }));
+
+    await waitFor(() => expect(saved).toHaveLength(1));
+    expect(saved[0]).toMatchObject({ pending_revoke: null });
+    await waitFor(() =>
+      expect(
+        screen.queryByText('An older key at this provider is still live.')
+      ).not.toBeInTheDocument()
+    );
   });
 });
