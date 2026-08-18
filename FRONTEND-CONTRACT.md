@@ -175,11 +175,21 @@ that change. The practical consequence: Twilio entries used to report
 `<sid>.json` and now report the bare `SK...` sid that the Twilio console shows,
 so an operator copying the id from the provider is no longer refused.
 
-`outstanding: true` with an empty `predecessor_key_id` can also mean the entry
-carries a partial marker set, where the recorded id survived but the retry
-coordinates did not. Retry answers `409 no_pending_revoke` for that shape;
-resolve still works, because it matches on the id rather than the URL. So when
-the server reports outstanding and retry 409s, offer resolve, not retry.
+There is one further shape, and note it is the opposite of the empty-id case
+above: `outstanding: true` with a POPULATED `predecessor_key_id` on an entry
+whose retry coordinates are gone. Retry answers `409 no_pending_revoke` for it,
+because retry needs the URL; resolve still works, because it matches on the id.
+So when the server reports outstanding and retry 409s, offer resolve, not retry.
+
+(An earlier revision of this paragraph said "empty `predecessor_key_id`", which
+was backwards and would have sent an implementer to wire resolve onto the
+empty-id case, where the server hard-400s every click. The server reports this
+shape only when the id passes its charset check, which an empty string does
+not. No known writer can currently produce the shape at all: the only writer of
+the recorded id sets the URL three lines earlier, and the markers are deleted
+as a group. The reader handles it defensively so a future writer, or a
+hand-repaired row, cannot create a stranded key the product can neither see nor
+clear.)
 
 This field is a **derived read-only fact**, computed fresh from the encrypted
 markers on every response. It is never accepted on `PUT /api/vault/{id}` (same
