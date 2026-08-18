@@ -118,6 +118,12 @@ var storageSideWrites = []storageSideWrite{
 		"the entry's CURRENT stored provider_meta, re-sent because the statement writes provider, " +
 			"provider_meta and auto_rotate together and only auto_rotate is changing here"},
 
+	{"vault_pending_revoke.go", "clearRevokeHalfOfRotationError", "db.CASVaultEntryRotationErrorParams", "ProviderMeta",
+		"NOT a write: provider_meta is the compare-and-swap PRE-IMAGE in this query's WHERE clause " +
+			"(provider_meta IS ?), and the only SET target is last_rotation_error. It is the already-sealed " +
+			"ciphertext read straight off GetVaultEntryMeta and used as an optimistic-lock token, exactly " +
+			"like casToken in casEditProviderMeta; re-sealing it would change the bytes and make every CAS miss"},
+
 	{"vault_ownership_repair.go", "reindexAfterCustodianChange", "db.UpdateVaultEntryMetaAtRestParams", "Name",
 		"custodian transfer: the ciphertext is carried across untouched and only name_bidx is " +
 			"recomputed, because the index is keyed by the custodian and the ciphertext is not"},

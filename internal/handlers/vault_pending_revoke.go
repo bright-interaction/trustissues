@@ -219,7 +219,8 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 				"flight (very likely a concurrent rotation recorded a failure); leaving it as found rather "+
 				"than clearing a newer alarm this retry knows nothing about", "entry", id)
 		default:
-			h.clearRevokeHalfOfRotationError(ctx, r, id, meta.LastRotationError.String)
+			h.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.retry", id,
+				fresh.LastRotationError.String, fresh.ProviderMeta)
 		}
 	}
 
@@ -340,7 +341,8 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		logError(r, "vault.pending_revoke.resolve: last_rotation_error changed while resolving; leaving "+
 			"it as found rather than clearing a newer alarm", "entry", id)
 	} else {
-		h.clearRevokeHalfOfRotationError(ctx, r, id, lastRotationError)
+		h.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.resolve", id,
+			freshRow.LastRotationError.String, freshRow.ProviderMeta)
 	}
 
 	userID := middleware.GetUserID(r.Context())
@@ -524,24 +526,34 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 // failure (a delivery error, say) in place.
 //
 // All three callers (the retry and resolve endpoints, and the provider-change
-// discard in Update) re-read and compare the column BEFORE calling this. That
-// early check lives at the call sites on purpose: the value each one compares
-// against is the value it made its own decision from, and each wants to log its
-// own reason when it declines. But a re-read is a fast path and a diagnostic,
-// NOT the atomic guarantee -- it cannot close the window between itself and the
-// write below. The write does, by compare-and-swapping on `current`.
+// discard in Update) re-read the row BEFORE calling this and pass the two values
+// they read: `current` (the last_rotation_error text) and `providerMeta` (the
+// provider_meta ciphertext, straight off the same GetVaultEntryMeta row). The
+// callers also compare `current` themselves and log their own reason when they
+// decline -- but a call-site re-read is a fast path and a diagnostic, NOT the
+// atomic guarantee. This is: it compare-and-swaps on BOTH values.
 //
-// CAS, not an unconditional UPDATE. Between the caller's re-read and this write
-// a rotation can record a failure into last_rotation_error (recordRotationFailure
-// writes this column without touching provider_meta, so no provider_meta CAS
-// covers it). An unconditional write would erase that newer alarm about a key
-// this path knows nothing about -- durably, because a manual rotation does not
-// re-run to re-record it, so the entry would report clean while the key is live
-// upstream. On a miss we LEAVE IT: the stored value is newer and truer than the
-// clear we derived, and re-deriving on top of it is exactly that erasure. Not
-// retried, for the same reason (see the query doc; contrast appendRotationLog,
-// whose retry is safe only because an append is additive).
-func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, entryID, current string) {
+// Why both. An unconditional write here erases a rotation-failure alarm that a
+// concurrent recordRotation* recorded between the caller's re-read and this
+// write -- durably, because a manual rotation does not re-run to re-record it,
+// so the entry would report clean while a key is live upstream. Comparing
+// last_rotation_error catches a concurrent recordRotationFailure (it writes a
+// distinct rotFail string). But the revoke alarm is the bare static const
+// revokeStillLiveMsg, byte-identical for two different keys, so a concurrent
+// recordRotationOutcome that re-arms it about a DIFFERENT still-live key would
+// slip a text-only compare (an ABA). provider_meta is the discriminator: the
+// alarm always travels with the pending-revoke markers, and provider_meta is
+// re-sealed with a fresh nonce on every write, so any marker change moves its
+// ciphertext and fails the CAS. See the query doc.
+//
+// On a miss we LEAVE IT: the stored state is newer and truer, and re-deriving
+// the clear on top of it is exactly the erasure the compare prevents. Leaving a
+// stale revoke alarm is the safe direction. Not retried (contrast
+// appendRotationLog, whose retry is safe only because an append is additive).
+//
+// `site` tags the log lines with the calling path so a persist failure or a lost
+// race is attributable to the retry, resolve or provider-change-discard site.
+func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString) {
 	cleared := withoutRevokeStillLive(current)
 	if cleared == current {
 		return
@@ -550,14 +562,15 @@ func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *ht
 		LastRotationError:   toNullString(cleared),
 		ID:                  entryID,
 		LastRotationError_2: toNullString(current),
+		ProviderMeta:        providerMeta,
 	})
 	if uErr != nil {
-		logError(r, "vault.pending_revoke: persist last_rotation_error failed", "entry", entryID, "error", uErr)
+		logError(r, site+": persist last_rotation_error failed", "entry", entryID, "error", uErr)
 		return
 	}
 	if n, rErr := res.RowsAffected(); rErr == nil && n == 0 {
-		logError(r, "vault.pending_revoke: last_rotation_error changed between the re-read and the clear "+
-			"(very likely a concurrent rotation recorded a failure); left the newer alarm in place",
-			"entry", entryID)
+		logError(r, site+": last_rotation_error or provider_meta changed between the re-read and the clear "+
+			"(very likely a concurrent rotation re-armed the alarm or a marker); left it in place as the "+
+			"newer, truer state", "entry", entryID)
 	}
 }

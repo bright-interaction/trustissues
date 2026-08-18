@@ -307,13 +307,25 @@ UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
 -- Compare-and-swap sibling of UpdateVaultEntryRotationError, for the CLEARERS
 -- ONLY: the pending-revoke retry/resolve endpoints and the provider-change
 -- discard. Each strips just the revoke half of last_rotation_error and writes
--- the remainder back, and each re-reads the column first -- but a re-read is not
+-- the remainder back, and each re-reads the row first -- but a re-read is not
 -- atomic with the write, so a rotation that records a failure in that window
--- (recordRotationFailure writes this column WITHOUT touching provider_meta, so
--- no provider_meta CAS covers it) would be clobbered by an unconditional UPDATE.
--- Worse durably: a MANUAL rotation does not re-run to re-record the alarm, so
--- the entry then reports clean while a key is live upstream. The compare closes
--- that residual window.
+-- would be clobbered by an unconditional UPDATE. Worse durably: a MANUAL
+-- rotation does not re-run to re-record the alarm, so the entry then reports
+-- clean while a key is live upstream. This CAS closes that window.
+--
+-- TWO predicates, because the revoke alarm is not unique per key. It is the
+-- bare static const revokeStillLiveMsg (no key id in it, on purpose -- it must
+-- not leak one into an operator-visible field), so two "old key not revoked"
+-- alarms about two DIFFERENT predecessor keys are byte-identical. A value
+-- compare on last_rotation_error ALONE therefore cannot tell "nobody wrote"
+-- from "a rotation re-armed the same sentence about a different, still-live
+-- key" (an ABA). The revoke alarm always travels with the pending-revoke
+-- markers in provider_meta, and provider_meta is re-sealed with a FRESH NONCE on
+-- every write (see CASProviderMeta), so its ciphertext is a per-write-unique
+-- witness: comparing it too means any concurrent marker change fails the CAS
+-- even when the alarm text collides. recordRotationFailure, which writes a
+-- distinct rotFail string WITHOUT touching provider_meta, is caught by the text
+-- predicate instead. Between them the two predicates admit no ABA.
 --
 -- The three OUTCOME recorders (recordRotationOutcome, recordRotationOutcome-
 -- Undeliverable, recordRotationFailure) deliberately do NOT use this: each
@@ -323,14 +335,13 @@ UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
 --
 -- A lost CAS here is NOT retried (unlike appendRotationLog, whose retry is safe
 -- only because an append is additive): on a miss the stored value is a newer,
--- truer alarm about a different attempt, and re-deriving the clear on top of it
--- is exactly the erasure the compare exists to prevent. The caller leaves it.
---
--- Comparing the column (via COALESCE so NULL and the empty string are one
--- value) rather than updated_at is deliberate, same as CASVaultEntryRotationLog:
--- updated_at is bumped by every neighbouring write and would spuriously fail.
+-- truer alarm, and re-deriving the clear on top of it is exactly the erasure the
+-- compare exists to prevent. Leaving a stale revoke alarm is the safe direction
+-- (an operator over-warned, not a live key reported clean), so the caller leaves
+-- it. `provider_meta IS ?` not `= ?`: provider_meta is NULL for an entry that
+-- never had one, and NULL = NULL is NULL in SQL, same as CASProviderMeta.
 UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND COALESCE(last_rotation_error, '') = ?;
+WHERE id = ? AND COALESCE(last_rotation_error, '') = ? AND provider_meta IS ?;
 
 -- name: GetVaultEntryRotationLog :one
 SELECT COALESCE(rotation_log, '') FROM vault_entries WHERE id = ?;

@@ -2729,11 +2729,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		default:
 			// The same CAS'd clear the retry/resolve endpoints use. The re-read
 			// above is a fast path and a diagnostic; clearRevokeHalfOfRotationError
-			// compares the column again inside the UPDATE, so an alarm that lands
-			// between this re-read and the write is preserved, not erased. This is
-			// the third and last clearer, so the unconditional writer now has no
-			// caller outside the three outcome recorders.
-			h.clearRevokeHalfOfRotationError(ctx, r, id, metaRow.LastRotationError.String)
+			// compares both last_rotation_error AND provider_meta again inside the
+			// UPDATE, so an alarm (or a re-armed marker) that lands between this
+			// re-read and the write is preserved, not erased. This is the third and
+			// last clearer, so the unconditional writer now has no caller outside
+			// the three outcome recorders.
+			h.clearRevokeHalfOfRotationError(ctx, r, "vault.update.provider_change_discard", id,
+				metaRow.LastRotationError.String, metaRow.ProviderMeta)
 		}
 	}
 
