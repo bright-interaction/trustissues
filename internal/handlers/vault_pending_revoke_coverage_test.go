@@ -376,6 +376,22 @@ func TestZZPendingRevokeStatusFromRedacts(t *testing.T) {
 		mustNotHave []string
 	}{
 		{name: "no marker at all", raw: `{"key_id":"k2"}`, wantNil: true},
+		{
+			// A PARTIAL SET. Every "is there a pending revoke" decision used to
+			// key on the URL alone, so this shape showed no chip, answered
+			// no_pending_revoke on retry and 400'd on resolve: invisible to the
+			// product and impossible to clear, while reconcileProviderMetaForStorage
+			// carried it across every later Save. Resolve matches on the id, so
+			// reporting it outstanding is both honest and actionable.
+			name:      "the recorded id survived but the coordinates did not",
+			raw:       `{"key_id":"k2","pending_revoke_key_id":"K_old_1"}`,
+			wantKeyID: "K_old_1",
+		},
+		{
+			name:    "a junk recorded id with no coordinates is not a pending revoke",
+			raw:     `{"pending_revoke_key_id":"not a key id"}`,
+			wantNil: true,
+		},
 		{name: "empty object", raw: `{}`, wantNil: true},
 		{
 			name:        "a real URL is reduced to the last path segment",

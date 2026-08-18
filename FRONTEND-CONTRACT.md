@@ -166,6 +166,21 @@ server's conservative charset check, and when the marker is a URL whose path
 reduces to nothing nameable (no path, or a bare `/`); the server will not
 invent an id out of punctuation just to have something to show.
 
+Since 2026-08-18 the server RECORDS the predecessor id at the moment it queues
+the revoke, rather than deriving it from the marker URL afterwards. For any
+entry stranded from that point on, `predecessor_key_id` is the provider's exact
+key id: safe to show verbatim, and safe to require back on resolve. The
+derivation described above is now only the fallback for rows stranded before
+that change. The practical consequence: Twilio entries used to report
+`<sid>.json` and now report the bare `SK...` sid that the Twilio console shows,
+so an operator copying the id from the provider is no longer refused.
+
+`outstanding: true` with an empty `predecessor_key_id` can also mean the entry
+carries a partial marker set, where the recorded id survived but the retry
+coordinates did not. Retry answers `409 no_pending_revoke` for that shape;
+resolve still works, because it matches on the id rather than the URL. So when
+the server reports outstanding and retry 409s, offer resolve, not retry.
+
 This field is a **derived read-only fact**, computed fresh from the encrypted
 markers on every response. It is never accepted on `PUT /api/vault/{id}` (same
 as `provider_meta`'s other reserved keys. Sending it back is harmless, the

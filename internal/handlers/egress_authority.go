@@ -791,6 +791,18 @@ func pendingRevokeStatusFrom(raw string) *pendingRevokeStatus {
 	meta := ParseProviderMeta(raw)
 	v := meta[pendingRevokeURL]
 	if v == "" {
+		// A PARTIAL SET IS STILL AN OUTSTANDING REVOKE, and used to be invisible.
+		// Every "is there a pending revoke" decision in the tree keyed on the
+		// URL alone, so a row that kept the recorded id but lost the URL showed
+		// no chip, answered no_pending_revoke on retry, and 400'd on resolve:
+		// nothing in the product could see it or clear it, while
+		// reconcileProviderMetaForStorage faithfully carried it across every
+		// later Save. Report it as outstanding with no coordinates, which is
+		// the honest state and is one the operator CAN acknowledge away --
+		// resolve needs the id, not the URL.
+		if id := meta[pendingRevokeKeyID]; conservativeKeyIDPattern.MatchString(id) {
+			return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: id}
+		}
 		return nil
 	}
 	// THE RECORDED ID WINS. deferRevokeOldProviderKey now writes the
