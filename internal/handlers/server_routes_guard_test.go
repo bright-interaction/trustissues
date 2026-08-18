@@ -50,6 +50,15 @@ var routeGuardRequirements = []routeGuardRequirement{
 	{"/mcp", "", "VaultOnlyBlock", "use_secret mints capability tokens through the same Issue handler; blocking the gateway and not this is the same door twice"},
 	{"/secrets", "", "VaultOnlyBlock", "POST /secrets/issue mints a token /proxy spends by injecting a decrypted secret upstream"},
 	{"/issue", "", "capabilityLimiter", "single-use tokens: minting is the real budget"},
+	// The pending-revoke pair. Retry SPENDS the entry's live credential against
+	// the provider on every call, so an unbounded one is a free oracle for
+	// "is this key still valid upstream" and a way to burn the operator's
+	// provider rate limit from inside. Resolve writes provider_meta. The shared
+	// 500/min apiLimiter is not a per-feature bound on either.
+	{"/{id}/pending-revoke/retry", "Post", "sensitiveOpLimiter",
+		"each call spends the entry's current credential upstream; unbounded, it is a liveness oracle for a key the caller cannot read"},
+	{"/{id}/pending-revoke/resolve", "Post", "sensitiveOpLimiter",
+		"it erases the vault's only record of an orphaned upstream key, so it belongs under the same bound as rotate"},
 	{"/proxy/{host}/*", "", "proxyLimiter", "mounted outside /api and its apiLimiter, so this is its only bound"},
 	{"/settings/ai", "Put", "AdminOnly", "the write that decides which entry is the instance's provider key, and therefore what the egress pin pins"},
 	// The credential access trail. Its rows name WHICH SECRET an agent spent,

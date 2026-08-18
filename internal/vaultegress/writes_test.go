@@ -109,6 +109,23 @@ func writeCases() []writeCase {
 			},
 		},
 		{
+			// PrevProviderMeta is the seed value '{}' so the ticket, not a stale
+			// token, is what decides the outcome here. The CAS semantics proper
+			// get their own test below.
+			name:     "CASProviderMeta",
+			funcName: "CASProviderMeta",
+			field:    FieldProviderMeta,
+			column:   "provider_meta",
+			fn: func(ctx context.Context, q *db.Queries, tk egressgate.Ticket) error {
+				_, err := CASProviderMeta(ctx, q, tk, CASProviderMetaParams{
+					ProviderMeta:     sql.NullString{String: `{"site":"evil.example"}`, Valid: true},
+					PrevProviderMeta: sql.NullString{String: `{}`, Valid: true},
+					ID:               testEntryID,
+				})
+				return err
+			},
+		},
+		{
 			name:     "SetRotationTargets",
 			funcName: "SetRotationTargets",
 			field:    FieldRotationTargets,
@@ -369,4 +386,62 @@ func TestEveryExportedWriteIsCoveredHere(t *testing.T) {
 	}
 	t.Logf("%d exported writes, all covered: %v", len(writers), writers)
 	_ = filepath.Separator
+}
+
+// TestCASProviderMetaRefusesAStaleToken is the reason this wrapper exists at
+// all, and the ticket table above cannot see it: that table proves the gate
+// refuses a bad TICKET, which is a different question from whether the
+// compare-and-swap actually compares.
+//
+// The race it closes: both rotation paths hold provider_meta in memory across
+// the mint and write it back wholesale. A pending-revoke retry that lands
+// inside that window is not merely lost, it is REVERSED, because the
+// rotation's stale in-memory map still carries the markers the retry just
+// cleared and puts them back. An unconditional UPDATE cannot tell the two
+// apart. The stored value is randomly nonced ciphertext, so comparing it as an
+// opaque blob is sound and there is no ABA problem.
+func TestCASProviderMetaRefusesAStaleToken(t *testing.T) {
+	ctx := context.Background()
+	q, conn := newTestQueries(t)
+	tk := mustTicket(t, testEntryID, FieldProviderMeta)
+
+	seeded := readColumn(t, conn, "provider_meta")
+	if seeded != "{}" {
+		t.Fatalf("ABORT: seeded provider_meta is %q, want {}; this test would prove nothing", seeded)
+	}
+
+	// Positive control first. A CAS that never swaps would pass the negative
+	// case below for entirely the wrong reason.
+	ok, err := CASProviderMeta(ctx, q, tk, CASProviderMetaParams{
+		ProviderMeta:     sql.NullString{String: `{"round":"one"}`, Valid: true},
+		PrevProviderMeta: sql.NullString{String: `{}`, Valid: true},
+		ID:               testEntryID,
+	})
+	if err != nil {
+		t.Fatalf("CAS with a matching token errored: %v", err)
+	}
+	if !ok {
+		t.Fatal("CAS with a MATCHING token reported no swap. A compare-and-swap that never " +
+			"swaps would make every negative case below pass vacuously.")
+	}
+	if got := readColumn(t, conn, "provider_meta"); got != `{"round":"one"}` {
+		t.Fatalf("CAS reported success but the column is %q", got)
+	}
+
+	// Now the real question: a writer holding the PRE-swap value must lose.
+	ok, err = CASProviderMeta(ctx, q, tk, CASProviderMetaParams{
+		ProviderMeta:     sql.NullString{String: `{"round":"stale-writer"}`, Valid: true},
+		PrevProviderMeta: sql.NullString{String: `{}`, Valid: true}, // what it read before round one
+		ID:               testEntryID,
+	})
+	if err != nil {
+		t.Fatalf("a losing CAS must report ok=false, not error: %v", err)
+	}
+	if ok {
+		t.Fatal("a writer holding a STALE token was allowed to swap. This is the rotation " +
+			"resurrecting markers a concurrent revoke retry had already cleared.")
+	}
+	if got := readColumn(t, conn, "provider_meta"); got != `{"round":"one"}` {
+		t.Fatalf("the losing CAS still wrote: column is %q, want the round-one value untouched", got)
+	}
 }

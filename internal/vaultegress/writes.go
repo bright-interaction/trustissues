@@ -126,6 +126,19 @@ type ProviderMetaParams struct {
 	ID           string
 }
 
+// CASProviderMetaParams compare-and-swaps provider_meta: the write applies
+// only if the column still holds PrevProviderMeta at the moment it runs.
+//
+// PrevProviderMeta is a TOKEN, not a value to reason about: provider_meta is
+// sealed with a fresh random nonce on every write (see VaultHandler.encryptColumn),
+// so two writes of byte-identical plaintext never produce equal ciphertext and
+// there is no ABA problem in comparing it as an opaque blob.
+type CASProviderMetaParams struct {
+	ProviderMeta     sql.NullString
+	PrevProviderMeta sql.NullString
+	ID               string
+}
+
 // RotationTargetsParams writes the delivery targets. THE round-5 column.
 type RotationTargetsParams struct {
 	RotationTargets sql.NullString
@@ -252,6 +265,44 @@ func SetProviderMeta(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p
 		ProviderMeta: p.ProviderMeta,
 		ID:           p.ID,
 	})
+}
+
+// CASProviderMeta writes provider_meta only if it still holds the value the
+// caller read (p.PrevProviderMeta) at the moment this runs, and reports
+// whether the write applied.
+//
+// It exists for the pending-revoke retry endpoint (internal/handlers), the
+// first provider_meta writer that can genuinely race a rotation: retry reads
+// the row, spends the entry's LIVE credential against a real upstream over the
+// network, and only then writes back. Both rotation paths still hold their own
+// in-memory copy of provider_meta across their own mint-then-write window and
+// persist it wholesale (see persistProviderMetaAfterRevoke in the handlers
+// package), so without a compare-and-swap here a retry landing inside that
+// window would be silently overwritten, AND the rotation's stale map would
+// resurrect the very markers the retry just cleared. Converting the two
+// rotation paths themselves to this CAS is out of scope for this change; they
+// remain unconditional writers via SetProviderMeta.
+//
+// A false, nil-error return means a CONCURRENT WRITE, not a failure: the
+// caller re-reads the row and decides whether to retry (see the retry
+// handler's loop, bounded by rotationLogCASAttempts).
+func CASProviderMeta(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p CASProviderMetaParams) (bool, error) {
+	if err := tk.Authorizes(p.ID, FieldProviderMeta); err != nil {
+		return false, err
+	}
+	res, err := writer(q).CASVaultEntryProviderMeta(ctx, egressq.CASVaultEntryProviderMetaParams{
+		ProviderMeta:   p.ProviderMeta,
+		ID:             p.ID,
+		ProviderMeta_2: p.PrevProviderMeta,
+	})
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // SetRotationTargets writes the delivery targets. THE round-5 column: a

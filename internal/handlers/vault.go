@@ -707,6 +707,15 @@ type vaultEntryMeta struct {
 	// the next full unlock. Always sending the key (null or []) makes the
 	// response self-describing.
 	CustomFields []CustomField `json:"custom_fields"`
+	// PendingRevoke is a SIBLING derivation next to ProviderMeta, not a hole in
+	// its redaction: it is computed from the same four reserved provider_meta
+	// keys that redactReservedProviderMetaKeys strips, but it never carries the
+	// URL, method or auth scheme those markers hold, only whether a revoke is
+	// outstanding and a best-effort label for which predecessor key it names.
+	// See pendingRevokeStatusFrom. No omitempty, for the same reason as
+	// CustomFields above: a client must be able to tell "checked, nothing
+	// outstanding" (null) from "this response does not carry the fact" (absent).
+	PendingRevoke *pendingRevokeStatus `json:"pending_revoke"`
 	// The capability ceiling, returned so the edit form can show what is set.
 	// Not a secret: it is a list of hosts, and the operator needs to see it to
 	// narrow it. An empty list means no agent token can be minted at all.
@@ -752,6 +761,7 @@ type vaultEntryFull struct {
 // which is exactly why this one used to hand those values out without asking.
 func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultEntryMetaRow,
 	callerID string) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	e := vaultEntryMeta{
 		ID: row.ID,
 		// The projection used to omit collection_id, so every write response
@@ -770,9 +780,10 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),
 		DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
@@ -784,6 +795,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 
 // vaultMetaFromListAllRow converts a db.ListAllVaultEntriesRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -798,9 +810,10 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -808,6 +821,7 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 
 // vaultMetaFromListByUserRow converts a db.ListVaultEntriesByUserRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserRow) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -822,9 +836,10 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -832,6 +847,7 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 
 // vaultMetaFromMatchRow converts a db.MatchVaultEntriesByURLRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
@@ -845,9 +861,10 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -857,6 +874,7 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 // collection-aware listing that returns personal + collection entries) to a
 // vaultEntryMeta, including which collection the entry belongs to.
 func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntriesRow) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -872,9 +890,10 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -893,6 +912,7 @@ func (h *VaultHandler) vaultMetaFromMatchCollectionRow(row db.MatchCollectionVau
 // vaultMetaFromMatchAccessibleRow converts a collection-aware autofill match row
 // to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVaultEntriesByURLRow) vaultEntryMeta {
+	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		CollectionID:         nullStringPtr(row.CollectionID),
@@ -907,9 +927,10 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+		ProviderMeta:         redactReservedProviderMetaKeys(raw),
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
+		PendingRevoke:        pendingRevokeStatusFrom(raw),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
 	}
@@ -2735,6 +2756,42 @@ func (h *VaultHandler) recordReauthFailure(ctx context.Context, r *http.Request,
 	}
 }
 
+// reauthOrRefuse re-verifies the caller's password against the account
+// record, under the SAME lockout budget as login (see reauthLocked), and
+// writes the appropriate refusal itself when it fails. It reports whether the
+// caller may proceed.
+//
+// Extracted from three byte-identical copies (Unlock, Rotate, ValidateKey).
+// RetryPendingRevoke is a fourth site that needs the exact same re-auth --
+// same lockout, same capacity-exhausted carve-out, same failure recording --
+// and a fourth hand copy is how the first three drifted from being noticed as
+// one rule in the first place.
+func (h *VaultHandler) reauthOrRefuse(w http.ResponseWriter, r *http.Request, ctx context.Context, userID, password string) bool {
+	email, locked := h.reauthLocked(ctx, r, userID)
+	if locked {
+		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
+		return false
+	}
+
+	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
+	if err != nil {
+		writeUnauthorized(w, r, "user not found")
+		return false
+	}
+	if ok, verifyErr := passwordhash.Verify(password, passwordHash); verifyErr != nil || !ok {
+		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
+		// login_attempts rows that reauthLocked counts, so counting it here is the
+		// same lockout vector as on login. See capacityExhausted.
+		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
+			return false
+		}
+		h.recordReauthFailure(ctx, r, email)
+		writeForbidden(w, r, "incorrect password")
+		return false
+	}
+	return true
+}
+
 func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Password string `json:"password"`
@@ -2748,26 +2805,7 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
 
-	email, locked := h.reauthLocked(ctx, r, userID)
-	if locked {
-		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
-		return
-	}
-
-	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
-	if err != nil {
-		writeUnauthorized(w, r, "user not found")
-		return
-	}
-	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
-		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
-		// login_attempts rows that reauthLocked counts, so counting it here is the
-		// same lockout vector as on login. See capacityExhausted.
-		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
-			return
-		}
-		h.recordReauthFailure(ctx, r, email)
-		writeForbidden(w, r, "incorrect password")
+	if !h.reauthOrRefuse(w, r, ctx, userID, req.Password) {
 		return
 	}
 
@@ -2785,6 +2823,10 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 
 	entries := []vaultEntryFull{}
 	for _, row := range rows {
+		// Hoisted so the redaction and the derived pending-revoke status read the
+		// SAME plaintext. Deriving from a second decrypt would let the two
+		// disagree if the column changed between them.
+		raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
 		e := vaultEntryFull{
 			vaultEntryMeta: vaultEntryMeta{
 				ID:                   row.ID,
@@ -2800,9 +2842,10 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 				ExpiresAt:            nullTimePtr(row.ExpiresAt),
 				LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 				Provider:             row.Provider.String,
-				ProviderMeta:         redactReservedProviderMetaKeys(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)),
+				ProviderMeta:         redactReservedProviderMetaKeys(raw),
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
+				PendingRevoke:        pendingRevokeStatusFrom(raw),
 				// Through the exit, like the entry's own value below. A
 				// secret:true custom field is a credential the operator
 				// deposited here and it rides out in this same body.
@@ -2864,26 +2907,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// Verify password against current user
 	userID := middleware.GetUserID(r.Context())
 
-	email, locked := h.reauthLocked(ctx, r, userID)
-	if locked {
-		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
-		return
-	}
-
-	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
-	if err != nil {
-		writeUnauthorized(w, r, "user not found")
-		return
-	}
-	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
-		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
-		// login_attempts rows that reauthLocked counts, so counting it here is the
-		// same lockout vector as on login. See capacityExhausted.
-		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
-			return
-		}
-		h.recordReauthFailure(ctx, r, email)
-		writeForbidden(w, r, "incorrect password")
+	if !h.reauthOrRefuse(w, r, ctx, userID, req.Password) {
 		return
 	}
 
@@ -3010,8 +3034,8 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 
 			// Consume any revoke left outstanding by an earlier rotation BEFORE
 			// Rotate overwrites its coordinates. See
-			// retryOutstandingRevokeBeforeMint.
-			staleRevokeWarn = retryOutstandingRevokeBeforeMint(rotateCtx, providerMeta, meta.Name, providerName, oldValue)
+			// retryOutstandingRevoke.
+			staleRevokeWarn = retryOutstandingRevoke(rotateCtx, providerMeta, meta.Name, providerName, oldValue)
 
 			rotatedValue, rotErr := provider.Rotate(rotateCtx, oldPlain, providerMeta)
 			if rotErr != nil {
@@ -3489,26 +3513,7 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 
 	userID := middleware.GetUserID(r.Context())
 
-	email, locked := h.reauthLocked(ctx, r, userID)
-	if locked {
-		writeRateLimited(w, r, "too many attempts, try again in 15 minutes")
-		return
-	}
-
-	passwordHash, err := h.queries.GetUserPasswordHash(ctx, userID)
-	if err != nil {
-		writeUnauthorized(w, r, "user not found")
-		return
-	}
-	if ok, verifyErr := passwordhash.Verify(req.Password, passwordHash); verifyErr != nil || !ok {
-		// Capacity is not a wrong password, and recordReauthFailure writes the SAME
-		// login_attempts rows that reauthLocked counts, so counting it here is the
-		// same lockout vector as on login. See capacityExhausted.
-		if capacityExhausted(w, r, verifyErr, "vault.reauth") {
-			return
-		}
-		h.recordReauthFailure(ctx, r, email)
-		writeForbidden(w, r, "incorrect password")
+	if !h.reauthOrRefuse(w, r, ctx, userID, req.Password) {
 		return
 	}
 

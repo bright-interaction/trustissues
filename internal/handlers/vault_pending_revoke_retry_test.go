@@ -16,7 +16,7 @@ import (
 // were destroyed one rotation later having never been retried once: the outcome
 // the deferral exists to prevent, delayed by a cycle rather than avoided.
 //
-// retryOutstandingRevokeBeforeMint runs the outstanding revoke first, with the
+// retryOutstandingRevoke runs the outstanding revoke first, with the
 // entry's current value. These tests pin that ordering, the success and failure
 // outcomes, and the no-op case.
 
@@ -51,7 +51,7 @@ func TestOutstandingRevokeIsRetriedBeforeTheNextMint(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	warn := retryOutstandingRevokeBeforeMint(context.Background(), meta, "the-entry", "resend",
+	warn := retryOutstandingRevoke(context.Background(), meta, "the-entry", "resend",
 		testPlaintext("re_SECOND"))
 
 	if warn != "" {
@@ -82,7 +82,7 @@ func TestAFailedRetryKeepsTheCoordinatesAndWarns(t *testing.T) {
 	meta := map[string]string{"key_id": "key-2"}
 	deferRevokeOldProviderKey(meta, "DELETE", "https://api.resend.com/api-keys/key-1", revokeAuthBearer)
 
-	warn := retryOutstandingRevokeBeforeMint(context.Background(), meta, "the-entry", "resend",
+	warn := retryOutstandingRevoke(context.Background(), meta, "the-entry", "resend",
 		testPlaintext("re_SECOND"))
 
 	if warn == "" {
@@ -114,7 +114,7 @@ func TestRetryBeforeMintIsANoOpWithNothingOutstanding(t *testing.T) {
 	})
 
 	meta := map[string]string{"key_id": "abc"}
-	if warn := retryOutstandingRevokeBeforeMint(context.Background(), meta, "e", "resend",
+	if warn := retryOutstandingRevoke(context.Background(), meta, "e", "resend",
 		testPlaintext("NEW")); warn != "" {
 		t.Errorf("a no-op retry reported %q", warn)
 	}
@@ -127,7 +127,7 @@ func TestRetryBeforeMintIsANoOpWithNothingOutstanding(t *testing.T) {
 
 	// And with a nil map, which the rotation paths can reach for an entry with
 	// no provider configured.
-	if warn := retryOutstandingRevokeBeforeMint(context.Background(), nil, "e", "", testPlaintext("NEW")); warn != "" {
+	if warn := retryOutstandingRevoke(context.Background(), nil, "e", "", testPlaintext("NEW")); warn != "" {
 		t.Errorf("a nil-meta retry reported %q", warn)
 	}
 }

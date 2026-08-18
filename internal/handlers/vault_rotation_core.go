@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
@@ -48,7 +48,7 @@ type rotationDeps struct {
 	vault   *VaultHandler
 }
 
-// retryOutstandingRevokeBeforeMint consumes a pending revoke left by an EARLIER
+// retryOutstandingRevoke consumes a pending revoke left by an EARLIER
 // rotation, before this rotation's mint overwrites its coordinates.
 //
 // THIS IS THE CONSUMER THAT MAKES PRESERVING THE COORDINATES WORTH ANYTHING.
@@ -78,22 +78,30 @@ type rotationDeps struct {
 // operator that an older key is still live upstream and is about to lose its
 // retry record, instead of that record vanishing in silence.
 //
-// KNOWN COVERAGE HOLE: THIS ONLY RUNS WHEN A ROTATION RUNS.
+// FORMERLY "KNOWN COVERAGE HOLE: THIS ONLY RUNS WHEN A ROTATION RUNS."
 //
-// Both rotation paths call it, so a scheduled entry retries on every sweep and
-// any entry retries when an operator clicks Rotate. But an ON-DEMAND entry
-// (auto_rotate = 0) is never picked up by the sweep, so if nobody rotates it
-// again its stranded key is never retried once, and nothing anywhere surfaces
-// that. The coordinates sit on the row indefinitely, correct and unread.
+// That hole is now closed on the operator-visible side. There is a THIRD
+// caller: VaultHandler.RetryPendingRevoke, behind POST
+// /api/vault/{id}/pending-revoke/retry (vault_pending_revoke.go). It calls this
+// function verbatim, with the entry's current value, exactly like the two
+// rotation paths do, so the three callers share one behaviour rather than the
+// endpoint re-deriving it. An operator looking at an on-demand entry
+// (auto_rotate = 0) that the scheduled sweep will never touch again can now
+// make it retry the stranded revoke without triggering a whole rotation, which
+// is the affordance this comment used to say was the smaller, more honest fix.
 //
-// That is the cost of choosing the cheapest consumer. Closing it properly needs
-// a consumer that does not ride on a rotation: a background reconciler over rows
-// carrying pending_revoke_url, or an operator-visible "an older key at this
-// provider is still live, retry the revoke" affordance on the entry itself. The
-// second is the smaller build and the more honest one, because it also answers
-// the terminal case where the revoke can never succeed and the only current
-// escape is changing the provider.
-func retryOutstandingRevokeBeforeMint(ctx context.Context, meta map[string]string,
+// THE RESIDUAL, STATED HONESTLY: NOBODY IS NOTIFIED.
+//
+// Closing "never retried" is not the same as closing "never surfaced". The new
+// endpoint is pull, not push: pendingRevokeStatusFrom puts outstanding: true on
+// the entry's own GET/list response, so the fact is visible the moment an
+// operator is already looking at that entry, but nothing scans the table, fires
+// an alert, or badges a list view to tell them to go look. An on-demand entry
+// with a stranded key that nobody happens to open still alerts no one, for as
+// long as nobody opens it. Closing that residual needs the other half this
+// comment originally named: a background reconciler (or a scheduled digest)
+// over rows carrying pending_revoke_url, which remains unbuilt.
+func retryOutstandingRevoke(ctx context.Context, meta map[string]string,
 	entryName, provider string, current secretexit.Plaintext) string {
 
 	if meta == nil || meta[pendingRevokeURL] == "" {
@@ -147,34 +155,54 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 			"entry", entryName, "detail", revokeWarn)
 	}
 
-	// Persist the key id Rotate minted, so the NEXT rotation revokes the key we
-	// just created instead of a stale predecessor. Errors are logged, never
-	// discarded: losing this write means the next revoke targets a dead id and the
-	// real predecessor leaks.
-	// THE WRITE-BACK IS ALSO A HOST-CHOOSING WRITE, and nobody authorizes it.
-	//
-	// This map came back out of a provider adapter. Twilio writes key_sid,
-	// backblaze writes key_id, and the whole map is then persisted with no
-	// authorization check anywhere, because it is the server recording its own
-	// work. An adapter that wrote a HOST-influencing key (grafana's instance,
-	// datadog's site) would therefore move the entry's destination from inside
-	// the rotation it was asked to perform, with nobody's permission.
-	// TestProviderRequestsStayInsideTheirDeclaredHosts detects that in the suite;
-	// this refuses it in production.
-	//
-	// The oracle is deliberately absent, which egressgate reads as deny: there is
-	// no principal on this path. A rotation is triggered by the scheduler or by a
-	// caller who has already been authorized to rotate, and neither of those is
-	// "and may also repoint this secret". So the only write allowed here is one
-	// that adds nothing.
+	// The write-back half is shared with the pending-revoke retry endpoint; see
+	// persistProviderMetaAfterRevoke. It already logs its own failure cause, so
+	// there is nothing further to do with the error here: revokeWarn, not a
+	// persist failure, is this function's contract with its caller.
+	_ = persistProviderMetaAfterRevoke(ctx, deps, entryID, entryName, provider, providerMeta)
+	return revokeWarn
+}
+
+// persistProviderMetaAfterRevoke is the write-back half of
+// revokeOldKeyAndPersistMeta, pulled out so the pending-revoke retry endpoint
+// (VaultHandler.RetryPendingRevoke, and its terminal sibling
+// ResolvePendingRevoke) can persist the SAME way a rotation does, rather than a
+// second hand-rolled copy of a host-choosing write drifting from this one.
+//
+// Persists the key id a revoke or a rotation's mint just recorded, so the NEXT
+// attempt targets the current predecessor instead of a stale one. Errors are
+// logged, never silently discarded: losing this write means the next revoke
+// targets a dead id and the real predecessor leaks.
+//
+// THE WRITE-BACK IS ALSO A HOST-CHOOSING WRITE, and nobody authorizes it.
+//
+// providerMeta came back out of a provider adapter, or out of the caller's own
+// edits to it (a retry deleting the pending_revoke_* markers). Twilio writes
+// key_sid, backblaze writes key_id, and the whole map is then persisted with no
+// authorization check anywhere, because it is the server recording its own
+// work. An adapter that wrote a HOST-influencing key (grafana's instance,
+// datadog's site) would therefore move the entry's destination from inside an
+// operation nobody asked to also repoint the secret.
+// TestProviderRequestsStayInsideTheirDeclaredHosts detects that in the suite;
+// this refuses it in production.
+//
+// The oracle is deliberately absent, which egressgate reads as deny: there is
+// no principal on this path. A rotation is triggered by the scheduler or by a
+// caller who has already been authorized to rotate; a retry is triggered by a
+// caller already authorized to spend and write the entry (see
+// VaultHandler.RetryPendingRevoke). Neither of those is "and may also repoint
+// this secret". So the only write allowed here is one that adds nothing.
+func persistProviderMetaAfterRevoke(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string) error {
 	beforeMeta := map[string]string{}
-	if row, rErr := deps.queries.GetVaultEntryMeta(ctx, entryID); rErr != nil {
+	row, rErr := deps.queries.GetVaultEntryMeta(ctx, entryID)
+	if rErr != nil {
 		slog.Error("vault rotation: could not read the stored provider_meta to check the write-back",
 			"entry", entryName, "error", rErr)
-		return revokeWarn
-	} else {
-		beforeMeta = ParseProviderMeta(deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta))
+		return rErr
 	}
+	beforeRaw := deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	beforeMeta = ParseProviderMeta(beforeRaw)
+
 	tk, tkErr := egressgate.Decide(egressgate.Request{
 		EntryID: entryID,
 		What:    egressFieldProviderMeta,
@@ -185,20 +213,67 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 	if tkErr != nil {
 		slog.Error("vault rotation: refusing to persist a provider_meta write-back that moves the "+
 			"entry's reachable hosts", "entry", entryName, "provider", provider, "error", tkErr)
-		return revokeWarn
+		return tkErr
 	}
 
-	if metaJSON, mErr := json.Marshal(providerMeta); mErr != nil {
+	// FROM THE RAW STORED COLUMN, NOT FROM THE map[string]string.
+	//
+	// provider_meta is operator-authored JSON and its values are not all
+	// strings: a port is a number, a scope list is an array. json.Unmarshal
+	// into a map[string]string does not DROP a non-string value, it records a
+	// type error, discards it, and leaves the key present holding "" -- so
+	// marshalling the map back writes {"port":""} over a stored {"port":8080},
+	// with a 200 and no diagnostic, permanently.
+	//
+	// This is the third site in this column to need the fix and the second to
+	// be found only after shipping the first: providerMetaBytesPreservingTypes
+	// was extracted for casEditProviderMeta in the very change that left this
+	// twin -- its own sibling, split out of revokeOldKeyAndPersistMeta in the
+	// same pass -- still on the plain marshal. Whoever adds a fourth writer:
+	// take the values from the stored bytes and only the KEY changes from your
+	// map, the way this does.
+	metaJSON, mErr := providerMetaBytesPreservingTypes(beforeRaw, beforeMeta, providerMeta)
+	if mErr != nil {
 		slog.Error("vault rotation: marshal provider_meta failed", "entry", entryName, "error", mErr)
-	} else if encMeta, encErr := deps.vault.encryptColumn(string(metaJSON)); encErr != nil {
+		return mErr
+	}
+	encMeta, encErr := deps.vault.encryptColumn(string(metaJSON))
+	if encErr != nil {
 		slog.Error("vault rotation: encrypt provider_meta failed", "entry", entryName, "error", encErr)
-	} else if pErr := vaultegress.SetProviderMeta(ctx, deps.queries, tk, vaultegress.ProviderMetaParams{
+		return encErr
+	}
+	if pErr := vaultegress.SetProviderMeta(ctx, deps.queries, tk, vaultegress.ProviderMetaParams{
 		ProviderMeta: toNullString(encMeta),
 		ID:           entryID,
 	}); pErr != nil {
 		slog.Error("vault rotation: persist provider_meta failed", "entry", entryName, "error", pErr)
+		return pErr
 	}
-	return revokeWarn
+	return nil
+}
+
+// withoutRevokeStillLive removes revokeStillLiveMsg from a last_rotation_error
+// value, and ONLY that -- it is deliberately not "contains revokeStillLiveMsg
+// -> clear the whole field", which would also erase an unrelated failure
+// sitting next to it.
+//
+// foldRevokeOutcome joins a delivery failure and the revoke warning as
+// errSummary + "; " + revokeStillLiveMsg, so the two facts can share one
+// column. A successful pending-revoke retry only settles the revoke half; the
+// delivery failure, if any, is still true and must survive. So this matches
+// exactly the two shapes foldRevokeOutcome can produce (the message alone, or
+// the message as a trailing "; "-joined suffix) and leaves anything else
+// unchanged, including a value that merely contains the message as a
+// substring somewhere the join never puts it.
+func withoutRevokeStillLive(s string) string {
+	switch {
+	case s == revokeStillLiveMsg:
+		return ""
+	case strings.HasSuffix(s, "; "+revokeStillLiveMsg):
+		return strings.TrimSuffix(s, "; "+revokeStillLiveMsg)
+	default:
+		return s
+	}
 }
 
 // rotationRecord is everything needed to finalise a rotation that has already
@@ -465,7 +540,7 @@ func hasNotifyTarget(targets []RotationTarget) bool {
 }
 
 // combineRevokeWarnings merges this rotation's revoke warning with one left by
-// retryOutstandingRevokeBeforeMint, keeping both.
+// retryOutstandingRevoke, keeping both.
 //
 // The two name DIFFERENT keys and both are true. Choosing between them, which
 // is what an `if revokeWarn == "" ` fallback does, silently drops one, and it

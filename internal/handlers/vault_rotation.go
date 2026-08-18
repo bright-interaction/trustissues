@@ -212,8 +212,8 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		oldValueCopy := plaintext // carried to delivery still opaque
 
 		// Consume any revoke left outstanding by an earlier rotation BEFORE
-		// Rotate overwrites its coordinates. See retryOutstandingRevokeBeforeMint.
-		staleRevokeWarn := retryOutstandingRevokeBeforeMint(rotateCtx, meta, entry.Name, providerName, plaintext)
+		// Rotate overwrites its coordinates. See retryOutstandingRevoke.
+		staleRevokeWarn := retryOutstandingRevoke(rotateCtx, meta, entry.Name, providerName, plaintext)
 
 		rotated, err := provider.Rotate(rotateCtx, oldPlain, meta)
 		newValue := vaultHandler.MintedEntrySecret([]byte(rotated), entry.ID, entry.Name)

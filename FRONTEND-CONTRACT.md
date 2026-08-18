@@ -127,6 +127,180 @@ Copied from dockyard's design language: white cards on a slate-50 body.
 - Voice: wry but clean. One dry line per page subtitle, no jokes in errors.
   No em dashes anywhere.
 
+## Pending revoke: retry + resolve (new 2026-08-18, being implemented now)
+
+Closes the gap where an on-demand entry (`auto_rotate: false`) whose last
+rotation left a predecessor key un-revoked at the provider never retries that
+revoke and never surfaces it, because the only consumer of the stored retry
+markers is the rotation path itself. This is the operator-visible fix: a field
+on every vault entry response, plus two buttons' worth of endpoint.
+
+### New field on every vault entry object (`vaultEntryMeta`)
+
+Every response that already returns a vault entry (list, get-one, unlock,
+create, update, rotate, validate's entry echo where applicable) gains one more
+top-level key, **always present, never omitted**, same discipline as
+`custom_fields`:
+
+```jsonc
+"pending_revoke": null
+```
+
+or, when the row has a revoke outstanding:
+
+```jsonc
+"pending_revoke": {
+  "outstanding": true,
+  "predecessor_key_id": "key-1"
+}
+```
+
+`predecessor_key_id` is a best-effort label for display only (e.g. "the key
+ending in `key-1` is still live upstream"); never treat it as a full
+credential id you can round-trip elsewhere except back into
+`acknowledged_key_id` on the resolve call below. It can be `""` (empty string)
+while `outstanding` is still `true`, for a predecessor id the backend could not
+safely characterize; render that as "an older key" or similar, not as a blank.
+Concretely, it is withheld when the marker is a bare key id that fails the
+server's conservative charset check, and when the marker is a URL whose path
+reduces to nothing nameable (no path, or a bare `/`); the server will not
+invent an id out of punctuation just to have something to show.
+
+This field is a **derived read-only fact**, computed fresh from the encrypted
+markers on every response. It is never accepted on `PUT /api/vault/{id}` (same
+as `provider_meta`'s other reserved keys. Sending it back is harmless, the
+backend ignores/redacts it, but do not wire it into the edit form's dirty
+tracking).
+
+### `POST /api/vault/{id}/pending-revoke/retry`
+
+The "retry this revoke now" button. Requires password re-auth, same UX as
+Rotate/Unlock/Validate (prompt for password, same 429/403 handling).
+
+Request:
+
+```jsonc
+{ "password": "the user's account password" }
+```
+
+Response `200` (the attempt was actually performed, check `revoked`, not just
+the status code, to know whether it worked):
+
+```jsonc
+{
+  "revoked": true,
+  "detail": "",
+  "pending_revoke": null
+}
+```
+
+or, when the upstream is still refusing the revoke:
+
+```jsonc
+{
+  "revoked": false,
+  "detail": "old key not revoked (still live at provider); see server logs",
+  "pending_revoke": { "outstanding": true, "predecessor_key_id": "key-1" }
+}
+```
+
+`detail` is always that exact static sentence on failure (never the raw
+upstream error, which only goes to the server log), so it is safe to render
+verbatim.
+
+Failure responses (all the existing `{ "error", "code", "request_id" }` shape
+already used everywhere else in this API):
+
+| status | `code` | when |
+|---|---|---|
+| 400 | `BAD_REQUEST` | missing password |
+| 401 | `UNAUTHORIZED` | user lookup failed |
+| 403 | `FORBIDDEN` | wrong password |
+| 403 | `destination_pinned` | this secret is pinned to the AI gateway; spending it here is refused |
+| 404 | `NOT_FOUND` | entry does not exist, or caller lacks read/spend/write rights (removed creator, stranger, disabled account, same as every other vault endpoint, refusals never distinguish "gone" from "not yours") |
+| 409 | `unknown_provider` | entry's provider isn't one this server can talk to (same wording as Rotate) |
+| 409 | `decrypt_failed` | the stored value could not be decrypted |
+| 409 | `no_pending_revoke` | nothing outstanding; calling retry on a clean entry is a safe no-op you'll see as this, not as success |
+| 429 | `RATE_LIMITED` | too many recent failed re-auths, try again in 15 minutes |
+
+A `429` from the sensitive-op rate limiter itself (distinct from the
+reauth-lockout `429` above) is also possible under heavy use; treat any `429`
+the same way (backoff, "try again shortly").
+
+Note there is no `500` documented for "revoke failed": a failed revoke is a
+successful *attempt* (`revoked: false`), not a server *error*. That is a
+statement about HTTP status handling, **not** a licence to render it quietly:
+`revoked: false` means a credential the operator believes is dead is still
+live at the provider, which is the most alarming outcome this endpoint has.
+
+Render it as BOTH:
+
+- the persistent inline state, keep the "an older key is still live" banner
+  up, driven by the `pending_revoke` you got back, and
+- an explicit notification that the click did not work (the shipped UI fires
+  an error toast carrying `detail`).
+
+What the "not a server error" rule actually forbids is treating it like a
+transport failure: do not show a generic "something went wrong", do not
+retry it automatically, and do not clear or hide the banner. An earlier
+revision of this document said to render `revoked: false` "instead of an
+error", which read as "do not alarm the operator" and would have removed the
+only signal that a live orphaned credential is still out there, the exact
+regression `pending-revoke-affordance.test.tsx` pins.
+
+### `POST /api/vault/{id}/pending-revoke/resolve`
+
+The "I dealt with this a different way, stop showing it" button, the
+terminal escape hatch for a predecessor key that can never be revoked through
+this UI (provider changed, key already gone, etc). No password required (same
+as delete, which also needs none). The caller must know and type/paste the
+predecessor key id shown by `pending_revoke.predecessor_key_id`, this is a
+confirmation, not just a click, precisely because it discards the record with
+no upstream verification.
+
+Request:
+
+```jsonc
+{ "acknowledged_key_id": "key-1" }
+```
+
+Response `200` on success:
+
+```jsonc
+{
+  "resolved": true,
+  "pending_revoke": null
+}
+```
+
+Response `400` (`BAD_REQUEST`) when `acknowledged_key_id` is missing, empty,
+or does not exactly match the current `predecessor_key_id`, markers are left
+untouched on the row, so it's safe to just re-show the confirmation and let
+the user retry. There is intentionally no way to resolve a marker "blind"
+(empty predecessor id resolves nothing); if `predecessor_key_id` renders empty
+in the UI, resolve is not offered, only retry, or contacting an admin.
+
+`404` (`NOT_FOUND`) under the same authz conditions as every other vault
+endpoint (entry access via `canWrite` only here, no spend right needed, this
+never touches the provider).
+
+### UI notes
+
+- Surface `pending_revoke` wherever an entry's rotation status is already
+  shown (list row, detail panel). It is **independent** of
+  `rotation_status`/`last_rotation_error`, an entry can read
+  `rotation_status: "success"` and still carry `pending_revoke.outstanding:
+  true`; do not fold the two into one badge.
+- Suggested copy: "An older key at this provider may still be live" with a
+  "Retry revoke" button (→ POST .../retry) and, once the user has confirmed
+  out-of-band that it's handled, a secondary "Mark resolved" action (→ POST
+  .../resolve) that requires re-typing/pasting the shown
+  `predecessor_key_id`.
+- On-demand entries (`auto_rotate: false`) are the whole point of this
+  feature, they never get picked up by the scheduled sweep, so this UI is
+  the *only* way that class of entry's stranded key ever gets retried. Do not
+  gate visibility of the retry button on `auto_rotate`.
+
 ## Contract assumptions the backend must satisfy (not yet all verified)
 
 Verified against handlers already written: auth endpoints, activity list

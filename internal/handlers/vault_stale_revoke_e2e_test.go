@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,7 @@ import (
 
 // THE RETRY HAS TO BE WIRED IN, NOT MERELY WRITTEN.
 //
-// vault_pending_revoke_retry_test.go proves retryOutstandingRevokeBeforeMint
+// vault_pending_revoke_retry_test.go proves retryOutstandingRevoke
 // behaves; it says nothing about whether either rotation path calls it, and a
 // helper nobody calls is exactly the shape of "a preserved record nothing
 // reads" that this work exists to close. Deleting the call from either path
@@ -57,7 +58,7 @@ func (s *revokeSink) sawStale() bool {
 
 // staleRevokeEnv seeds an entry mid-partial-rotation: a previous rotation minted
 // key-2 and its revoke of key-1 failed, so the coordinates are on the row.
-func staleRevokeEnv(t *testing.T) (*VaultHandler, *db.Queries, string, string, *revokeSink) {
+func staleRevokeEnv(t *testing.T, autoRotate int64) (*VaultHandler, *db.Queries, string, string, *revokeSink) {
 	t.Helper()
 	h, queries := newCollectionAuthzEnv(t)
 	installRotationFakes(t)
@@ -97,7 +98,7 @@ func staleRevokeEnv(t *testing.T) (*VaultHandler, *db.Queries, string, string, *
 	if err := setProviderFixture(t, queries, vaultegress.ProviderParams{
 		Provider:     toNullString(revokeFailProvider),
 		ProviderMeta: toNullString(enc),
-		AutoRotate:   sql.NullInt64{Int64: 1, Valid: true},
+		AutoRotate:   sql.NullInt64{Int64: autoRotate, Valid: true},
 		ID:           entryID,
 	}); err != nil {
 		t.Fatalf("set provider: %v", err)
@@ -117,7 +118,7 @@ func staleRevokeEnv(t *testing.T) (*VaultHandler, *db.Queries, string, string, *
 }
 
 func TestStrandedKeyIsRevokedByTheNextManualRotation(t *testing.T) {
-	h, queries, owner, entryID, sink := staleRevokeEnv(t)
+	h, queries, owner, entryID, sink := staleRevokeEnv(t, 1)
 
 	rec := httptest.NewRecorder()
 	h.Rotate(rec, vaultAuthzRequest(http.MethodPost, "/api/vault/"+entryID+"/rotate",
@@ -137,7 +138,7 @@ func TestStrandedKeyIsRevokedByTheNextManualRotation(t *testing.T) {
 }
 
 func TestStrandedKeyIsRevokedByTheNextSweepRotation(t *testing.T) {
-	h, queries, _, entryID, sink := staleRevokeEnv(t)
+	h, queries, _, entryID, sink := staleRevokeEnv(t, 1)
 
 	due, err := queries.ListVaultEntriesNeedingRotation(context.Background())
 	if err != nil {
@@ -174,5 +175,104 @@ func assertStaleMarkerGone(t *testing.T, h *VaultHandler, queries *db.Queries, e
 	meta := ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	if strings.Contains(meta[pendingRevokeURL], "stranded-key") {
 		t.Errorf("the stranded key's coordinates survived a successful retry: %+v", meta)
+	}
+}
+
+// TestStrandedKeyIsRevokedByTheRetryEndpointOnAnOnDemandEntry is the
+// operator-visible closure of retryOutstandingRevoke's KNOWN COVERAGE HOLE
+// (vault_rotation_core.go): an on-demand entry (auto_rotate = 0) that the
+// scheduled sweep will never pick up again, and that nobody has clicked Rotate
+// on, still had its stranded predecessor key sitting there forever before this
+// endpoint existed. This drives the REAL handler, against a real (test) upstream,
+// on exactly that shape of entry.
+func TestStrandedKeyIsRevokedByTheRetryEndpointOnAnOnDemandEntry(t *testing.T) {
+	h, queries, owner, entryID, sink := staleRevokeEnv(t, 0) // auto_rotate = 0: on-demand
+
+	// ABORT if the scheduled sweep's own due query would select this entry: that
+	// would prove the sweep can reach it after all, and this test would show
+	// nothing about the endpoint it exists to cover.
+	due, err := queries.ListVaultEntriesNeedingRotation(context.Background())
+	if err != nil {
+		t.Fatalf("due list: %v", err)
+	}
+	for _, row := range due {
+		if row.ID == entryID {
+			t.Fatalf("ABORT: entry %s is due for the scheduled sweep even with auto_rotate=0; this "+
+				"test cannot prove the sweep genuinely cannot reach it", entryID)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	h.RetryPendingRevoke(rec, vaultAuthzRequest(http.MethodPost, "/api/vault/"+entryID+"/pending-revoke/retry",
+		owner, "user", entryID, `{"password":"`+rotationTestPassword+`"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ABORT: the retry endpoint itself failed with %d, so nothing below is being tested (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Revoked bool `json:"revoked"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if !resp.Revoked {
+		t.Fatalf("the retry endpoint reported revoked=false: %s", rec.Body.String())
+	}
+	if !sink.sawStale() {
+		t.Fatalf("the stranded predecessor was never revoked through the retry endpoint; it only issued %v. "+
+			"An on-demand entry that nobody rotates again would have carried this marker forever",
+			sink.all())
+	}
+	assertStaleMarkerGone(t, h, queries, entryID)
+}
+
+// TestPendingRevokeRetryRefusesAPinnedEntry proves the retry endpoint asks
+// spendProviderSecret, not just an ad-hoc host check: the entry is wired into
+// the AI gateway as a DIFFERENT provider's key (openai, api.openai.com), while
+// its own declared provider egress resolves to the test sink instead. That
+// mismatch is refused only if spendProviderSecret's PIN check actually runs.
+//
+// This is the ablation the brief calls out by name: performPendingRevoke mints
+// its OWN secretexit receipt, so providerDo alone would let the revoke through
+// even with spendProviderSecret removed. Only the pin check, which lives
+// exclusively in spendProviderSecret, catches this. Dropping that call is
+// exactly the mutation proven below to flip this test red.
+func TestPendingRevokeRetryRefusesAPinnedEntry(t *testing.T) {
+	h, queries, owner, entryID, sink := staleRevokeEnv(t, 1)
+
+	// PUT /api/settings/ai is AdminOnly; this is that write, wiring the gateway
+	// to a provider the entry itself is NOT configured for.
+	if err := queries.UpsertSetting(context.Background(), db.UpsertSettingParams{
+		Key: "ai_key_openai", Value: entryID,
+	}); err != nil {
+		t.Fatalf("wire the gateway: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.RetryPendingRevoke(rec, vaultAuthzRequest(http.MethodPost, "/api/vault/"+entryID+"/pending-revoke/retry",
+		owner, "user", entryID, `{"password":"`+rotationTestPassword+`"}`))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a pinned entry's retry returned %d, want 403 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if sink.sawStale() {
+		t.Fatalf("a pinned entry's retry reached the upstream revoke anyway: %v", sink.all())
+	}
+	assertStaleMarkerStillPresent(t, h, queries, entryID)
+}
+
+// assertStaleMarkerStillPresent is assertStaleMarkerGone's negation, for a
+// refused retry: the marker must survive a refusal exactly as it must not
+// survive a success.
+func assertStaleMarkerStillPresent(t *testing.T, h *VaultHandler, queries *db.Queries, entryID string) {
+	t.Helper()
+	row, err := queries.GetVaultEntryMeta(context.Background(), entryID)
+	if err != nil {
+		t.Fatalf("reload entry: %v", err)
+	}
+	meta := ParseProviderMeta(h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta))
+	if !strings.Contains(meta[pendingRevokeURL], "stranded-key") {
+		t.Errorf("a refused retry discarded the stranded key's coordinates anyway: %+v", meta)
 	}
 }

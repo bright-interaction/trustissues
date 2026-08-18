@@ -10,6 +10,36 @@ import (
 	"database/sql"
 )
 
+const cASVaultEntryProviderMeta = `-- name: CASVaultEntryProviderMeta :execresult
+UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND provider_meta IS ?
+`
+
+type CASVaultEntryProviderMetaParams struct {
+	ProviderMeta   sql.NullString `json:"provider_meta"`
+	ID             string         `json:"id"`
+	ProviderMeta_2 sql.NullString `json:"provider_meta_2"`
+}
+
+// Compare-and-swap on provider_meta itself, for the pending-revoke retry
+// endpoint. Both rotation paths still hold providerMeta in memory across the
+// mint and write it back wholesale (see revokeOldKeyAndPersistMeta /
+// persistProviderMetaAfterRevoke), so a retry landing in that window would
+// otherwise be silently lost AND the rotation's stale in-memory map would
+// RESURRECT the markers the retry just cleared when it writes moments later.
+//
+// The stored value is randomly-nonced ciphertext (a fresh seal per write), so
+// comparing it as an opaque token has no ABA problem: two writes of the
+// "same" plaintext never produce the same bytes, which is exactly the
+// property a compare-and-swap token needs and updated_at (whole-second
+// resolution, bumped by neighbouring writes) does not have.
+//
+// `IS`, not `=`, because the previous value can legitimately be NULL (an
+// entry with no provider_meta yet), and NULL = NULL is NULL in SQL, which
+// would never match and would make the CAS unusable for that row.
+func (q *Queries) CASVaultEntryProviderMeta(ctx context.Context, arg CASVaultEntryProviderMetaParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, cASVaultEntryProviderMeta, arg.ProviderMeta, arg.ID, arg.ProviderMeta_2)
+}
+
 const createVaultEntry = `-- name: CreateVaultEntry :exec
 
 INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, name_bidx, encryption_version)

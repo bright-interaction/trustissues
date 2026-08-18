@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -655,27 +657,166 @@ func reconcileProviderMetaForStorage(raw string, stored map[string]string, keep 
 	return string(out), true
 }
 
+// redactReservedProviderMetaKeys DECODES TO map[string]json.RawMessage, NOT
+// map[string]string, and that is a data-loss fix, not a style choice.
+//
+// The first version of this function went through ParseProviderMeta, the same
+// map[string]string parse the write-path validator uses, on the argument that
+// symmetry with the validator was the correctness proof. It was, for the
+// validator's question ("is a reserved key present"). It was silently wrong
+// for THIS function's job, which is "hand back everything else unchanged":
+// json.Unmarshal into a map[string]string does not drop a key whose value is
+// not a JSON string, it records a type error, discards it, and leaves the key
+// PRESENT holding "". So a row with no markers at all -- {"port":8080} -- came
+// back as {"port":""} the moment len(meta) was nonzero for any reason, and an
+// API client that read that response and PUT it back (the same resubmit this
+// function exists to make safe, see the doc above) wrote 8080 to "" on disk
+// permanently, with a 200 and no diagnostic. It fires ONLY on a row carrying a
+// reserved key, because otherwise `found` stays false and raw is returned
+// byte-identical -- which is exactly why a row with a pending revoke marker
+// was the one shape that could lose an unrelated integer field on its next
+// read.
+//
+// Decoding to json.RawMessage, the way reconcileProviderMetaForStorage's own
+// doc comment already argues for on the write side, keeps every OTHER value
+// byte-exact while still letting the four reserved keys be deleted, which is
+// all a redaction ever needed to do.
 func redactReservedProviderMetaKeys(raw string) string {
-	meta := ParseProviderMeta(raw)
-	if len(meta) == 0 {
+	if raw == "" || raw == "{}" {
+		return raw
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		// Not a JSON object of the shape this function understands. The read
+		// path's job is to render what is there, not repair it: a column that
+		// is not an object carries no reserved key either side can act on.
 		return raw
 	}
 	found := false
 	for _, k := range reservedProviderMetaKeys {
-		if _, ok := meta[k]; ok {
-			delete(meta, k)
+		if _, ok := fields[k]; ok {
+			delete(fields, k)
 			found = true
 		}
 	}
 	if !found {
 		return raw
 	}
-	out, err := json.Marshal(meta)
+	out, err := json.Marshal(fields)
 	if err != nil {
-		// Unreachable for map[string]string, and the safe direction if it ever
-		// is reached: an empty object leaks nothing, where returning raw would
-		// hand back the markers this function exists to remove.
+		// Unreachable for a map of json.RawMessage decoded from a successful
+		// Unmarshal, and the safe direction if it ever is reached: an empty
+		// object leaks nothing, where returning raw would hand back the markers
+		// this function exists to remove.
 		return "{}"
 	}
 	return string(out)
+}
+
+// conservativeKeyIDPattern bounds what pendingRevokeStatusFrom will ever echo
+// back as a b2-scheme predecessor key id. b2 application key ids are
+// alphanumeric; this is deliberately a little more permissive (adds - and _)
+// rather than a little less, because the failure mode of being too strict is
+// silently withholding a real id, and the failure mode of being too loose is
+// bounded by the character class itself -- no separators, no quotes, no
+// whitespace, nothing that reads as a path or a URL fragment.
+var conservativeKeyIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// isNonNamePathBase reports whether path.Base returned something that is not a
+// name at all. There are THREE such values: "." (for an empty path), "/" (for a
+// bare root) and ".." (for a path whose last element is a dot-dot). path.Base
+// never returns the empty string -- path.Base("") is "." -- so the "" arm below
+// is unreachable and kept only so the set reads as closed; do not cite it as
+// live coverage. An earlier version of the caller listed ".", "/" and the dead
+// "" and let ".." through, so a stranded-key alarm could name ".." as the
+// predecessor and ResolvePendingRevoke would demand the operator type it back.
+//
+// Note this is only about how an id is DISPLAYED. A path component can still
+// masquerade as a key id when the path is truncated -- an empty id yields
+// "api-keys" from ".../api-keys/", which looks entirely plausible and is worse
+// for that reason. That class is closed at the producer by
+// revokeTargetIsNameable, which refuses a trailing slash and a stray query.
+//
+// Deliberately a reject-list of the four rather than an accept-list on a
+// charset: legitimate predecessor ids are provider-shaped, not uniform --
+// Twilio's is "<sid>.json" -- so an accept-list tight enough to exclude ".."
+// also excludes real ids, and withholding a real id is what makes an entry
+// unresolvable. deferRevokeOldProviderKey now refuses to create a traversing
+// marker in the first place, so on rows written after that fix this is
+// unreachable; it stays for rows written before it.
+func isNonNamePathBase(seg string) bool {
+	return seg == "" || seg == "." || seg == ".." || seg == "/"
+}
+
+// pendingRevokeStatus is the derived, client-safe summary of a row's
+// pending_revoke_* markers: whether a revoke is outstanding, and which
+// predecessor key it names. It is deliberately two facts and nothing more --
+// no method, no auth scheme, no URL -- because those three stay behind
+// redactReservedProviderMetaKeys exactly like today, and pendingRevokeStatus
+// is a SIBLING derivation, not a hole in that redaction.
+type pendingRevokeStatus struct {
+	Outstanding      bool   `json:"outstanding"`
+	PredecessorKeyID string `json:"predecessor_key_id"`
+}
+
+// pendingRevokeStatusFrom derives pendingRevokeStatus from a provider_meta
+// JSON string already decrypted off the column -- the same input
+// redactReservedProviderMetaKeys takes, read through the same ParseProviderMeta
+// used everywhere else this map is read. It returns nil when there is nothing
+// outstanding, so the JSON field this becomes on vaultEntryMeta is `null`
+// rather than an object of zero values, and a client can tell "nothing to
+// retry" from "there is one, and its predecessor id is unrepresentable" (the
+// latter still reports Outstanding: true with an empty id, below).
+//
+// It never emits meta[pendingRevokeURL] verbatim, on purpose: that value is
+// still a reserved key and un-redacting it, even partially, reopens the
+// operator-lockout bug fixed 2026-08-17 (see the doc above
+// redactReservedProviderMetaKeys). Two shapes are recognised, matching the two
+// ways deferRevokeOldProviderKey ever populates it (vault_providers.go):
+//
+//   - a real request URL (every scheme except b2): parsed with net/url, and
+//     if it has a host, reduced to path.Base(u.Path) ONLY. Query and fragment
+//     are dropped, and the host itself is never returned; a client learns
+//     which key, never where it lives. A Base that is pure punctuation ("."
+//     for an empty path, "/" for a bare root) is not a key id and is withheld
+//     like the b2 charset failure below.
+//   - the b2 scheme, where pending_revoke_url holds the bare OLD key id
+//     rather than a URL at all (see deferRevokeOldProviderKey's doc,
+//     vault_providers.go:449-452): returned as-is only when it matches
+//     conservativeKeyIDPattern, else "" -- Outstanding stays true either way,
+//     because there IS a marker on the row, but junk that fails the charset
+//     check is withheld rather than echoed to a client unfiltered.
+func pendingRevokeStatusFrom(raw string) *pendingRevokeStatus {
+	meta := ParseProviderMeta(raw)
+	v := meta[pendingRevokeURL]
+	if v == "" {
+		return nil
+	}
+	if u, err := url.Parse(v); err == nil && u.Host != "" {
+		// path.Base is total but not injective: it maps "" to "." and "/" to
+		// "/", so a marker URL with no path or a bare root path would render
+		// those punctuation marks to the operator AS the predecessor key id --
+		// and ResolvePendingRevoke would then demand they type "." back to
+		// acknowledge it. Neither is a key id, so treat them as the
+		// unrepresentable case the contract already defines (outstanding stays
+		// true, the id is withheld, and the UI offers retry but not resolve)
+		// rather than inventing an id out of punctuation.
+		// POSITIVE TEST, not a hand-listed set of punctuation. The first version
+		// of this filtered out ".", "/" and "" -- three of the four things
+		// path.Base can hand back that are not key ids. It missed "..", which
+		// path.Base returns for a path ending in a dot-dot segment, so a
+		// stranded-key alarm could still name ".." as the predecessor and
+		// ResolvePendingRevoke would demand the operator type it back.
+		// Enumerating what to reject loses to enumerating what to accept: this
+		// is the same charset the b2 arm below already requires, so both arms
+		// now agree and any future path.Base surprise is closed by default.
+		if seg := path.Base(u.Path); !isNonNamePathBase(seg) {
+			return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: seg}
+		}
+		return &pendingRevokeStatus{Outstanding: true}
+	}
+	if conservativeKeyIDPattern.MatchString(v) {
+		return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: v}
+	}
+	return &pendingRevokeStatus{Outstanding: true}
 }

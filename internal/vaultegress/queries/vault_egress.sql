@@ -64,6 +64,25 @@ UPDATE vault_entries SET provider = ?, provider_meta = ?, auto_rotate = ?, updat
 -- name: UpdateVaultEntryProviderMeta :exec
 UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: CASVaultEntryProviderMeta :execresult
+-- Compare-and-swap on provider_meta itself, for the pending-revoke retry
+-- endpoint. Both rotation paths still hold providerMeta in memory across the
+-- mint and write it back wholesale (see revokeOldKeyAndPersistMeta /
+-- persistProviderMetaAfterRevoke), so a retry landing in that window would
+-- otherwise be silently lost AND the rotation's stale in-memory map would
+-- RESURRECT the markers the retry just cleared when it writes moments later.
+--
+-- The stored value is randomly-nonced ciphertext (a fresh seal per write), so
+-- comparing it as an opaque token has no ABA problem: two writes of the
+-- "same" plaintext never produce the same bytes, which is exactly the
+-- property a compare-and-swap token needs and updated_at (whole-second
+-- resolution, bumped by neighbouring writes) does not have.
+--
+-- `IS`, not `=`, because the previous value can legitimately be NULL (an
+-- entry with no provider_meta yet), and NULL = NULL is NULL in SQL, which
+-- would never match and would make the CAS unusable for that row.
+UPDATE vault_entries SET provider_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND provider_meta IS ?;
+
 -- name: UpdateVaultEntryRotationTargets :exec
 UPDATE vault_entries SET rotation_targets = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 

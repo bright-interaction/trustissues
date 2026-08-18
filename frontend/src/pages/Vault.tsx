@@ -1618,6 +1618,17 @@ export default function Vault() {
                 // had rather than being blanked, and a present one must survive.
                 last_rotation_error:
                   data.last_rotation_error ?? e.last_rotation_error ?? '',
+                // A manual rotate here is the retry point for a PREVIOUS stranded
+                // key too (see internal/handlers: a failed delete keeps the old
+                // key's coordinates and retries them at the next rotation), so
+                // this response is authoritative on whether one is still
+                // outstanding: explicit null means the server just cleared it,
+                // an object means one exists (possibly a NEW one, replacing the
+                // old). Only fall back to the prior value if the field is
+                // missing from the response altogether (`undefined`), same
+                // "absent vs explicit" distinction as last_rotation_error above.
+                pending_revoke:
+                  data.pending_revoke !== undefined ? data.pending_revoke : e.pending_revoke,
               }
             : e
         )
@@ -2676,6 +2687,26 @@ export default function Vault() {
                           // useState, not react-query, so the row badge and the
                           // panel's own seed would keep showing the old provider
                           // until a manual reload without this.
+                          //
+                          // A provider change also drops any pending_revoke marker
+                          // server-side (the stranded key belonged to the OLD
+                          // provider relationship, so it stops being this entry's
+                          // problem to retry), but the response to a provider save
+                          // is not a full VaultEntry, so nothing here tells us that
+                          // happened. Clear it locally too: otherwise the banner
+                          // this whole feature adds would survive its own cure,
+                          // pointing at a provider the entry no longer targets.
+                          setVaultEntries((prev) =>
+                            prev.map((e) =>
+                              e.id === entry.id ? { ...e, ...patch, pending_revoke: null } : e
+                            )
+                          );
+                        }}
+                        onPendingRevokeChanged={(patch) => {
+                          // retry/resolve happen entirely inside the panel; without
+                          // this the vaultEntries copy of pending_revoke never moves,
+                          // so closing and reopening the panel re-seeds the banner
+                          // from stale data even after it was already cleared.
                           setVaultEntries((prev) =>
                             prev.map((e) => (e.id === entry.id ? { ...e, ...patch } : e))
                           );
@@ -2761,6 +2792,31 @@ export default function Vault() {
                               >
                                 <AlertCircle className="h-3 w-3" />
                                 Failed
+                              </span>
+                            )}
+                            {/*
+                              Deliberately gated on pending_revoke.outstanding, NOT
+                              on last_rotation_error above. The server overwrites
+                              last_rotation_error on every later rotation attempt
+                              (failed or not) while a pending_revoke marker survives
+                              until it is retried or acknowledged, so an entry can
+                              sit with no "Failed" chip at all and still have an old,
+                              still-live key stranded at the provider. That is exactly
+                              the on-demand case (auto_rotate off) this exists for:
+                              it may never rotate again for a human to notice via
+                              last_rotation_error, so this cannot depend on it.
+                            */}
+                            {entry.pending_revoke?.outstanding && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700"
+                                title={
+                                  entry.pending_revoke.predecessor_key_id
+                                    ? `Key ${entry.pending_revoke.predecessor_key_id} could not be deleted at the provider and may still authenticate. Unlock the vault and open Manage rotation delivery to act on it.`
+                                    : 'An older key could not be deleted at the provider and may still authenticate. Unlock the vault and open Manage rotation delivery to act on it.'
+                                }
+                              >
+                                <AlertCircle className="h-3 w-3" />
+                                Predecessor key live
                               </span>
                             )}
                           </div>

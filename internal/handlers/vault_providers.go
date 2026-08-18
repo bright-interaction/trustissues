@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -446,10 +448,92 @@ func successorScopes(meta map[string]string, metaKey string, fallback, required 
 // only known after an authorize round trip performed with the NEW credentials,
 // so there is nothing fixed to store at defer time. It carries the OLD key id
 // to delete instead; performPendingRevoke's b2 arm does the round trip itself.
-func deferRevokeOldProviderKey(meta map[string]string, method, url, authScheme string) {
+func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authScheme string) {
+	// FAIL CLOSED ON A PREDECESSOR ID THIS SERVER CANNOT NAME.
+	//
+	// Every caller builds rawURL by concatenating a provider-specific base with
+	// meta["key_id"] (or its per-provider twin: api_key_id, key_sid). Those are
+	// ORDINARY provider_meta keys -- they are not in reservedProviderMetaKeys,
+	// nothing validates provider_meta VALUES anywhere, so any principal with
+	// canWrite on the entry supplies that string verbatim through PUT
+	// /api/vault/{id}.
+	//
+	// What made that a security defect rather than a data-quality one: net/http
+	// does not clean dot segments, so "../domains/x" as a key id reaches the
+	// wire as DELETE /api-keys/../domains/x, and providerDo constrains only the
+	// HOST (it reads req.URL.Hostname() and never looks at the path). The
+	// declared-host refusal, which prior notes call the only layer behind a
+	// planted marker, does not bound this at all. The revoke is authenticated
+	// with the entry's live credential, so the traversed request is a
+	// fully-authorised DELETE against a path the caller chose -- and the
+	// retry endpoint now fires it on demand and returns a success boolean,
+	// which is also an oracle for what that path hit.
+	//
+	// Validated HERE, in the one function every defer goes through, rather than
+	// at the five call sites, so a sixth site added later inherits it. The
+	// predecessor id must survive a round trip through path.Base unchanged and
+	// be charset-clean, which additionally guarantees pendingRevokeStatusFrom
+	// can always render it -- see the note there about punctuation ids.
+	if !revokeTargetIsNameable(rawURL, authScheme) {
+		// NOT SILENT, AND NOT A DROPPED MARKER. Recording nothing would leave a
+		// live predecessor with no trace, which is the 2026-08-17 shape. This is
+		// the same channel Neon already uses when a provider returns no id: the
+		// rotation downgrades to partial and alarms, and the operator is told to
+		// deal with the predecessor by hand.
+		meta["last_revoke_error"] = "the previous key's recorded id is not a usable key id, so no revoke " +
+			"was queued for it; delete the predecessor at the provider by hand and correct this entry's key id"
+		return
+	}
 	meta[pendingRevokeMethod] = method
-	meta[pendingRevokeURL] = url
+	meta[pendingRevokeURL] = rawURL
 	meta[pendingRevokeAuth] = authScheme
+}
+
+// revokeTargetIsNameable reports whether a deferred revoke target is one this
+// server is willing to send an authenticated request at.
+//
+// THE TEST IS TRAVERSAL, NOT CHARSET, and that distinction was paid for. The
+// first version of this used conservativeKeyIDPattern (^[A-Za-z0-9_-]+$), on
+// the reasoning that the id pendingRevokeStatusFrom is willing to echo is the
+// id we should be willing to send. That is wrong about this domain: Twilio's
+// deferred URL ends "/Keys/<sid>.json" (see the call site below), so the final
+// segment legitimately carries a dot, and the strict pattern refused Twilio's
+// revoke outright -- turning a working revoke into a permanent orphan, which
+// is a worse outcome than the traversal it was meant to stop. Measured: the
+// fake upstream saw 0 requests where it should have seen 1.
+//
+// So this checks only what actually makes the request dangerous: that the path
+// cannot climb out of the collection the provider base pins it to, and that
+// nothing else rides along with it.
+func revokeTargetIsNameable(rawURL, authScheme string) bool {
+	if strings.TrimSpace(rawURL) == "" {
+		return false
+	}
+	if authScheme == revokeAuthB2 {
+		// Not a URL: b2 carries the bare OLD key id, which performPendingRevoke
+		// sends in a JSON BODY to a fixed endpoint it derives itself. There is
+		// no path to traverse, so the only requirement is that it is a single
+		// opaque token rather than something that could be read as structure.
+		return !strings.ContainsAny(rawURL, "/?#\\ \t\r\n")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	// A query, fragment or userinfo would travel with the request; none of the
+	// five call sites builds one, so any that appears came from the id.
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return false
+	}
+	// THE ONE THAT MATTERS. path.Clean collapses dot segments, so if cleaning
+	// changes the path, the path contained traversal. net/http does not clean
+	// before writing the request line (measured: "/api-keys/../domains/x"
+	// reaches the server verbatim) and providerDo constrains only the HOST, so
+	// without this the entry's live credential authenticates a DELETE against
+	// a path the caller chose. A trailing slash also fails here, which is
+	// correct: it means the id was empty and path.Base would hand back a path
+	// SEGMENT dressed up as a key id.
+	return u.Path != "" && path.Clean(u.Path) == u.Path
 }
 
 // performPendingRevoke runs a revoke recorded by deferRevokeOldProviderKey,

@@ -98,6 +98,7 @@ export default function RotationManager({
   entry,
   onScheduleSaved,
   onProviderSaved,
+  onPendingRevokeChanged,
 }: {
   entry: VaultEntry;
   // Patches the caller's in-memory copy after a schedule save. The unlocked
@@ -111,6 +112,11 @@ export default function RotationManager({
   // Same reason as onScheduleSaved: patches the caller's in-memory entry after
   // a provider save so the badge and this panel agree without a full reload.
   onProviderSaved?: (patch: { provider: string; provider_meta: string }) => void;
+  // Same reason again: retry/resolve below run entirely inside this panel, so
+  // without this callback a close-then-reopen re-seeds pendingRevoke from the
+  // parent's now-stale `entry.pending_revoke` and the banner comes back after
+  // it was already cleared. See pendingRevoke's own comment.
+  onPendingRevokeChanged?: (patch: { pending_revoke: VaultEntry['pending_revoke'] }) => void;
 }) {
   const queryClient = useQueryClient();
   const [targets, setTargets] = useState<RotationTarget[] | null>(null);
@@ -121,6 +127,21 @@ export default function RotationManager({
   const [providerMeta, setProviderMeta] = useState<Record<string, string>>(() =>
     parseProviderMeta(entry.provider_meta)
   );
+
+  // Seeded once from the prop, same lifecycle as interval/autoRotate/providerMeta
+  // above: this panel unmounts on close (see Vault.tsx's `rotationPanelId ===
+  // entry.id &&` guard) and remounts fresh on reopen, so a plain useState seed
+  // is safe here -- there is no stale-closure window to guard with an effect.
+  // What IS unsafe is the caller's OWN copy of entry.pending_revoke going
+  // stale after a retry/resolve that happened in here, which is what
+  // onPendingRevokeChanged (below) exists to prevent.
+  const [pendingRevoke, setPendingRevoke] = useState<VaultEntry['pending_revoke']>(
+    entry.pending_revoke ?? null
+  );
+  const [retryOpen, setRetryOpen] = useState(false);
+  const [retryPassword, setRetryPassword] = useState('');
+  const [resolveConfirmOpen, setResolveConfirmOpen] = useState(false);
+  const [resolveConfirmInput, setResolveConfirmInput] = useState('');
 
   const targetsQuery = useQuery({
     queryKey: queryKeys.vault.targets(entry.id),
@@ -224,6 +245,54 @@ export default function RotationManager({
     onError: (e: Error) => toast.error(e.message || 'Failed to save provider'),
   });
 
+  // Applies a fresh pending_revoke value (from a retry/resolve response, or
+  // `null` after resolve) to both this panel's own state and the caller's
+  // stale copy. Centralized so the two call sites below cannot drift.
+  function applyPendingRevoke(next: VaultEntry['pending_revoke']) {
+    setPendingRevoke(next);
+    onPendingRevokeChanged?.({ pending_revoke: next });
+    queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
+  }
+
+  const retryPendingRevoke = useMutation({
+    mutationFn: (password: string) => vaultApi.pendingRevokeRetry(entry.id, password),
+    onSuccess: (data) => {
+      // The contract's response always carries pending_revoke, but do not let a
+      // missing field on a FAILED attempt read as "resolved": that is exactly
+      // the bug class this whole feature exists to close (a 200 that means
+      // failure must not clear the banner). Only a missing field on a
+      // SUCCESSFUL revoke may be treated as "nothing pending anymore".
+      const next =
+        data.pending_revoke !== undefined
+          ? data.pending_revoke
+          : data.revoked
+            ? null
+            : pendingRevoke;
+      applyPendingRevoke(next);
+      if (data.revoked) {
+        toast.success(data.detail || 'Predecessor key revoked at the provider');
+      } else {
+        // revoked: false on a 200 is the FAILURE case, not a partial success.
+        // The banner above stays up (see applyPendingRevoke/next above) and
+        // this MUST surface as an error, matching the rotate-response rule at
+        // Vault.tsx's rotateSecretMutation: a 200 does not mean it worked.
+        toast.error(data.detail || 'Could not revoke the predecessor key. It is still live at the provider.');
+      }
+    },
+    onError: (e: Error) => toast.error(e.message || 'Failed to retry the revoke'),
+  });
+
+  const resolvePendingRevoke = useMutation({
+    mutationFn: () => vaultApi.pendingRevokeResolve(entry.id, resolveConfirmInput),
+    onSuccess: () => {
+      applyPendingRevoke(null);
+      toast.success('Marked as handled. Nothing was deleted at the provider.');
+      setResolveConfirmOpen(false);
+      setResolveConfirmInput('');
+    },
+    onError: (e: Error) => toast.error(e.message || 'Failed to update'),
+  });
+
   function patch(i: number, fields: Partial<RotationTarget>) {
     setTargets(working.map((t, idx) => (idx === i ? { ...t, ...fields } : t)));
   }
@@ -259,6 +328,176 @@ export default function RotationManager({
           </div>
         </div>
       </div>
+
+      {/* Stranded predecessor key: a PAST rotation minted a replacement but
+          could not delete the key it replaced at the provider, and nothing
+          has retried it since. This is independent of last_rotation_error
+          above (that field is about the MOST RECENT rotation attempt and gets
+          overwritten by the next one) and is the only signal an on-demand
+          entry (auto_rotate off) has, since it may never rotate again for a
+          human to notice the failure any other way. */}
+      {pendingRevoke?.outstanding && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <div className="flex-1">
+            <div className="font-medium">An older key at this provider is still live.</div>
+            <div className="mt-0.5 text-amber-700">
+              {/* predecessor_key_id is allowed to be "" while outstanding is
+                  still true, for a marker the backend could not safely
+                  characterize. FRONTEND-CONTRACT.md requires that be rendered
+                  as "an older key", never as a blank <code> element. */}
+              {pendingRevoke.predecessor_key_id ? (
+                <>
+                  The last rotation replaced key{' '}
+                  <code className="rounded bg-amber-100 px-1 py-0.5 font-mono">
+                    {pendingRevoke.predecessor_key_id}
+                  </code>{' '}
+                  but could not delete it, and it still authenticates at{' '}
+                  {selectedProvider?.label ?? providerName ?? 'the provider'}.
+                </>
+              ) : (
+                <>
+                  The last rotation replaced an older key but could not delete it, and it
+                  still authenticates at{' '}
+                  {selectedProvider?.label ?? providerName ?? 'the provider'}. This server
+                  could not determine that key&apos;s id, so it cannot be marked resolved
+                  here: retry the revoke, or delete the key at the provider and ask
+                  an admin to clear the record.
+                </>
+              )}
+            </div>
+
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setRetryOpen((v) => !v);
+                  setRetryPassword('');
+                  setResolveConfirmOpen(false);
+                }}
+                className="rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100"
+              >
+                Retry the revoke
+              </button>
+              {selectedProvider?.dashboard_url && (
+                <a
+                  href={selectedProvider.dashboard_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  Open {selectedProvider.label} dashboard
+                </a>
+              )}
+              {/* Resolve is deliberately NOT offered without a predecessor id:
+                  the confirmation IS typing that id back, so with "" the
+                  disabled test ('' !== '') is false, the button is live, and
+                  every click is a guaranteed 400 from the server's own
+                  equality check. FRONTEND-CONTRACT.md: "if predecessor_key_id
+                  renders empty in the UI, resolve is not offered". */}
+              {pendingRevoke.predecessor_key_id && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setResolveConfirmOpen((v) => !v);
+                    setResolveConfirmInput('');
+                    setRetryOpen(false);
+                  }}
+                  className="rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100"
+                >
+                  I deleted it myself
+                </button>
+              )}
+            </div>
+
+            {retryOpen && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (retryPassword) {
+                    retryPendingRevoke.mutate(retryPassword);
+                    setRetryOpen(false);
+                    setRetryPassword('');
+                  }
+                }}
+                className="mt-2 flex items-center gap-2"
+              >
+                <input
+                  type="password"
+                  value={retryPassword}
+                  onChange={(e) => setRetryPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  autoFocus
+                  className="flex-1 rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-amber-400"
+                />
+                <button
+                  type="submit"
+                  disabled={!retryPassword || retryPendingRevoke.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {retryPendingRevoke.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Retry'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setRetryOpen(false); setRetryPassword(''); }}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+              </form>
+            )}
+
+            {resolveConfirmOpen && pendingRevoke.predecessor_key_id && (
+              <div className="mt-2 rounded-lg border border-amber-300 bg-white p-3">
+                <p className="text-xs font-medium text-slate-700">
+                  Confirm you deleted{' '}
+                  <code className="rounded bg-slate-100 px-1 py-0.5 font-mono">
+                    {pendingRevoke.predecessor_key_id}
+                  </code>{' '}
+                  at {selectedProvider?.label ?? providerName ?? 'the provider'} yourself, outside this tool.
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  This only clears the vault&apos;s record that a key is stranded. It does NOT delete
+                  anything at the provider, so do that first or the old key stays live.
+                </p>
+                <label className="mt-2 block">
+                  <span className="mb-0.5 block text-xs font-medium text-slate-500">
+                    Type the key id above to confirm
+                  </span>
+                  <input
+                    type="text"
+                    value={resolveConfirmInput}
+                    onChange={(e) => setResolveConfirmInput(e.target.value)}
+                    placeholder={pendingRevoke.predecessor_key_id}
+                    className="w-full rounded-lg border border-slate-200 px-2 py-1.5 font-mono text-xs outline-none focus:border-slate-400"
+                  />
+                </label>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => resolvePendingRevoke.mutate()}
+                    disabled={
+                      resolveConfirmInput !== pendingRevoke.predecessor_key_id ||
+                      resolvePendingRevoke.isPending
+                    }
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {resolvePendingRevoke.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Confirm, clear the record'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setResolveConfirmOpen(false); setResolveConfirmInput(''); }}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Rotation provider: what mints the replacement value. Comes first because
           the schedule and targets below only matter once something can actually

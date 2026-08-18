@@ -51,6 +51,14 @@ export interface VaultEntry {
   // Capability ceiling, returned so the edit form can show what is set. An empty
   // or absent list means no agent token can be minted for this secret at all.
   destination_patterns?: string[];
+  // Set when a PAST rotation minted a replacement but could not delete the key
+  // it replaced at the provider, and nothing has retried or acknowledged that
+  // failure since. `outstanding: false` (or the whole field null/absent) means
+  // there is nothing stranded right now. For an on-demand entry (auto_rotate
+  // false) this is the ONLY signal that an old, still-live credential exists:
+  // last_rotation_error gets overwritten by the next failed rotation, but an
+  // on-demand entry may never rotate again, so pending_revoke is what survives.
+  pending_revoke?: { outstanding: boolean; predecessor_key_id: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -250,6 +258,29 @@ export const vaultApi = {
     request<VaultEntry & { value: string }>(`/vault/${id}/rotate`, {
       method: 'POST',
       body: JSON.stringify({ password }),
+    }),
+  // Retries deleting the stranded predecessor key at the provider (see
+  // VaultEntry.pending_revoke). Requires the account password, same shape as
+  // rotate. A 200 does NOT mean the key is gone: `revoked: false` is the
+  // FAILURE case (the provider still refused/erred) and is not thrown as an
+  // ApiError, so callers must check the field, not just the HTTP status. The
+  // server 409s when there is nothing pending to retry.
+  pendingRevokeRetry: (id: string, password: string) =>
+    request<{ revoked: boolean; detail: string; pending_revoke: VaultEntry['pending_revoke'] }>(
+      `/vault/${id}/pending-revoke/retry`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ password }),
+      }
+    ),
+  // Operator attestation that they deleted the predecessor key themselves,
+  // outside this tool. No password: this only clears the LOCAL marker, it
+  // never touches the provider. The caller must echo back the exact
+  // predecessor_key_id shown, and the server 400s on a mismatch.
+  pendingRevokeResolve: (id: string, acknowledgedKeyId: string) =>
+    request<void>(`/vault/${id}/pending-revoke/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ acknowledged_key_id: acknowledgedKeyId }),
     }),
   // Move an entry into a collection (editor/manager on the destination) or back
   // to personal (pass null). Requires write access to the entry itself.

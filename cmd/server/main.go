@@ -698,6 +698,10 @@ func main() {
 				r.Delete("/{id}", vaultHandler.Delete)
 				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/rotate", vaultHandler.Rotate)
 				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/validate", vaultHandler.ValidateKey)
+				// Both spend or mutate a credential, so they sit under the same
+				// limiter as rotate/validate rather than the general API one.
+				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/retry", vaultHandler.RetryPendingRevoke)
+				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/resolve", vaultHandler.ResolvePendingRevoke)
 				r.Get("/{id}/targets", vaultHandler.GetTargets)
 				r.Put("/{id}/targets", vaultHandler.UpdateTargets)
 				r.Put("/{id}/schedule", vaultHandler.UpdateSchedule)
