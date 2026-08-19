@@ -1,58 +1,49 @@
 # gitleaks config for Trustissues (used by the public-mirror publish gate and any
 # local scan). Extends the default ruleset, then allowlists PLACEHOLDERS and TEST
-# FIXTURES.
+# FIXTURES **by value, never by path**.
 #
 # The fixtures matter more here than in the other mirrors. Trustissues ships
 # Shield, a PII/secret redactor, and the only way to test a redactor is to feed it
 # things that look exactly like real secrets: sk_live_ keys, IBANs, personnummer,
 # API tokens. internal/shield/testdata/pii.corpus exists to hold those, and every
-# one of them is synthetic. Without this allowlist the publish gate would refuse
+# one of them is synthetic. Without an allowlist the publish gate would refuse
 # forever over the test data that proves the product works.
 #
-# A genuine leaked credential would not sit under testdata/ and would not carry a
-# change-me marker, so both are still caught.
+# WHY THERE IS NO `paths` KEY, AND WHY ADDING ONE BACK IS A P0
+#
+# This config used to carry five `paths` entries -- internal/shield/testdata/.*
+# plus the _test.go files of shield, handlers, config and columncrypto -- and one
+# for scripts/mirror-secret-allowlist.txt. Measured on gitleaks 8.30.1, a
+# `ghp_`-shaped token planted in any of those files scanned CLEAN under this
+# config and DIRTY under the default ruleset: gitleaks resolves `paths` and
+# `regexes` as OR even with condition = "AND", so a path entry is a whole-file
+# exemption whatever else is written beside it. GitHub push protection blocked a
+# fixture this gate had already passed, which is how the blind spot surfaced.
+#
+# That made split-public-repo.sh -- the gate that calls itself authoritative
+# immediately before an irreversible force-push of a SECRETS MANAGER -- unable to
+# fail over a credential in exactly the files where somebody reproducing a
+# production leak pastes the real one to see whether Shield catches it.
+#
+# So every exemption below names the value it excuses. A fixture that is not
+# listed is reported, wherever it lives, including inside the redactor's own
+# tests and inside this repo's testdata. scripts/test-gitleaks-allowlist.sh
+# plants an unmarked credential in each formerly-exempt location and asserts the
+# refusal; scripts/ci.sh runs it. Do not re-add `paths`: it would silently
+# restore the whole-file exemption this shape exists to remove.
 title = "trustissues"
 
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Config placeholders and Shield's synthetic PII/secret corpus"
-paths = [
-  '''internal/shield/testdata/.*''',
-  '''internal/shield/.*_test\.go''',
-  '''internal/handlers/.*_test\.go''',
-  # A sequential hex placeholder that exists only to make the rest of the config
-  # valid so one field is under test, and a key whose value literally reads
-  # "test-vault-key-with-enough-entropy". Both verified to appear in zero
-  # non-test files.
-  '''internal/config/.*_test\.go''',
-  '''internal/columncrypto/.*_test\.go''',
-  # The gate's own source. mirror-secret-allowlist.txt documents each synthetic
-  # fixture BY VALUE with the reason it is safe, so the file necessarily contains
-  # credential-shaped strings and gitleaks flags its Stripe-shaped example. This
-  # is the self-trip CLAUDE.md section 15 names: a gate refusing its own source
-  # because the file carrying the marker ships inside the tree it scans.
-  '''scripts/mirror-secret-allowlist\.txt''',
-]
+description = "Config placeholders and synthetic fixtures, keyed by VALUE and never by path"
 regexes = [
-  # The reflectguard false-positive fixture, as it existed in commit f165f9248
-  # ONLY. Two minutes later f80d7b07d replaced it with the low-entropy
-  # `sk-live/AbCdEf/1234/XyZ`, which is the fix the 2026-08-15 decision called
-  # for, but this gate scans HISTORY and that commit still carries the original.
-  # The two hits are the same 16-hex fixture differing in the last character:
-  # dialects_test.go:137 defines it and :144 embeds a deliberate "one character
-  # off" near-miss, both feeding TestDecodedReadingsDoNotFireOnCleanTraffic,
-  # whose whole job is proving the scanner does NOT fire on clean traffic.
-  # Verified to appear in exactly two monorepo commits and zero working trees.
-  #
-  # Allowlisted BY VALUE and never by path. Adding
-  # `internal/reflectguard/.*_test\.go` to the paths list also clears these two,
-  # and an ablation showed it then reports "no leaks found" over a real secret
-  # planted in that package: a path entry makes this gate structurally unable to
-  # fail over a credential vault's own guard code. Same reasoning as the
-  # correct-horse-battery-staple entry below.
-  '''sk-live-9f3a2b7c8d1e4f5[ab]''',
+  # ---------------------------------------------------------------------------
+  # Placeholder MARKERS. Deliberately unanchored substrings: these say in the
+  # value itself that they are not credentials, and a real issued key does not
+  # carry them.
+  # ---------------------------------------------------------------------------
   '''changeme''',
   '''change[_-]?me''',
   '''your_[a-z0-9_]*''',
@@ -69,8 +60,64 @@ regexes = [
   '''GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ''',
   # xkcd 936's passphrase, used as the login password in
   # scripts/live-crossversion-skeptic.sh so the script reads as obviously
-  # synthetic. Allowlisted BY VALUE rather than by adding the script to `paths`:
-  # that file drives a live instance, so it is exactly the wrong place to stop
-  # scanning for real credentials.
+  # synthetic. Allowlisted BY VALUE rather than by adding the script to a paths
+  # list: that file drives a live instance, so it is exactly the wrong place to
+  # stop scanning for real credentials.
   '''correct-horse-battery-staple''',
+
+  # ---------------------------------------------------------------------------
+  # Synthetic fixtures, ANCHORED to the exact value. `^...$` matches the whole
+  # secret gitleaks extracted, so each entry excuses one string and nothing that
+  # merely contains it. Every one was verified to appear in zero non-test files.
+  #
+  # These replace the five deleted `paths` entries one finding at a time. The
+  # cost is that a new credential-shaped fixture fails the gate until someone
+  # adds it here with a reason -- which is the intended cost in a repo whose
+  # product is a credential vault.
+  # ---------------------------------------------------------------------------
+
+  # The reflectguard false-positive fixture, as it existed in commit f165f9248
+  # ONLY. Two minutes later f80d7b07d replaced it with the low-entropy
+  # `sk-live/AbCdEf/1234/XyZ`, which is the fix the 2026-08-15 decision called
+  # for, but this gate scans HISTORY and that commit still carries the original.
+  # The two hits are the same 16-hex fixture differing in the last character:
+  # dialects_test.go:137 defines it and :144 embeds a deliberate "one character
+  # off" near-miss, both feeding TestDecodedReadingsDoNotFireOnCleanTraffic,
+  # whose whole job is proving the scanner does NOT fire on clean traffic.
+  # Verified to appear in exactly two monorepo commits and zero working trees.
+  '''^sk-live-9f3a2b7c8d1e4f5[ab]$''',
+
+  # Shield's redaction fixtures. This package's assertions are "the redactor
+  # tokenizes a string shaped like a live Stripe key", so its table is made of
+  # credential-shaped strings by construction; a value that did not look like a
+  # key would not exercise the redactor at all. All four spell a placeholder
+  # alphabet (ABCDEF / abcdefg / abcd1234efgh) rather than the random
+  # alphanumerics an issued key carries.
+  # internal/shield/marker_forgery_test.go, redact_hostname_test.go,
+  # testdata/pii.corpus, and quoted back by scripts/mirror-secret-allowlist.txt.
+  '''^sk_live_ABCDEF1234567890$''',
+  '''^sk_live_51HabcdefgABCDEFG$''',
+  '''^sk_test_abcd1234efgh$''',
+  '''^rk_live_abcd1234efgh$''',
+
+  # Vault-key fixtures in internal/config and internal/columncrypto. The first
+  # states its role in English; the other two are the digits 0-9 and their
+  # reverse repeated to the key length, which is what a key generator never
+  # produces. internal/config/config_hint_test.go,
+  # internal/config/vault_key_previous_test.go,
+  # internal/columncrypto/columncrypto_test.go, and the two handler tests that
+  # set ShieldKey to the same sequential placeholder.
+  '''^test-vault-key-with-enough-entropy-0123456789$''',
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^fedcba9876543210fedcba9876543210$''',
+
+  # Handler fixtures. Each names its own role: the capability test's secret says
+  # "test", the rekey test's says the key was lost, and the traversal test's
+  # Twilio-shaped SID is the sequential hex placeholder above with the SK prefix
+  # the twilio-api-key rule requires.
+  # internal/handlers/capability_test.go, vault_rekey_test.go,
+  # vault_revoke_target_traversal_test.go.
+  '''^sk-live-test-1234567890$''',
+  '''^lost-vault-key-11ee77aa3390cc55bb220d6f$''',
+  '''^SK_EXAMPLE_NOT_A_REAL_SID$''',
 ]

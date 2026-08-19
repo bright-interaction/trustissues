@@ -90,7 +90,12 @@ out in the value), and if a publish gate flags one, add it to
 `scripts/mirror-secret-allowlist.txt` or `.gitleaks.toml` **by value with a
 reason**. Never allowlist a credential prefix such as `sk_live_`: real keys
 carry that prefix, and blinding the scanner to it in this repo of all repos
-defeats the gate entirely.
+defeats the gate entirely. Never allowlist a **path** either, for the same
+reason one step further out: gitleaks treats a `paths` entry as a whole-file
+exemption whatever else sits beside it, so exempting a fixture's file stops the
+scan from reporting a real credential pasted into it later.
+`scripts/test-gitleaks-allowlist.sh` plants one in each formerly-exempt file
+and fails if it is not reported; `scripts/ci.sh` runs it.
 
 ## Reporting a vulnerability
 

@@ -202,6 +202,24 @@ secret_scan() {
   fi
 }
 
+# The secret scan above is only as good as what its allowlist still reports.
+# .gitleaks.toml used to exempt five locations BY PATH -- including Shield's own
+# fixtures and testdata -- and a path entry is a whole-file exemption whatever
+# else is written beside it, so a real credential pasted into any of them scanned
+# clean while GitHub push protection blocked it. This plants an unmarked
+# credential in each of those locations and asserts the refusal, so the gate
+# above cannot go blind again without this step going red.
+allowlist_guard() {
+  local bin rc
+  [ -f scripts/test-gitleaks-allowlist.sh ] || {
+    echo "scripts/test-gitleaks-allowlist.sh is missing; nothing proves the secret scan still reports" >&2
+    return 1
+  }
+  bin="$(tool gitleaks github.com/zricethezav/gitleaks/v8@latest)"; rc=$?
+  [ "$rc" = "0" ] || return "$rc"
+  GITLEAKS="$bin" bash scripts/test-gitleaks-allowlist.sh
+}
+
 vuln_scan() {
   local bin rc
   bin="$(tool govulncheck golang.org/x/vuln/cmd/govulncheck@latest)"; rc=$?
@@ -360,6 +378,7 @@ backup_restore_tests() {
 }
 
 step "secret scan"                secret_scan
+step "secret-scan allowlist guard" allowlist_guard
 step "vulnerability scan"         vuln_scan
 step "frontend dependency scan"   frontend_dep_scan
 step "backup/restore suite"       backup_restore_tests
