@@ -116,7 +116,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 	})
 
 	t.Run("b2: backblaze shape, authorize-then-delete authenticated as the NEW key pair", func(t *testing.T) {
-		var authorizeAuth, deleteAuth string
+		var authorizeAuth, deleteAuth, deletePath string
 		var authorizeHits, deleteHits int
 		var deleteBody string
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -135,12 +135,19 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 						// what this test would otherwise fail to notice). rewriteTo
 						// still forces the actual TCP connection back to this same
 						// fake server regardless of the hostname named here.
-						"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com"},
+						// Carries b2MintBase so the DESTINATION is observable.
+						// rewriteTo rewrites scheme+host on every outbound
+						// request and keeps only path+query, so no fixture using
+						// this harness can see which host the code chose. The
+						// path survives, and only a request built from the
+						// apiUrl this response returns arrives carrying it.
+						"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com" + b2MintBase},
 					},
 				})
 			case strings.Contains(r.URL.Path, "b2_delete_key"):
 				deleteHits++
 				deleteAuth = r.Header.Get("Authorization")
+				deletePath = r.URL.Path
 				b, _ := io.ReadAll(r.Body)
 				deleteBody = string(b)
 				w.WriteHeader(http.StatusOK)
@@ -178,6 +185,34 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		// only that one in place, `"Bearer "+token` on delReq was green
 		// everywhere. Half a two-part contract asserted reads exactly like all
 		// of it.
+		// The delete leg's DESTINATION, which nothing asserted until now.
+		// b2_delete_key's base URL is the apiUrl b2_authorize_account returned,
+		// not the fixed host -- the same contract the mint leg had wrong until
+		// eda98b431. Measured before this assertion existed: rebuilding delReq
+		// against "https://api.backblazeb2.com" was GREEN across all 21
+		// packages, and providerDo does not catch it either, because the fixed
+		// host is itself inside backblaze's declared ".backblazeb2.com" suffix.
+		//
+		// This is the same half-asserted-contract shape 19184afda fixed for the
+		// mint and for THIS leg's header, and then missed for this leg's
+		// destination, one file over from where the pattern already lived.
+		//
+		// KNOWN LIMIT, stated rather than left to be rediscovered: this pins the
+		// PATH, not the HOST, because rewriteTo erases the host before any
+		// fixture sees it. A mutation that keeps the returned path and swaps
+		// only the host is still green here. And B2's real apiUrl is host-only,
+		// so against a production-shaped response b2MintBase would be "" and
+		// strings.HasPrefix would be vacuously true. What this DOES catch is the
+		// regression that actually happened twice in this file -- ignoring the
+		// returned base URL altogether -- and CheckHost still bounds the damage
+		// to some host inside .backblazeb2.com. The durable fix is to make
+		// rewriteTransport record the original host so fixtures can assert it
+		// directly, which closes this for all nine provider adapters at once.
+		if !strings.HasPrefix(deletePath, b2MintBase) {
+			t.Errorf("b2_delete_key was sent to %q, which does not start with %q, the base URL "+
+				"b2_authorize_account returned. The fixed api.backblazeb2.com host is only correct "+
+				"for b2_authorize_account itself.", deletePath, b2MintBase)
+		}
 		if deleteAuth != "tok-xyz" {
 			t.Errorf("b2_delete_key Authorization = %q, want the raw account authorization token "+
 				"%q. B2 takes the token as the entire header value; \"Bearer \"+token is a "+
