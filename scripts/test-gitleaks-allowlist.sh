@@ -13,12 +13,21 @@
 # protection blocked a fixture split-public-repo.sh had already passed, which is
 # how it surfaced. The exemptions are keyed BY VALUE now.
 #
-# That change is only worth anything if an unmarked credential is actually
-# reported, so this plants one in every formerly-exempt location and checks.
+# EVERYTHING THIS SCRIPT CHECKS IS DERIVED FROM .gitleaks.toml, NOT LISTED HERE.
 #
-# It checks BOTH directions on purpose. A matcher can fail by refusing
-# everything too: if the value entries were wrong the committed tree itself would
-# be dirty, and the clean-tree precondition below is what catches that.
+# The first version of this guard hardcoded a 7-entry list of files to plant in,
+# and grepped the config text for a `paths` key. Both halves were evadable, and
+# each half alone caught the obvious attack so it looked solid:
+#
+#   * the grep missed `"paths" = [...]` (a TOML quoted key, which gitleaks
+#     HONOURS) and missed a `paths` list living in a file that `[extend] path`
+#     pulls in (also honoured).
+#   * the hardcoded file list could not see an exemption added anywhere else.
+#
+# Combine one evasion of each and the guard is fully green while a whole-file
+# exemption is live. So: the structural half PARSES the TOML instead of grepping
+# it, and the planting half asks gitleaks which files this config is actually
+# excusing and plants in every one of them.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,91 +40,152 @@ if ! command -v "$GITLEAKS" >/dev/null 2>&1; then
   echo "Install it (brew install gitleaks) or set GITLEAKS=/path/to/gitleaks."
   exit 99
 fi
-
-scan() { "$GITLEAKS" dir . --config .gitleaks.toml --no-banner --redact 2>&1 || true; }
-
-# Count "no leaks found", not "leaks found": the latter is a SUBSTRING of the
-# former, so a clean tree read as dirty in the sibling copy of this test. Same
-# family as the `producer | grep -q` pipefail trap in CLAUDE.md 15b, and the same
-# lesson: assert on the content you actually mean.
-clean() { printf '%s\n' "$1" | grep -c 'no leaks found' || true; }
-
-fail=0
-
-# 1. The config must carry no `paths` key at all. This is the cheap structural
-#    half: the planted-secret cases below would catch a re-added path entry for
-#    the locations they name, but not for a location added later, and this does.
-if grep -qE '^[[:space:]]*paths[[:space:]]*=' .gitleaks.toml; then
-  echo "FAIL: .gitleaks.toml has a \`paths\` key. A path entry is a whole-file"
-  echo "      exemption whatever else is written beside it (condition = \"AND\""
-  echo "      does not narrow it). Allowlist the VALUE instead."
-  fail=1
-else
-  echo "ok: no \`paths\` key in .gitleaks.toml"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is not installed, so the config could not be PARSED and this guard did NOT run."
+  echo "A grep over the config text is not a substitute; see the header."
+  exit 99
 fi
 
-# 2. The tree as committed must be clean, or the planted-secret assertions cannot
-#    tell their own finding from a pre-existing one -- and a value entry that has
-#    gone stale shows up here rather than as a mystery gate refusal at publish.
-before="$(scan)"
-if [ "$(clean "$before")" -eq 0 ]; then
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+fail=0
+
+# ── 1. structural: the config must not exempt anything BY PATH ───────────────
+#
+# Parsed, not grepped. tomllib resolves quoted keys, dotted keys and nested
+# tables to the same structure, so `"paths" = [...]`, `paths=[...]` and a
+# `paths` under any table all look identical here and none of them can hide.
+# `[extend] path` is refused outright: it pulls in another config whose own
+# allowlist this process cannot see, which is the same whole-file exemption one
+# level of indirection away.
+python3 - .gitleaks.toml <<'PY' || fail=1
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as fh:
+    cfg = tomllib.load(fh)
+
+bad = []
+def walk(node, trail):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "paths":
+                bad.append(".".join(trail + [k]))
+            walk(v, trail + [k])
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            walk(v, trail + [f"[{i}]"])
+
+walk(cfg, [])
+extend_path = cfg.get("extend", {}).get("path")
+if extend_path:
+    bad.append(f"extend.path -> {extend_path}")
+
+if bad:
+    print("FAIL: .gitleaks.toml exempts by PATH (or includes a config that can):")
+    for b in bad:
+        print(f"        {b}")
+    print("      A path entry is a whole-file exemption whatever else is written")
+    print("      beside it; condition = \"AND\" does not narrow it. Allowlist the")
+    print("      VALUE instead, anchored, with the reason it is synthetic.")
+    sys.exit(1)
+print("ok: no path-keyed exemption anywhere in the parsed config")
+PY
+
+scan_json() {
+  "$GITLEAKS" dir . --config "$1" --no-banner --report-format json \
+    --report-path "$2" >/dev/null 2>&1 || true
+  [ -f "$2" ] || echo '[]' >"$2"
+}
+
+# ── 2. the committed tree must be clean ─────────────────────────────────────
+#
+# Or the planting below cannot tell its own finding from a pre-existing one --
+# and a value entry that has gone stale surfaces HERE, as a named file, instead
+# of as a mystery gate refusal minutes before an irreversible force-push. This
+# is the direction a matcher fails when it is too NARROW; the planting covers
+# the too-broad direction.
+scan_json .gitleaks.toml "$WORK/before.json"
+if [ "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$WORK/before.json")" != "0" ]; then
   echo "FAIL: the working tree already has findings, so this test proves nothing."
   echo "      Either a fixture changed and its allowlist entry did not, or a real"
   echo "      credential landed in the tree. Do not silence it with a path entry."
-  printf '%s\n' "$before"
+  python3 -c 'import json,sys
+for f in json.load(open(sys.argv[1])): print("        %s:%s %s" % (f["File"], f["StartLine"], f["RuleID"]))' "$WORK/before.json"
   exit 1
 fi
 echo "ok: clean tree"
 
-# 3. Plant an unmarked credential in every location the old config exempted
-#    wholesale. The literal is assembled at runtime: writing it out here would
-#    make THIS file a finding, which is the guard tripping over its own test data
-#    (the estate has shipped that shape before -- a gate that refused its own
-#    source). ghp_ is the shape GitHub push protection caught while this gate
-#    said OK.
-TARGETS=(
-  internal/shield/redact_hostname_test.go
-  internal/shield/marker_forgery_test.go
-  internal/shield/testdata/pii.corpus
-  internal/handlers/capability_test.go
-  internal/config/config_hint_test.go
-  internal/columncrypto/columncrypto_test.go
-  scripts/mirror-secret-allowlist.txt
-)
-PLANTED="ghp""_""ABCDEFGHIJ0123456789abcdefghij0123456789"
+# ── 3. which files is this config actually excusing? ────────────────────────
+#
+# Asked, not assumed. A bare useDefault config reports every finding the real
+# one suppresses, so its file set IS the blast radius of the allowlist and it
+# updates itself when a fixture moves or a new one lands.
+printf 'title = "bare"\n\n[extend]\nuseDefault = true\n' >"$WORK/bare.toml"
+scan_json "$WORK/bare.toml" "$WORK/bare.json"
+mapfile -t TARGETS < <(python3 -c 'import json,sys
+print("\n".join(sorted({f["File"] for f in json.load(open(sys.argv[1]))})))' "$WORK/bare.json")
+
+# Anti-vacuity. An empty or near-empty derived set means the derivation broke,
+# and a guard that plants in nothing prints PASS having checked nothing --
+# precisely the shape this file exists to refuse.
+if [ "${#TARGETS[@]}" -lt 5 ]; then
+  echo "FAIL: only ${#TARGETS[@]} excused file(s) derived from .gitleaks.toml."
+  echo "      The derivation is broken, so this guard would plant in almost"
+  echo "      nothing and still print PASS. Refusing to report either way."
+  exit 1
+fi
+echo "ok: derived ${#TARGETS[@]} excused file(s) from the config"
+
+# ── 4. plant a credential of EVERY family the allowlist touches ─────────────
+#
+# Three, not one. The single ghp_ token the first version planted could not see
+# a Stripe or Twilio entry being widened -- un-anchoring
+# `^sk_live_ABCDEF1234567890$` to `sk_live_[A-Za-z0-9_]+` was invisible to it.
+# Each literal is assembled at runtime: writing them out would make THIS file a
+# finding, which is the guard tripping over its own test data.
+PLANT_GH="ghp""_""ABCDEFGHIJ0123456789abcdefghij0123456789"
+PLANT_STRIPE="sk""_live_""9RtQ4vWxYz7BnMkLpJhGfDsA"
+PLANT_TWILIO="SK""9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+WANT_RULES="github-pat stripe-access-token twilio-api-key"
+
 CURRENT=""
 # Always returns 0. Bash exits with the status of the EXIT trap's last command,
 # so a restore() that ends in a failed test would turn a PASS into exit 1.
 restore() {
-  if [ -n "$CURRENT" ] && [ -f "$CURRENT.allowlisttest.bak" ]; then
-    mv -f "$CURRENT.allowlisttest.bak" "$CURRENT"
+  if [ -n "$CURRENT" ] && [ -f "$WORK/target.bak" ]; then
+    mv -f "$WORK/target.bak" "$CURRENT"
   fi
+  rm -rf "$WORK"
   return 0
 }
 trap restore EXIT
 
 for t in "${TARGETS[@]}"; do
-  # A missing target is a FAIL, never a skip. If a file is renamed and this list
-  # is not, the guard quietly stops covering that location while still printing
-  # PASS, which is the exact failure mode it exists to prevent.
   if [ ! -f "$t" ]; then
-    echo "FAIL: $t does not exist; this guard has stopped covering it. Re-point"
-    echo "      the TARGETS list rather than dropping the entry."
+    echo "FAIL: $t was reported by the bare scan but does not exist; the derivation is wrong"
     fail=1
     continue
   fi
   CURRENT="$t"
-  cp "$t" "$t.allowlisttest.bak"
-  printf '\n// planted by scripts/test-gitleaks-allowlist.sh: %s\n' "$PLANTED" >> "$t"
-  after="$(scan)"
-  mv -f "$t.allowlisttest.bak" "$t"
+  cp "$t" "$WORK/target.bak"
+  {
+    printf '\n// planted by scripts/test-gitleaks-allowlist.sh: %s\n' "$PLANT_GH"
+    printf '// planted by scripts/test-gitleaks-allowlist.sh: %s\n' "$PLANT_STRIPE"
+    printf '// planted by scripts/test-gitleaks-allowlist.sh: %s\n' "$PLANT_TWILIO"
+  } >>"$t"
+  scan_json .gitleaks.toml "$WORK/after.json"
+  mv -f "$WORK/target.bak" "$t"
   CURRENT=""
-  if [ "$(clean "$after")" -gt 0 ]; then
-    echo "FAIL: an unmarked credential planted in $t was NOT reported."
-    echo "      The allowlist is exempting the file rather than the value."
+  missing="$(python3 -c 'import json,sys
+found={f["RuleID"] for f in json.load(open(sys.argv[1]))}
+print(" ".join(r for r in sys.argv[2].split() if r not in found))' "$WORK/after.json" "$WANT_RULES")"
+  if [ -n "$missing" ]; then
+    echo "FAIL: credentials planted in $t were NOT reported: $missing"
+    echo "      The allowlist is exempting the file, or the entry for that family"
+    echo "      is broader than the one value it is meant to excuse."
     fail=1
   else
-    echo "ok: refused an unmarked credential in $t"
+    echo "ok: refused all three planted families in $t"
   fi
 done
 
