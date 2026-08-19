@@ -1757,6 +1757,72 @@ func (p *ZitadelProvider) Validate(ctx context.Context, key string, meta map[str
 
 // ─── Backblaze B2 ───────────────────────────────────────────────────────────
 
+// backblazeAuthorize performs B2's b2_authorize_account round trip and returns
+// the short-lived ACCOUNT AUTHORIZATION TOKEN plus the storage apiUrl that every
+// other B2 call has to use.
+//
+// It exists because Rotate did not do this and could therefore never have
+// worked. B2 documents two things about b2_create_key that the old code broke at
+// once: it takes "an account authorization token, obtained from
+// b2_authorize_account", and its base URL is "the base URL returned by calling
+// b2_authorize_account". Rotate sent `Basic base64(keyId:secret)` to the fixed
+// api.backblazeb2.com host instead, which is the b2_authorize_account contract
+// applied to the wrong endpoint. b2_authorize_account is the ONLY B2 call that
+// takes Basic auth and the only one whose host is fixed.
+//
+// It was never noticed because no test asserted the mint's Authorization header.
+// Negative control, measured 2026-08-19: replacing that header with
+// `Bogus NOT-A-CREDENTIAL-AT-ALL` left the whole suite green, and deleting it
+// left the suite green with only the Go compiler objecting. The revoke leg one
+// function down had the assertion (vault_revoke_auth_scheme_test.go) and failed
+// instantly under the same mutation. One helper for all three call sites is the
+// structural half of that fix: there is now a single place that knows the
+// contract, so an assertion on any one of them covers the shape.
+//
+// status is the HTTP status B2 answered with, or 0 when there was no answer at
+// all (empty key id, unbuildable request, transport failure). Validate needs
+// that distinction: a 401 is a VERDICT about the key and must be reported as
+// "invalid", while a dial failure is not a verdict about anything.
+func backblazeAuthorize(ctx context.Context, keyID, key string) (token, apiURL string, status int, err error) {
+	if keyID == "" {
+		return "", "", 0, fmt.Errorf("key_id required")
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + key))
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.backblazeb2.com/b2api/v3/b2_authorize_account", nil)
+	if err != nil {
+		return "", "", 0, err
+	}
+	req.Header.Set("Authorization", "Basic "+auth)
+	resp, err := providerDo(req)
+	if err != nil {
+		return "", "", 0, err
+	}
+	body, _ := readProviderBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", resp.StatusCode, newUpstreamHTTPError(resp.StatusCode, body)
+	}
+	var authResp struct {
+		AuthorizationToken string `json:"authorizationToken"`
+		APIInfo            struct {
+			StorageAPI struct {
+				APIURL string `json:"apiUrl"`
+			} `json:"storageApi"`
+		} `json:"apiInfo"`
+	}
+	if err := json.Unmarshal(body, &authResp); err != nil {
+		return "", "", resp.StatusCode, fmt.Errorf("could not parse the authorize response")
+	}
+	// Both fields, not just the apiUrl. The old revoke leg checked the apiUrl
+	// alone and would have sent an empty Authorization header to the delete
+	// endpoint, which reads upstream as an unauthenticated request rather than
+	// as the malformed response it actually is.
+	if authResp.AuthorizationToken == "" || authResp.APIInfo.StorageAPI.APIURL == "" {
+		return "", "", resp.StatusCode, fmt.Errorf("could not resolve authorizationToken and apiUrl")
+	}
+	return authResp.AuthorizationToken, authResp.APIInfo.StorageAPI.APIURL, resp.StatusCode, nil
+}
+
 type BackblazeProvider struct{}
 
 func (p *BackblazeProvider) Name() string        { return "backblaze" }
@@ -1784,12 +1850,23 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 		"keyName":      name,
 		"capabilities": caps,
 	})
-	auth := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + currentKey))
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.backblazeb2.com/b2api/v3/b2_create_key", strings.NewReader(string(payload)))
+	// b2_create_key needs the account authorization token from
+	// b2_authorize_account, on the apiUrl that same response names. Sending
+	// Basic keyId:secret to the fixed host -- what this did until 2026-08-19 --
+	// is the b2_authorize_account contract pointed at the wrong endpoint, and B2
+	// rejects it. See backblazeAuthorize.
+	token, apiURL, _, err := backblazeAuthorize(ctx, keyID, currentKey)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Basic "+auth)
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL+"/b2api/v3/b2_create_key", strings.NewReader(string(payload)))
+	if err != nil {
+		return "", err
+	}
+	// Raw, with no scheme prefix. B2's account authorization token is sent as
+	// the entire header value; "Bearer "+token is a different, wrong header, and
+	// the revoke leg has always sent it correctly one function down.
+	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := providerDo(req)
 	if err != nil {
@@ -1850,44 +1927,27 @@ func (p *BackblazeProvider) Rotate(ctx context.Context, currentKey string, meta 
 // Rotate, before the new value was persisted; see deferRevokeOldProviderKey's
 // doc for why that was the bug this file exists to have fixed.
 func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID, newKey, oldKeyID string) {
-	auth := base64.StdEncoding.EncodeToString([]byte(newKeyID + ":" + newKey))
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.backblazeb2.com/b2api/v3/b2_authorize_account", nil)
+	token, apiURL, status, err := backblazeAuthorize(ctx, newKeyID, newKey)
 	if err != nil {
-		meta["last_revoke_error"] = "b2 authorize: " + err.Error()
-		return
-	}
-	req.Header.Set("Authorization", "Basic "+auth)
-	resp, err := providerDo(req)
-	if err != nil {
-		meta["last_revoke_error"] = "b2 authorize: " + err.Error()
-		return
-	}
-	body, _ := readProviderBody(resp)
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		meta["last_revoke_error"] = fmt.Sprintf("b2 authorize: HTTP %d", resp.StatusCode)
-		return
-	}
-	var authResp struct {
-		AuthorizationToken string `json:"authorizationToken"`
-		APIInfo            struct {
-			StorageAPI struct {
-				APIURL string `json:"apiUrl"`
-			} `json:"storageApi"`
-		} `json:"apiInfo"`
-	}
-	if err := json.Unmarshal(body, &authResp); err != nil || authResp.APIInfo.StorageAPI.APIURL == "" {
-		meta["last_revoke_error"] = "b2 authorize: could not resolve apiUrl"
+		// Status only when B2 actually answered. This string is persisted in
+		// provider_meta and shown to operators, and the upstream body adds
+		// nothing they can act on while widening what a revoke failure can
+		// write into a record an operator reads.
+		reason := err.Error()
+		if status != 0 && status != http.StatusOK {
+			reason = fmt.Sprintf("HTTP %d", status)
+		}
+		meta["last_revoke_error"] = "b2 authorize: " + reason
 		return
 	}
 	delPayload, _ := json.Marshal(map[string]string{"applicationKeyId": oldKeyID})
 	delReq, err := http.NewRequestWithContext(ctx, "POST",
-		authResp.APIInfo.StorageAPI.APIURL+"/b2api/v3/b2_delete_key", strings.NewReader(string(delPayload)))
+		apiURL+"/b2api/v3/b2_delete_key", strings.NewReader(string(delPayload)))
 	if err != nil {
 		meta["last_revoke_error"] = "b2 delete key: " + err.Error()
 		return
 	}
-	delReq.Header.Set("Authorization", authResp.AuthorizationToken)
+	delReq.Header.Set("Authorization", token)
 	delReq.Header.Set("Content-Type", "application/json")
 	dr, err := providerDo(delReq)
 	if err != nil {
@@ -1929,22 +1989,17 @@ func backblazeRevokeOldKey(ctx context.Context, meta map[string]string, newKeyID
 }
 
 func (p *BackblazeProvider) Validate(ctx context.Context, key string, meta map[string]string) (bool, error) {
-	keyID := meta["key_id"]
-	if keyID == "" {
-		return false, fmt.Errorf("key_id required")
+	// Same round trip Rotate now makes, through the same helper, so "what does
+	// authenticating to B2 look like" has exactly one answer in this file.
+	_, _, status, err := backblazeAuthorize(ctx, meta["key_id"], key)
+	if status != 0 {
+		// B2 answered, and its answer IS the verdict. A 401 means the key is no
+		// longer valid, which is a successful validation returning false, not an
+		// error. A 200 whose body we could not parse still means the credential
+		// authenticated, which is the only question Validate asks.
+		return status == 200, nil
 	}
-	auth := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + key))
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.backblazeb2.com/b2api/v3/b2_authorize_account", nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Authorization", "Basic "+auth)
-	resp, err := providerDo(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 200, nil
+	return false, err
 }
 
 // ─── Forgejo / Gitea ────────────────────────────────────────────────────────

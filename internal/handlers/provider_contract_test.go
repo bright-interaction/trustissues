@@ -289,24 +289,67 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 
 	t.Run("backblaze", func(t *testing.T) {
 		var caps []string
+		// b2_create_key takes the account authorization token from
+		// b2_authorize_account, raw and with no scheme, on the apiUrl that same
+		// response names. This fixture used to answer every path with one body
+		// and never look at a header, so it graded `Basic base64(keyId:secret)`
+		// sent to the wrong host as a pass for the entire life of the adapter.
+		const accountToken = "b2-account-authorization-token"
+		var authorized bool
+		var mintAuth string
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-			var in struct {
-				Capabilities []string `json:"capabilities"`
+			switch {
+			case strings.Contains(r.URL.Path, "b2_authorize_account"):
+				authorized = true
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"authorizationToken": accountToken,
+					// Has to resolve under the ".backblazeb2.com" suffix
+					// declared for backblaze in egress_authority.go, or
+					// CheckHost refuses the mint before it is sent. rewriteTo
+					// still forces the connection back to this fake server.
+					"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com"}},
+				})
+			case strings.Contains(r.URL.Path, "b2_create_key"):
+				mintAuth = r.Header.Get("Authorization")
+				if !authorized {
+					t.Errorf("b2_create_key was called without a preceding b2_authorize_account; " +
+						"its token and its base URL both come from that call")
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if mintAuth != accountToken {
+					t.Errorf("b2_create_key Authorization = %q, want the raw account authorization "+
+						"token %q", mintAuth, accountToken)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				var in struct {
+					Capabilities []string `json:"capabilities"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&in)
+				if len(in.Capabilities) > 0 {
+					caps = in.Capabilities
+				}
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"applicationKey": "K0new", "applicationKeyId": "0021new",
+				})
+			default:
+				t.Errorf("unexpected B2 request to %s", r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
 			}
-			_ = json.NewDecoder(r.Body).Decode(&in)
-			if len(in.Capabilities) > 0 {
-				caps = in.Capabilities
-			}
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"applicationKey": "K0new", "applicationKeyId": "0021new",
-				"apiUrl": "http://127.0.0.1", "authorizationToken": "tok",
-			})
 		})
 		p := &BackblazeProvider{}
 		meta := map[string]string{"key_id": "0021old", "account_id": "acct"}
 		if _, err := p.Rotate(providerCtx(p, meta), "K0old", meta); err != nil {
 			t.Fatalf("rotate: %v", err)
+		}
+		if mintAuth != accountToken {
+			t.Errorf("b2_create_key presented Authorization %q, want the raw account authorization "+
+				"token %q.\nB2 documents b2_create_key as taking \"an account authorization token, "+
+				"obtained from b2_authorize_account\"; Basic keyId:secret is the b2_authorize_account "+
+				"contract pointed at the wrong endpoint.", mintAuth, accountToken)
 		}
 		for _, want := range []string{"writeKeys", "deleteKeys"} {
 			if !hasScope(caps, want) {

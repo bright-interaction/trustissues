@@ -67,9 +67,45 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 	}
 
 	var revokeAttempts int
+	// The account authorization token b2_authorize_account hands out. The mint
+	// has to present THIS, raw, or the fixture 401s it: dispatching on the URL
+	// path alone is what let Rotate send `Basic keyId:secret` to the wrong host
+	// for the whole life of the b2 adapter with every B2 test still green.
+	const accountToken = "b2-account-authorization-token"
+	var authorized bool
+	var mintAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.Contains(r.URL.Path, "b2_authorize_account"):
+			// Reached by the MINT now, which is correct and is the fix:
+			// b2_create_key needs a token from here and a base URL from here.
+			// The revoke leg is no longer detected by this branch -- it is
+			// detected by b2_delete_key below, which is the call that actually
+			// destroys the predecessor and the only one this test forbids.
+			authorized = true
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"authorizationToken": accountToken,
+				// Must resolve under the ".backblazeb2.com" suffix declared for
+				// backblaze in egress_authority.go or CheckHost refuses the mint
+				// before it is sent. rewriteTo still forces the connection back
+				// to this same fake server.
+				"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com"}},
+			})
 		case strings.Contains(r.URL.Path, "b2_create_key"):
+			mintAuth = r.Header.Get("Authorization")
+			if !authorized {
+				t.Errorf("b2_create_key was called without a preceding b2_authorize_account; " +
+					"its token and its base URL both come from that call")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if mintAuth != accountToken {
+				t.Errorf("b2_create_key Authorization = %q, want the raw account authorization "+
+					"token %q", mintAuth, accountToken)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			// THE RACE. This is the fake upstream standing in for the real
 			// b2_create_key call, at the exact moment the real one would return
 			// to Rotate with a freshly minted successor key. A concurrent save
@@ -94,16 +130,12 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"applicationKey": "K0new", "applicationKeyId": "0021new",
 			})
-		case strings.Contains(r.URL.Path, "b2_authorize_account"), strings.Contains(r.URL.Path, "b2_delete_key"):
+		case strings.Contains(r.URL.Path, "b2_delete_key"):
 			// THE ASSERTION, made live. If the fix holds, this branch is never
 			// reached at all: the handler returns 409 before
 			// revokeOldKeyAndPersistMeta -> performPendingRevoke ever runs.
 			revokeAttempts++
 			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"authorizationToken": "tok",
-				"apiInfo":            map[string]any{"storageApi": map[string]any{"apiUrl": "https://ignored.example"}},
-			})
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -125,6 +157,13 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "rotation_conflict") {
 		t.Errorf("409 body does not report rotation_conflict: %s", rec.Body.String())
+	}
+	// The mint reached the fixture at all, and reached it holding the account
+	// authorization token. Without this the 409 above is satisfied just as well
+	// by a mint that never authenticated correctly in the first place.
+	if mintAuth != accountToken {
+		t.Errorf("b2_create_key presented Authorization %q, want the raw account authorization token %q",
+			mintAuth, accountToken)
 	}
 
 	// THE WHOLE POINT. A CAS conflict must not have destroyed the predecessor
