@@ -73,7 +73,7 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 	// for the whole life of the b2 adapter with every B2 test still green.
 	const accountToken = "b2-account-authorization-token"
 	var authorized bool
-	var mintAuth string
+	var mintAuth, mintPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "b2_authorize_account"):
@@ -90,10 +90,11 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 				// backblaze in egress_authority.go or CheckHost refuses the mint
 				// before it is sent. rewriteTo still forces the connection back
 				// to this same fake server.
-				"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com"}},
+				"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com" + b2MintBase}},
 			})
 		case strings.Contains(r.URL.Path, "b2_create_key"):
 			mintAuth = r.Header.Get("Authorization")
+			mintPath = r.URL.Path
 			if !authorized {
 				t.Errorf("b2_create_key was called without a preceding b2_authorize_account; " +
 					"its token and its base URL both come from that call")
@@ -103,6 +104,12 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 			if mintAuth != accountToken {
 				t.Errorf("b2_create_key Authorization = %q, want the raw account authorization "+
 					"token %q", mintAuth, accountToken)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if !strings.HasPrefix(mintPath, b2MintBase) {
+				t.Errorf("b2_create_key went to %q, which does not start with the base URL "+
+					"b2_authorize_account returned (%q)", mintPath, b2MintBase)
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -164,6 +171,10 @@ func TestBackblazeCASConflictLeavesThePredecessorLive(t *testing.T) {
 	if mintAuth != accountToken {
 		t.Errorf("b2_create_key presented Authorization %q, want the raw account authorization token %q",
 			mintAuth, accountToken)
+	}
+	if !strings.HasPrefix(mintPath, b2MintBase) {
+		t.Errorf("b2_create_key was sent to %q, not under the base URL b2_authorize_account returned (%q)",
+			mintPath, b2MintBase)
 	}
 
 	// THE WHOLE POINT. A CAS conflict must not have destroyed the predecessor

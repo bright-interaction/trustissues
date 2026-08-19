@@ -116,7 +116,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 	})
 
 	t.Run("b2: backblaze shape, authorize-then-delete authenticated as the NEW key pair", func(t *testing.T) {
-		var authorizeAuth string
+		var authorizeAuth, deleteAuth string
 		var authorizeHits, deleteHits int
 		var deleteBody string
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +140,7 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 				})
 			case strings.Contains(r.URL.Path, "b2_delete_key"):
 				deleteHits++
+				deleteAuth = r.Header.Get("Authorization")
 				b, _ := io.ReadAll(r.Body)
 				deleteBody = string(b)
 				w.WriteHeader(http.StatusOK)
@@ -170,6 +171,17 @@ func TestDeferredRevokeAuthenticatesThewayEachProviderRequires(t *testing.T) {
 		if authorizeAuth != wantAuth {
 			t.Errorf("b2_authorize_account Authorization = %q, want %q (base64 of the NEW keyId:secret "+
 				"pair, per Backblaze's own Basic-auth contract)", authorizeAuth, wantAuth)
+		}
+		// The DELETE leg's own header, which nothing asserted until now. The
+		// authorize assertion above is a different value from the same helper
+		// (Basic keyId:secret, not the token), so it does not cover this: with
+		// only that one in place, `"Bearer "+token` on delReq was green
+		// everywhere. Half a two-part contract asserted reads exactly like all
+		// of it.
+		if deleteAuth != "tok-xyz" {
+			t.Errorf("b2_delete_key Authorization = %q, want the raw account authorization token "+
+				"%q. B2 takes the token as the entire header value; \"Bearer \"+token is a "+
+				"different, wrong header.", deleteAuth, "tok-xyz")
 		}
 		if !strings.Contains(deleteBody, "0021old") {
 			t.Errorf("b2_delete_key body = %q, want it to target the OLD key id 0021old, not the new one",

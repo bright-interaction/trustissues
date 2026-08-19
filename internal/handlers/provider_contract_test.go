@@ -24,6 +24,23 @@ import (
 // barrier, only the belief in one.
 //
 // withFakeUpstream points a provider at a local server and restores everything after.
+// b2MintBase is how a fixture asserts WHERE b2_create_key was sent, through a
+// transport that erases the host.
+//
+// rewriteTransport below rewrites u.Host and clears r2.Host before the request
+// reaches the fake upstream, so no fixture in this package can observe which
+// vendor host an adapter dialled. That is not a small blind spot: it means a
+// path-dispatching fixture asserts the VERB and never the DESTINATION. Measured
+// on this commit -- sending b2's mint back to the fixed api.backblazeb2.com host
+// while keeping the correct token was GREEN across all 21 packages.
+//
+// The PATH survives the rewrite. So b2_authorize_account answers with an apiUrl
+// carrying this prefix, and only a mint that actually builds its URL from the
+// returned base URL can arrive with it. B2's real apiUrl is host-only, but
+// `apiURL + "/b2api/v3/b2_create_key"` preserves whatever path it carries, so a
+// path-bearing base is a legitimate response shape and a stricter probe.
+const b2MintBase = "/b2-storage-base"
+
 func withFakeUpstream(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -296,7 +313,7 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 		// sent to the wrong host as a pass for the entire life of the adapter.
 		const accountToken = "b2-account-authorization-token"
 		var authorized bool
-		var mintAuth string
+		var mintAuth, mintPath string
 		withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.Contains(r.URL.Path, "b2_authorize_account"):
@@ -308,10 +325,11 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 					// declared for backblaze in egress_authority.go, or
 					// CheckHost refuses the mint before it is sent. rewriteTo
 					// still forces the connection back to this fake server.
-					"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com"}},
+					"apiInfo": map[string]any{"storageApi": map[string]any{"apiUrl": "https://storage001.backblazeb2.com" + b2MintBase}},
 				})
 			case strings.Contains(r.URL.Path, "b2_create_key"):
 				mintAuth = r.Header.Get("Authorization")
+				mintPath = r.URL.Path
 				if !authorized {
 					t.Errorf("b2_create_key was called without a preceding b2_authorize_account; " +
 						"its token and its base URL both come from that call")
@@ -321,6 +339,12 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 				if mintAuth != accountToken {
 					t.Errorf("b2_create_key Authorization = %q, want the raw account authorization "+
 						"token %q", mintAuth, accountToken)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if !strings.HasPrefix(mintPath, b2MintBase) {
+					t.Errorf("b2_create_key went to %q, which does not start with the base URL "+
+						"b2_authorize_account returned (%q)", mintPath, b2MintBase)
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
@@ -344,6 +368,12 @@ func TestMintedSuccessorCanSustainTheRotationChain(t *testing.T) {
 		meta := map[string]string{"key_id": "0021old", "account_id": "acct"}
 		if _, err := p.Rotate(providerCtx(p, meta), "K0old", meta); err != nil {
 			t.Fatalf("rotate: %v", err)
+		}
+		if !strings.HasPrefix(mintPath, b2MintBase) {
+			t.Errorf("b2_create_key was sent to %q, which does not start with %q, the base URL "+
+				"b2_authorize_account returned.\nB2 documents b2_create_key's base URL as \"the "+
+				"base URL returned by calling b2_authorize_account\"; the fixed host is only "+
+				"correct for b2_authorize_account itself.", mintPath, b2MintBase)
 		}
 		if mintAuth != accountToken {
 			t.Errorf("b2_create_key presented Authorization %q, want the raw account authorization "+

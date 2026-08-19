@@ -503,8 +503,19 @@ func (s stubUpstream) RoundTrip(r *http.Request) (*http.Response, error) {
 	if s.hits != nil {
 		*s.hits++
 	}
+	// authorizationToken + apiInfo.storageApi.apiUrl are backblaze's, and they
+	// are load-bearing for the same reason `status` is mutable above. b2's mint
+	// is a TWO-step call now: without them backblazeAuthorize bails and Rotate
+	// never reaches b2_create_key, so this probe stops covering the b2 arm
+	// entirely. The anti-vacuity check below cannot notice, because the
+	// authorize request still counts as one attempt. Measured when the two-step
+	// mint landed: 4 attempts, all api.backblazeb2.com, zero to the storage
+	// host. The apiUrl must resolve under the ".backblazeb2.com" suffix
+	// egress_authority.go declares, or CheckHost refuses the second leg and the
+	// probe is starved a different way.
 	body := `{"id":"x","key":"x","token":"x","sha1":"x","secret":"x","sid":"SKx","api_key":"x",` +
 		`"api_key_id":"x","applicationKey":"x","applicationKeyId":"x","result":{"id":"x","value":"x"},` +
+		`"authorizationToken":"x","apiInfo":{"storageApi":{"apiUrl":"https://storage001.backblazeb2.com"}},` +
 		`"data":{"id":"x","attributes":{"key":"x"}}}`
 	code := 200
 	if s.status != nil {
