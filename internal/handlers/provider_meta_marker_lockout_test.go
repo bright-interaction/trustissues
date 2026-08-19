@@ -94,7 +94,14 @@ func TestAFailedRevokeDoesNotLockTheOwnerOutOfTheirOwnRotationConfig(t *testing.
 		"pending_revoke_auth":   revokeAuthBearer,
 		"last_revoke_error":     "revoke old key: HTTP 503",
 		"pending_revoke_key_id": "old-key-id",
-		"key_id":                "new-key-id",
+		// A second, OLDER stranded predecessor queued behind the head. It is a
+		// reserved key like the four above, so it must be redacted on the way out
+		// and carried across an untouched Save the same way -- and if it were not,
+		// an ordinary Save would silently discard the only record of a key that is
+		// live at the vendor, which is the whole class this test exists for.
+		"pending_revoke_stranded": `[{"key_id":"older-key-id","method":"DELETE",` +
+			`"url":"https://api.resend.com/api-keys/older-key-id","auth":"bearer"}]`,
+		"key_id": "new-key-id",
 	}
 	rawStored, err := json.Marshal(stored)
 	if err != nil {

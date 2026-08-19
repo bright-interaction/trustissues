@@ -25,10 +25,22 @@ import (
 // The CAS gates on BOTH last_rotation_error AND provider_meta, and each subtest is
 // an ablation of one predicate:
 //   - the distinct-string race is caught by the text predicate;
-//   - the same-string ABA (a concurrent recordRotationOutcome re-arms the bare
-//     static revokeStillLiveMsg about a DIFFERENT key, byte-identical) is caught
-//     ONLY by the provider_meta predicate, because the alarm always travels with a
-//     provider_meta marker change and provider_meta re-nonces on every write.
+//   - a same-string re-arm with NO accompanying provider_meta write is caught by
+//     the KEY IDENTITY the alarm now carries, again through the text predicate;
+//   - a re-arm on an OLD-SHAPE row, whose alarm carries no identity to compare,
+//     is caught only by the provider_meta predicate.
+//
+// THE THIRD SUBTEST USED TO MANUFACTURE ITS OWN PRECONDITION, and that is the
+// reason this doc is long. It called setMeta before setErr, i.e. it ARRANGED the
+// provider_meta write the fix assumed always accompanies the alarm, and then
+// observed that the co-gate caught the ABA. It could therefore only ever
+// certify the assumption; it could not test it. The assumption was false:
+// persistProviderMetaAfterRevoke has four branches that write no provider_meta,
+// its error is discarded with `_ =` in revokeOldKeyAndPersistMeta, and
+// recordRotationOutcome writes the alarm regardless. The subtests below now
+// exercise BOTH branches -- the one where provider_meta moves and the one where
+// it does not -- and the "does not" case is the one that reproduces the real
+// failure, so it is written first.
 func TestClearRevokeHalfOfRotationErrorIsCompareAndSwap(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 	ctx := context.Background()
@@ -89,7 +101,7 @@ func TestClearRevokeHalfOfRotationErrorIsCompareAndSwap(t *testing.T) {
 		setErr(t, id, composite)
 
 		text, pm := snapshot(t, id)
-		h.clearRevokeHalfOfRotationError(ctx, req, "test.clean", id, text, pm)
+		h.clearRevokeHalfOfRotationError(ctx, req, "test.clean", id, text, pm, []string{"K1"})
 
 		if got := readErr(t, id); got != "target apply failed: HTTP 500" {
 			t.Fatalf("co-resident failure not preserved / revoke half not cleared: got %q", got)
@@ -108,22 +120,61 @@ func TestClearRevokeHalfOfRotationErrorIsCompareAndSwap(t *testing.T) {
 		newAlarm := "rotation failed: upstream 503 while minting the replacement key"
 		setErr(t, id, newAlarm)
 
-		h.clearRevokeHalfOfRotationError(ctx, req, "test.race", id, text, pm)
+		h.clearRevokeHalfOfRotationError(ctx, req, "test.race", id, text, pm, []string{"K1"})
 
 		if got := readErr(t, id); got != newAlarm {
 			t.Fatalf("clear erased a newer distinct alarm: got %q, want %q", got, newAlarm)
 		}
 	})
 
-	t.Run("does not erase a SAME-STRING alarm re-armed about a different key (provider_meta predicate)", func(t *testing.T) {
-		// This is the ABA the text predicate alone cannot see: revokeStillLiveMsg is a
-		// bare static const with no key identity, so a concurrent recordRotationOutcome
-		// that re-arms it about a different, still-live key writes byte-identical text.
-		// It always moves provider_meta (the new key's markers), which the CAS compares.
+	t.Run("catches a re-arm about a different key with NO provider_meta write (the branch the old guard could not reach)", func(t *testing.T) {
+		// THE BRANCH THE PREVIOUS VERSION OF THIS TEST MANUFACTURED AWAY.
+		//
+		// The co-gate's stated premise was "the revoke alarm always travels with
+		// the pending-revoke markers". It does not. persistProviderMetaAfterRevoke
+		// returns early without writing provider_meta on four branches (row read
+		// error, the provider changed mid-rotation, an egress refusal, and a
+		// marshal/encrypt/persist failure), revokeOldKeyAndPersistMeta throws that
+		// error away with `_ =`, and recordRotationOutcome writes the alarm anyway.
+		//
+		// So this subtest deliberately does NOT touch provider_meta between the
+		// snapshot and the concurrent re-arm. The co-gate is therefore inert here
+		// BY CONSTRUCTION, and the only thing that can catch the ABA is the alarm
+		// naming its own subject.
+		id := "caserr-noprovmeta-" + randomHex(6)
+		mustEntry(t, h, queries, id, owner, "Entry "+id, "V")
+		setMeta(t, id, `{"key_id":"A"}`)
+		setErr(t, id, revokeStillLiveMsgFor([]string{"K2"}))
+		text, pm := snapshot(t, id)
+
+		// Concurrent rotation: its revoke of K1 failed and its provider_meta
+		// write-back hit one of the four silent branches, so it re-arms the alarm
+		// about a DIFFERENT still-live key and provider_meta does not move.
+		rearmed := revokeStillLiveMsgFor([]string{"K1"})
+		setErr(t, id, rearmed)
+
+		// Our retry settled K2 and clears only K2.
+		h.clearRevokeHalfOfRotationError(ctx, req, "test.noprovmeta", id, text, pm, []string{"K2"})
+
+		if got := readErr(t, id); got != rearmed {
+			t.Fatalf("the clear erased an alarm re-armed about a DIFFERENT live key while provider_meta "+
+				"never moved, so the co-gate could not see it: got %q, want %q.\n"+
+				"This is the branch the pre-2026-08-19 guard could not reach because it wrote provider_meta "+
+				"itself before writing the alarm.", got, rearmed)
+		}
+	})
+
+	t.Run("the provider_meta predicate still catches a same-string ABA on an OLD-SHAPE row", func(t *testing.T) {
+		// The residual the value-level identity cannot cover: a row written before
+		// the alarm carried key ids holds the bare const, so two alarms about two
+		// different keys really are byte-identical and the text predicate is blind.
+		// provider_meta re-nonces on every write, so when the concurrent rotation
+		// DID move the markers, its ciphertext is the witness. This is the case the
+		// 2026-08-18 co-gate genuinely closes, and it is why the co-gate stays.
 		id := "caserr-aba-" + randomHex(6)
 		mustEntry(t, h, queries, id, owner, "Entry "+id, "V")
 		setMeta(t, id, `{"key_id":"A","markers":"removed-by-resolve"}`)
-		setErr(t, id, revokeStillLiveMsg)
+		setErr(t, id, revokeStillLiveMsg) // old shape: no key identity
 		text, pm := snapshot(t, id)
 
 		// Concurrent rotation: re-arms the SAME sentence about key B (byte-identical
@@ -131,7 +182,7 @@ func TestClearRevokeHalfOfRotationErrorIsCompareAndSwap(t *testing.T) {
 		setMeta(t, id, `{"key_id":"B","pending_revoke":"re-armed for a different live key"}`)
 		setErr(t, id, revokeStillLiveMsg) // same bytes as the snapshot
 
-		h.clearRevokeHalfOfRotationError(ctx, req, "test.aba", id, text, pm)
+		h.clearRevokeHalfOfRotationError(ctx, req, "test.aba", id, text, pm, []string{"K1"})
 
 		if got := readErr(t, id); got != revokeStillLiveMsg {
 			t.Fatalf("clear erased a same-string alarm re-armed about a different live key (ABA): got %q, want it left intact %q",

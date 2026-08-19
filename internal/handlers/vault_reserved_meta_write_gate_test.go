@@ -72,7 +72,12 @@ func TestReservedProviderMetaKeysAreRefusedOnBothWriteDoors(t *testing.T) {
 		// Server-owned: written by deferRevokeOldProviderKey from the id the
 		// provider adapter already holds, never supplied by a client.
 		"pending_revoke_key_id": true,
-		"last_revoke_error":     true,
+		// Server-owned: the QUEUE of displaced marker sets that
+		// dischargePendingRevokeHead promotes into the head. A client that could
+		// plant one would be planting a pending_revoke_url with a delay fuse, so
+		// it is refused and redacted exactly like the head markers it feeds.
+		"pending_revoke_stranded": true,
+		"last_revoke_error":       true,
 	}
 	got := map[string]bool{}
 	for _, k := range reservedProviderMetaKeys {

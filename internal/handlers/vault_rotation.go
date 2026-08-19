@@ -332,6 +332,9 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			OldValue:    oldValueCopy,
 			NewValue:    newValue,
 			RevokeWarn:  revokeWarn,
+			// The twin of the manual path's line; see the comment there for why
+			// this is read AFTER revokeOldKeyAndPersistMeta rather than before.
+			RevokeKeyIDs: outstandingRevokeKeyIDs(meta),
 		})
 
 		// Per-path by design: the sweep has no request to attribute the activity to.

@@ -2441,6 +2441,9 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// can refuse to act on a newer alarm. Same discipline as the two clearers
 	// in vault_pending_revoke.go.
 	discardedFromRotationError := ""
+	// Every key the discarded marker set named (head plus stranded backlog), so
+	// the clear below settles the alarm for all of them and only them.
+	var discardedKeyIDs []string
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
 		// Fetch current values for fields not being updated
 		current, fetchErr := qtx.GetVaultEntryMeta(ctx, id)
@@ -2542,13 +2545,22 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				// path worked. Record what was abandoned, so the two surfaces
 				// leave the same trail.
 				discardedFromRotationError = current.LastRotationError.String
-				if st := pendingRevokeStatusFrom(h.decryptColumnOrLog(
-					current.ProviderMeta.String, "{}", vaultFieldProviderMeta)); st != nil {
+				discardedMeta := ParseProviderMeta(h.decryptColumnOrLog(
+					current.ProviderMeta.String, "{}", vaultFieldProviderMeta))
+				if st := pendingRevokeStatusFromMeta(discardedMeta); st != nil {
 					discardedPredecessorKey = st.PredecessorKeyID
 					if discardedPredecessorKey == "" {
 						discardedPredecessorKey = "(id unavailable)"
 					}
 				}
+				// EVERY key the discarded marker set named, not just the head.
+				// reconcileProviderMetaForStorage strips the whole reserved set
+				// including the stranded backlog, so a provider change abandons the
+				// queue as well as the head, and the alarm must be settled for all
+				// of them or it would name keys this row can no longer even
+				// describe. discardedPredecessorKey stays the head alone: it is what
+				// the activity row reports, and that sentence is about one key.
+				discardedKeyIDs = outstandingRevokeKeyIDs(discardedMeta)
 			}
 			metaToStore, metaReconciled := reconcileProviderMetaForStorage(
 				metaSource, beforeMeta, keepMarkers)
@@ -2735,7 +2747,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			// last clearer, so the unconditional writer now has no caller outside
 			// the three outcome recorders.
 			h.clearRevokeHalfOfRotationError(ctx, r, "vault.update.provider_change_discard", id,
-				metaRow.LastRotationError.String, metaRow.ProviderMeta)
+				metaRow.LastRotationError.String, metaRow.ProviderMeta, discardedKeyIDs)
 		}
 	}
 
@@ -3444,6 +3456,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		OldValue:    oldValue,
 		NewValue:    newValue,
 		RevokeWarn:  revokeWarn,
+		// READ AFTER revokeOldKeyAndPersistMeta, not before. That call runs the
+		// deferred revoke and, on a confirmed success, discharges the head marker
+		// and promotes the backlog, so the map only names the keys that are still
+		// live once it has returned. Reading earlier would alarm about a key this
+		// pass had just killed.
+		RevokeKeyIDs: outstandingRevokeKeyIDs(providerMeta),
 	}
 	if targetsUndecryptable {
 		// The value IS rotated and the predecessor IS revoked, so this is a partial

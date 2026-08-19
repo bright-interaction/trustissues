@@ -333,29 +333,53 @@ func TestZZCasEditProviderMetaRace(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// MISSING TEST 3: withoutRevokeStillLive table test.
+// MISSING TEST 3: withoutRevokeStillLiveKeys table test.
+//
+// Extended 2026-08-19 when the clear became PER-KEY. The first eight cases are
+// the original ones, unchanged in expectation, driven with a settled set that
+// covers whatever the value names -- they pin that an alarm with no key identity
+// (every row written before that change) still clears exactly as it did. The
+// cases after them are the new behaviour: an alarm that names two keys must
+// SURVIVE settling one of them.
 // ---------------------------------------------------------------------------
 
-func TestZZWithoutRevokeStillLive(t *testing.T) {
+func TestZZWithoutRevokeStillLiveKeys(t *testing.T) {
+	k1k2 := revokeStillLiveMsgFor([]string{"K1", "K2"})
 	cases := []struct {
-		name string
-		in   string
-		want string
+		name    string
+		in      string
+		settled []string
+		want    string
 	}{
-		{"empty", "", ""},
-		{"the message alone clears the field", revokeStillLiveMsg, ""},
-		{"joined suffix keeps the delivery failure", "webhook delivery failed: HTTP 500; " + revokeStillLiveMsg, "webhook delivery failed: HTTP 500"},
-		{"an unrelated error survives untouched", "webhook delivery failed: HTTP 500", "webhook delivery failed: HTTP 500"},
-		{"the message as a PREFIX is not the join shape and must not be trimmed", revokeStillLiveMsg + "; webhook delivery failed", revokeStillLiveMsg + "; webhook delivery failed"},
-		{"a bare substring in the middle is not the join shape", "before " + revokeStillLiveMsg + " after", "before " + revokeStillLiveMsg + " after"},
-		{"trailing whitespace defeats the suffix match (documented shape only)", revokeStillLiveMsg + " ", revokeStillLiveMsg + " "},
-		{"doubled suffix removes exactly one", "x; " + revokeStillLiveMsg + "; " + revokeStillLiveMsg, "x; " + revokeStillLiveMsg},
+		// --- old shape: no key identity in the value at all ---
+		{"empty", "", []string{"K1"}, ""},
+		{"the message alone clears the field", revokeStillLiveMsg, []string{"K1"}, ""},
+		{"joined suffix keeps the delivery failure", "webhook delivery failed: HTTP 500; " + revokeStillLiveMsg, []string{"K1"}, "webhook delivery failed: HTTP 500"},
+		{"an unrelated error survives untouched", "webhook delivery failed: HTTP 500", []string{"K1"}, "webhook delivery failed: HTTP 500"},
+		{"the message as a PREFIX is not the join shape and must not be trimmed", revokeStillLiveMsg + "; webhook delivery failed", []string{"K1"}, revokeStillLiveMsg + "; webhook delivery failed"},
+		{"a bare substring in the middle is not the join shape", "before " + revokeStillLiveMsg + " after", []string{"K1"}, "before " + revokeStillLiveMsg + " after"},
+		{"trailing whitespace defeats the suffix match (documented shape only)", revokeStillLiveMsg + " ", []string{"K1"}, revokeStillLiveMsg + " "},
+		{"doubled suffix removes exactly one", "x; " + revokeStillLiveMsg + "; " + revokeStillLiveMsg, []string{"K1"}, "x; " + revokeStillLiveMsg},
+
+		// --- new shape: the value names its subject ---
+		{"settling the only named key clears the clause", revokeStillLiveMsgFor([]string{"K2"}), []string{"K2"}, ""},
+		{"settling ONE of two leaves the other armed", k1k2, []string{"K2"}, revokeStillLiveMsgFor([]string{"K1"})},
+		{"settling the other one leaves the first armed", k1k2, []string{"K1"}, revokeStillLiveMsgFor([]string{"K2"})},
+		{"settling both clears the clause", k1k2, []string{"K1", "K2"}, ""},
+		{"settling a key the alarm does not name changes nothing", k1k2, []string{"K9"}, k1k2},
+		{"settling nothing changes nothing", k1k2, nil, k1k2},
+		{"a co-resident delivery failure survives a partial settle",
+			"webhook delivery failed: HTTP 500; " + k1k2, []string{"K1"},
+			"webhook delivery failed: HTTP 500; " + revokeStillLiveMsgFor([]string{"K2"})},
+		{"a co-resident delivery failure survives a full settle",
+			"webhook delivery failed: HTTP 500; " + k1k2, []string{"K1", "K2"},
+			"webhook delivery failed: HTTP 500"},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := withoutRevokeStillLive(c.in); got != c.want {
-				t.Errorf("withoutRevokeStillLive(%q) = %q, want %q", c.in, got, c.want)
+			if got := withoutRevokeStillLiveKeys(c.in, c.settled); got != c.want {
+				t.Errorf("withoutRevokeStillLiveKeys(%q, %v) = %q, want %q", c.in, c.settled, got, c.want)
 			}
 		})
 	}

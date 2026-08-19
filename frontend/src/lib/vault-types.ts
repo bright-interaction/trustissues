@@ -277,11 +277,21 @@ export const vaultApi = {
   // outside this tool. No password: this only clears the LOCAL marker, it
   // never touches the provider. The caller must echo back the exact
   // predecessor_key_id shown, and the server 400s on a mismatch.
+  //
+  // ACKNOWLEDGING ONE KEY IS NOT ACKNOWLEDGING ALL OF THEM, so the response
+  // carries pending_revoke like the retry response does. An entry can hold a
+  // QUEUE of stranded predecessors; discharging the acknowledged one promotes
+  // the next, and the server hands that back. This was typed `void`, so the
+  // caller had nothing to read and hardcoded null: the banner cleared while an
+  // older key was still live at the vendor.
   pendingRevokeResolve: (id: string, acknowledgedKeyId: string) =>
-    request<void>(`/vault/${id}/pending-revoke/resolve`, {
-      method: 'POST',
-      body: JSON.stringify({ acknowledged_key_id: acknowledgedKeyId }),
-    }),
+    request<{ resolved: boolean; pending_revoke: VaultEntry['pending_revoke'] }>(
+      `/vault/${id}/pending-revoke/resolve`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ acknowledged_key_id: acknowledgedKeyId }),
+      }
+    ),
   // Move an entry into a collection (editor/manager on the destination) or back
   // to personal (pass null). Requires write access to the entry itself.
   moveToCollection: (id: string, collectionId: string | null) =>

@@ -537,8 +537,14 @@ func egressInfluencingMetaKeys() []string {
 // the new secret, "b2" drives a whole authorize-then-delete flow), so a client
 // that could plant it could redirect what gets authenticated where, same as the
 // method/URL pair.
+//
+// pending_revoke_stranded is reserved for the sharpest reason of all: it is a
+// QUEUE of method/url/auth triples that dischargePendingRevokeHead promotes into
+// the head, so a client that could plant one would be planting a pending_revoke_url
+// with a delay fuse. It is redacted on the way out and refused on the way in,
+// exactly like the head markers it feeds.
 var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth,
-	pendingRevokeKeyID, "last_revoke_error"}
+	pendingRevokeKeyID, pendingRevokeStranded, "last_revoke_error"}
 
 // rejectReservedProviderMetaKeys reports the first server-owned key found in a
 // client-supplied provider_meta, if any.
@@ -788,7 +794,17 @@ type pendingRevokeStatus struct {
 //     because there IS a marker on the row, but junk that fails the charset
 //     check is withheld rather than echoed to a client unfiltered.
 func pendingRevokeStatusFrom(raw string) *pendingRevokeStatus {
-	meta := ParseProviderMeta(raw)
+	return pendingRevokeStatusFromMeta(ParseProviderMeta(raw))
+}
+
+// pendingRevokeStatusFromMeta is the same derivation over an already-parsed map.
+//
+// Split out so outstandingRevokeKeyIDs can name the head key the way the chip
+// and the resolve dialog name it, without re-marshalling a map it already holds.
+// The alarm must never name a key the operator is not also shown, and sharing
+// this one function is what makes that true by construction rather than by two
+// implementations agreeing.
+func pendingRevokeStatusFromMeta(meta map[string]string) *pendingRevokeStatus {
 	v := meta[pendingRevokeURL]
 	if v == "" {
 		// A PARTIAL SET IS STILL AN OUTSTANDING REVOKE, and used to be invisible.

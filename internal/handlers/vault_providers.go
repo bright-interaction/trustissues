@@ -493,6 +493,21 @@ func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authSchem
 			"was queued for it; delete the predecessor at the provider by hand and correct this entry's key id"
 		return
 	}
+	// NEVER OVERWRITE A SURVIVING HEAD THAT NAMES A DIFFERENT KEY.
+	//
+	// This was the CRITICAL. The four markers below describe ONE revoke, and the
+	// map handed in is frequently a SURVIVING marker set: a failed revoke leaves
+	// all four in place and the next rotation defers over them. So rotation N+1
+	// EVICTED rotation N's stranded predecessor, and since the alarm was one
+	// identity-free const and RotationLogEntry has no key field, nothing durable
+	// named the evicted key any more. It stayed valid at the vendor while the
+	// product, once the surviving key was settled, reported the entry clean.
+	//
+	// Displaced coordinates now go on the backlog instead, and are promoted back
+	// into the head when this one is discharged. See
+	// pushDisplacedHeadOntoBacklog: a re-defer of the SAME key still overwrites
+	// in place, which is what the paragraph below is about.
+	pushDisplacedHeadOntoBacklog(meta, rawURL, predecessorID)
 	meta[pendingRevokeMethod] = method
 	meta[pendingRevokeURL] = rawURL
 	meta[pendingRevokeAuth] = authScheme
@@ -518,23 +533,22 @@ func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authSchem
 	}
 }
 
-// deletePendingRevokeMarkers removes every pending-revoke marker from a
-// provider_meta map.
+// pendingRevokeMarkerKeys is the HEAD marker set: the four keys a confirmed
+// revoke discharges. It is a strict subset of reservedProviderMetaKeys, which
+// also carries last_revoke_error (a warning that outlives the markers) and
+// pendingRevokeStranded (the backlog, which deliberately OUTLIVES a discharge --
+// settling the head says nothing about the older keys queued behind it).
 //
 // It exists so the set lives in ONE place. Adding pendingRevokeKeyID meant
 // finding three hand-written three-delete blocks, which is precisely the
 // incomplete-migration shape this estate keeps paying for: a fourth marker
 // added later with one site missed leaves a partial marker on the row, and a
 // partial marker is indistinguishable from a real stranded key.
-func deletePendingRevokeMarkers(m map[string]string) {
-	for _, k := range pendingRevokeMarkerKeys {
-		delete(m, k)
-	}
-}
-
-// pendingRevokeMarkerKeys is the transient set a confirmed revoke discards.
-// It is a strict subset of reservedProviderMetaKeys, which also carries
-// last_revoke_error (a warning that outlives the markers).
+//
+// The discharge itself is dischargePendingRevokeHead in
+// vault_pending_revoke_history.go. It used to be deletePendingRevokeMarkers here;
+// it moved and was renamed when the marker set became a queue, because it now
+// PROMOTES the next backlog entry as well as deleting these four.
 var pendingRevokeMarkerKeys = []string{
 	pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth, pendingRevokeKeyID,
 }
@@ -664,7 +678,7 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 	// then "fixed" backblaze to match the comment, which silently discarded the
 	// coordinates of live keys. See backblazeRevokeOldKey for the full argument.
 	if meta["last_revoke_error"] == "" {
-		deletePendingRevokeMarkers(meta)
+		dischargePendingRevokeHead(meta)
 	}
 }
 

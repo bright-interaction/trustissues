@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/alerts"
@@ -300,30 +299,6 @@ func persistProviderMetaAfterRevoke(ctx context.Context, deps rotationDeps, entr
 	return nil
 }
 
-// withoutRevokeStillLive removes revokeStillLiveMsg from a last_rotation_error
-// value, and ONLY that -- it is deliberately not "contains revokeStillLiveMsg
-// -> clear the whole field", which would also erase an unrelated failure
-// sitting next to it.
-//
-// foldRevokeOutcome joins a delivery failure and the revoke warning as
-// errSummary + "; " + revokeStillLiveMsg, so the two facts can share one
-// column. A successful pending-revoke retry only settles the revoke half; the
-// delivery failure, if any, is still true and must survive. So this matches
-// exactly the two shapes foldRevokeOutcome can produce (the message alone, or
-// the message as a trailing "; "-joined suffix) and leaves anything else
-// unchanged, including a value that merely contains the message as a
-// substring somewhere the join never puts it.
-func withoutRevokeStillLive(s string) string {
-	switch {
-	case s == revokeStillLiveMsg:
-		return ""
-	case strings.HasSuffix(s, "; "+revokeStillLiveMsg):
-		return strings.TrimSuffix(s, "; "+revokeStillLiveMsg)
-	default:
-		return s
-	}
-}
-
 // rotationRecord is everything needed to finalise a rotation that has already
 // committed its value.
 type rotationRecord struct {
@@ -342,6 +317,16 @@ type rotationRecord struct {
 	NewValue secretexit.Plaintext
 	// RevokeWarn is what revokeOldKeyAndPersistMeta returned.
 	RevokeWarn string
+	// RevokeKeyIDs are the keys this row still says are live at the provider,
+	// read off provider_meta AFTER the revoke attempt (outstandingRevokeKeyIDs):
+	// the head marker's predecessor plus every entry on the stranded backlog.
+	//
+	// It is what gives the alarm a subject. Sourcing it from the MAP rather than
+	// from the warning text is the point: the warnings are prose assembled by
+	// combineRevokeWarnings out of two different failures, while the map is the
+	// authoritative answer to "which keys did we fail to kill". An empty slice
+	// degrades the alarm to the bare const, which is the pre-change behaviour.
+	RevokeKeyIDs []string
 }
 
 // recordRotationOutcome delivers to configured targets, computes the true final
@@ -370,9 +355,13 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 		}
 	}
 
-	status, errSummary, revokeAlert := foldRevokeOutcome(status, errSummary, rec.RevokeWarn)
+	status, errSummary, revokeAlert := foldRevokeOutcome(status, errSummary, rec.RevokeWarn, rec.RevokeKeyIDs)
 	if revokeAlert {
-		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsg)
+		// The alert body names the keys too, from the same bounded renderer, so
+		// the email and the column agree. It was the bare const, which meant an
+		// operator holding two alerts about two different stranded keys could not
+		// tell them apart.
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsgFor(rec.RevokeKeyIDs))
 	}
 
 	// Honour a "Notify only" target. It transmits nothing, so the delivery loop
@@ -408,12 +397,25 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 	return status, errSummary
 }
 
-// revokeStillLiveMsg is the ONLY text either path may persist about a failed
-// old-key revoke.
+// revokeStillLiveMsg is the STEM of the only text either path may persist about
+// a failed old-key revoke. Nothing writes it directly any more: everything goes
+// through revokeStillLiveMsgFor, which appends the bounded key identity.
 //
-// Static on purpose. The raw revoke error can embed the provider URL, the key id
-// and the upstream response body, and last_rotation_error is API-visible, so the
-// detail belongs in the slog line and nowhere else.
+// Static on purpose, and that has NOT been relaxed. The raw revoke error can
+// embed the provider URL and the upstream response body, and last_rotation_error
+// is API-visible, so all of that still belongs in the slog line and nowhere else.
+// What changed is narrower: the KEY ID is appended, and only an id that passes
+// conservativeKeyIDPattern, which is the identical filter
+// pendingRevokeStatusFrom already applies to the predecessor_key_id field every
+// entry GET and list response hands the same readers. So the alarm discloses
+// nothing that surface did not already disclose.
+//
+// It had to change. A single identity-free const standing for N still-live keys
+// is not clearable: settling one of them cleared the alarm for all of them, and
+// a CAS over the value could not tell "nobody wrote" from "somebody re-armed the
+// same sentence about a different key". Those are the audit's P0-1 and P1-1, and
+// they are one defect: an alarm that carries no identity cannot be cleared
+// safely, and a CAS cannot discriminate what the value does not encode.
 const revokeStillLiveMsg = "old key not revoked (still live at provider); see server logs"
 
 // foldRevokeOutcome merges "the predecessor key is still live upstream" into a
@@ -437,7 +439,13 @@ const revokeStillLiveMsg = "old key not revoked (still live at provider); see se
 // The scheduled sweep already computed this correctly. Both paths now call this,
 // so the rule is stated once instead of being re-derived at the two sites that
 // finalise a rotation.
-func foldRevokeOutcome(status, errSummary, revokeWarn string) (outStatus, outSummary string, alert bool) {
+// keyIDs names the keys the row still says are live, and is what stops this
+// function collapsing N facts into one. It used to write the bare const whatever
+// happened, so two stranded keys produced one alarm and settling either one
+// cleared it for both -- with the older key's coordinates already overwritten,
+// nothing in the product named it again. Empty keyIDs still renders the bare
+// const, which is what a row with no nameable predecessor id gets.
+func foldRevokeOutcome(status, errSummary, revokeWarn string, keyIDs []string) (outStatus, outSummary string, alert bool) {
 	if revokeWarn == "" {
 		return status, errSummary, false
 	}
@@ -445,10 +453,11 @@ func foldRevokeOutcome(status, errSummary, revokeWarn string) (outStatus, outSum
 	if status == "success" {
 		status = "partial"
 	}
+	msg := revokeStillLiveMsgFor(keyIDs)
 	if errSummary == "" {
-		errSummary = revokeStillLiveMsg
+		errSummary = msg
 	} else {
-		errSummary = errSummary + "; " + revokeStillLiveMsg
+		errSummary = errSummary + "; " + msg
 	}
 	return status, errSummary, true
 }

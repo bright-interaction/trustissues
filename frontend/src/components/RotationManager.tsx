@@ -300,9 +300,28 @@ export default function RotationManager({
 
   const resolvePendingRevoke = useMutation({
     mutationFn: () => vaultApi.pendingRevokeResolve(entry.id, resolveConfirmInput),
-    onSuccess: () => {
-      applyPendingRevoke(null);
-      toast.success('Marked as handled. Nothing was deleted at the provider.');
+    onSuccess: (data) => {
+      // FORWARD THE SERVER'S ANSWER, NEVER A HARDCODED null.
+      //
+      // This used to be applyPendingRevoke(null) against a `void`-typed
+      // response, on the assumption that acknowledging the key shown clears
+      // everything. It does not: an entry can carry a QUEUE of stranded
+      // predecessors, and discharging the acknowledged one PROMOTES the next.
+      // Hardcoding null took the banner down while an older key was still live
+      // at the vendor, which is the same false-assurance failure the server
+      // side of this feature was just fixed for. Same undefined-guard as the
+      // retry path: a missing field must not read as "nothing pending".
+      const next = data.pending_revoke !== undefined ? data.pending_revoke : null;
+      applyPendingRevoke(next);
+      if (next?.outstanding) {
+        toast.success(
+          next.predecessor_key_id
+            ? `Marked as handled. Another predecessor key (${next.predecessor_key_id}) is still outstanding on this entry.`
+            : 'Marked as handled. Another predecessor key is still outstanding on this entry.'
+        );
+      } else {
+        toast.success('Marked as handled. Nothing was deleted at the provider.');
+      }
       setResolveConfirmOpen(false);
       setResolveConfirmInput('');
     },

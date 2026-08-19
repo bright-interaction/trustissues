@@ -140,6 +140,20 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 			"there is no revoke outstanding on this entry")
 		return
 	}
+	// CAPTURED BEFORE THE SPEND, because performPendingRevoke discharges the head
+	// marker in place on a confirmed success and promotes the next stranded key
+	// into it. Reading the id afterwards would name the key that is now waiting,
+	// so the clear below would settle the wrong one -- and leave the one actually
+	// revoked alarming forever.
+	settledKeyIDs := []string{}
+	if st := pendingRevokeStatusFromMeta(providerMeta); st != nil && st.PredecessorKeyID != "" {
+		settledKeyIDs = append(settledKeyIDs, st.PredecessorKeyID)
+	}
+	// The RAW recorded id beside targetURL, not the derived one above, because
+	// this pair is what the transform below compares against a marker set to ask
+	// "is this still the head I settled". A legacy row records no id and is
+	// matched on the URL alone, which is exactly what sameRevokeTarget does.
+	settledHeadKeyID := providerMeta[pendingRevokeKeyID]
 
 	// THE SPEND, NOT OPTIONAL. performPendingRevoke (called inside
 	// retryOutstandingRevoke below) mints its OWN secretexit receipt, so
@@ -174,8 +188,24 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 	// just cleared with its own stale copy. See vaultegress.CASProviderMeta.
 	work, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL,
 		providerMetaRaw, providerMeta, casToken, func(m map[string]string) {
-			if revoked {
-				deletePendingRevokeMarkers(m)
+			// GUARDED ON IDENTITY, BECAUSE THE DISCHARGE IS NO LONGER IDEMPOTENT.
+			//
+			// This transform runs TWICE in the ordinary case: performPendingRevoke
+			// already discharged the head in `providerMeta` in place, and
+			// casEditProviderMeta then copies that map and applies this. While a
+			// discharge was a plain four-key delete, running it again was harmless.
+			// It now PROMOTES the oldest stranded predecessor into the head, so an
+			// unguarded second run would discharge the promoted key as well: the
+			// retry would settle K2 and silently discard K1's coordinates in the
+			// same breath, which is the exact eviction this change exists to stop.
+			// Measured before this guard existed: the head came back empty and the
+			// next retry answered 409 no_pending_revoke.
+			//
+			// Comparing against the head we set out to settle makes it idempotent
+			// again, and keeps the CAS-miss path correct: on a re-read the fresh row
+			// still names that head, so the discharge applies there exactly once.
+			if revoked && sameRevokeTarget(m[pendingRevokeKeyID], m[pendingRevokeURL], settledHeadKeyID, targetURL) {
+				dischargePendingRevokeHead(m)
 			}
 		})
 	if persistErr != nil {
@@ -220,7 +250,7 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 				"than clearing a newer alarm this retry knows nothing about", "entry", id)
 		default:
 			h.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.retry", id,
-				fresh.LastRotationError.String, fresh.ProviderMeta)
+				fresh.LastRotationError.String, fresh.ProviderMeta, settledKeyIDs)
 		}
 	}
 
@@ -308,12 +338,20 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		lastRotationError = metaRow.LastRotationError.String
 	}
 
-	// Delete the three markers from this FRESHLY read map, under the same
+	// Discharge the head marker set on this FRESHLY read map, under the same
 	// gated CAS write the retry endpoint uses. Provider and every other meta
 	// key are untouched.
-	_, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL, raw, meta, casToken,
+	//
+	// ACKNOWLEDGING ONE KEY DOES NOT ACKNOWLEDGE THE ONES QUEUED BEHIND IT.
+	// dischargePendingRevokeHead promotes the oldest stranded predecessor into the
+	// head, so the operator is shown the next one and the chip stays up. That is
+	// why the response below reports the RESULTING status rather than a hardcoded
+	// nil: telling the client "resolved, nothing outstanding" while another key is
+	// still live at the vendor is the same false-assurance failure this whole
+	// change exists to remove.
+	result, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL, raw, meta, casToken,
 		func(m map[string]string) {
-			deletePendingRevokeMarkers(m)
+			dischargePendingRevokeHead(m)
 		})
 	if persistErr != nil {
 		logError(r, "vault.pending_revoke.resolve: could not persist", "entry", id, "error", persistErr)
@@ -341,8 +379,12 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		logError(r, "vault.pending_revoke.resolve: last_rotation_error changed while resolving; leaving "+
 			"it as found rather than clearing a newer alarm", "entry", id)
 	} else {
+		// ONLY the key the operator named. The acknowledgement is an explicit
+		// statement about one key ("I have confirmed THAT one is not a concern"),
+		// so it may not settle an alarm about any other.
 		h.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.resolve", id,
-			freshRow.LastRotationError.String, freshRow.ProviderMeta)
+			freshRow.LastRotationError.String, freshRow.ProviderMeta,
+			[]string{req.AcknowledgedKeyID})
 	}
 
 	userID := middleware.GetUserID(r.Context())
@@ -350,9 +392,11 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		fmt.Sprintf("Pending revoke resolved for vault secret: %s (key: %s, user: %s)",
 			h.sealSecretName(r.Context(), entryName), req.AcknowledgedKeyID, userID))
 
+	resultJSON, _ := json.Marshal(result)
 	writeJSON(w, http.StatusOK, pendingRevokeResolveResponse{
-		Resolved:      true,
-		PendingRevoke: nil,
+		Resolved: true,
+		// The PROMOTED status, not nil. See the comment on the CAS above.
+		PendingRevoke: pendingRevokeStatusFrom(string(resultJSON)),
 	})
 }
 
@@ -538,13 +582,28 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 // write -- durably, because a manual rotation does not re-run to re-record it,
 // so the entry would report clean while a key is live upstream. Comparing
 // last_rotation_error catches a concurrent recordRotationFailure (it writes a
-// distinct rotFail string). But the revoke alarm is the bare static const
-// revokeStillLiveMsg, byte-identical for two different keys, so a concurrent
-// recordRotationOutcome that re-arms it about a DIFFERENT still-live key would
-// slip a text-only compare (an ABA). provider_meta is the discriminator: the
-// alarm always travels with the pending-revoke markers, and provider_meta is
-// re-sealed with a fresh nonce on every write, so any marker change moves its
-// ciphertext and fails the CAS. See the query doc.
+// distinct rotFail string), AND, now that the revoke alarm carries the ids of
+// the keys it is about, it also catches a concurrent recordRotationOutcome that
+// re-arms the alarm about a DIFFERENT still-live key: that write produces
+// different bytes, so the text predicate sees it.
+//
+// THE PROVIDER_META PREDICATE STAYS, AND THE REASON IT WAS ORIGINALLY GIVEN WAS
+// WRONG. The 2026-08-18 change justified it as "the revoke alarm always travels
+// with the pending-revoke markers". It does not: persistProviderMetaAfterRevoke
+// has four branches that write no provider_meta at all (a read failure, the
+// provider changed under us, an egress refusal, a marshal/encrypt/persist
+// error), revokeOldKeyAndPersistMeta discards its error with `_ =`, and
+// recordRotationOutcome writes the alarm regardless. So on those branches the
+// co-gate had no discriminator and degraded to the text-only compare it
+// replaced. It is kept for the two jobs it genuinely does: the CONCURRENT
+// same-string re-arm where provider_meta DID move, and every row written before
+// the alarm carried identity, whose value still cannot discriminate anything.
+// The value-level identity is the fix for the rest. Two predicates, two
+// different failure modes, neither sufficient alone.
+//
+// settledKeyIDs names the keys this caller just settled, and ONLY those are
+// removed from the alarm. Settling one of several still-live keys used to clear
+// the alarm for all of them.
 //
 // On a miss we LEAVE IT: the stored state is newer and truer, and re-deriving
 // the clear on top of it is exactly the erasure the compare prevents. Leaving a
@@ -553,8 +612,8 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 //
 // `site` tags the log lines with the calling path so a persist failure or a lost
 // race is attributable to the retry, resolve or provider-change-discard site.
-func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString) {
-	cleared := withoutRevokeStillLive(current)
+func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString, settledKeyIDs []string) {
+	cleared := withoutRevokeStillLiveKeys(current, settledKeyIDs)
 	if cleared == current {
 		return
 	}

@@ -145,11 +145,18 @@ function entry(over: Partial<VaultEntry> = {}): VaultEntry {
   };
 }
 
-function renderRotationManager(e: VaultEntry) {
+// onPendingRevokeChanged is optional so existing callers are unaffected. It is
+// the prop the parent uses to keep its own copy of pending_revoke fresh, and a
+// test that cares whether the component forwarded the SERVER's value (rather
+// than a hardcoded null) has to observe it.
+function renderRotationManager(
+  e: VaultEntry,
+  onPendingRevokeChanged?: (patch: { pending_revoke: VaultEntry['pending_revoke'] }) => void
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
   render(
     <QueryClientProvider client={qc}>
-      <RotationManager entry={e} />
+      <RotationManager entry={e} onPendingRevokeChanged={onPendingRevokeChanged} />
     </QueryClientProvider>
   );
   return qc;
@@ -251,6 +258,59 @@ describe('"I deleted it myself" only clears the local record, and refuses to do 
 
     await user.click(confirmButton);
     await waitFor(() => expect(resolveMock).toHaveBeenCalledWith('e1', PREDECESSOR_KEY_ID));
+  });
+
+  it('keeps the banner up when the server hands back ANOTHER stranded key after the resolve', async () => {
+    // An entry can carry a QUEUE of stranded predecessors: rotation N's revoke
+    // of K1 failed, rotation N+1 stranded K2 as well. Acknowledging the key the
+    // banner is currently showing discharges only that one, and the server
+    // PROMOTES the next and returns it.
+    //
+    // This handler used to call applyPendingRevoke(null) unconditionally against
+    // a `void`-typed response, so the banner came down and the operator was told
+    // the entry was handled while an older key was still authenticating at the
+    // vendor. That is the same false-assurance failure the server side of this
+    // feature was fixed for, arriving one layer up.
+    const user = userEvent.setup();
+    const stillOutstanding = { outstanding: true, predecessor_key_id: 'K-older' };
+    resolveMock.mockResolvedValue({ resolved: true, pending_revoke: stillOutstanding });
+    const pendingRevokeChangedMock = vi.fn();
+    renderRotationManager(entry(), pendingRevokeChangedMock);
+
+    await screen.findByText('An older key at this provider is still live.');
+    await user.click(screen.getByRole('button', { name: 'I deleted it myself' }));
+    const confirmButton = await screen.findByRole('button', { name: 'Confirm, clear the record' });
+    await user.type(screen.getByPlaceholderText(PREDECESSOR_KEY_ID), PREDECESSOR_KEY_ID);
+    await user.click(confirmButton);
+
+    await waitFor(() => expect(resolveMock).toHaveBeenCalledWith('e1', PREDECESSOR_KEY_ID));
+    // The banner must STAY, because another key is still live.
+    expect(
+      await screen.findByText('An older key at this provider is still live.')
+    ).toBeInTheDocument();
+    // And the parent's copy must carry the promoted key, not null.
+    expect(pendingRevokeChangedMock).toHaveBeenCalledWith({ pending_revoke: stillOutstanding });
+  });
+
+  it('positive control: the banner DOES come down when nothing is left outstanding', async () => {
+    // Without this, the test above would pass against a component that simply
+    // never clears the banner.
+    const user = userEvent.setup();
+    resolveMock.mockResolvedValue({ resolved: true, pending_revoke: null });
+    renderRotationManager(entry());
+
+    await screen.findByText('An older key at this provider is still live.');
+    await user.click(screen.getByRole('button', { name: 'I deleted it myself' }));
+    const confirmButton = await screen.findByRole('button', { name: 'Confirm, clear the record' });
+    await user.type(screen.getByPlaceholderText(PREDECESSOR_KEY_ID), PREDECESSOR_KEY_ID);
+    await user.click(confirmButton);
+
+    await waitFor(() => expect(resolveMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(
+        screen.queryByText('An older key at this provider is still live.')
+      ).not.toBeInTheDocument()
+    );
   });
 });
 

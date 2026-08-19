@@ -166,7 +166,7 @@ func TestPredecessorKeyIDIsRecordedNotReDerived(t *testing.T) {
 		if meta[pendingRevokeKeyID] != "key_old_1" {
 			t.Fatalf("ABORT: the id was not recorded: %+v", meta)
 		}
-		deletePendingRevokeMarkers(meta)
+		dischargePendingRevokeHead(meta)
 		for _, k := range pendingRevokeMarkerKeys {
 			if _, left := meta[k]; left {
 				t.Errorf("%s survived the marker deletion: %+v", k, meta)

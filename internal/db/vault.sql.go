@@ -207,19 +207,43 @@ type CASVaultEntryRotationErrorParams struct {
 // rotation does not re-run to re-record the alarm, so the entry then reports
 // clean while a key is live upstream. This CAS closes that window.
 //
-// TWO predicates, because the revoke alarm is not unique per key. It is the
-// bare static const revokeStillLiveMsg (no key id in it, on purpose -- it must
-// not leak one into an operator-visible field), so two "old key not revoked"
-// alarms about two DIFFERENT predecessor keys are byte-identical. A value
-// compare on last_rotation_error ALONE therefore cannot tell "nobody wrote"
-// from "a rotation re-armed the same sentence about a different, still-live
-// key" (an ABA). The revoke alarm always travels with the pending-revoke
-// markers in provider_meta, and provider_meta is re-sealed with a FRESH NONCE on
-// every write (see CASProviderMeta), so its ciphertext is a per-write-unique
-// witness: comparing it too means any concurrent marker change fails the CAS
-// even when the alarm text collides. recordRotationFailure, which writes a
-// distinct rotFail string WITHOUT touching provider_meta, is caught by the text
-// predicate instead. Between them the two predicates admit no ABA.
+// TWO predicates, and the argument for the second one has been CORRECTED. Read
+// this in full before touching either.
+//
+// The revoke alarm used to be the bare static const revokeStillLiveMsg with no
+// key id in it, so two "old key not revoked" alarms about two DIFFERENT
+// predecessor keys were byte-identical and a value compare on
+// last_rotation_error ALONE could not tell "nobody wrote" from "a rotation
+// re-armed the same sentence about a different, still-live key" (an ABA). The
+// 2026-08-18 fix co-gated on provider_meta and justified it with "the revoke
+// alarm always travels with the pending-revoke markers".
+//
+// THAT PREMISE IS FALSE, and the 2026-08-19 audit reproduced it.
+// persistProviderMetaAfterRevoke has four branches that write NO provider_meta
+// (the row read fails, the provider changed under us, the egress gate refuses,
+// or marshal/encrypt/persist fails), revokeOldKeyAndPersistMeta discards its
+// error with a bare `_ =`, and recordRotationOutcome writes the alarm anyway.
+// On any of those branches the co-gate had no discriminator at all and degraded
+// to exactly the text-only compare it was introduced to replace.
+//
+// The real fix is at the VALUE, not at the second column: revokeStillLiveMsgFor
+// now appends the ids of the keys the alarm is about, bounded by
+// conservativeKeyIDPattern (the same filter the predecessor_key_id API field
+// already passes, so nothing new is disclosed). A re-arm about a different key
+// now writes different BYTES, which the text predicate sees on every branch,
+// including all four above. A CAS cannot discriminate what the value does not
+// encode; now it encodes it.
+//
+// The provider_meta predicate STAYS, for two jobs the value cannot do:
+//   - the CONCURRENT same-string case where provider_meta genuinely did move
+//     (marker changes re-seal the column with a FRESH NONCE, see CASProviderMeta,
+//     so its ciphertext is a per-write-unique witness);
+//   - every row written BEFORE the alarm carried identity, whose stored value
+//     still cannot discriminate anything.
+//
+// recordRotationFailure, which writes a distinct rotFail string WITHOUT touching
+// provider_meta, is caught by the text predicate. Neither predicate is
+// sufficient alone and neither may be removed on the strength of the other.
 //
 // The three OUTCOME recorders (recordRotationOutcome, recordRotationOutcome-
 // Undeliverable, recordRotationFailure) deliberately do NOT use this: each
