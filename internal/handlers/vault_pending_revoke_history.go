@@ -49,13 +49,17 @@ const pendingRevokeStranded = "pending_revoke_stranded"
 // maxStrandedRevokes bounds the backlog. It is a cap on an ENCRYPTED column that
 // no operator can prune by hand, so it cannot be unbounded.
 //
-// On overflow the OLDEST entries are kept and the newest is refused, which is
-// the opposite of the usual ring-buffer instinct and is the whole point: the
+// On overflow the OLDEST entries are kept and the newest defer is refused, which
+// is the opposite of the usual ring-buffer instinct and is the whole point: the
 // oldest stranded key is the one whose coordinates have survived the most
 // rotations without being retried, so it is the one closest to being forgotten
-// forever. The refused key is not silent either -- it goes out through
-// last_revoke_error, the same channel an unnameable predecessor id already uses,
-// so the rotation downgrades to partial and alarms.
+// forever. The refusal is a VETO, not a log line: pushDisplacedHeadOntoBacklog
+// returns false and deferRevokeOldProviderKey then records nothing, so the head
+// it would have overwritten keeps its coordinates. And it is not silent either
+// -- it goes out through last_revoke_error, the same channel an unnameable
+// predecessor id already uses, and performPendingRevoke carries that value
+// across its own attempt so a same-rotation revoke success cannot erase it. The
+// rotation downgrades to partial and alarms.
 //
 // Reaching 32 stranded keys on one entry means 32 consecutive rotations each
 // failed their revoke, which is a provider outage measured in months. The bound
@@ -127,45 +131,94 @@ func setStrandedRevokes(m map[string]string, list []strandedRevoke) {
 // Identity is the recorded id when both sides have one, and the URL otherwise,
 // because a row written before deferRevokeOldProviderKey started recording ids
 // has no id to compare and its URL is what distinguishes it.
-func pushDisplacedHeadOntoBacklog(m map[string]string, newURL, newKeyID string) {
+//
+// THE RETURN VALUE IS A VETO, AND IT IS THE POINT.
+//
+// This used to return nothing. On the two paths where it CANNOT preserve the
+// head (the backlog is full, or the backlog is present but unreadable) it
+// logged, set last_revoke_error and bare-returned, and the caller then
+// overwrote all four head markers anyway. The displaced key landed in neither
+// the head nor the backlog: a credential still valid at the vendor with nothing
+// in the product naming it, which is the exact eviction this file exists to
+// close. The doc at the top of this file claims the queue never FORGETS a key,
+// and a refusal that cannot veto is the only way that claim could be false.
+//
+// false means "the caller must NOT record its new predecessor", so the surviving
+// head keeps its coordinates and stays retryable. That is the same keep-oldest
+// direction maxStrandedRevokes already chose, for the same reason: the older key
+// has been live at the vendor longer. It cannot wedge the entry, because retry
+// and resolve discharge the head at any time and a defer over an empty head is
+// accepted unconditionally.
+func pushDisplacedHeadOntoBacklog(m map[string]string, newURL, newKeyID string) bool {
 	headURL := m[pendingRevokeURL]
 	headKeyID := m[pendingRevokeKeyID]
 	if headURL == "" && headKeyID == "" {
-		return
+		return true
 	}
 	if sameRevokeTarget(headKeyID, headURL, newKeyID, newURL) {
-		return
+		return true
 	}
 	backlog, malformed := parseStrandedRevokes(m)
 	if malformed {
-		// Do not rewrite a value we could not read. The head is still overwritten
-		// by the caller, so say so through the alarm channel rather than dropping
-		// the fact.
-		m["last_revoke_error"] = "a previous key's revoke coordinates could not be preserved because this " +
-			"entry's stranded-revoke record is unreadable; delete the predecessor at the provider by hand"
-		return
+		// Do not rewrite a value we could not read, and do not overwrite the head
+		// on the strength of a record we cannot see. The key this rotation
+		// replaced is the one that goes unrecorded, and it is named in the log.
+		slog.Error("vault pending revoke: the stranded-revoke backlog is unreadable, so the key this "+
+			"rotation replaced was not queued for revoke; it must be deleted at the provider by hand",
+			"key_id", newKeyID)
+		m["last_revoke_error"] = "this entry's stranded-revoke record is unreadable, so the key this " +
+			"rotation replaced was not queued for revoke; delete it at the provider by hand"
+		return false
 	}
 	for _, s := range backlog {
 		if sameRevokeTarget(s.KeyID, s.URL, headKeyID, headURL) {
-			return // already recorded; a re-defer must not duplicate it
+			return true // already recorded; a re-defer must not duplicate it
 		}
 	}
 	if len(backlog) >= maxStrandedRevokes {
 		// Keep the oldest, refuse the newest, and be loud about it. See the doc
 		// on maxStrandedRevokes for why this direction.
-		slog.Error("vault pending revoke: the stranded-revoke backlog is full, so this predecessor's "+
-			"coordinates were not preserved; it must be deleted at the provider by hand",
-			"key_id", headKeyID, "backlog", len(backlog))
-		m["last_revoke_error"] = "too many previous keys are already stranded on this entry, so this one's " +
-			"revoke coordinates were not preserved; delete it at the provider by hand"
-		return
+		slog.Error("vault pending revoke: the stranded-revoke backlog is full, so the key this "+
+			"rotation replaced was not queued for revoke; it must be deleted at the provider by hand",
+			"key_id", newKeyID, "backlog", len(backlog))
+		m["last_revoke_error"] = "too many previous keys are already stranded on this entry, so the key " +
+			"this rotation replaced was not queued for revoke; delete it at the provider by hand"
+		return false
 	}
 	setStrandedRevokes(m, append(backlog, strandedRevoke{
-		KeyID:  headKeyID,
+		KeyID:  displacedHeadKeyID(m, headKeyID),
 		Method: m[pendingRevokeMethod],
 		URL:    headURL,
 		Auth:   m[pendingRevokeAuth],
 	}))
+	return true
+}
+
+// displacedHeadKeyID names the head being pushed onto the backlog the SAME way
+// pendingRevokeStatusFromMeta names it, so a key does not become less nameable
+// by being queued than it was while it held the head.
+//
+// It matters because deferRevokeOldProviderKey DELETES pending_revoke_key_id
+// whenever the id it was handed fails conservativeKeyIDPattern, and that id comes
+// straight out of provider_meta["key_id"], which is operator-writable and
+// validated nowhere. So a head carrying no recorded id is not only a legacy row
+// shape: any entry whose key id holds a character the charset rejects freshly
+// produces one. Pushed with KeyID "", outstandingRevokeKeyIDs skips the entry
+// entirely, so settling the keys it CAN name clears the whole alarm while that
+// one is still outstanding at the vendor.
+//
+// The derivation is pendingRevokeStatusFromMeta's, CALLED rather than
+// reimplemented. That function was split out precisely so the alarm can never
+// name a key the chip and the resolve dialog do not; a second copy of the rule
+// here would be two implementations agreeing by luck.
+func displacedHeadKeyID(m map[string]string, headKeyID string) string {
+	if headKeyID != "" {
+		return headKeyID
+	}
+	if st := pendingRevokeStatusFromMeta(m); st != nil {
+		return st.PredecessorKeyID
+	}
+	return ""
 }
 
 // sameRevokeTarget reports whether two marker sets describe one key.

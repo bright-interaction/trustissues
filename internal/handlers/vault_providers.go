@@ -507,7 +507,18 @@ func deferRevokeOldProviderKey(meta map[string]string, method, rawURL, authSchem
 	// into the head when this one is discharged. See
 	// pushDisplacedHeadOntoBacklog: a re-defer of the SAME key still overwrites
 	// in place, which is what the paragraph below is about.
-	pushDisplacedHeadOntoBacklog(meta, rawURL, predecessorID)
+	//
+	// AND THE REFUSAL IS A VETO. It returns false when it could not preserve the
+	// surviving head (backlog full, or backlog unreadable). Ignoring that return
+	// is what made the refusal a log line instead of a decision: the four markers
+	// below were overwritten regardless, so the displaced key was in neither the
+	// head nor the backlog. Refusing the defer keeps the older key's coordinates
+	// on the row and retryable; the key this rotation replaced goes unrecorded
+	// and is reported through last_revoke_error, which downgrades the rotation to
+	// partial and alarms.
+	if !pushDisplacedHeadOntoBacklog(meta, rawURL, predecessorID) {
+		return
+	}
 	meta[pendingRevokeMethod] = method
 	meta[pendingRevokeURL] = rawURL
 	meta[pendingRevokeAuth] = authScheme
@@ -620,6 +631,39 @@ func revokeTargetIsNameable(rawURL, authScheme string) bool {
 func performPendingRevoke(ctx context.Context, meta map[string]string, provider string,
 	newKey secretexit.Plaintext) {
 
+	// A LAST_REVOKE_ERROR WRITTEN BEFORE THIS ATTEMPT IS ABOUT A DIFFERENT KEY,
+	// SO THIS ATTEMPT MAY NOT DELETE IT.
+	//
+	// deferRevokeOldProviderKey writes that flag when it cannot record a
+	// predecessor at all (an unnameable id, and via pushDisplacedHeadOntoBacklog
+	// a full or unreadable backlog), and neon writes it when the provider hands
+	// back a key with no id. All of those happen during the mint, moments before
+	// this runs, and none of them is about the head this function is revoking.
+	// revokeOldProviderKey and backblazeRevokeOldKey then deleted the whole flag
+	// on a 2xx-or-404, so a rotation whose own revoke SUCCEEDED erased the record
+	// of the key it had just failed to queue: revokeWarn came back "" in
+	// revokeOldKeyAndPersistMeta, foldRevokeOutcome folded to status success with
+	// no alert, and persistProviderMetaAfterRevoke made the erasure durable. That
+	// is the only combination in this package that loses a live vendor key with
+	// no durable record at all, and it is the twin of the veto above it.
+	//
+	// The attempt therefore gets a clean slot to report ITS outcome into, and
+	// whatever was carried in is put back around it. The discharge decision at
+	// the bottom still reads only this attempt's outcome, which is what it has
+	// always meant. Both arms are covered because both are called from here.
+	carried := meta["last_revoke_error"]
+	delete(meta, "last_revoke_error")
+	defer func() {
+		if carried == "" {
+			return
+		}
+		if attempt := meta["last_revoke_error"]; attempt != "" {
+			meta["last_revoke_error"] = carried + "; also: " + attempt
+			return
+		}
+		meta["last_revoke_error"] = carried
+	}()
+
 	method, url, scheme := meta[pendingRevokeMethod], meta[pendingRevokeURL], meta[pendingRevokeAuth]
 	if url == "" {
 		return
@@ -686,8 +730,11 @@ func performPendingRevoke(ctx context.Context, meta map[string]string, provider 
 // records the outcome in meta["last_revoke_error"] instead of swallowing it. A
 // failed revoke means the OLD key is still live at the provider, so the rotation
 // is only PARTIAL - the caller/flow surfaces this rather than reporting success.
-// A 404 is treated as already-revoked (success). On success any prior error flag
-// is cleared. Providers set meta["key_id"] to the NEW id separately.
+// A 404 is treated as already-revoked (success). On success it clears the flag,
+// which is correct ONLY because performPendingRevoke hands it an empty slot and
+// restores anything that was carried in around it: this function owns the flag
+// for the duration of one attempt and must never delete a refusal written about
+// some other key. Providers set meta["key_id"] to the NEW id separately.
 func revokeOldProviderKey(ctx context.Context, meta map[string]string, method, url, authHeader string) {
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
