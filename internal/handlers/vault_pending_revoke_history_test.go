@@ -36,26 +36,30 @@ const historyProvider = "test-revoke-history"
 // historySink is a fake upstream that records every revoke and can be flipped
 // between "the provider is down" and "the provider works".
 type historySink struct {
-	mu              sync.Mutex
-	hits            []string
-	code            int
-	failFirstDelete bool
+	mu         sync.Mutex
+	hits       []string
+	code       int
+	failSuffix string
 }
 
 func (s *historySink) setCode(c int) { s.mu.Lock(); s.code = c; s.mu.Unlock() }
 
-func (s *historySink) setFailFirstDelete(v bool) { s.mu.Lock(); s.failFirstDelete = v; s.mu.Unlock() }
+// setFailSuffix makes ONE key permanently unrevokable while every other key
+// succeeds. That is the ordinary shape of a stranded predecessor: the key is
+// gone from the vendor's side, or its own delete is rejected, while the account
+// is otherwise healthy.
+//
+// It replaces a fail-the-first-delete-only switch, whose whole purpose was to
+// manufacture the interleaving the deleted cap+1 fixture needed. Failing one
+// key needs no timing trick, which is exactly what lets the saturation fixture
+// below reach the cap the way production reaches it.
+func (s *historySink) setFailSuffix(v string) { s.mu.Lock(); s.failSuffix = v; s.mu.Unlock() }
 
 func (s *historySink) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	code := s.code
 	if r.Method == http.MethodDelete {
-		// The provider is down when the rotation starts and back up moments
-		// later. That is the ONLY way one rotation can both preserve a stranded
-		// head (its opening retry fails) and then successfully revoke that same
-		// head (its own deferred attempt succeeds), which is the interleaving the
-		// cap-refusal case turns on.
-		if s.failFirstDelete && len(s.hits) == 0 {
+		if s.failSuffix != "" && strings.HasSuffix(r.URL.Path, s.failSuffix) {
 			code = http.StatusServiceUnavailable
 		}
 		s.hits = append(s.hits, fmt.Sprintf("%d %s", code, r.URL.Path))
@@ -184,23 +188,34 @@ func oldShapeStrandedMeta(base string) string {
 		base+"/keys/K1")
 }
 
-// capBoundBacklogMeta seeds a row whose backlog is one entry OVER the writer's
-// cap, with a head that is about to be revoked successfully.
+// capSaturatedBacklogMeta seeds the SATURATION STATE THE WRITERS ACTUALLY
+// PRODUCE: a surviving head plus a backlog sitting exactly on the cap.
 //
-// WHY ONE OVER, AND WHY THAT IS NOT A CHEAT. maxStrandedRevokes bounds what
-// pushDisplacedHeadOntoBacklog will APPEND; parseStrandedRevokes and
-// dischargePendingRevokeHead deliberately accept any length (the review measured
-// 20,000 entries parsing cleanly), so a longer row is a state the readers
-// support by design. It is also the only fixture that puts the writer exactly at
-// its cap at defer time with no stale-retry warning in play: every other route
-// to the cap needs the rotation's OPENING retry to fail, and that failure raises
-// its own warning through combineRevokeWarnings, which would arm the alarm and
-// mask the very erasure this test exists to catch. Here the opening retry
-// SUCCEEDS, its discharge promotes one entry out of the backlog, and the backlog
-// lands on the cap with a clean warning slate.
-func capBoundBacklogMeta(base string) string {
-	backlog := make([]strandedRevoke, 0, maxStrandedRevokes+1)
-	for i := 0; i <= maxStrandedRevokes; i++ {
+// A FIXTURE MUST BE REACHABLE BY THE SYSTEM'S OWN WRITERS, NOT MERELY TOLERATED
+// BY ITS READERS. This replaces a fixture that seeded maxStrandedRevokes+1
+// entries and defended itself on reader tolerance: parseStrandedRevokes and
+// dischargePendingRevokeHead do accept any length, and that is true and beside
+// the point. The discriminator is the writers, and there are exactly two. The
+// append at pushDisplacedHeadOntoBacklog sits past a len(backlog) >=
+// maxStrandedRevokes guard, so its output is never longer than the cap; the
+// promotion in dischargePendingRevokeHead writes backlog[1:], which strictly
+// shrinks. All six persistence doors write maps derived from those two, the key
+// is refused on both client write doors and redacted on read, and the cap and
+// the key were introduced in the same commit, so no legacy row can carry a
+// longer list either. Driving the real sweep 40 times with every revoke failing
+// saturates at 32 and holds there forever.
+//
+// So the true saturation state is HEAD + 32 BACKLOG = 33 KEYS OUTSTANDING on one
+// entry, which is what this seeds. A 33-entry backlog is a state only a test can
+// construct, and at the largest genuinely reachable length the old fixture
+// failed against correct source: its seed was the only thing holding it up.
+//
+// The head is K1 with its own revoke permanently failing, so the rotation's
+// opening retry cannot discharge it and the backlog is still full when the mint
+// defers K2 over it. That is the cap refusal in its reachable form.
+func capSaturatedBacklogMeta(base string) string {
+	backlog := make([]strandedRevoke, 0, maxStrandedRevokes)
+	for i := 0; i < maxStrandedRevokes; i++ {
 		id := fmt.Sprintf("S%03d", i)
 		backlog = append(backlog, strandedRevoke{
 			KeyID:  id,
@@ -227,58 +242,58 @@ func capBoundBacklogMeta(base string) string {
 	return string(out)
 }
 
-// TestAtTheBacklogCapASameRotationSuccessCannotEraseTheRefusal is the pair
-// proof, driven end to end through the real scheduled rotation.
+// TestAtBacklogSaturationTheCapRefusalVetoesTheDefer is HIGH-1 end to end in a
+// state the writers can reach. It is the round-2 review's
+// TestLens1NaturalCapRefusalWithNoSeedOverTheCap, adopted verbatim in intent:
+// backlog seeded to exactly the cap, head K1, and only K1's own revoke failing.
 //
-// It is one test because the two defects are only fatal together, and each
-// assertion below names the one it belongs to.
+// The sequence the sweep runs on this row:
 //
-// The sequence the sweep runs on this row, with the provider healthy:
-//
-//	retryOutstandingRevoke   DELETE /keys/K1  -> 200, head discharged, S000 promoted,
-//	                                            backlog now sits exactly on the cap
-//	provider.Rotate          mints K3, defers K2 over the surviving head S000
+//	retryOutstandingRevoke   DELETE /keys/K1 -> 503, the head SURVIVES and the
+//	                                           backlog is still on the cap
+//	provider.Rotate          mints K3, defers K2 over the surviving head K1
 //	                         -> the backlog is full, so the defer is REFUSED
-//	revokeOldKeyAndPersistMeta DELETE /keys/S000 -> 200, a SUCCESS in the same rotation
+//	revokeOldKeyAndPersistMeta DELETE /keys/K1 -> 503, the head is still K1
 //
-// HIGH-1: without a veto, that refused defer overwrote all four head markers
-// anyway. S000 then lived in neither the head nor the backlog, the rotation
-// revoked K2 instead of it, and S000 stayed valid at the vendor with nothing in
-// the product naming it.
+// Measured, base against the veto removed:
 //
-// HIGH-2: the refusal is written to last_revoke_error, and revokeOldProviderKey
-// deleted that flag wholesale on the 2xx above. revokeOldKeyAndPersistMeta then
-// read "" for revokeWarn, foldRevokeOutcome folded the pass to status success
-// with no alert, and persistProviderMetaAfterRevoke made the erasure durable.
-// Every assertion below is on a RE-READ row, not on staged state.
-func TestAtTheBacklogCapASameRotationSuccessCannotEraseTheRefusal(t *testing.T) {
-	h, queries, _, entryID, sink := revokeHistoryEnv(t, capBoundBacklogMeta)
+//	with the veto:    head="K1"   backlog=32  outstanding=33  sink=[503 K1 503 K1]
+//	veto removed:     head="S000" backlog=31  outstanding=32  sink=[503 K1 200 K2]
+//
+// Without the veto the refused defer overwrites all four head markers anyway, so
+// the rotation revokes K2 -- the key whose defer was REFUSED -- its discharge
+// promotes S000 into the head, and K1 is evicted into nothing: live at the
+// vendor, named in neither the head nor the backlog nor the alarm.
+func TestAtBacklogSaturationTheCapRefusalVetoesTheDefer(t *testing.T) {
+	h, queries, _, entryID, sink := revokeHistoryEnv(t, capSaturatedBacklogMeta)
 	sink.setCode(http.StatusOK)
+	sink.setFailSuffix("/keys/K1")
 
 	RotateVaultKeys(h.db, queries, h)
 	h.WaitForDelivery(5e9)
 
 	meta, lastErr := revokeHistoryMeta(t, h, queries, entryID)
 	backlog, malformed := parseStrandedRevokes(meta)
-	t.Logf("after rotation: last_rotation_error=%q head=%q backlog=%d sink=%v",
-		lastErr, meta[pendingRevokeKeyID], len(backlog), sink.all())
+	outstanding := outstandingRevokeKeyIDs(meta)
+	t.Logf("after rotation: last_rotation_error=%q head=%q backlog=%d outstanding=%d sink=%v",
+		lastErr, meta[pendingRevokeKeyID], len(backlog), len(outstanding), sink.all())
 
 	if malformed {
 		t.Fatalf("the backlog did not parse: %q", meta[pendingRevokeStranded])
 	}
-	if !sink.revokedOK("K1") {
-		t.Fatalf("ABORT: the opening retry never settled K1, so the backlog never reached the cap "+
-			"and nothing below is being tested. sink=%v", sink.all())
+	if sink.revokedOK("K1") {
+		t.Fatalf("ABORT: the sink accepted a delete of K1, so the head was discharged, the backlog "+
+			"dropped below the cap and no refusal ever happened. sink=%v", sink.all())
 	}
 
-	// HIGH-1. The defer that could not be recorded must not have overwritten the
-	// head. S000 held it, so S000 is what this rotation revoked.
-	if !sink.revokedOK("S000") {
-		t.Errorf("the rotation never revoked S000; sink=%v.\n"+
+	// The defer that could not be recorded must not have overwritten the head.
+	if meta[pendingRevokeKeyID] != "K1" {
+		t.Errorf("the head names %q, want K1.\n"+
 			"At the cap the refusal must VETO the defer. If it does not, the head is overwritten with "+
-			"K2, the rotation revokes K2 instead, and S000 -- whose coordinates were the only record of "+
-			"how to kill it -- is in neither the head nor the backlog while still valid at the vendor.",
-			sink.all())
+			"K2, the rotation revokes K2 instead, that success promotes S000 into the head, and K1 -- "+
+			"whose coordinates were the only record of how to kill it -- is in neither the head nor the "+
+			"backlog while still valid at the vendor. head=%q backlog=%d sink=%v",
+			meta[pendingRevokeKeyID], meta[pendingRevokeKeyID], len(backlog), sink.all())
 	}
 	for _, hit := range sink.all() {
 		if strings.HasSuffix(hit, "/keys/K2") {
@@ -287,36 +302,32 @@ func TestAtTheBacklogCapASameRotationSuccessCannotEraseTheRefusal(t *testing.T) 
 				sink.all())
 		}
 	}
-	if strings.Contains(meta[pendingRevokeStranded], `"S000"`) || meta[pendingRevokeKeyID] == "S000" {
-		t.Errorf("S000 was revoked but is still queued: head=%q backlog=%q",
-			meta[pendingRevokeKeyID], meta[pendingRevokeStranded])
+
+	// Nothing was dropped on the way through. The refusal costs exactly the key
+	// it refused: the head plus the full backlog are all still named.
+	if len(outstanding) != maxStrandedRevokes+1 {
+		t.Errorf("the row names %d outstanding keys, want %d (K1 plus S000..S%03d).\n"+
+			"outstanding=%v", len(outstanding), maxStrandedRevokes+1, maxStrandedRevokes-1, outstanding)
+	}
+	named := strings.Join(outstanding, ",")
+	if !strings.Contains(named, "K1") {
+		t.Errorf("K1 is no longer named anywhere: outstanding=%v", outstanding)
+	}
+	for i := 0; i < maxStrandedRevokes; i++ {
+		id := fmt.Sprintf("S%03d", i)
+		if !strings.Contains(named, id) {
+			t.Errorf("%s is no longer named anywhere: outstanding=%v", id, outstanding)
+		}
 	}
 
-	// HIGH-2. The refusal survived a revoke that SUCCEEDED in the same rotation.
+	// The rotation must not report clean. Its own revoke failed, and the refused
+	// defer said so through last_revoke_error as well.
 	if lastErr == "" {
-		t.Errorf("last_rotation_error is empty on the re-read row.\n"+
-			"The defer at the cap was refused and said so through last_revoke_error; the head revoke "+
-			"then returned 200 and revokeOldProviderKey deleted that flag, so the pass folded to a "+
-			"clean success. K2 is live at the vendor, was never queued, and now has no durable record "+
-			"anywhere. sink=%v", sink.all())
+		t.Errorf("last_rotation_error is empty on the re-read row; a key is live at the vendor. sink=%v",
+			sink.all())
 	}
 	if !strings.Contains(lastErr, revokeStillLiveMsg) {
 		t.Errorf("last_rotation_error is %q, want it to carry the still-live alarm", lastErr)
-	}
-
-	// Nothing else was dropped on the way through: every key the row was holding
-	// that this rotation did not kill is still named.
-	outstanding := outstandingRevokeKeyIDs(meta)
-	if len(outstanding) != maxStrandedRevokes {
-		t.Errorf("the row names %d outstanding keys, want %d (S001..S%03d).\n"+
-			"The refusal must cost exactly the key it refused and nothing else. outstanding=%v",
-			len(outstanding), maxStrandedRevokes, maxStrandedRevokes, outstanding)
-	}
-	for i := 1; i <= maxStrandedRevokes; i++ {
-		id := fmt.Sprintf("S%03d", i)
-		if !strings.Contains(strings.Join(outstanding, ","), id) {
-			t.Errorf("%s is no longer named anywhere: outstanding=%v", id, outstanding)
-		}
 	}
 }
 
@@ -377,6 +388,67 @@ func TestARefusedDeferSurvivesARevokeThatSucceedsInTheSameRotation(t *testing.T)
 			"last_revoke_error. The revoke that succeeded moments later deleted it, so the rotation "+
 			"reports clean while a key nothing in the product can name is still live at the vendor. "+
 			"sink=%v", sink.all())
+	}
+	if !strings.Contains(lastErr, revokeStillLiveMsg) {
+		t.Errorf("last_rotation_error is %q, want it to carry the still-live alarm", lastErr)
+	}
+}
+
+// TestTheManualRotatePathAlsoKeepsARefusalThroughASuccessfulRevoke is the
+// MANUAL TWIN of the test above, and it exists because the two paths are
+// protected by DIFFERENT MECHANISMS.
+//
+// The sweep is protected by performPendingRevoke's carry: it lifts any
+// pre-attempt last_revoke_error across its own attempt so a same-rotation
+// success cannot delete it. That carry is a NO-OP on the manual path.
+// h.Rotate lifts the flag out of provider_meta and deletes it BEFORE
+// revokeOldKeyAndPersistMeta is ever called, so `carried` is always "" by the
+// time performPendingRevoke sees the map. What saves the manual path instead is
+// an older, unrelated mechanism: the local pendingRevokeWarn plus the
+// `if warn != ""` guard on the revokeOldKeyAndPersistMeta result, which keeps
+// the mint-time refusal when this rotation's own revoke SUCCEEDS and returns "".
+//
+// Two mechanisms doing one job, and until this test both regression tests for
+// the refusal drove RotateVaultKeys only. Ablating that guard to the sweep's
+// plain assignment -- the shape sitting beside it in the same diff, and the
+// obvious thing a future simplification reaches for -- left the entire package
+// green. An operator would then click Rotate, get a 200 and a clean success with
+// last_rotation_error NULL, while a key this server refused to name is live at
+// the provider.
+//
+// The discriminating case is a refusal at mint time followed by a revoke that
+// SUCCEEDS, which is why every delete here returns 200: with the guard the
+// refusal survives, without it revokeWarn is overwritten with "" and the alarm
+// is never armed. The opening retry must also succeed, or its own stale-retry
+// warning would arm the alarm by itself and mask the guard entirely.
+func TestTheManualRotatePathAlsoKeepsARefusalThroughASuccessfulRevoke(t *testing.T) {
+	h, queries, owner, entryID, sink := revokeHistoryEnv(t, unnameableIDStrandedMeta)
+	sink.setCode(http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	h.Rotate(rec, vaultAuthzRequest(http.MethodPost, "/api/vault/"+entryID+"/rotate",
+		owner, "user", entryID, `{"password":"`+rotationTestPassword+`"}`))
+	h.WaitForDelivery(5e9)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ABORT: the manual rotation itself failed with %d, nothing below is being tested: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	meta, lastErr := revokeHistoryMeta(t, h, queries, entryID)
+	t.Logf("MANUAL: last_rotation_error=%q head=%q backlog=%q sink=%v",
+		lastErr, meta[pendingRevokeKeyID], meta[pendingRevokeStranded], sink.all())
+
+	if !sink.revokedOK("K1") || !sink.revokedOK("B1") {
+		t.Fatalf("ABORT: the manual rotation did not settle both K1 and B1, so the successful-revoke "+
+			"half of this test never happened and the guard is not being exercised. sink=%v", sink.all())
+	}
+	if lastErr == "" {
+		t.Fatalf("HIGH-2 DEFEATED ON MANUAL: last_rotation_error is empty on the re-read row.\n"+
+			"The mint refused to queue a revoke for an unnameable predecessor and recorded that in "+
+			"last_revoke_error, which h.Rotate lifted into pendingRevokeWarn. The revoke that succeeded "+
+			"moments later returned \"\", and without the `if warn != \"\"` guard that empty string "+
+			"overwrites the refusal. The operator sees a 200 and a clean rotation while a key this "+
+			"server will not name is live at the vendor. sink=%v", sink.all())
 	}
 	if !strings.Contains(lastErr, revokeStillLiveMsg) {
 		t.Errorf("last_rotation_error is %q, want it to carry the still-live alarm", lastErr)

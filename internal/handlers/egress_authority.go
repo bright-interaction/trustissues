@@ -859,5 +859,39 @@ func pendingRevokeStatusFromMeta(meta map[string]string) *pendingRevokeStatus {
 	if conservativeKeyIDPattern.MatchString(v) {
 		return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: v}
 	}
+	// THE B2 ARM HAS NO HOST, SO THE path.Base RESCUE ABOVE IS CATEGORICALLY
+	// UNAVAILABLE TO IT, AND THAT IS WHAT LEFT A B2 KEY UNSETTLEABLE.
+	//
+	// revokeTargetIsNameable's b2 branch bans only "/?#\" and whitespace, so an
+	// operator-written key id of "abc.def" is QUEUED: deferRevokeOldProviderKey
+	// records it as pending_revoke_url and, because the dot fails
+	// conservativeKeyIDPattern, deletes pending_revoke_key_id. Every id fallback
+	// above then misses it -- url.Parse("abc.def") yields Host == "", so the
+	// path.Base rescue that saves the equivalent http shape never runs, and the
+	// charset check just above rejects the dot. The row reported Outstanding with
+	// an EMPTY id, so outstandingRevokeKeyIDs skipped it, displacedHeadKeyID
+	// queued it nameless, and ResolvePendingRevoke could never target it because
+	// it requires a non-empty PredecessorKeyID. The operator settles every key the
+	// alarm does name, the alarm clears, and the key is live at B2 forever.
+	// Measured: url="abc.def" key_id="" status={Outstanding:true PredecessorKeyID:}
+	// and a backlog entry {KeyID: URL:abc.def Auth:b2} with outstanding=[ghi].
+	//
+	// In this arm pending_revoke_url IS the bare key id (see
+	// deferRevokeOldProviderKey's doc), so the id is right there. Withholding it
+	// bought nothing: the http arm already hands back path.Base unfiltered by the
+	// charset -- that is exactly why Twilio's "<sid>.json" renders -- and the b2
+	// gate has already guaranteed this value is a single opaque token with no
+	// structure to it. So this is PARITY WITH THE HTTP ARM, gated on the same
+	// isNonNamePathBase reject-list, not a new disclosure: what may reach
+	// last_rotation_error is still bounded separately by sanitizeRevokeKeyIDs.
+	//
+	// Fixed HERE, in the one derivation, rather than in displacedHeadKeyID where
+	// the review located the symptom. That function calls this one precisely so
+	// the alarm can never name a key the chip and the resolve dialog do not; a b2
+	// special case there would have been a second copy of the rule, and it would
+	// have fixed neither resolve nor the chip.
+	if meta[pendingRevokeAuth] == revokeAuthB2 && !isNonNamePathBase(v) {
+		return &pendingRevokeStatus{Outstanding: true, PredecessorKeyID: v}
+	}
 	return &pendingRevokeStatus{Outstanding: true}
 }

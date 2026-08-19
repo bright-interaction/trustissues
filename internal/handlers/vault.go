@@ -3396,6 +3396,25 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// and URL taken out of provider_meta, so it is the same question as every
 	// other outbound call and it gets the same answer.
 	deps := rotationDeps{queries: h.queries, vault: h}
+	// THE `warn != ""` GUARD IS LOAD BEARING, AND IT IS THE ONLY THING
+	// PROTECTING THIS PATH. Do not simplify it to `revokeWarn = ...`.
+	//
+	// The sweep is protected by performPendingRevoke's carry, which lifts a
+	// pre-attempt last_revoke_error across its own attempt. THAT CARRY IS A
+	// NO-OP HERE: this handler lifts the flag into pendingRevokeWarn and deletes
+	// it above, before revokeOldKeyAndPersistMeta runs, so the carry always sees
+	// "". Two mechanisms doing one job, and this is the manual path's half.
+	//
+	// revokeWarn already holds any refusal the MINT recorded (a full or
+	// unreadable stranded backlog, or a predecessor id this server will not
+	// name). That refusal is about a DIFFERENT key than the one this revoke
+	// targets. So when this revoke SUCCEEDS and returns "", a plain assignment
+	// erases the refusal: foldRevokeOutcome then folds the pass to status
+	// success with no alert, the operator gets a 200 and a clean
+	// last_rotation_error, and the unqueued key is live at the provider with
+	// nothing naming it. Pinned by
+	// TestTheManualRotatePathAlsoKeepsARefusalThroughASuccessfulRevoke, which is
+	// the only test in this package that fails when this guard is dropped.
 	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerName,
 		providerMeta, newValue); warn != "" {
 		revokeWarn = warn
