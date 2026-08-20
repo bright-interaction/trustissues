@@ -592,8 +592,10 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 // with the pending-revoke markers". It does not: persistProviderMetaAfterRevoke
 // has four branches that write no provider_meta at all (a read failure, the
 // provider changed under us, an egress refusal, a marshal/encrypt/persist
-// error), revokeOldKeyAndPersistMeta discards its error with `_ =`, and
-// recordRotationOutcome writes the alarm regardless. So on those branches the
+// error), and recordRotationOutcome writes the alarm regardless.
+// (revokeOldKeyAndPersistMeta used to discard that error with `_ =` too; it now
+// returns it as a second warning, which ends the rotation's claim to be clean
+// but still writes no provider_meta here.) So on those branches the
 // co-gate had no discriminator and degraded to the text-only compare it
 // replaced. It is kept for the two jobs it genuinely does: the CONCURRENT
 // same-string re-arm where provider_meta DID move, and every row written before

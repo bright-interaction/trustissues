@@ -3415,8 +3415,15 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// nothing naming it. Pinned by
 	// TestTheManualRotatePathAlsoKeepsARefusalThroughASuccessfulRevoke, which is
 	// the only test in this package that fails when this guard is dropped.
-	if warn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerName,
-		providerMeta, newValue); warn != "" {
+	//
+	// The second return is the provider_meta write-back outcome and is NOT subject
+	// to the guard above: that guard exists because an empty revokeWarn can mean
+	// "this revoke succeeded" while an earlier refusal about a DIFFERENT key is
+	// still outstanding. metaWriteWarn has no such predecessor to erase -- it is
+	// this pass's own write, reported once -- so it is carried straight through.
+	warn, metaWriteWarn := revokeOldKeyAndPersistMeta(ctx, deps, id, meta.Name, providerName,
+		providerMeta, newValue)
+	if warn != "" {
 		revokeWarn = warn
 	}
 	// BOTH warnings, not the newer one.
@@ -3466,15 +3473,16 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// Opened, like the scheduled path does. This name goes into the activity
 		// log, the alert email and the delivery payload the consuming service
 		// receives; stored form would be an enc:v1: blob in all three.
-		EntryName:   meta.Name, // already opened at the top of Rotate
-		Provider:    providerName,
-		Method:      rotationMethod,
-		UserID:      userID,
-		RotationLog: entryRow.RotationLog.String,
-		Targets:     targets,
-		OldValue:    oldValue,
-		NewValue:    newValue,
-		RevokeWarn:  revokeWarn,
+		EntryName:     meta.Name, // already opened at the top of Rotate
+		Provider:      providerName,
+		Method:        rotationMethod,
+		UserID:        userID,
+		RotationLog:   entryRow.RotationLog.String,
+		Targets:       targets,
+		OldValue:      oldValue,
+		NewValue:      newValue,
+		RevokeWarn:    revokeWarn,
+		MetaWriteWarn: metaWriteWarn,
 		// READ AFTER revokeOldKeyAndPersistMeta, not before. That call runs the
 		// deferred revoke and, on a confirmed success, discharges the head marker
 		// and promotes the backlog, so the map only names the keys that are still

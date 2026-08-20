@@ -282,7 +282,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 		// vault_rotation_core.go. This path used to hold its own copy of it, which is
 		// how the two drifted on five separate behaviours.
 		deps := rotationDeps{queries: queries, vault: vaultHandler}
-		revokeWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, providerName, meta, newValue)
+		revokeWarn, metaWriteWarn := revokeOldKeyAndPersistMeta(rotateCtx, deps, entry.ID, entry.Name, providerName, meta, newValue)
 		// BOTH warnings, not the newer one.
 		//
 		// This chose revokeWarn and fell back to staleRevokeWarn only when it
@@ -315,6 +315,7 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			recordRotationOutcomeUndeliverable(ctx, deps, rotationRecord{
 				EntryID: entry.ID, EntryName: entry.Name, Provider: providerName,
 				Method: "auto", UserID: entry.UserID, RotationLog: entry.RotationLog.String,
+				MetaWriteWarn: metaWriteWarn,
 			})
 			LogActivity(queries, nil, "vault.auto_rotate", fmt.Sprintf(
 				"Auto-rotated vault secret but NOT delivered: %s (provider: %s, rotation_targets unreadable)",
@@ -322,16 +323,17 @@ func rotateOneEntry(passCtx context.Context, queries *db.Queries, vaultHandler *
 			return
 		}
 		status, _ := recordRotationOutcome(ctx, deps, rotationRecord{
-			EntryID:     entry.ID,
-			EntryName:   entry.Name,
-			Provider:    providerName,
-			Method:      "auto",
-			UserID:      entry.UserID,
-			RotationLog: entry.RotationLog.String,
-			Targets:     targets,
-			OldValue:    oldValueCopy,
-			NewValue:    newValue,
-			RevokeWarn:  revokeWarn,
+			EntryID:       entry.ID,
+			EntryName:     entry.Name,
+			Provider:      providerName,
+			Method:        "auto",
+			UserID:        entry.UserID,
+			RotationLog:   entry.RotationLog.String,
+			Targets:       targets,
+			OldValue:      oldValueCopy,
+			NewValue:      newValue,
+			RevokeWarn:    revokeWarn,
+			MetaWriteWarn: metaWriteWarn,
 			// The twin of the manual path's line; see the comment there for why
 			// this is read AFTER revokeOldKeyAndPersistMeta rather than before.
 			RevokeKeyIDs: outstandingRevokeKeyIDs(meta),

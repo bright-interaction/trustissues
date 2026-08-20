@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -80,8 +81,14 @@ func TestTheRotationWriteBackDoesNotResurrectDischargedMarkers(t *testing.T) {
 	// THE RACE: the operator changes provider, which discharges the markers.
 	forceProviderConfig(t, h, entryID, "sendgrid", `{"key_id":"K2"}`)
 
-	if err := persistProviderMetaAfterRevoke(ctx, deps, entryID, "Entry", "resend", passStart); err != nil {
-		t.Fatalf("write-back: %v", err)
+	// WRITES NOTHING, AND SAYS SO. This used to assert only `err == nil`, which
+	// was scaffolding rather than an invariant: writing nothing and reporting
+	// nothing were the same return value, so the caller folded the rotation to a
+	// clean success while meta["key_id"] stayed on the predecessor. The no-write
+	// below is still the point of this test; the sentinel is what makes it
+	// visible. See TestAProviderChangedMidRotationIsNotRecordedAsSuccess.
+	if err := persistProviderMetaAfterRevoke(ctx, deps, entryID, "Entry", "resend", passStart); !errors.Is(err, errProviderChangedMidRotation) {
+		t.Fatalf("write-back: want errProviderChangedMidRotation, got %v", err)
 	}
 
 	got := entryMetaMap(t, h, deps.queries, entryID)

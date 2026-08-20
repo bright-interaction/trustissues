@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -126,8 +127,10 @@ func retryOutstandingRevoke(ctx context.Context, meta map[string]string,
 }
 
 // revokeOldKeyAndPersistMeta destroys the predecessor key upstream and then writes
-// provider_meta exactly ONCE. It returns the revoke warning, if any, for the
-// caller to pass to recordRotationOutcome.
+// provider_meta exactly ONCE. It returns TWO warnings, both for the caller to pass
+// to recordRotationOutcome: the revoke warning, and the provider_meta write-back
+// warning. They are independent -- either, neither or both can be set -- and they
+// describe different damage, so neither may be collapsed into the other.
 //
 // Order matters and is the whole point of the function. The manual path used to
 // write meta first and clean up afterwards, so the markers reached the column on
@@ -142,9 +145,9 @@ func retryOutstandingRevoke(ctx context.Context, meta map[string]string,
 // Call only after the value is durably stored: revoking earlier means a failure in
 // the encrypt/persist window leaves the old credential dead upstream and the new
 // one discarded, with no copy of either anywhere.
-func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string, newValue secretexit.Plaintext) string {
+func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID, entryName, provider string, providerMeta map[string]string, newValue secretexit.Plaintext) (string, string) {
 	if providerMeta == nil {
-		return ""
+		return "", ""
 	}
 	performPendingRevoke(ctx, providerMeta, provider, newValue)
 	revokeWarn := providerMeta["last_revoke_error"]
@@ -155,11 +158,45 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 	}
 
 	// The write-back half is shared with the pending-revoke retry endpoint; see
-	// persistProviderMetaAfterRevoke. It already logs its own failure cause, so
-	// there is nothing further to do with the error here: revokeWarn, not a
-	// persist failure, is this function's contract with its caller.
-	_ = persistProviderMetaAfterRevoke(ctx, deps, entryID, entryName, provider, providerMeta)
-	return revokeWarn
+	// persistProviderMetaAfterRevoke.
+	//
+	// ITS ERROR IS A SECOND, INDEPENDENT OUTCOME, NOT A DETAIL OF THE REVOKE.
+	//
+	// This used to be a bare `_ =`, justified by "it already logs its own failure
+	// cause, so there is nothing further to do with the error here". That is true
+	// of OBSERVABILITY and false of CORRECTNESS, and the two were conflated. A
+	// slog line is not a durable record: last_rotation_error, rotation_log and the
+	// alert are, and all three said the rotation was clean.
+	//
+	// What is actually lost. providerMeta is the PASS-START map this rotation has
+	// been mutating; by this point meta["key_id"] (or its per-provider twin) has
+	// already advanced to the key the mint just created. If the write-back does
+	// not land, the column keeps the PREDECESSOR's id while encrypted_value holds
+	// the SUCCESSOR's secret. For any provider whose id is merely bookkeeping that
+	// strands the predecessor: the next rotation revokes a dead id and the live
+	// key is never named again. For backblaze and twilio it is worse, because the
+	// id is half the credential -- backblazeAuthorize sends
+	// base64(meta["key_id"] + ":" + value) -- so the stored pair is a mismatched
+	// id/secret that authenticates as nobody. The entry is dead on arrival and,
+	// before this, reported status success with last_rotation_error NULL.
+	//
+	// Deliberately a SEPARATE return value rather than folded into revokeWarn.
+	// foldRevokeOutcome renders revokeWarn as revokeStillLiveMsgFor(), i.e. "old
+	// key not revoked (still live at provider)", and on the common shape of this
+	// failure the revoke SUCCEEDED -- the predecessor really is dead. Reusing that
+	// channel would trade a silent falsehood for a loud one, which is the exact
+	// class of defect the rest of this file exists to undo.
+	//
+	// The "provider changed under us" branch returns nil, not an error: writing
+	// nothing is the CORRECT outcome there, and it must stay a clean success.
+	metaWarn := ""
+	if pErr := persistProviderMetaAfterRevoke(ctx, deps, entryID, entryName, provider, providerMeta); pErr != nil {
+		metaWarn = metaWriteBackFailedMsg
+		if errors.Is(pErr, errProviderChangedMidRotation) {
+			metaWarn = providerChangedMidRotationMsg
+		}
+	}
+	return revokeWarn, metaWarn
 }
 
 // persistProviderMetaAfterRevoke is the write-back half of
@@ -211,11 +248,27 @@ func persistProviderMetaAfterRevoke(ctx context.Context, deps rotationDeps, entr
 	// column, so they read back as a live stranded key and falsify the
 	// vault.pending_revoke_discarded activity row the provider change wrote.
 	// Nothing here is salvageable once the configuration it describes is gone.
+	//
+	// WRITING NOTHING IS CORRECT. REPORTING NOTHING IS NOT, AND IT USED TO DO BOTH.
+	//
+	// This branch returned a bare nil, which the caller could not distinguish from
+	// "the write-back landed". The rotation therefore folded to status success with
+	// last_rotation_error NULL and no alert -- while meta["key_id"] in the column
+	// still named the PREDECESSOR and encrypted_value already held the SUCCESSOR's
+	// secret. For backblaze and twilio the id is half the credential
+	// (backblazeAuthorize sends base64(meta["key_id"] + ":" + value)), so the stored
+	// pair authenticates as nobody: measured, the stored pair 401s where the correct
+	// pair 200s. The predecessor is also already destroyed upstream by this point.
+	//
+	// The entry is incoherent either way -- it now names a provider the committed
+	// value was never minted at -- and that is precisely why it cannot be recorded
+	// as clean. The sentinel travels up so the caller can say so in the durable
+	// record, without this function acquiring an opinion about rotation status.
 	if row.Provider.String != provider {
 		slog.Warn("vault rotation: the entry's provider changed during this rotation, so the "+
 			"provider_meta write-back was skipped rather than restoring the previous provider's state",
 			"entry", entryName, "rotated_as", provider, "now", row.Provider.String)
-		return nil
+		return errProviderChangedMidRotation
 	}
 
 	beforeRaw := deps.vault.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
@@ -315,8 +368,13 @@ type rotationRecord struct {
 	// can be read, logged or transmitted except through secretexit.Exit.
 	OldValue secretexit.Plaintext
 	NewValue secretexit.Plaintext
-	// RevokeWarn is what revokeOldKeyAndPersistMeta returned.
+	// RevokeWarn is the FIRST warning revokeOldKeyAndPersistMeta returned.
 	RevokeWarn string
+	// MetaWriteWarn is its SECOND: the provider_meta write-back did not land, so
+	// the stored key id no longer describes the credential that is live at the
+	// provider. Empty on the "provider changed under us" branch, which writes
+	// nothing on purpose and is a clean outcome.
+	MetaWriteWarn string
 	// RevokeKeyIDs are the keys this row still says are live at the provider,
 	// read off provider_meta AFTER the revoke attempt (outstandingRevokeKeyIDs):
 	// the head marker's predecessor plus every entry on the stranded backlog.
@@ -362,6 +420,17 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 		// operator holding two alerts about two different stranded keys could not
 		// tell them apart.
 		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsgFor(rec.RevokeKeyIDs))
+	}
+
+	// Folded AFTER the revoke and BEFORE the notify-target success dispatch, so a
+	// rotation whose write-back failed can never reach the "rotated successfully"
+	// notification below.
+	status, errSummary, metaAlert := foldMetaWriteOutcome(status, errSummary, rec.MetaWriteWarn)
+	if metaAlert {
+		// The warning itself, not a const chosen here: MetaWriteWarn is already one
+		// of the two static strings, and picking a fixed one would make the alert
+		// contradict the column on the branch that did not choose it.
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, rec.MetaWriteWarn)
 	}
 
 	// Honour a "Notify only" target. It transmits nothing, so the delivery loop
@@ -417,6 +486,56 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 // they are one defect: an alarm that carries no identity cannot be cleared
 // safely, and a CAS cannot discriminate what the value does not encode.
 const revokeStillLiveMsg = "old key not revoked (still live at provider); see server logs"
+
+// metaWriteBackFailedMsg is the only text either path may persist about a
+// provider_meta write-back that did not land.
+//
+// Static, for the same reason revokeStillLiveMsg is: the underlying error can be
+// a driver message, an egressgate refusal naming hosts, or a cipher error, and
+// last_rotation_error is API-visible. The cause belongs in the slog line
+// persistProviderMetaAfterRevoke already writes at each of its four failure
+// branches. Unlike the revoke alarm this carries no key id: the whole failure is
+// that we do not know which id the row now holds, so naming one would assert
+// precisely the fact that is in doubt.
+const metaWriteBackFailedMsg = "provider_meta write-back failed; the stored key id may not match the live credential; see server logs"
+
+// errProviderChangedMidRotation marks the one write-back branch that is a
+// DELIBERATE no-write rather than a failure. It still ends the rotation's claim
+// to be clean; see the branch itself for why writing nothing is right and
+// reporting nothing was not.
+var errProviderChangedMidRotation = errors.New("provider changed mid-rotation; provider_meta not written")
+
+// providerChangedMidRotationMsg is what that branch records. Distinct from
+// metaWriteBackFailedMsg because the operator's next step differs: nothing is
+// retryable here, the entry needs a human to decide whether the value it now
+// holds belongs to the provider it now names.
+//
+// Static, like its siblings, and it names no provider: the entry's current and
+// previous provider are exactly what is in dispute, and last_rotation_error is
+// API-visible. Both are in the slog line above.
+const providerChangedMidRotationMsg = "the entry's provider changed during this rotation; the rotated value was minted at the previous provider and its key id was not recorded; see server logs"
+
+// foldMetaWriteOutcome merges "the provider_meta write-back did not land" into a
+// rotation's final status, and reports whether an alert is owed.
+//
+// Separate from foldRevokeOutcome because the two facts are independent and a
+// rotation can carry both. Same shape deliberately: a delivery failure is
+// already partial or error and must not be promoted back up, and the summary
+// appends rather than replaces so no earlier fact is overwritten.
+func foldMetaWriteOutcome(status, errSummary, metaWarn string) (outStatus, outSummary string, alert bool) {
+	if metaWarn == "" {
+		return status, errSummary, false
+	}
+	if status == "success" {
+		status = "partial"
+	}
+	if errSummary == "" {
+		errSummary = metaWarn
+	} else {
+		errSummary = errSummary + "; " + metaWarn
+	}
+	return status, errSummary, true
+}
 
 // foldRevokeOutcome merges "the predecessor key is still live upstream" into a
 // rotation's final status, and reports whether an alert is owed.
@@ -489,8 +608,21 @@ func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, 
 		"entry", rec.EntryName)
 	dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, undeliverableMsg)
 
+	// A write-back failure survives this path too. Both facts are true at once and
+	// this function is the only writer of the column on it, so folding here is the
+	// only way the second one is durable: the caller sets rec.RevokeWarn = "" before
+	// calling (the predecessor really is dead) but MetaWriteWarn stays set, and an
+	// undeliverable rotation whose key id is also wrong is strictly worse than one
+	// whose id is right. Same static text, appended the same way foldMetaWriteOutcome
+	// appends it, so the two paths render one fact identically.
+	summary := undeliverableMsg
+	if rec.MetaWriteWarn != "" {
+		summary = summary + "; " + rec.MetaWriteWarn
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, rec.MetaWriteWarn)
+	}
+
 	if err := deps.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
-		LastRotationError: toNullString(undeliverableMsg),
+		LastRotationError: toNullString(summary),
 		ID:                rec.EntryID,
 	}); err != nil {
 		slog.Error("vault rotation: persist last_rotation_error failed", "entry", rec.EntryName, "error", err)
@@ -499,7 +631,7 @@ func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, 
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Status:    "partial",
 		Provider:  rec.Provider,
-		Error:     undeliverableMsg,
+		Error:     summary,
 		Method:    rec.Method,
 	})
 }

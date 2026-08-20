@@ -327,8 +327,11 @@ UPDATE vault_entries SET last_rotation_error = ?, updated_at = CURRENT_TIMESTAMP
 -- THAT PREMISE IS FALSE, and the 2026-08-19 audit reproduced it.
 -- persistProviderMetaAfterRevoke has four branches that write NO provider_meta
 -- (the row read fails, the provider changed under us, the egress gate refuses,
--- or marshal/encrypt/persist fails), revokeOldKeyAndPersistMeta discards its
--- error with a bare `_ =`, and recordRotationOutcome writes the alarm anyway.
+-- or marshal/encrypt/persist fails), and recordRotationOutcome writes the alarm
+-- anyway. (revokeOldKeyAndPersistMeta used to DISCARD that error with a bare
+-- `_ =` as well; it now returns it as a second warning, so the rotation is no
+-- longer recorded as clean -- but it still writes no provider_meta here, so the
+-- co-gate is no better off.)
 -- On any of those branches the co-gate had no discriminator at all and degraded
 -- to exactly the text-only compare it was introduced to replace.
 --

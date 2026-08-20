@@ -35,9 +35,11 @@ import (
 // provider_meta write the fix assumed always accompanies the alarm, and then
 // observed that the co-gate caught the ABA. It could therefore only ever
 // certify the assumption; it could not test it. The assumption was false:
-// persistProviderMetaAfterRevoke has four branches that write no provider_meta,
-// its error is discarded with `_ =` in revokeOldKeyAndPersistMeta, and
-// recordRotationOutcome writes the alarm regardless. The subtests below now
+// persistProviderMetaAfterRevoke has four branches that write no provider_meta
+// and recordRotationOutcome writes the alarm regardless. (Its error was also
+// discarded with `_ =` in revokeOldKeyAndPersistMeta until that was fixed; it is
+// now a second warning. The branches still write no provider_meta, so the
+// premise this subtest attacks is unchanged.) The subtests below now
 // exercise BOTH branches -- the one where provider_meta moves and the one where
 // it does not -- and the "does not" case is the one that reproduces the real
 // failure, so it is written first.
@@ -134,8 +136,10 @@ func TestClearRevokeHalfOfRotationErrorIsCompareAndSwap(t *testing.T) {
 		// the pending-revoke markers". It does not. persistProviderMetaAfterRevoke
 		// returns early without writing provider_meta on four branches (row read
 		// error, the provider changed mid-rotation, an egress refusal, and a
-		// marshal/encrypt/persist failure), revokeOldKeyAndPersistMeta throws that
-		// error away with `_ =`, and recordRotationOutcome writes the alarm anyway.
+		// marshal/encrypt/persist failure) and recordRotationOutcome writes the
+		// alarm anyway. revokeOldKeyAndPersistMeta now returns that error as a
+		// second warning rather than throwing it away with `_ =`, which changes the
+		// recorded STATUS but not this: provider_meta still does not move.
 		//
 		// So this subtest deliberately does NOT touch provider_meta between the
 		// snapshot and the concurrent re-arm. The co-gate is therefore inert here
