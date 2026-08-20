@@ -151,7 +151,7 @@ func (u unboundedRead) describe() string {
 }
 
 // RECOGNISING A READ BY THE NAME OF THE FUNCTION DOING IT IS THE SAME MISTAKE
-// AS RECOGNISING A DECRYPT BY THE SHAPE OF THE CALL (see AUDIT-ROUND-19.md).
+// AS RECOGNISING A DECRYPT BY THE SHAPE OF THE CALL (see docs/audit-history/AUDIT-ROUND-19.md).
 //
 // The first version of this detector matched one callee: io.ReadAll, with the
 // package qualifier `io` and exactly one argument. That is a dialect list, and a
