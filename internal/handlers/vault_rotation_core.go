@@ -187,8 +187,11 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 	// channel would trade a silent falsehood for a loud one, which is the exact
 	// class of defect the rest of this file exists to undo.
 	//
-	// The "provider changed under us" branch returns nil, not an error: writing
-	// nothing is the CORRECT outcome there, and it must stay a clean success.
+	// The "provider changed under us" branch is the one that writes nothing ON
+	// PURPOSE, and it still writes nothing. What changed is that it now SAYS so,
+	// through its own sentinel and its own message: writing nothing there is
+	// correct, reporting nothing was the defect. It is not a clean success -- the
+	// committed value was minted at a provider the entry no longer names.
 	metaWarn := ""
 	if pErr := persistProviderMetaAfterRevoke(ctx, deps, entryID, entryName, provider, providerMeta); pErr != nil {
 		metaWarn = metaWriteBackFailedMsg
@@ -200,10 +203,21 @@ func revokeOldKeyAndPersistMeta(ctx context.Context, deps rotationDeps, entryID,
 }
 
 // persistProviderMetaAfterRevoke is the write-back half of
-// revokeOldKeyAndPersistMeta, pulled out so the pending-revoke retry endpoint
-// (VaultHandler.RetryPendingRevoke, and its terminal sibling
-// ResolvePendingRevoke) can persist the SAME way a rotation does, rather than a
-// second hand-rolled copy of a host-choosing write drifting from this one.
+// revokeOldKeyAndPersistMeta, and it has exactly ONE caller.
+//
+// ITS DOC USED TO CLAIM IT WAS SHARED WITH THE PENDING-REVOKE RETRY ENDPOINT --
+// that RetryPendingRevoke and its terminal sibling ResolvePendingRevoke "can
+// persist the SAME way a rotation does". They never did: both write through
+// casEditProviderMeta (vault_pending_revoke.go:189, :352), and the difference is
+// substantive rather than cosmetic. This writes via vaultegress.SetProviderMeta
+// unconditionally; they write via vaultegress.CASProviderMeta with a compare
+// token and a retry on miss, precisely because a rotation racing their row could
+// otherwise lose their write or resurrect markers they just cleared. The comment
+// at vault_pending_revoke.go:183-188 spells that contrast out.
+//
+// The claim was untrue in the commit that introduced it, not stale, so it is
+// removed rather than softened. If the two are ever genuinely merged, the CAS is
+// the behaviour that has to win.
 //
 // Persists the key id a revoke or a rotation's mint just recorded, so the NEXT
 // attempt targets the current predecessor instead of a stale one. Errors are
@@ -372,8 +386,12 @@ type rotationRecord struct {
 	RevokeWarn string
 	// MetaWriteWarn is its SECOND: the provider_meta write-back did not land, so
 	// the stored key id no longer describes the credential that is live at the
-	// provider. Empty on the "provider changed under us" branch, which writes
-	// nothing on purpose and is a clean outcome.
+	// provider. Set on ALL FOUR no-write branches, including "the provider changed
+	// under us" -- that one declines to write on purpose, which makes it a correct
+	// no-write and NOT a clean rotation. It carries its own message
+	// (providerChangedMidRotationMsg) because the operator's next step differs.
+	// Empty only when the write-back landed, or when there was no provider_meta to
+	// write at all.
 	MetaWriteWarn string
 	// RevokeKeyIDs are the keys this row still says are live at the provider,
 	// read off provider_meta AFTER the revoke attempt (outstandingRevokeKeyIDs):
