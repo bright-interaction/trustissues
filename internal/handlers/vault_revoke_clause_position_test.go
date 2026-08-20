@@ -104,3 +104,52 @@ func TestBothNewFoldMessagesSurviveASettle(t *testing.T) {
 		}
 	}
 }
+
+// TestTheParserSettlesWhatTheComposerProduces closes a composer/parser gap that
+// every other fixture in this package leaves open.
+//
+// All of them hand-join `alarm + "; " + metaWriteBackFailedMsg`. The constants
+// are production's; the JOIN is the test author's. So changing the separator in
+// foldMetaWriteOutcome to " | " reproduces the original P0 exactly -- the parser
+// stops recognising the clause, every settle path silently no-ops -- and all
+// four test files still pass, because none of them ever asks production to
+// build the string.
+//
+// This one does. Its input comes from the two folds that write the column.
+func TestTheParserSettlesWhatTheComposerProduces(t *testing.T) {
+	status, summary, _ := foldRevokeOutcome("success", "", "the revoke failed", []string{"K1"})
+	_, summary, _ = foldMetaWriteOutcome(status, summary, metaWriteBackFailedMsg)
+
+	if !strings.Contains(summary, revokeStillLiveMsg) || !strings.Contains(summary, metaWriteBackFailedMsg) {
+		t.Fatalf("the composer did not produce both clauses: %q", summary)
+	}
+
+	t.Run("the revoke half settles", func(t *testing.T) {
+		got := withoutRevokeStillLiveKeys(summary, []string{"K1"})
+		if got == summary {
+			t.Fatalf("byte-identical, so the caller's `cleared == current` early return fires before "+
+				"the CAS and the operator's settle is silently lost: %q", got)
+		}
+		if strings.Contains(got, revokeStillLiveMsg) {
+			t.Errorf("the settled revoke clause survived: %q", got)
+		}
+		if !strings.Contains(got, metaWriteBackFailedMsg) {
+			t.Errorf("settling the revoke half erased the write-back half: %q", got)
+		}
+	})
+
+	t.Run("the write-back half settles", func(t *testing.T) {
+		got := withoutMetaWriteClauses(summary)
+		if got == summary {
+			t.Fatalf("byte-identical: the write-back alarm has no working clearer against a "+
+				"production-composed value: %q", got)
+		}
+		if strings.Contains(got, metaWriteBackFailedMsg) {
+			t.Errorf("the write-back clause survived: %q", got)
+		}
+		if !strings.Contains(got, revokeStillLiveMsg) {
+			t.Errorf("clearing the write-back half erased an alarm about a key still live "+
+				"upstream, which this act did nothing about: %q", got)
+		}
+	})
+}

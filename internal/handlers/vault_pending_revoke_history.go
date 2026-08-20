@@ -414,10 +414,20 @@ func splitRevokeClause(s string) (head, keyList string, ok bool) {
 	return liftClause(s, start, end), keyList, true
 }
 
-// metaWriteClauses are the alarm texts recordRotationOutcome folds in when the
-// provider_meta write-back did not land. Both are settled by the same act -- an
-// operator writing the provider configuration -- so they clear together.
-var metaWriteClauses = []string{metaWriteBackFailedMsg, providerChangedMidRotationMsg}
+// metaWriteClauses is the ONE alarm text a provider_meta write can discharge.
+//
+// providerChangedMidRotationMsg USED TO BE IN THIS LIST AND IT WAS WRONG. That
+// alarm is not about the metadata being stale, it is about the committed VALUE
+// having been minted at a provider the entry no longer names. Rewriting
+// provider_meta does not move the value, so clearing it there asserted a
+// reconciliation nobody performed -- and vault_rotation_core.go's own comment on
+// the constant says exactly that: the entry needs a human to decide whether the
+// value it holds belongs to the provider it now names.
+//
+// Its discharge is a SUCCESSFUL ROTATION, which is a real path and not a gap:
+// that pass snapshots the row's now-current provider, mints against it, and
+// recordRotationOutcome writes a clean outcome over the column.
+var metaWriteClauses = []string{metaWriteBackFailedMsg}
 
 // withoutMetaWriteClauses removes the provider_meta write-back alarms from a
 // last_rotation_error value, leaving every other clause exactly as found.

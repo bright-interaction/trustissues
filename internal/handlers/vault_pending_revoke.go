@@ -632,10 +632,16 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 // It clears ONLY these two clauses. A co-resident revoke alarm or delivery
 // failure is a different fact about a different thing and survives untouched --
 // writing provider_meta does not revoke a key that is still live upstream.
-func (h *VaultHandler) clearMetaWriteHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString) {
+// It returns the value it actually wrote and whether the CAS applied, because
+// the caller holds a PRE-TRANSACTION snapshot of this column that a later clear
+// compares against. Without that, this function's own write looks to the next
+// clear like a concurrent actor, and it abstains -- stranding a co-resident
+// revoke alarm permanently. Returning ("", false) means nothing was written, by
+// no-op or by a lost race, and the caller's baseline must NOT move.
+func (h *VaultHandler) clearMetaWriteHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString) (string, bool) {
 	cleared := withoutMetaWriteClauses(current)
 	if cleared == current {
-		return
+		return "", false
 	}
 	res, uErr := h.queries.CASVaultEntryRotationError(ctx, db.CASVaultEntryRotationErrorParams{
 		LastRotationError:   toNullString(cleared),
@@ -645,13 +651,47 @@ func (h *VaultHandler) clearMetaWriteHalfOfRotationError(ctx context.Context, r 
 	})
 	if uErr != nil {
 		logError(r, site+": persist last_rotation_error failed", "entry", entryID, "error", uErr)
-		return
+		return "", false
 	}
 	if n, rErr := res.RowsAffected(); rErr == nil && n == 0 {
 		logError(r, site+": last_rotation_error or provider_meta changed between the re-read and the clear "+
 			"(very likely a concurrent rotation re-armed the alarm); left it in place as the newer, truer state",
 			"entry", entryID)
+		return "", false
 	}
+	return cleared, true
+}
+
+// providerMetaSatisfiesRequired reports whether every provider_meta key the
+// adapter genuinely needs is present and non-blank in the map about to be
+// stored.
+//
+// It is the second half of the gate on the write-back alarm clear, and it exists
+// because a PUT carrying `{"provider_meta":"{}"}` DELETES key_id -- which is half
+// the credential on backblaze and twilio -- and the first version of that clear
+// then erased the alarm warning about exactly that. A write that strips the
+// column cannot be the write that proves the column is now correct.
+func providerMetaSatisfiesRequired(provider string, meta map[string]string) bool {
+	for key := range requiredProviderMeta[provider] {
+		if strings.TrimSpace(meta[key]) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// sameProviderMeta compares the plaintext maps, so a re-save that changes nothing
+// is not mistaken for an operator correcting the configuration.
+func sameProviderMeta(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString, settledKeyIDs []string) {

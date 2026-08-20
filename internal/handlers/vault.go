@@ -2444,6 +2444,18 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Every key the discarded marker set named (head plus stranded backlog), so
 	// the clear below settles the alarm for all of them and only them.
 	var discardedKeyIDs []string
+	// THE PROVIDER_META WRITE-BACK ALARM CLEAR, gated on the write having actually
+	// improved the column rather than merely having been requested.
+	//
+	// metaWriteClearFrom is the PRE-TRANSACTION last_rotation_error, so the clear
+	// can refuse to act on an alarm a concurrent rotation armed after this
+	// decision -- the same discipline discardedFromRotationError follows, and its
+	// absence let the first version erase a freshly re-armed alarm.
+	metaWriteClearFrom := ""
+	metaWriteClearEligible := false
+	// The provider_meta ciphertext THIS transaction wrote, used as the other half
+	// of the CAS pre-image. Taken from the transaction, never re-read afterwards.
+	var metaWriteClearProviderMeta sql.NullString
 	if req.Provider != nil || req.ProviderMeta != nil || req.AutoRotate != nil {
 		// Fetch current values for fields not being updated
 		current, fetchErr := qtx.GetVaultEntryMeta(ctx, id)
@@ -2567,6 +2579,28 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			// afterMeta is what the egress gate reasons over, so it has to agree
 			// with what is about to be written.
 			afterMeta = ParseProviderMeta(metaToStore)
+			// ELIGIBILITY, decided on what is ACTUALLY ABOUT TO BE WRITTEN.
+			//
+			// The first version triggered on `req.ProviderMeta != nil` alone, i.e.
+			// on the SHAPE OF THE REQUEST rather than on any change to the entry,
+			// and three separate P0s came out of that one mistake:
+			//
+			//   * a no-op save cleared the alarm. RotationManager has no dirty
+			//     check, so an operator reading the badge and pressing Save
+			//     disarmed the thing they were reading.
+			//   * `{"provider_meta":"{}"}` DELETED key_id -- half the credential on
+			//     backblaze and twilio -- and cleared the alarm about it in the same
+			//     request, turning a destructive write silent.
+			//   * it discharged providerChangedMidRotationMsg, which no
+			//     provider_meta write can honestly discharge (see metaWriteClauses).
+			//
+			// So: the plaintext map must actually CHANGE, and the result must still
+			// satisfy the adapter's required keys. A write that empties the column
+			// cannot be the write that proves the column is correct.
+			metaWriteClearFrom = current.LastRotationError.String
+			metaWriteClearEligible = req.ProviderMeta != nil &&
+				!sameProviderMeta(beforeMeta, afterMeta) &&
+				providerMetaSatisfiesRequired(provider, afterMeta)
 			// One decision, one ticket, and the ticket is what the write demands.
 			// authorityForEgressChange still computes the resulting host set for
 			// the pin loop below; the AUTHORITY half now goes through the same
@@ -2660,6 +2694,18 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				}
 				encMeta = enc
 			}
+			// THE CAS PRE-IMAGE COMES FROM THE TRANSACTION, NOT FROM A LATER READ.
+			//
+			// The first version re-read the row after tx.Commit -- and after the
+			// deferred-activity loop, which this file documents as a multi-second
+			// stall -- then used what it found as the pre-image. Anything a racing
+			// rotation wrote in that window BECAME the pre-image, so the CAS
+			// compared the racing writer's values against themselves and matched:
+			// thread B arms metaWriteBackFailedMsg about a failure that happened
+			// after this request decided anything, and this request deletes it and
+			// returns 200 clean. That is the estate's own tier-0 TOCTOU gotcha
+			// recurring in the file the gotcha was written about.
+			metaWriteClearProviderMeta = toNullString(encMeta)
 			if err := vaultegress.SetProvider(ctx, qtx, providerTicket, vaultegress.ProviderParams{
 				Provider:     toNullString(provider),
 				ProviderMeta: toNullString(encMeta),
@@ -2710,13 +2756,19 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// clear below it, so the entry handed back already reflects the settle. An
 	// operator who fixes the configuration and still sees the red alarm in the
 	// response has been told their fix did not work.
-	if req.Provider != nil || req.ProviderMeta != nil {
-		if metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr != nil {
-			logError(r, "vault.update: could not re-read last_rotation_error after a provider_meta write, "+
-				"so a stale write-back alarm may remain", "entry", id, "error", mErr)
-		} else {
-			h.clearMetaWriteHalfOfRotationError(ctx, r, "vault.update.provider_meta_written", id,
-				metaRow.LastRotationError.String, metaRow.ProviderMeta)
+	if metaWriteClearEligible {
+		// No re-read: both halves of the pre-image are what this transaction saw
+		// and wrote, so a rotation that landed in between makes the CAS miss
+		// instead of being mistaken for the state this request decided from.
+		if cleared, applied := h.clearMetaWriteHalfOfRotationError(ctx, r,
+			"vault.update.provider_meta_written", id,
+			metaWriteClearFrom, metaWriteClearProviderMeta); applied {
+			// THIS WRITE MOVED THE BASELINE the discard clear below compares
+			// against. Without this line that clear sees its own handler's change,
+			// concludes a concurrent rotation intervened, and abstains -- leaving a
+			// co-resident revoke alarm armed about keys whose markers this same
+			// request just discarded, with nothing left to revoke them.
+			discardedFromRotationError = cleared
 		}
 	}
 
