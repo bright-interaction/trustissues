@@ -2814,15 +2814,32 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				"committing (very likely a concurrent rotation recorded a failure); leaving it as found "+
 				"rather than clearing a newer alarm", "entry", id)
 		default:
-			// The same CAS'd clear the retry/resolve endpoints use. The re-read
-			// above is a fast path and a diagnostic; clearRevokeHalfOfRotationError
-			// compares both last_rotation_error AND provider_meta again inside the
-			// UPDATE, so an alarm (or a re-armed marker) that lands between this
-			// re-read and the write is preserved, not erased. This is the third and
-			// last clearer, so the unconditional writer now has no caller outside
-			// the three outcome recorders.
+			// The same CAS'd clear the retry/resolve endpoints use.
+			//
+			// THE PROVIDER_META HALF OF THE CO-GATE COMES FROM THE TRANSACTION.
+			// It used to be metaRow.ProviderMeta, i.e. the SAME post-commit re-read
+			// that produced the last_rotation_error above -- so both columns of the
+			// compare were the racer's own just-written state, and the co-gate
+			// compared it against itself. A tautology cannot detect anything.
+			//
+			// The comment here used to claim the opposite ("an alarm or a re-armed
+			// marker that lands between this re-read and the write is preserved"),
+			// and the test that appears to prove it snapshots provider_meta BEFORE
+			// the racing write -- an idealised caller discipline this path did not
+			// follow. The helper was verified in isolation while its only vulnerable
+			// caller went untested.
+			//
+			// It matters most on rows whose alarm carries no key identity, which is
+			// NOT just legacy rows: any key id failing conservativeKeyIDPattern
+			// renders the bare const today, and provider_meta["key_id"] is
+			// operator-writable and validated nowhere. A Resend versioned id like
+			// "v2/K1" fails on the slash.
+			//
+			// last_rotation_error stays as re-read because the switch above has
+			// already compared it against the pre-transaction snapshot; provider_meta
+			// had no such guard.
 			h.clearRevokeHalfOfRotationError(ctx, r, "vault.update.provider_change_discard", id,
-				metaRow.LastRotationError.String, metaRow.ProviderMeta, discardedKeyIDs)
+				metaRow.LastRotationError.String, metaWriteClearProviderMeta, discardedKeyIDs)
 		}
 	}
 

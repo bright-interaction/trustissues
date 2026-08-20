@@ -153,3 +153,26 @@ func TestTheParserSettlesWhatTheComposerProduces(t *testing.T) {
 		}
 	})
 }
+
+// TestOrdinaryProviderKeyIDsCanRenderTheIdentityFreeAlarm pins the reachability
+// half of the co-gate finding.
+//
+// The identity-free alarm -- the bare const, with no "[keys: ...]" to
+// discriminate an ABA re-arm -- was believed to be a legacy-row shape that no
+// longer occurs. It occurs today: revokeStillLiveMsgFor drops every id failing
+// conservativeKeyIDPattern, and provider_meta["key_id"] is operator-writable and
+// validated nowhere. A Resend versioned id fails on the slash, with no
+// adversary involved.
+func TestOrdinaryProviderKeyIDsCanRenderTheIdentityFreeAlarm(t *testing.T) {
+	for _, id := range []string{"v2/K1", "key with space", "k+1"} {
+		if got := revokeStillLiveMsgFor([]string{id}); got != revokeStillLiveMsg {
+			continue // it survived the filter; fine, it keeps its identity
+		} else {
+			t.Logf("key id %q renders the identity-free alarm: %q", id, got)
+			return
+		}
+	}
+	t.Error("no ordinary-looking key id produced the identity-free alarm; if the charset filter " +
+		"widened, the co-gate's remaining job may have changed too -- re-check " +
+		"clearRevokeHalfOfRotationError's callers")
+}
