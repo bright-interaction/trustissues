@@ -614,6 +614,46 @@ func providerMetaBytesPreservingTypes(rawJSON string, before, after map[string]s
 //
 // `site` tags the log lines with the calling path so a persist failure or a lost
 // race is attributable to the retry, resolve or provider-change-discard site.
+// clearMetaWriteHalfOfRotationError settles the provider_meta write-back alarms
+// on an entry whose provider configuration an operator has just written.
+//
+// WHY THAT ACT SETTLES THEM. Both alarms say the same thing in two registers:
+// the key id stored in provider_meta may not describe the credential that is
+// live at the provider. An operator who has just written provider or
+// provider_meta has addressed exactly that column, deliberately, by hand. There
+// is nothing further for the product to verify and nothing else that could
+// discharge it -- the alarms are about a value only a human can reconcile with
+// the provider's own console.
+//
+// Same CAS and the same refusal-to-guess as clearRevokeHalfOfRotationError: on a
+// miss the stored state is newer and truer, so it is left alone. Leaving a stale
+// alarm is the safe direction; erasing a fresh one is not.
+//
+// It clears ONLY these two clauses. A co-resident revoke alarm or delivery
+// failure is a different fact about a different thing and survives untouched --
+// writing provider_meta does not revoke a key that is still live upstream.
+func (h *VaultHandler) clearMetaWriteHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString) {
+	cleared := withoutMetaWriteClauses(current)
+	if cleared == current {
+		return
+	}
+	res, uErr := h.queries.CASVaultEntryRotationError(ctx, db.CASVaultEntryRotationErrorParams{
+		LastRotationError:   toNullString(cleared),
+		ID:                  entryID,
+		LastRotationError_2: toNullString(current),
+		ProviderMeta:        providerMeta,
+	})
+	if uErr != nil {
+		logError(r, site+": persist last_rotation_error failed", "entry", entryID, "error", uErr)
+		return
+	}
+	if n, rErr := res.RowsAffected(); rErr == nil && n == 0 {
+		logError(r, site+": last_rotation_error or provider_meta changed between the re-read and the clear "+
+			"(very likely a concurrent rotation re-armed the alarm); left it in place as the newer, truer state",
+			"entry", entryID)
+	}
+}
+
 func (h *VaultHandler) clearRevokeHalfOfRotationError(ctx context.Context, r *http.Request, site, entryID, current string, providerMeta sql.NullString, settledKeyIDs []string) {
 	cleared := withoutRevokeStillLiveKeys(current, settledKeyIDs)
 	if cleared == current {

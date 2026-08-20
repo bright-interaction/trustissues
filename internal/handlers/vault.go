@@ -2697,6 +2697,29 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		LogActivityFromRequest(h.queries, r, a.action, a.detail)
 	}
 
+	// SETTLE THE PROVIDER_META WRITE-BACK ALARMS, if the operator just wrote that
+	// configuration. This is their only clearer; see
+	// clearMetaWriteHalfOfRotationError for why writing the column discharges an
+	// alarm about the column.
+	//
+	// AutoRotate alone does not count. The gate that reconciles provider_meta
+	// above also fires for it, but flipping a schedule says nothing about whether
+	// the stored key id matches the live credential.
+	//
+	// Placed BEFORE the response row is read, unlike the provider-change discard
+	// clear below it, so the entry handed back already reflects the settle. An
+	// operator who fixes the configuration and still sees the red alarm in the
+	// response has been told their fix did not work.
+	if req.Provider != nil || req.ProviderMeta != nil {
+		if metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr != nil {
+			logError(r, "vault.update: could not re-read last_rotation_error after a provider_meta write, "+
+				"so a stale write-back alarm may remain", "entry", id, "error", mErr)
+		} else {
+			h.clearMetaWriteHalfOfRotationError(ctx, r, "vault.update.provider_meta_written", id,
+				metaRow.LastRotationError.String, metaRow.ProviderMeta)
+		}
+	}
+
 	// Fetch updated entry (post-commit, so it reflects what was actually stored)
 	row, err := h.queries.GetVaultEntryMeta(ctx, id)
 	if err == sql.ErrNoRows {

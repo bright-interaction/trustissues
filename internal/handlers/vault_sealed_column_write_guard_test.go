@@ -124,6 +124,12 @@ var storageSideWrites = []storageSideWrite{
 			"ciphertext read straight off GetVaultEntryMeta and used as an optimistic-lock token, exactly " +
 			"like casToken in casEditProviderMeta; re-sealing it would change the bytes and make every CAS miss"},
 
+	{"vault_pending_revoke.go", "clearMetaWriteHalfOfRotationError", "db.CASVaultEntryRotationErrorParams", "ProviderMeta",
+		"NOT a write, for the identical reason as its sibling above: the same CAS query, the same " +
+			"already-sealed pre-image used as an optimistic-lock token, and last_rotation_error again the " +
+			"only SET target. This one settles the provider_meta write-back alarms after an operator " +
+			"rewrites the provider configuration by hand"},
+
 	{"vault_ownership_repair.go", "reindexAfterCustodianChange", "db.UpdateVaultEntryMetaAtRestParams", "Name",
 		"custodian transfer: the ciphertext is carried across untouched and only name_bidx is " +
 			"recomputed, because the index is keyed by the custodian and the ciphertext is not"},

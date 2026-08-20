@@ -334,77 +334,109 @@ func revokeStillLiveMsgFor(keyIDs []string) string {
 	return revokeStillLiveMsg + revokeKeyListPrefix + strings.Join(ids, revokeKeyListSep) + revokeKeyListSuffix
 }
 
-// splitRevokeClause takes last_rotation_error apart into the part that is NOT
-// about the revoke and the key list the revoke clause names.
+// clauseSpanAtJoin finds `clause` inside a last_rotation_error value at a "; "
+// JOIN BOUNDARY, and returns the span to lift out.
 //
-// It recognises exactly the shapes the folds produce and nothing else: the
-// message at a "; " JOIN BOUNDARY, with an optional key list. A value that
-// merely CONTAINS the message somewhere the join never puts it is left alone,
-// which is the property the former withoutRevokeStillLive had and must keep --
-// see TestTheRevokeClauseIsOnlyRecognisedAtAJoinBoundary.
+// The boundary is the whole safety property. A bare substring match would tear
+// apart a delivery error that merely quotes one of these sentences, so the match
+// must BEGIN the value or follow a "; ", and must END the value or be followed
+// by one. Anything else is prose that happens to contain the words, and is left
+// alone -- see TestTheRevokeClauseIsOnlyRecognisedAtAJoinBoundary.
 //
-// POSITION-INDEPENDENT, AND THAT IS THE FIX. This used to anchor the clause to
-// the END of the value: the whole string, or a trailing "; "-joined suffix.
-// That was never a property of the FORMAT, only of the fold ORDER -- it held
-// because foldRevokeOutcome happened to be the last fold to touch the column.
-// The moment foldMetaWriteOutcome began appending after it, the clause moved
-// into the middle, this returned ok=false, withoutRevokeStillLiveKeys handed
-// back its input byte-identical, and the caller's `cleared == current` early
-// return fired BEFORE the CAS and without a log line. An operator settling a
-// stranded key through Retry got 200 {"revoked": true} while the column still
-// said the key was live, the badge stayed red, and the next retry 409'd.
+// It scans rather than anchoring to either end. Anchoring is what broke the
+// clear path when a second fold began appending after the revoke clause: the
+// position of a clause is a property of the fold ORDER, which changes, not of
+// the format, which does not.
 //
-// Anchoring to the end again would just re-arm that trap for whoever adds the
-// next fold, so the position assumption is removed rather than restored.
-func splitRevokeClause(s string) (head, keyList string, ok bool) {
-	for from := 0; from <= len(s); {
-		rel := strings.Index(s[from:], revokeStillLiveMsg)
+// extend, when non-nil, may grow the span past the clause before the trailing
+// boundary is checked. Only the revoke clause uses it, for its optional key list.
+func clauseSpanAtJoin(s, clause string, extend func(tail string) int) (start, end int, ok bool) {
+	for from := 0; from+len(clause) <= len(s); {
+		rel := strings.Index(s[from:], clause)
 		if rel < 0 {
-			return "", "", false
+			return 0, 0, false
 		}
-		start := from + rel
-		end := start + len(revokeStillLiveMsg)
-
-		// The clause must BEGIN the value or follow a "; " join. Without this a
-		// bare substring match would tear apart a delivery error that merely
-		// quotes the sentence.
+		start = from + rel
+		end = start + len(clause)
 		if !(start == 0 || (start >= 2 && s[start-2:start] == "; ")) {
 			from = start + 1
 			continue
 		}
-
-		// The key list, when present, sits immediately after the message. Ids are
-		// filtered by conservativeKeyIDPattern, so none can contain the suffix.
-		list := ""
-		if tail := s[end:]; strings.HasPrefix(tail, revokeKeyListPrefix) {
-			afterPrefix := tail[len(revokeKeyListPrefix):]
-			if j := strings.Index(afterPrefix, revokeKeyListSuffix); j >= 0 {
-				list = afterPrefix[:j]
-				end += len(revokeKeyListPrefix) + j + len(revokeKeyListSuffix)
-			}
+		if extend != nil {
+			end += extend(s[end:])
 		}
-
-		// ...and it must END the value or be followed by a "; " join, so a longer
-		// sentence that merely starts with the message is not mistaken for it.
 		if end != len(s) && !strings.HasPrefix(s[end:], "; ") {
 			from = start + 1
 			continue
 		}
-
-		// Lift the clause out and repair the join it sat in.
-		before := strings.TrimSuffix(s[:start], "; ")
-		after := strings.TrimPrefix(s[end:], "; ")
-		switch {
-		case before == "":
-			head = after
-		case after == "":
-			head = before
-		default:
-			head = before + "; " + after
-		}
-		return head, list, true
+		return start, end, true
 	}
-	return "", "", false
+	return 0, 0, false
+}
+
+// liftClause removes s[start:end] and repairs the "; " join it sat in.
+func liftClause(s string, start, end int) string {
+	before := strings.TrimSuffix(s[:start], "; ")
+	after := strings.TrimPrefix(s[end:], "; ")
+	switch {
+	case before == "":
+		return after
+	case after == "":
+		return before
+	default:
+		return before + "; " + after
+	}
+}
+
+// splitRevokeClause takes last_rotation_error apart into the part that is NOT
+// about the revoke and the key list the revoke clause names.
+func splitRevokeClause(s string) (head, keyList string, ok bool) {
+	start, end, found := clauseSpanAtJoin(s, revokeStillLiveMsg, func(tail string) int {
+		// Reset per candidate: a candidate that later fails the trailing-boundary
+		// check must not leave its key list behind for the next one.
+		keyList = ""
+		if !strings.HasPrefix(tail, revokeKeyListPrefix) {
+			return 0
+		}
+		afterPrefix := tail[len(revokeKeyListPrefix):]
+		j := strings.Index(afterPrefix, revokeKeyListSuffix)
+		if j < 0 {
+			return 0
+		}
+		// Ids are filtered by conservativeKeyIDPattern, so none can contain the
+		// suffix and the FIRST one closes the list.
+		keyList = afterPrefix[:j]
+		return len(revokeKeyListPrefix) + j + len(revokeKeyListSuffix)
+	})
+	if !found {
+		return "", "", false
+	}
+	return liftClause(s, start, end), keyList, true
+}
+
+// metaWriteClauses are the alarm texts recordRotationOutcome folds in when the
+// provider_meta write-back did not land. Both are settled by the same act -- an
+// operator writing the provider configuration -- so they clear together.
+var metaWriteClauses = []string{metaWriteBackFailedMsg, providerChangedMidRotationMsg}
+
+// withoutMetaWriteClauses removes the provider_meta write-back alarms from a
+// last_rotation_error value, leaving every other clause exactly as found.
+//
+// THESE ALARMS HAD NO CLEARER AT ALL when they were introduced, which is a
+// defect in its own right: revokeStillLiveMsg has three settle paths, and an
+// alarm an operator cannot discharge is one they learn to ignore. The
+// provider-changed case usually self-heals on the next rotation, because that
+// pass snapshots the row's now-current provider; the write-back-failure case on
+// backblaze and twilio does NOT, because the id is half the credential, so the
+// stored pair is dead and the next mint fails against it. That is precisely the
+// case that needs a human, and the human needs a button.
+func withoutMetaWriteClauses(s string) string {
+	for _, clause := range metaWriteClauses {
+		if start, end, ok := clauseSpanAtJoin(s, clause, nil); ok {
+			s = liftClause(s, start, end)
+		}
+	}
+	return s
 }
 
 // withoutRevokeStillLiveKeys settles the named keys in a last_rotation_error

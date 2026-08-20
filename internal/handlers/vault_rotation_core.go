@@ -515,6 +515,15 @@ const revokeStillLiveMsg = "old key not revoked (still live at provider); see se
 // branches. Unlike the revoke alarm this carries no key id: the whole failure is
 // that we do not know which id the row now holds, so naming one would assert
 // precisely the fact that is in doubt.
+//
+// SETTLED BY clearMetaWriteHalfOfRotationError, which fires when an operator
+// writes provider or provider_meta through PUT /api/vault/{id} -- the
+// RotationManager "save provider" button. Both alarms here are about that
+// column, so writing it by hand is the act that discharges them. An alarm with
+// no settle path is one operators learn to ignore, and this one in particular
+// cannot self-heal: on backblaze and twilio the stored id is half the
+// credential, so the next rotation's mint fails against the dead pair rather
+// than blanket-NULLing the column the way a clean rotation would.
 const metaWriteBackFailedMsg = "provider_meta write-back failed; the stored key id may not match the live credential; see server logs"
 
 // errProviderChangedMidRotation marks the one write-back branch that is a
