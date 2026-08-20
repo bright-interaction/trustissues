@@ -337,24 +337,72 @@ func revokeStillLiveMsgFor(keyIDs []string) string {
 // splitRevokeClause takes last_rotation_error apart into the part that is NOT
 // about the revoke and the key list the revoke clause names.
 //
-// It recognises exactly the shapes foldRevokeOutcome produces and nothing else:
-// the message alone, or the message as a trailing "; "-joined suffix, each with
-// an optional key list. A value that merely CONTAINS the message somewhere the
-// join never puts it is left alone, which is the property the former
-// withoutRevokeStillLive had and must keep.
+// It recognises exactly the shapes the folds produce and nothing else: the
+// message at a "; " JOIN BOUNDARY, with an optional key list. A value that
+// merely CONTAINS the message somewhere the join never puts it is left alone,
+// which is the property the former withoutRevokeStillLive had and must keep --
+// see TestTheRevokeClauseIsOnlyRecognisedAtAJoinBoundary.
+//
+// POSITION-INDEPENDENT, AND THAT IS THE FIX. This used to anchor the clause to
+// the END of the value: the whole string, or a trailing "; "-joined suffix.
+// That was never a property of the FORMAT, only of the fold ORDER -- it held
+// because foldRevokeOutcome happened to be the last fold to touch the column.
+// The moment foldMetaWriteOutcome began appending after it, the clause moved
+// into the middle, this returned ok=false, withoutRevokeStillLiveKeys handed
+// back its input byte-identical, and the caller's `cleared == current` early
+// return fired BEFORE the CAS and without a log line. An operator settling a
+// stranded key through Retry got 200 {"revoked": true} while the column still
+// said the key was live, the badge stayed red, and the next retry 409'd.
+//
+// Anchoring to the end again would just re-arm that trap for whoever adds the
+// next fold, so the position assumption is removed rather than restored.
 func splitRevokeClause(s string) (head, keyList string, ok bool) {
-	rest := s
-	if strings.HasSuffix(rest, revokeKeyListSuffix) {
-		if i := strings.LastIndex(rest, revokeKeyListPrefix); i >= 0 {
-			keyList = rest[i+len(revokeKeyListPrefix) : len(rest)-len(revokeKeyListSuffix)]
-			rest = rest[:i]
+	for from := 0; from <= len(s); {
+		rel := strings.Index(s[from:], revokeStillLiveMsg)
+		if rel < 0 {
+			return "", "", false
 		}
-	}
-	switch {
-	case rest == revokeStillLiveMsg:
-		return "", keyList, true
-	case strings.HasSuffix(rest, "; "+revokeStillLiveMsg):
-		return strings.TrimSuffix(rest, "; "+revokeStillLiveMsg), keyList, true
+		start := from + rel
+		end := start + len(revokeStillLiveMsg)
+
+		// The clause must BEGIN the value or follow a "; " join. Without this a
+		// bare substring match would tear apart a delivery error that merely
+		// quotes the sentence.
+		if !(start == 0 || (start >= 2 && s[start-2:start] == "; ")) {
+			from = start + 1
+			continue
+		}
+
+		// The key list, when present, sits immediately after the message. Ids are
+		// filtered by conservativeKeyIDPattern, so none can contain the suffix.
+		list := ""
+		if tail := s[end:]; strings.HasPrefix(tail, revokeKeyListPrefix) {
+			afterPrefix := tail[len(revokeKeyListPrefix):]
+			if j := strings.Index(afterPrefix, revokeKeyListSuffix); j >= 0 {
+				list = afterPrefix[:j]
+				end += len(revokeKeyListPrefix) + j + len(revokeKeyListSuffix)
+			}
+		}
+
+		// ...and it must END the value or be followed by a "; " join, so a longer
+		// sentence that merely starts with the message is not mistaken for it.
+		if end != len(s) && !strings.HasPrefix(s[end:], "; ") {
+			from = start + 1
+			continue
+		}
+
+		// Lift the clause out and repair the join it sat in.
+		before := strings.TrimSuffix(s[:start], "; ")
+		after := strings.TrimPrefix(s[end:], "; ")
+		switch {
+		case before == "":
+			head = after
+		case after == "":
+			head = before
+		default:
+			head = before + "; " + after
+		}
+		return head, list, true
 	}
 	return "", "", false
 }

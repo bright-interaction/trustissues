@@ -356,7 +356,22 @@ func TestZZWithoutRevokeStillLiveKeys(t *testing.T) {
 		{"the message alone clears the field", revokeStillLiveMsg, []string{"K1"}, ""},
 		{"joined suffix keeps the delivery failure", "webhook delivery failed: HTTP 500; " + revokeStillLiveMsg, []string{"K1"}, "webhook delivery failed: HTTP 500"},
 		{"an unrelated error survives untouched", "webhook delivery failed: HTTP 500", []string{"K1"}, "webhook delivery failed: HTTP 500"},
-		{"the message as a PREFIX is not the join shape and must not be trimmed", revokeStillLiveMsg + "; webhook delivery failed", []string{"K1"}, revokeStillLiveMsg + "; webhook delivery failed"},
+		// EXPECTATION CHANGED 2026-08-20, and deliberately.
+		//
+		// This case used to want the value returned UNTOUCHED, named "the message
+		// as a PREFIX is not the join shape". That was true when foldRevokeOutcome
+		// was the last fold to touch the column, so a revoke clause could only ever
+		// be trailing and anything else was an unrecognised shape to leave alone.
+		//
+		// foldMetaWriteOutcome now appends a second clause after it, so "revoke
+		// clause; another clause" is a shape production DOES emit -- and refusing to
+		// parse it is what broke every settle path (see splitRevokeClause). The
+		// refusal encoded a fold ORDER, not a safety property.
+		//
+		// The genuine safety property is unchanged and still pinned by the two cases
+		// below: the message must sit at a "; " join boundary, so a bare substring
+		// mid-sentence is still left alone.
+		{"the message followed by another clause IS a join shape and clears", revokeStillLiveMsg + "; webhook delivery failed", []string{"K1"}, "webhook delivery failed"},
 		{"a bare substring in the middle is not the join shape", "before " + revokeStillLiveMsg + " after", []string{"K1"}, "before " + revokeStillLiveMsg + " after"},
 		{"trailing whitespace defeats the suffix match (documented shape only)", revokeStillLiveMsg + " ", []string{"K1"}, revokeStillLiveMsg + " "},
 		{"doubled suffix removes exactly one", "x; " + revokeStillLiveMsg + "; " + revokeStillLiveMsg, []string{"K1"}, "x; " + revokeStillLiveMsg},

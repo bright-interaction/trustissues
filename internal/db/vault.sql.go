@@ -237,6 +237,18 @@ type CASVaultEntryRotationErrorParams struct {
 // including all four above. A CAS cannot discriminate what the value does not
 // encode; now it encodes it.
 //
+// THAT ARGUMENT ASSUMES THE CLEAR ACTUALLY REACHES THIS STATEMENT, which is a
+// real precondition and not a given. The clause is lifted out of the value by
+// splitRevokeClause before the CAS runs, and that parser was originally anchored
+// to the END of last_rotation_error -- a property of the fold ORDER, not of the
+// format. When foldMetaWriteOutcome (2026-08-20) began appending a second clause
+// after the revoke one, the parse failed, withoutRevokeStillLiveKeys returned its
+// input byte-identical, and the caller returned on `cleared == current` BEFORE
+// this CAS, silently: settling a stranded key answered 200 {"revoked": true}
+// while the column still said it was live. The parser is now position-independent
+// and must stay that way; anchoring it to either end re-arms the trap for whoever
+// adds the next fold.
+//
 // The provider_meta predicate STAYS, for two jobs the value cannot do:
 //   - the CONCURRENT same-string case where provider_meta genuinely did move
 //     (marker changes re-seal the column with a FRESH NONCE, see CASProviderMeta,
