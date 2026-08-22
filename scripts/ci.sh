@@ -59,6 +59,19 @@ IN_MIRROR=1
 # TRUSTISSUES_CI_SKIP_TOOLS=1 to skip those checks when offline; they then report
 # SKIPPED rather than passing quietly. An install that fails for any other reason is a
 # FAILURE, not a skip: "I could not check" must never read as "there is nothing here".
+#
+# EVERY MODULE BELOW IS VERSION-PINNED. These two binaries are the secret scan and
+# the vulnerability scan -- the two checks whose whole job is to refuse a build --
+# and they were installed with @latest, so the gate that decides whether this repo
+# may publish was whatever version those projects shipped that morning. That is an
+# unreviewed third-party upgrade on every CI run, executed in a job holding the
+# checkout, and a supply-chain compromise of either module reaches the pipeline
+# before anybody reads a release note. Pinning also makes the scanners' own
+# behaviour reproducible: an @latest scanner that starts or stops reporting a
+# finding changes this repository's verdict with no commit behind it.
+#
+# Bumping one of these is a deliberate act: change the version here, run the suite,
+# and land it as its own commit so the diff records which scanner moved.
 tool() {
   local bin="$1" mod="$2" path
   if command -v "$bin" >/dev/null 2>&1; then command -v "$bin"; return 0; fi
@@ -193,7 +206,7 @@ step "frontend tests (RUN)"           frontend_tests
 # payload's own full history separately before it pushes.
 secret_scan() {
   local bin rc
-  bin="$(tool gitleaks github.com/zricethezav/gitleaks/v8@latest)"; rc=$?
+  bin="$(tool gitleaks github.com/zricethezav/gitleaks/v8@v8.30.1)"; rc=$?
   [ "$rc" = "0" ] || return "$rc"
   if [ "$IN_MIRROR" = "1" ]; then
     "$bin" detect --source . --config .gitleaks.toml --no-banner --redact
@@ -215,14 +228,14 @@ allowlist_guard() {
     echo "scripts/test-gitleaks-allowlist.sh is missing; nothing proves the secret scan still reports" >&2
     return 1
   }
-  bin="$(tool gitleaks github.com/zricethezav/gitleaks/v8@latest)"; rc=$?
+  bin="$(tool gitleaks github.com/zricethezav/gitleaks/v8@v8.30.1)"; rc=$?
   [ "$rc" = "0" ] || return "$rc"
   GITLEAKS="$bin" bash scripts/test-gitleaks-allowlist.sh
 }
 
 vuln_scan() {
   local bin rc
-  bin="$(tool govulncheck golang.org/x/vuln/cmd/govulncheck@latest)"; rc=$?
+  bin="$(tool govulncheck golang.org/x/vuln/cmd/govulncheck@v1.7.0)"; rc=$?
   [ "$rc" = "0" ] || return "$rc"
   "$bin" ./...
 }

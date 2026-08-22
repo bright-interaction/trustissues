@@ -1,5 +1,5 @@
 # Stage 1: Build frontend
-FROM oven/bun:1-alpine AS frontend
+FROM oven/bun:1-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb AS frontend
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/bun.lock* ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
@@ -22,7 +22,7 @@ RUN bun run build
 # the GOTOOLCHAIN=local that every official golang image bakes in -- and with
 # the go-version pin in .github/workflows/ci.yml. internal/buildpins asserts
 # all three agree and refuses if any drifts.
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS builder
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /trustissues ./cmd/server
 
 # Stage 3: Minimal runtime
-FROM alpine:3.21
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
 # `sqlite` (the CLI) as well as `sqlite-libs` (the shared library the binary
 # links against). The documented backup procedure runs
 # `docker compose exec trustissues sqlite3 ... ".backup ..."`, which is the only

@@ -36,11 +36,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned, not tag-pinned. A tag is mutable: whoever can move v4 can
+      # run their code in a job that has this repository checked out. The
+      # trailing comment is the human-readable version; the SHA is the pin.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # the secret scan reads full history, not just the tip
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           # A literal pin, NOT go-version-file. setup-go@v5 parses only the
           # `go` directive out of go.mod and stops -- it has no `toolchain`
@@ -51,9 +54,20 @@ jobs:
           go-version: "1.26.6"
           cache: true
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          # A literal pin, for the same reason go-version is one above.
+          # `latest` meant the frontend was type-checked by whatever bun
+          # released that morning, so a bun regression arrived as a CI failure
+          # on an unrelated PR with nothing in the repository having changed.
+          #
+          # NOT in lockstep with the Dockerfile, and nothing checks that it is.
+          # The Dockerfile builds the SHIPPED frontend from its own digest-
+          # pinned oven/bun image; this only type-checks. Both are now pinned,
+          # so any drift between them is at least stationary and visible in a
+          # diff rather than moving underneath both. A buildpins-style lockstep
+          # guard for bun is the real fix and does not exist yet.
+          bun-version: "1.4.0"
 
       - name: All checks (build, vet, gofmt, migrations, tests, frontend, secrets, vulnerabilities)
         run: bash scripts/ci.sh
