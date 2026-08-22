@@ -16,11 +16,18 @@ export default function Layout({ children }: LayoutProps) {
       <Sidebar />
       <main className="pl-56">
         {/*
-          The vault policy can require 2FA for everyone. Refusing the login
-          instead would lock out every account the moment an admin ticks the
-          box, including accounts that never had a chance to enrol, so the
-          server flags the account and we nag here on every page until it is
-          set up. Disabling 2FA is refused server-side while the policy is on.
+          The vault policy can require 2FA for everyone. Refusing the LOGIN
+          would lock out every account the moment an admin ticks the box,
+          including accounts that never had a chance to enrol, so login still
+          succeeds and the server flags the account here instead.
+
+          This banner is not decoration any more. As of the enrolment gate
+          (internal/middleware/totp_enrollment.go) the server refuses every
+          route except /api/auth while this flag is set, so a flagged user can
+          reach exactly two things: this banner and the enrolment form it links
+          to. Every other page will show its own error. Keep the link working
+          and keep it pointing at a tab whose data comes only from /api/auth --
+          it is the sole way out of the gate.
         */}
         {user?.totp_enrollment_required && (
           <div className="border-b border-amber-200 bg-amber-50 px-6 py-3">
@@ -30,7 +37,8 @@ export default function Layout({ children }: LayoutProps) {
                 <span className="font-medium">
                   Two-factor authentication is required.
                 </span>{' '}
-                Your administrator requires 2FA on every account.{' '}
+                Your administrator requires 2FA on every account. The rest of
+                the vault stays locked until you finish setting it up.{' '}
                 <Link
                   to="/settings?tab=account"
                   className="font-medium underline hover:text-amber-950"

@@ -587,214 +587,225 @@ func main() {
 				r.Post("/totp/disable", authHandler.TOTPDisable)
 			})
 
-			// Settings. Vault policy reads are open to every authenticated
-			// role (the vault UI needs the auto-lock deadline); everything
-			// else is admin only.
-			r.Route("/settings", func(r chi.Router) {
-				r.Get("/vault-policy", settingsHandler.GetVaultPolicy)
+			// Everything past this point is behind the TOTP-enrolment gate.
+			//
+			// /api/auth above is deliberately OUTSIDE it: enrolling is how a
+			// user gets past the gate, so gating enrolment would lock out every
+			// un-enrolled account the moment the policy is switched on. Putting
+			// the exemption here, as a route group, rather than in a list of
+			// exempt paths inside the middleware, is what makes a route added
+			// below gated by DEFAULT. See RequireTOTPEnrollment.
+			r.Group(func(r chi.Router) {
+				r.Use(timw.RequireTOTPEnrollment(dbConn))
+				// Settings. Vault policy reads are open to every authenticated
+				// role (the vault UI needs the auto-lock deadline); everything
+				// else is admin only.
+				r.Route("/settings", func(r chi.Router) {
+					r.Get("/vault-policy", settingsHandler.GetVaultPolicy)
+					r.Group(func(r chi.Router) {
+						r.Use(timw.AdminOnly())
+						r.Put("/vault-policy", settingsHandler.UpdateVaultPolicy)
+						r.Get("/session-duration", settingsHandler.GetSessionDuration)
+						r.Put("/session-duration", settingsHandler.UpdateSessionDuration)
+						r.Get("/smtp", settingsHandler.GetSMTP)
+						r.Put("/smtp", settingsHandler.UpdateSMTP)
+						r.Post("/smtp/test", settingsHandler.TestSMTP)
+					})
+				})
+
+				// API keys for programmatic clients (the browser extension).
+				// Per-user and available to every authenticated role, since a
+				// vault_only teammate also needs to connect the extension.
+				r.Route("/api-keys", func(r chi.Router) {
+					r.Get("/", apiKeyHandler.List)
+					r.Post("/", apiKeyHandler.Create)
+					r.Delete("/{keyId}", apiKeyHandler.Delete)
+				})
+
+				// Activity log + exports (admin only).
 				r.Group(func(r chi.Router) {
 					r.Use(timw.AdminOnly())
-					r.Put("/vault-policy", settingsHandler.UpdateVaultPolicy)
-					r.Get("/session-duration", settingsHandler.GetSessionDuration)
-					r.Put("/session-duration", settingsHandler.UpdateSessionDuration)
-					r.Get("/smtp", settingsHandler.GetSMTP)
-					r.Put("/smtp", settingsHandler.UpdateSMTP)
-					r.Post("/smtp/test", settingsHandler.TestSMTP)
-				})
-			})
-
-			// API keys for programmatic clients (the browser extension).
-			// Per-user and available to every authenticated role, since a
-			// vault_only teammate also needs to connect the extension.
-			r.Route("/api-keys", func(r chi.Router) {
-				r.Get("/", apiKeyHandler.List)
-				r.Post("/", apiKeyHandler.Create)
-				r.Delete("/{keyId}", apiKeyHandler.Delete)
-			})
-
-			// Activity log + exports (admin only).
-			r.Group(func(r chi.Router) {
-				r.Use(timw.AdminOnly())
-				// The credential access trail. Admin-gated with the activity log
-				// and for the same reason: it names which secret an agent spent,
-				// which is the inventory, and it is the one surface that answers
-				// "who used this credential, when, and to where" after the entry
-				// itself has been deleted.
-				r.Get("/capability-log", capabilityHandler.ListCapabilityLog)
-				r.Get("/activity", activityHandler.List)
-				r.Get("/activity/export/csv", activityHandler.ExportCSV)
-				r.Get("/activity/export/json", activityHandler.ExportJSON)
-			})
-
-			// Admin user + invitation + notification-channel management.
-			r.Route("/admin", func(r chi.Router) {
-				r.Use(timw.AdminOnly())
-
-				r.Route("/users", func(r chi.Router) {
-					r.Get("/", userHandler.List)
-					r.Post("/", userHandler.Create)
-					r.Patch("/{id}", userHandler.Update)
-					r.Delete("/{id}", userHandler.Delete)
-					r.Post("/{id}/reset-password", userHandler.ResetPassword)
-					// Incident response: an admin must be able to see and cut
-					// off another user's API keys (a stolen extension key
-					// otherwise survives every action the victim can take).
-					r.Get("/{id}/api-keys", apiKeyHandler.AdminList)
-					r.Post("/{id}/api-keys/revoke-all", apiKeyHandler.AdminRevokeAll)
-					r.Post("/{id}/api-keys/{keyId}/revoke", apiKeyHandler.AdminRevoke)
+					// The credential access trail. Admin-gated with the activity log
+					// and for the same reason: it names which secret an agent spent,
+					// which is the inventory, and it is the one surface that answers
+					// "who used this credential, when, and to where" after the entry
+					// itself has been deleted.
+					r.Get("/capability-log", capabilityHandler.ListCapabilityLog)
+					r.Get("/activity", activityHandler.List)
+					r.Get("/activity/export/csv", activityHandler.ExportCSV)
+					r.Get("/activity/export/json", activityHandler.ExportJSON)
 				})
 
-				r.Route("/invitations", func(r chi.Router) {
-					r.Get("/", userHandler.ListInvitations)
-					r.Post("/", userHandler.CreateInvitation)
-					r.Delete("/{id}", userHandler.DeleteInvitation)
-					r.Post("/{id}/resend", userHandler.ResendInvitation)
+				// Admin user + invitation + notification-channel management.
+				r.Route("/admin", func(r chi.Router) {
+					r.Use(timw.AdminOnly())
+
+					r.Route("/users", func(r chi.Router) {
+						r.Get("/", userHandler.List)
+						r.Post("/", userHandler.Create)
+						r.Patch("/{id}", userHandler.Update)
+						r.Delete("/{id}", userHandler.Delete)
+						r.Post("/{id}/reset-password", userHandler.ResetPassword)
+						// Incident response: an admin must be able to see and cut
+						// off another user's API keys (a stolen extension key
+						// otherwise survives every action the victim can take).
+						r.Get("/{id}/api-keys", apiKeyHandler.AdminList)
+						r.Post("/{id}/api-keys/revoke-all", apiKeyHandler.AdminRevokeAll)
+						r.Post("/{id}/api-keys/{keyId}/revoke", apiKeyHandler.AdminRevoke)
+					})
+
+					r.Route("/invitations", func(r chi.Router) {
+						r.Get("/", userHandler.ListInvitations)
+						r.Post("/", userHandler.CreateInvitation)
+						r.Delete("/{id}", userHandler.DeleteInvitation)
+						r.Post("/{id}/resend", userHandler.ResendInvitation)
+					})
+
+					// The repair surface for migration 00034's fail-closed
+					// backfill. It refused to stamp secret_owner_user_id wherever
+					// the database could not prove the custodian deposited the
+					// secret, and an empty owner denies, so an operator needs to
+					// see what was withheld and take it deliberately. Admin-only
+					// because it enumerates entries across every user's vault and
+					// because AuthorizeTransfer grants a proof to nobody else.
+					r.Route("/vault/ownership", func(r chi.Router) {
+						r.Get("/", vaultHandler.ListUnownedEntries)
+					})
+					r.Post("/vault/{id}/ownership/claim", vaultHandler.ClaimSecretOwnership)
+					// The undo. A claim is reachable whenever the recorded owner
+					// cannot direct the entry, and almost every way to get there is
+					// a reversible call a collection manager can make without
+					// touching the entry. Without this route the helpful admin
+					// action makes the reversible thing permanent.
+					r.Post("/vault/{id}/ownership/restore", vaultHandler.RestoreSecretOwnership)
+
+					r.Route("/notification-channels", func(r chi.Router) {
+						r.Get("/", notificationChannelsHandler.List)
+						r.Post("/", notificationChannelsHandler.Create)
+						r.Patch("/{id}", notificationChannelsHandler.Update)
+						r.Delete("/{id}", notificationChannelsHandler.Delete)
+						r.Post("/{id}/test", notificationChannelsHandler.Test)
+					})
+
+					// Master-key rotation. The status read is cheap and safe to poll;
+					// the sweep is a whole-database rewrite, so it shares the
+					// sensitive-op budget with rotate and validate. Both are admin
+					// only: this is the one action that can decide whether the vault
+					// key an operator is about to delete is still load-bearing.
+					r.Get("/vault-key", vaultHandler.VaultKeyStatus)
+					r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/vault-key/rekey", vaultHandler.VaultKeyRekey)
 				})
 
-				// The repair surface for migration 00034's fail-closed
-				// backfill. It refused to stamp secret_owner_user_id wherever
-				// the database could not prove the custodian deposited the
-				// secret, and an empty owner denies, so an operator needs to
-				// see what was withheld and take it deliberately. Admin-only
-				// because it enumerates entries across every user's vault and
-				// because AuthorizeTransfer grants a proof to nobody else.
-				r.Route("/vault/ownership", func(r chi.Router) {
-					r.Get("/", vaultHandler.ListUnownedEntries)
-				})
-				r.Post("/vault/{id}/ownership/claim", vaultHandler.ClaimSecretOwnership)
-				// The undo. A claim is reachable whenever the recorded owner
-				// cannot direct the entry, and almost every way to get there is
-				// a reversible call a collection manager can make without
-				// touching the entry. Without this route the helpful admin
-				// action makes the reversible thing permanent.
-				r.Post("/vault/{id}/ownership/restore", vaultHandler.RestoreSecretOwnership)
-
-				r.Route("/notification-channels", func(r chi.Router) {
-					r.Get("/", notificationChannelsHandler.List)
-					r.Post("/", notificationChannelsHandler.Create)
-					r.Patch("/{id}", notificationChannelsHandler.Update)
-					r.Delete("/{id}", notificationChannelsHandler.Delete)
-					r.Post("/{id}/test", notificationChannelsHandler.Test)
+				// Vault (all roles incl. vault_only; per-entry ownership is
+				// enforced in the handlers). Mirrors dockyard main.go:899-912.
+				r.Route("/vault", func(r chi.Router) {
+					r.Get("/", vaultHandler.List)
+					r.Post("/", vaultHandler.Create)
+					r.Get("/providers", vaultHandler.Providers)
+					r.Get("/match", vaultHandler.Match)
+					r.With(timw.RateLimit(unlockLimiter)).Post("/unlock", vaultHandler.Unlock)
+					r.Put("/{id}", vaultHandler.Update)
+					r.Delete("/{id}", vaultHandler.Delete)
+					r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/rotate", vaultHandler.Rotate)
+					r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/validate", vaultHandler.ValidateKey)
+					// Both spend or mutate a credential, so they sit under the same
+					// limiter as rotate/validate rather than the general API one.
+					r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/retry", vaultHandler.RetryPendingRevoke)
+					r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/resolve", vaultHandler.ResolvePendingRevoke)
+					r.Get("/{id}/targets", vaultHandler.GetTargets)
+					r.Put("/{id}/targets", vaultHandler.UpdateTargets)
+					r.Put("/{id}/schedule", vaultHandler.UpdateSchedule)
+					r.Put("/{id}/collection", vaultHandler.MoveToCollection)
+					r.Post("/import/preview", vaultImportHandler.ImportPreview)
+					r.Post("/import/confirm", vaultImportHandler.ImportConfirm)
 				})
 
-				// Master-key rotation. The status read is cheap and safe to poll;
-				// the sweep is a whole-database rewrite, so it shares the
-				// sensitive-op budget with rotate and validate. Both are admin
-				// only: this is the one action that can decide whether the vault
-				// key an operator is about to delete is still load-bearing.
-				r.Get("/vault-key", vaultHandler.VaultKeyStatus)
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/vault-key/rekey", vaultHandler.VaultKeyRekey)
-			})
-
-			// Vault (all roles incl. vault_only; per-entry ownership is
-			// enforced in the handlers). Mirrors dockyard main.go:899-912.
-			r.Route("/vault", func(r chi.Router) {
-				r.Get("/", vaultHandler.List)
-				r.Post("/", vaultHandler.Create)
-				r.Get("/providers", vaultHandler.Providers)
-				r.Get("/match", vaultHandler.Match)
-				r.With(timw.RateLimit(unlockLimiter)).Post("/unlock", vaultHandler.Unlock)
-				r.Put("/{id}", vaultHandler.Update)
-				r.Delete("/{id}", vaultHandler.Delete)
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/rotate", vaultHandler.Rotate)
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/validate", vaultHandler.ValidateKey)
-				// Both spend or mutate a credential, so they sit under the same
-				// limiter as rotate/validate rather than the general API one.
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/retry", vaultHandler.RetryPendingRevoke)
-				r.With(timw.RateLimit(sensitiveOpLimiter)).Post("/{id}/pending-revoke/resolve", vaultHandler.ResolvePendingRevoke)
-				r.Get("/{id}/targets", vaultHandler.GetTargets)
-				r.Put("/{id}/targets", vaultHandler.UpdateTargets)
-				r.Put("/{id}/schedule", vaultHandler.UpdateSchedule)
-				r.Put("/{id}/collection", vaultHandler.MoveToCollection)
-				r.Post("/import/preview", vaultImportHandler.ImportPreview)
-				r.Post("/import/confirm", vaultImportHandler.ImportConfirm)
-			})
-
-			// Shared team vaults (collections) + membership. Any authenticated
-			// role may hold a collection membership, so this sits in the general
-			// group; the handlers enforce per-collection manager rights for
-			// mutations and 404 non-members.
-			r.Route("/collections", func(r chi.Router) {
-				r.Get("/", collectionHandler.List)
-				r.Post("/", collectionHandler.Create)
-				// Membership is an invitation: a pending row grants nothing
-				// until the invitee accepts here.
-				r.Get("/invitations", collectionHandler.ListPendingInvites)
-				r.Route("/{id}", func(r chi.Router) {
-					r.Get("/", collectionHandler.Get)
-					r.Put("/", collectionHandler.Update)
-					r.Delete("/", collectionHandler.Delete)
-					r.Get("/members", collectionHandler.ListMembers)
-					r.With(timw.RateLimit(membershipLimiter)).Post("/members", collectionHandler.AddMember)
-					r.Delete("/members/{userId}", collectionHandler.RemoveMember)
-					// Withdraw a PENDING invitation by email. The members list
-					// no longer hands out a user id for a pending seat (that
-					// was the account-enumeration oracle), and an address with
-					// no account never had one, so rescinding needs its own
-					// email-addressed route or an invite could never be undone.
-					r.With(timw.RateLimit(membershipLimiter)).Delete("/invitations", collectionHandler.RescindInvitation)
-					r.Post("/accept", collectionHandler.AcceptInvite)
-					r.Post("/decline", collectionHandler.DeclineInvite)
+				// Shared team vaults (collections) + membership. Any authenticated
+				// role may hold a collection membership, so this sits in the general
+				// group; the handlers enforce per-collection manager rights for
+				// mutations and 404 non-members.
+				r.Route("/collections", func(r chi.Router) {
+					r.Get("/", collectionHandler.List)
+					r.Post("/", collectionHandler.Create)
+					// Membership is an invitation: a pending row grants nothing
+					// until the invitee accepts here.
+					r.Get("/invitations", collectionHandler.ListPendingInvites)
+					r.Route("/{id}", func(r chi.Router) {
+						r.Get("/", collectionHandler.Get)
+						r.Put("/", collectionHandler.Update)
+						r.Delete("/", collectionHandler.Delete)
+						r.Get("/members", collectionHandler.ListMembers)
+						r.With(timw.RateLimit(membershipLimiter)).Post("/members", collectionHandler.AddMember)
+						r.Delete("/members/{userId}", collectionHandler.RemoveMember)
+						// Withdraw a PENDING invitation by email. The members list
+						// no longer hands out a user id for a pending seat (that
+						// was the account-enumeration oracle), and an address with
+						// no account never had one, so rescinding needs its own
+						// email-addressed route or an invite could never be undone.
+						r.With(timw.RateLimit(membershipLimiter)).Delete("/invitations", collectionHandler.RescindInvitation)
+						r.Post("/accept", collectionHandler.AcceptInvite)
+						r.Post("/decline", collectionHandler.DeclineInvite)
+					})
 				})
-			})
 
-			// AI gateway: proxy LLM calls to Claude/OpenAI with the team's
-			// provider key injected server-side and PII tokenized via Shield.
-			// The key itself is never exposed. Non-streaming only in v1.
-			//
-			// NOT open to vault_only. That role is what RedeemInvitation hands
-			// out over the PUBLIC invite endpoint, and it exists to let a
-			// teammate use the browser extension against their own secrets, not
-			// to spend the team's Claude/OpenAI budget. The handler has no role
-			// check of its own, and VaultOnlyBlock's doc says to mount it on
-			// every group that is not part of the vault surface; it was on
-			// /service-identities alone.
-			r.Group(func(r chi.Router) {
-				r.Use(timw.VaultOnlyBlock())
-				r.Use(timw.RateLimit(aiGatewayLimiter))
-				r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
-			})
-
-			// AI gateway + MCP config: any user reads status + connection URLs;
-			// only an admin points a provider at a key.
-			r.Get("/settings/ai", aiGatewayHandler.GetConfig)
-			r.With(timw.AdminOnly()).Put("/settings/ai", aiGatewayHandler.UpdateConfig)
-
-			// The capability bridge: MCP (list_secrets + use_secret, with Shield
-			// tokenizing tool results) and the HTTP mint route. Both hand out a
-			// token that /proxy spends by injecting a decrypted secret upstream,
-			// so they are ONE surface and get one rule.
-			//
-			// NOT open to vault_only, for the same reason /api/ai is not. That
-			// role is what RedeemInvitation hands out over the PUBLIC invite
-			// endpoint, and it exists to let a teammate use the browser extension
-			// against their own secrets, not to spend the team's Claude/OpenAI
-			// budget. Blocking the gateway while leaving the bridge open was the
-			// same door twice: an accepted vault_only member minted for the team
-			// key and drove POST /proxy/api.openai.com/v1/chat/completions, and
-			// the operator paid for it. Neither handler has a role check of its
-			// own; VaultOnlyBlock's doc says to mount it on every group that is
-			// not part of the vault surface, and this is not.
-			r.Group(func(r chi.Router) {
-				r.Use(timw.VaultOnlyBlock())
-				r.Post("/mcp", mcpHandler.Handle)
-				// Sensitive op: rate limited hard.
-				r.Route("/secrets", func(r chi.Router) {
-					r.With(timw.RateLimit(capabilityLimiter)).Post("/issue", capabilityHandler.Issue)
+				// AI gateway: proxy LLM calls to Claude/OpenAI with the team's
+				// provider key injected server-side and PII tokenized via Shield.
+				// The key itself is never exposed. Non-streaming only in v1.
+				//
+				// NOT open to vault_only. That role is what RedeemInvitation hands
+				// out over the PUBLIC invite endpoint, and it exists to let a
+				// teammate use the browser extension against their own secrets, not
+				// to spend the team's Claude/OpenAI budget. The handler has no role
+				// check of its own, and VaultOnlyBlock's doc says to mount it on
+				// every group that is not part of the vault surface; it was on
+				// /service-identities alone.
+				r.Group(func(r chi.Router) {
+					r.Use(timw.VaultOnlyBlock())
+					r.Use(timw.RateLimit(aiGatewayLimiter))
+					r.HandleFunc("/ai/{provider}/*", aiGatewayHandler.Proxy)
 				})
-			})
 
-			// Service identities: admin-only mint + list + revoke + delete +
-			// audit (the handlers enforce admin; VaultOnlyBlock keeps
-			// vault_only users off this non-vault surface). Mirrors dockyard
-			// main.go:864-868.
-			r.Route("/service-identities", func(r chi.Router) {
-				r.Use(timw.VaultOnlyBlock())
-				r.Get("/", serviceSecretsHandler.ListServiceIdentities)
-				r.Post("/", serviceSecretsHandler.CreateServiceIdentity)
-				r.Post("/{id}/revoke", serviceSecretsHandler.RevokeServiceIdentity)
-				r.Delete("/{id}", serviceSecretsHandler.DeleteServiceIdentity)
-				r.Get("/{id}/audit", serviceSecretsHandler.GetServiceIdentityAudit)
+				// AI gateway + MCP config: any user reads status + connection URLs;
+				// only an admin points a provider at a key.
+				r.Get("/settings/ai", aiGatewayHandler.GetConfig)
+				r.With(timw.AdminOnly()).Put("/settings/ai", aiGatewayHandler.UpdateConfig)
+
+				// The capability bridge: MCP (list_secrets + use_secret, with Shield
+				// tokenizing tool results) and the HTTP mint route. Both hand out a
+				// token that /proxy spends by injecting a decrypted secret upstream,
+				// so they are ONE surface and get one rule.
+				//
+				// NOT open to vault_only, for the same reason /api/ai is not. That
+				// role is what RedeemInvitation hands out over the PUBLIC invite
+				// endpoint, and it exists to let a teammate use the browser extension
+				// against their own secrets, not to spend the team's Claude/OpenAI
+				// budget. Blocking the gateway while leaving the bridge open was the
+				// same door twice: an accepted vault_only member minted for the team
+				// key and drove POST /proxy/api.openai.com/v1/chat/completions, and
+				// the operator paid for it. Neither handler has a role check of its
+				// own; VaultOnlyBlock's doc says to mount it on every group that is
+				// not part of the vault surface, and this is not.
+				r.Group(func(r chi.Router) {
+					r.Use(timw.VaultOnlyBlock())
+					r.Post("/mcp", mcpHandler.Handle)
+					// Sensitive op: rate limited hard.
+					r.Route("/secrets", func(r chi.Router) {
+						r.With(timw.RateLimit(capabilityLimiter)).Post("/issue", capabilityHandler.Issue)
+					})
+				})
+
+				// Service identities: admin-only mint + list + revoke + delete +
+				// audit (the handlers enforce admin; VaultOnlyBlock keeps
+				// vault_only users off this non-vault surface). Mirrors dockyard
+				// main.go:864-868.
+				r.Route("/service-identities", func(r chi.Router) {
+					r.Use(timw.VaultOnlyBlock())
+					r.Get("/", serviceSecretsHandler.ListServiceIdentities)
+					r.Post("/", serviceSecretsHandler.CreateServiceIdentity)
+					r.Post("/{id}/revoke", serviceSecretsHandler.RevokeServiceIdentity)
+					r.Delete("/{id}", serviceSecretsHandler.DeleteServiceIdentity)
+					r.Get("/{id}/audit", serviceSecretsHandler.GetServiceIdentityAudit)
+				})
 			})
 		})
 	})

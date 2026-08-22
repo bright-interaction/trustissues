@@ -40,7 +40,48 @@ const (
 	// outlive the one presented. Absent on the JWT path (an interactive login is
 	// not itself time-boxed this way) and absent for a key with no expiry.
 	APIKeyExpiryKey contextKey = "api_key_expires_at"
+	// PrincipalKindKey records WHICH credential authenticated this request:
+	// PrincipalSession for an interactive JWT login, PrincipalAPIKey for the
+	// X-API-Key path.
+	//
+	// It exists because the two facts that could already be used to infer this
+	// are both unreliable. APIKeyExpiryKey is only set when the key HAS an
+	// expiry, so a non-expiring key is indistinguishable from a session by that
+	// signal. SessionIDKey happens to be empty on the API-key path today, but
+	// that is a side effect of there being no jti to record, not a statement
+	// anybody made on purpose, and reading it as one means a future auth path
+	// that also lacks a session id silently joins whichever branch it was never
+	// considered for. This key says the thing directly.
+	PrincipalKindKey contextKey = "principal_kind"
 )
+
+// Principal kinds. PrincipalKind returns the empty string when no
+// authentication middleware has run, which every caller must treat as the
+// UNKNOWN case and never as a permissive default.
+const (
+	// PrincipalSession is an interactive login: a JWT from the Authorization
+	// header or the session cookie, backed by a revocable server-side session.
+	PrincipalSession = "session"
+	// PrincipalAPIKey is the X-API-Key path used by the browser extension and
+	// external integrations. It has no server-side session and no interactive
+	// login, so interactive-login controls (TOTP, and anything else gated on
+	// having just proved possession of a second factor) do not apply to it.
+	PrincipalAPIKey = "api_key"
+)
+
+// PrincipalKind reports which credential authenticated the request:
+// PrincipalSession, PrincipalAPIKey, or "" when the request never passed
+// through JWTOrAPIKeyAuth.
+//
+// Callers deciding whether to APPLY a restriction must treat "" as "apply it".
+// An unknown principal is not a trusted one, and defaulting the other way is
+// how a new auth path inherits an exemption nobody granted it.
+func PrincipalKind(ctx context.Context) string {
+	if v, ok := ctx.Value(PrincipalKindKey).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // APIKeyExpiry returns the authenticating API key's expiry, and ok=false when
 // the request was not authenticated by a time-boxed API key.
@@ -219,6 +260,7 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 					time.Now().UTC().Format(time.RFC3339), keyHash)
 
 				ctx := context.WithValue(r.Context(), UserIDKey, userID)
+				ctx = context.WithValue(ctx, PrincipalKindKey, PrincipalAPIKey)
 				// Carry this key's own expiry so a handler minting another
 				// credential cannot hand out one that outlives it.
 				if keyExpiresAt.Valid {
@@ -265,6 +307,7 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				return
 			}
 			ctx = context.WithValue(ctx, SessionIDKey, jti)
+			ctx = context.WithValue(ctx, PrincipalKindKey, PrincipalSession)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
