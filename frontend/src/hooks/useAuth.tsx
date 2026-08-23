@@ -102,6 +102,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         queryClient.clear();
         setUser(res.user);
         navigate(res.user.role === 'vault_only' ? '/vault' : '/');
+        // Belt and braces behind the login response now carrying
+        // totp_enrollment_required. The server is the source of truth for that
+        // flag and re-reading it here means a future change to the login
+        // payload cannot silently un-render the enrolment banner again.
+        void refreshUser();
       }
       return res;
     },

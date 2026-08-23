@@ -12,165 +12,289 @@ import (
 // Why this test reads the router's SYNTAX instead of driving the router.
 //
 // The gate it guards is middleware, and internal/middleware/totp_enrollment_test.go
-// already proves the middleware itself: refuses an un-enrolled session, passes an
-// enrolled one, exempts only API keys, fails closed on a database error. All of
-// that stayed green when the mount was deleted from this file. A gate that is
-// fully tested and not installed enforces nothing, and this codebase loses things
-// exactly that way -- "adding a file to the list that ENFORCES a property and not
-// the list that CHECKS it leaves the property true today and unguarded tomorrow".
+// already proves the middleware itself. All of that stayed green when the mount was
+// deleted from this file. A gate that is fully tested and not installed enforces
+// nothing, and this codebase loses things exactly that way.
 //
-// Driving the real router would be the stronger test. It is not available: the
-// router is built inline inside main() across roughly 370 lines with every handler
-// constructed in place, so there is nothing to call from a test. Extracting a
-// newRouter() seam is the right fix and is deliberately NOT bundled into a security
-// change -- it is a refactor of the process entrypoint and wants its own review.
-// Until it exists, this asserts the two structural facts that the mount depends on,
-// over the AST rather than over a regexp, because round 5 of this product's audit
-// history already showed a source-matching guard being walked through by four
-// planted paths.
+// Driving the real router would be stronger and is not available: the router is
+// built inline inside main() across ~370 lines with every handler constructed in
+// place, so there is nothing to call from a test. Extracting a newRouter() seam is
+// the right fix and is deliberately not bundled into a security change. If you
+// extract it, DELETE this file and replace it with a test that issues real requests.
 //
-// If you extract newRouter(), DELETE this file and replace it with a test that
-// issues real requests. It is a stand-in, not the intended end state.
+// WHAT THE FIRST VERSION GOT WRONG, because it is the whole reason this one is
+// shaped the way it is. It asserted the EXISTENCE of a gated group: somewhere in
+// main.go there is an r.Group that calls RequireTOTPEnrollment and mentions four
+// route prefixes. Review broke it with four mutations:
+//
+//	A7  delete the real r.Use, add a dead decoy group with four empty
+//	    r.Route stubs                                    -> GREEN, whole surface ungated
+//	A2b move /api/api-keys out of the gate               -> GREEN, not in the hardcoded four
+//	A3  register a new r.Route("/reports") outside       -> GREEN, never looked
+//	A4b replace the gate with a same-named no-op         -> GREEN, receiver ignored
+//
+// Every one of those is the same mistake: asserting that something good exists
+// somewhere, rather than that nothing bad exists anywhere. An existence claim is
+// satisfied by a decoy. So this version asserts the COMPLEMENT -- it enumerates
+// every route registered under the authenticated group and requires each one to be
+// either under /auth or inside a gated scope. That single assertion subsumes A7,
+// A2b, A3 and A5b, and needs no hardcoded list of route names to stay current.
 
-const gateMiddleware = "RequireTOTPEnrollment"
+const (
+	gateMiddleware = "RequireTOTPEnrollment"
+	authMiddleware = "JWTOrAPIKeyAuth"
+	// middlewarePkg is the import alias main.go uses for internal/middleware.
+	// The receiver is checked, not just the method name: mutation A4b replaced
+	// the gate with a locally defined function of the same name and the first
+	// version could not tell the difference.
+	middlewarePkg = "timw"
+)
 
-// findGatedGroups returns the body of EVERY r.Group(func(r chi.Router){...})
-// call that mounts the enrolment gate.
-//
-// It returns all of them, not the first one, and that is not defensiveness --
-// the single-result version of this function was written first and was blind to
-// its own ablation. ast.Inspect's `return false` only stops the walk
-// DESCENDING into that node; it keeps visiting siblings. So with the gate
-// mounted on two groups, the match was silently overwritten by whichever came
-// last, and planting the gate on /auth (the lockout this file exists to
-// prevent) left the later, innocent group as the one under test and the suite
-// stayed green. The same shape as the guard that "restates the same hardcoded
-// list as the production mechanism it guards", one level down: a checker that
-// examines one of N sites cannot see a defect introduced at any of the others.
-func findGatedGroups(file *ast.File) []*ast.BlockStmt {
-	var found []*ast.BlockStmt
+// routeSite is one registration and whether the scope enclosing it is gated.
+type routeSite struct {
+	pattern string
+	gated   bool
+	line    int
+}
+
+// verbs are the chi registration methods that bind a pattern to a handler.
+var verbs = map[string]bool{
+	"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+	"Head": true, "Options": true, "Handle": true, "HandleFunc": true,
+	"Method": true, "Mount": true,
+}
+
+// callsPkgFunc reports whether e is a call of <middlewarePkg>.<name>(...).
+// Both halves are checked, so a same-named local function is not mistaken for
+// the real middleware.
+func callsPkgFunc(e ast.Expr, name string) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != name {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == middlewarePkg
+}
+
+// bodyUses reports whether this block's own statements include
+// r.Use(<middlewarePkg>.<name>(...)).
+func bodyUses(block *ast.BlockStmt, name string) bool {
+	for _, stmt := range block.List {
+		es, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := es.X.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil || sel.Sel.Name != "Use" || len(call.Args) != 1 {
+			continue
+		}
+		if callsPkgFunc(call.Args[0], name) {
+			return true
+		}
+	}
+	return false
+}
+
+// joinPath composes a chi mount prefix with a child pattern.
+func joinPath(prefix, pat string) string {
+	switch {
+	case prefix == "":
+		return pat
+	case pat == "" || pat == "/":
+		return prefix
+	}
+	return strings.TrimSuffix(prefix, "/") + "/" + strings.TrimPrefix(pat, "/")
+}
+
+func stringLit(e ast.Expr) (string, bool) {
+	lit, ok := e.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	s, err := strconv.Unquote(lit.Value)
+	return s, err == nil
+}
+
+// collectRoutes walks a chi router body, carrying whether the enclosing scope is
+// gated, and records every pattern registered at any depth.
+// prefix is the accumulated mount path, so a Get("/me") nested inside
+// Route("/auth", ...) is recorded as "/auth/me". Recording the leaf alone made
+// the escape-hatch check compare "/me" against "/auth" and flag every
+// self-service route as ungated.
+func collectRoutes(block *ast.BlockStmt, prefix string, gated bool, fset *token.FileSet, out *[]routeSite) {
+	for _, stmt := range block.List {
+		es, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := es.X.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		// r.With(...).Get("/x", h) -- the outer call is the verb, so the switch
+		// below sees it. Mutation A5b used this shape.
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil {
+			continue
+		}
+		line := fset.Position(call.Pos()).Line
+
+		switch {
+		case sel.Sel.Name == "Group" && len(call.Args) == 1:
+			lit, ok := call.Args[0].(*ast.FuncLit)
+			if !ok {
+				continue
+			}
+			// A Group does not change the path, only the middleware scope.
+			collectRoutes(lit.Body, prefix, gated || bodyUses(lit.Body, gateMiddleware), fset, out)
+
+		case sel.Sel.Name == "Route" && len(call.Args) == 2:
+			pat, ok := stringLit(call.Args[0])
+			if !ok {
+				continue
+			}
+			full := joinPath(prefix, pat)
+			*out = append(*out, routeSite{full, gated, line})
+			if lit, ok := call.Args[1].(*ast.FuncLit); ok {
+				// A nested Route inherits its parent's gated state, and may add
+				// the gate itself.
+				collectRoutes(lit.Body, full, gated || bodyUses(lit.Body, gateMiddleware), fset, out)
+			}
+
+		case verbs[sel.Sel.Name] && len(call.Args) >= 1:
+			if pat, ok := stringLit(call.Args[0]); ok {
+				*out = append(*out, routeSite{joinPath(prefix, pat), gated, line})
+			}
+		}
+	}
+}
+
+// findAuthGroup returns the body of the r.Group that mounts JWTOrAPIKeyAuth --
+// every authenticated route in the product lives inside it.
+func findAuthGroup(file *ast.File) *ast.BlockStmt {
+	var found *ast.BlockStmt
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok || !isSelector(call.Fun, "Group") || len(call.Args) != 1 {
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil || sel.Sel.Name != "Group" || len(call.Args) != 1 {
 			return true
 		}
 		lit, ok := call.Args[0].(*ast.FuncLit)
 		if !ok {
 			return true
 		}
-		// Does this group's body mount the gate directly (r.Use(timw.RequireTOTPEnrollment(...)))?
-		for _, stmt := range lit.Body.List {
-			es, ok := stmt.(*ast.ExprStmt)
-			if !ok {
-				continue
-			}
-			use, ok := es.X.(*ast.CallExpr)
-			if !ok || !isSelector(use.Fun, "Use") || len(use.Args) != 1 {
-				continue
-			}
-			inner, ok := use.Args[0].(*ast.CallExpr)
-			if ok && isSelector(inner.Fun, gateMiddleware) {
-				found = append(found, lit.Body)
-				break
-			}
+		if bodyUses(lit.Body, authMiddleware) {
+			found = lit.Body
+			return false
 		}
-		// Keep descending: groups nest, and a gated group inside a gated group
-		// is still a site this file has to inspect.
 		return true
 	})
 	return found
 }
 
-func isSelector(e ast.Expr, name string) bool {
-	sel, ok := e.(*ast.SelectorExpr)
-	return ok && sel.Sel != nil && sel.Sel.Name == name
-}
-
-// routePrefixesIn collects the string literal of every r.Route("...") and
-// r.Mount("...") registered anywhere inside the given block.
-func routePrefixesIn(block ast.Node) []string {
-	var out []string
-	ast.Inspect(block, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) == 0 {
-			return true
-		}
-		if !isSelector(call.Fun, "Route") && !isSelector(call.Fun, "Mount") {
-			return true
-		}
-		lit, ok := call.Args[0].(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			return true
-		}
-		if s, err := strconv.Unquote(lit.Value); err == nil {
-			out = append(out, s)
-		}
-		return true
-	})
-	return out
-}
-
-func parseMain(t *testing.T) *ast.File {
+func parseMain(t *testing.T) (*ast.File, *token.FileSet) {
 	t.Helper()
-	f, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, parser.ParseComments)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, parser.ParseComments)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
-	return f
+	return f, fset
 }
 
-// The mount exists. Deleting the r.Use line fails here and nowhere else.
-func TestEnrollmentGateIsActuallyMountedOnTheRouter(t *testing.T) {
-	if len(findGatedGroups(parseMain(t))) == 0 {
-		t.Fatalf("no r.Group in main.go mounts %s.\n"+
-			"The middleware and its tests can be fully green while the router never installs it, "+
-			"which is a 2FA policy that silently enforces nothing.", gateMiddleware)
+// THE assertion. Every authenticated route is either the enrolment escape hatch
+// or behind the gate. Nothing else is permitted, so a route added anywhere new
+// fails here by default rather than needing to be predicted by a list.
+func TestEveryAuthenticatedRouteIsGatedOrIsTheEscapeHatch(t *testing.T) {
+	file, fset := parseMain(t)
+	authGroup := findAuthGroup(file)
+	if authGroup == nil {
+		t.Fatalf("no r.Group in main.go mounts %s.%s. Either the router was restructured or this "+
+			"guard stopped matching it; a guard that inspects nothing must fail rather than pass.",
+			middlewarePkg, authMiddleware)
+	}
+
+	var sites []routeSite
+	collectRoutes(authGroup, "", false, fset, &sites)
+	if len(sites) == 0 {
+		t.Fatal("found no routes inside the authenticated group; the walker is broken and this " +
+			"guard would pass no matter what the router did")
+	}
+
+	var ungated []routeSite
+	for _, s := range sites {
+		if s.pattern == "/auth" || strings.HasPrefix(s.pattern, "/auth/") {
+			continue // the escape hatch, deliberately outside the gate
+		}
+		if !s.gated {
+			ungated = append(ungated, s)
+		}
+	}
+	if len(ungated) > 0 {
+		for _, s := range ungated {
+			t.Errorf("main.go:%d  route %q is registered inside the authenticated group but NOT "+
+				"behind %s", s.line, s.pattern, gateMiddleware)
+		}
+		t.Fatalf("%d authenticated route(s) escape the enrolment gate. Every route under /api "+
+			"except /auth must sit inside the group that mounts %s -- /auth is the only exemption, "+
+			"because enrolling is the sole way past the gate.", len(ungated), gateMiddleware)
 	}
 }
 
-// The escape hatch is real: /auth must be registered OUTSIDE every gated group,
-// or switching require_totp on locks out every un-enrolled account, including
-// the only administrator on a fresh instance, with no route to enrol.
-func TestAuthRoutesStayOutsideTheGatedGroup(t *testing.T) {
-	groups := findGatedGroups(parseMain(t))
-	if len(groups) == 0 {
-		t.Skip("gate not mounted; TestEnrollmentGateIsActuallyMountedOnTheRouter reports that")
+// The escape hatch is real: /auth must NOT be gated, or switching require_totp on
+// locks out every un-enrolled account, including the only administrator on a
+// fresh instance, with no route to enrol.
+func TestAuthRoutesAreNotGated(t *testing.T) {
+	file, fset := parseMain(t)
+	authGroup := findAuthGroup(file)
+	if authGroup == nil {
+		t.Skip("auth group not found; TestEveryAuthenticatedRouteIsGatedOrIsTheEscapeHatch reports that")
 	}
-	// EVERY gated group, not just one: gating /auth anywhere is the lockout,
-	// regardless of how many other groups are innocent.
-	for i, group := range groups {
-		for _, p := range routePrefixesIn(group) {
-			if p == "/auth" || strings.HasPrefix(p, "/auth/") {
-				t.Fatalf("%q is registered INSIDE enrolment-gated group #%d of %d.\n"+
-					"Enrolling is the only way past the gate, so gating it locks out every "+
-					"un-enrolled user the moment the policy is switched on.", p, i+1, len(groups))
-			}
+	var sites []routeSite
+	collectRoutes(authGroup, "", false, fset, &sites)
+	for _, s := range sites {
+		if (s.pattern == "/auth" || strings.HasPrefix(s.pattern, "/auth/")) && s.gated {
+			t.Fatalf("main.go:%d  %q is INSIDE the enrolment gate. Enrolling is the only way past "+
+				"the gate, so gating it locks out every un-enrolled user the moment the policy is "+
+				"switched on.", s.line, s.pattern)
 		}
 	}
 }
 
-// The protected surface actually lives behind the gate. If someone moves the
-// vault routes out, the gate keeps passing its own tests while guarding
-// nothing.
-func TestTheGatedGroupStillContainsTheProtectedSurface(t *testing.T) {
-	groups := findGatedGroups(parseMain(t))
-	if len(groups) == 0 {
-		t.Skip("gate not mounted; TestEnrollmentGateIsActuallyMountedOnTheRouter reports that")
-	}
-	var got []string
-	for _, g := range groups {
-		got = append(got, routePrefixesIn(g)...)
-	}
-	inside := make(map[string]bool, len(got))
-	for _, p := range got {
-		inside[p] = true
-	}
-	// Deliberately a small, high-value set rather than an exhaustive mirror of
-	// the route table: a list that restates the whole router would have to be
-	// edited on every routing change and would be maintained by deletion.
-	for _, want := range []string{"/vault", "/settings", "/collections", "/admin"} {
-		if !inside[want] {
-			t.Errorf("%q is no longer inside the enrolment-gated group (found: %v)", want, got)
+// The gate is mounted with the real middleware, not something that merely shares
+// its name. Mutation A4b replaced it with a local no-op and the receiver-blind
+// first version could not tell.
+func TestGateMountIsTheRealMiddleware(t *testing.T) {
+	file, _ := parseMain(t)
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
 		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil || sel.Sel.Name != "Use" {
+			return true
+		}
+		if callsPkgFunc(call.Args[0], gateMiddleware) {
+			found = true
+			return false
+		}
+		return true
+	})
+	if !found {
+		t.Fatalf("no r.Use(%s.%s(...)) in main.go. A local function of the same name does not "+
+			"count: the receiver is part of the assertion.", middlewarePkg, gateMiddleware)
 	}
 }

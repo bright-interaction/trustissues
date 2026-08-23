@@ -124,37 +124,55 @@ func TestGatePassesEveryCaseItMustNotBlock(t *testing.T) {
 	}
 }
 
-// The browser extension authenticates with an API key and holds it
-// permanently. Gating that path would break the extension for every
-// un-enrolled user while denying an attacker nothing, because an attacker
-// holding a stolen API key never touches the interactive login this control
-// guards.
-func TestAPIKeyPrincipalIsNotSubjectToTheEnrollmentGate(t *testing.T) {
+// EVERY principal kind is gated, API keys included. This is the withdrawn
+// exemption, pinned as its inverse so it cannot come back by accident.
+//
+// The first version of this middleware let PrincipalAPIKey through. Review
+// showed the exemption was self-renewing: an api-key principal walked it
+// through to POST /api/api-keys -- which is inside the gated group, so a
+// session is refused there -- and minted a fresh key with no recorded
+// parentage and no expiry, so revoking the parent did not touch the child.
+//
+// The table deliberately includes kinds that do not exist. A gate whose
+// enforcement depends on recognising a known list of principals is one new auth
+// path away from a hole, and this codebase's recurring defect is exactly that
+// shape.
+func TestEveryPrincipalKindIsGatedIncludingAPIKeys(t *testing.T) {
 	db := enrollmentDB(t, "true", map[string]bool{"u1": false})
-	ctx := context.WithValue(context.Background(), UserIDKey, "u1")
-	ctx = context.WithValue(ctx, PrincipalKindKey, PrincipalAPIKey)
-	code, reached := serveThroughGate(t, db, ctx)
-	if !reached || code != http.StatusOK {
-		t.Fatalf("status = %d reached = %v, want 200/true: the extension's API key must keep working", code, reached)
-	}
-}
-
-// The exemption is for API keys SPECIFICALLY, not for "anything that is not a
-// session". A principal kind nobody has considered yet must be gated, so a
-// future auth path cannot inherit an exemption it was never granted.
-func TestUnknownPrincipalKindIsGatedNotExempted(t *testing.T) {
-	db := enrollmentDB(t, "true", map[string]bool{"u1": false})
-	for _, kind := range []string{"", "future_sso", "service_identity"} {
-		t.Run("kind="+kind, func(t *testing.T) {
+	for _, kind := range []string{PrincipalAPIKey, PrincipalSession, "", "future_sso", "service_identity"} {
+		name := kind
+		if name == "" {
+			name = "(unset)"
+		}
+		t.Run("kind="+name, func(t *testing.T) {
 			ctx := context.WithValue(context.Background(), UserIDKey, "u1")
 			if kind != "" {
 				ctx = context.WithValue(ctx, PrincipalKindKey, kind)
 			}
-			_, reached := serveThroughGate(t, db, ctx)
+			code, reached := serveThroughGate(t, db, ctx)
 			if reached {
-				t.Fatalf("principal kind %q was let through; only PrincipalAPIKey may bypass this gate", kind)
+				t.Fatalf("principal kind %q reached a gated route while require_totp was on "+
+					"and the user was not enrolled. No principal is exempt from this gate.", kind)
+			}
+			if code != http.StatusForbidden {
+				t.Fatalf("kind %q: status = %d, want %d", kind, code, http.StatusForbidden)
 			}
 		})
+	}
+}
+
+// An ENROLLED user is unaffected on every principal kind, so the gate does not
+// break the extension once its owner has enrolled.
+func TestEnrolledUserPassesOnEveryPrincipalKind(t *testing.T) {
+	db := enrollmentDB(t, "true", map[string]bool{"u1": true})
+	for _, kind := range []string{PrincipalAPIKey, PrincipalSession, ""} {
+		ctx := context.WithValue(context.Background(), UserIDKey, "u1")
+		if kind != "" {
+			ctx = context.WithValue(ctx, PrincipalKindKey, kind)
+		}
+		if code, reached := serveThroughGate(t, db, ctx); !reached || code != http.StatusOK {
+			t.Fatalf("kind %q: enrolled user was refused (status %d)", kind, code)
+		}
 	}
 }
 

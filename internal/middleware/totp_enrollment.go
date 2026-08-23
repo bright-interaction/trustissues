@@ -12,8 +12,9 @@ import (
 // contract: see FRONTEND-CONTRACT.md.
 const TOTPEnrollmentRequiredCode = "totp_enrollment_required"
 
-// RequireTOTPEnrollment refuses every request from an interactive session whose
-// user has not enrolled TOTP, while the `require_totp` vault policy is on.
+// RequireTOTPEnrollment refuses every request from a user who has not enrolled
+// TOTP, while the `require_totp` vault policy is on. Session or API key alike:
+// see the withdrawn exemption below.
 //
 // WHY THIS EXISTS AS A GATE AND NOT A BANNER.
 //
@@ -43,16 +44,34 @@ const TOTPEnrollmentRequiredCode = "totp_enrollment_required"
 // gated group is gated by default, and exempting one is a deliberate move to
 // a different block rather than an edit to a list somewhere else.
 //
-// WHY API KEYS ARE NOT GATED.
+// WHY API KEYS ARE GATED TOO, AFTER AN EXEMPTION WAS TRIED AND WITHDRAWN.
 //
-// TOTP is an interactive-login control: it proves a second factor at the
-// moment a human authenticates. An API key is a separate bearer credential the
-// user minted while already authenticated, and the browser extension holds one
-// permanently. Gating the API-key path would break the extension for every
-// un-enrolled user without denying an attacker anything, because an attacker
-// holding a stolen API key never touches the login flow this control guards.
-// The exemption is limited to PrincipalAPIKey specifically: an unknown
-// principal kind is gated, so a future auth path does not inherit it silently.
+// The first version of this middleware exempted PrincipalAPIKey, reasoning that
+// TOTP is an interactive-login control and that an API key is a credential the
+// user minted while already authenticated, so gating it would break the browser
+// extension without denying an attacker anything. Review refuted that premise
+// and demonstrated the exemption was a self-renewing bypass:
+//
+//	GET /api/vault + session cookie -> 403 totp_enrollment_required
+//	GET /api/vault + X-API-Key      -> 200, full entry list
+//	POST /api/api-keys + X-API-Key  -> 201, a BRAND NEW key, expires_at null
+//
+// The third line is the one that settles it. POST /api/api-keys lives inside
+// the gated group, so a session is correctly refused -- but an api-key
+// principal walked the exemption through to the same handler and minted a fresh
+// key, with no recorded parentage, so revoking the parent did not touch the
+// child. The expiry cap at apikeys.go:171-190 does not bind when the parent key
+// has no expiry, which is the default. An exemption that can mint its own
+// successors is not an exemption, it is an escape hatch with no lock.
+//
+// Fixing it by keeping the exemption would have needed UpdateVaultPolicy to
+// revoke every api_keys row belonging to an un-enrolled user in the same
+// transaction as the settings write -- otherwise keys already in flight defeat
+// the fix retroactively. That is more machinery, defending a premise that was
+// wrong to begin with. So the gate now asks one question of every principal:
+// is this user enrolled. The browser extension stops working for an un-enrolled
+// user while the policy is on, and that is the correct reading of "two-factor
+// authentication is required for all users" on a credential vault.
 //
 // FAIL CLOSED. A database error here refuses the request. The alternative is a
 // gate that stops enforcing exactly when the database is unhealthy, and this is
@@ -61,14 +80,6 @@ const TOTPEnrollmentRequiredCode = "totp_enrollment_required"
 func RequireTOTPEnrollment(db *sql.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// API keys are out of scope for an interactive-login control.
-			// Anything that is not positively identified as an API key is
-			// gated, including the empty (no auth middleware ran) case.
-			if PrincipalKind(r.Context()) == PrincipalAPIKey {
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			userID := GetUserID(r.Context())
 			if userID == "" {
 				// Unauthenticated requests never reach here in the mounted

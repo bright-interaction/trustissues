@@ -512,6 +512,15 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Role:        row.Role,
 		TOTPEnabled: totpEnabled,
 		CreatedAt:   nullTimeStr(row.CreatedAt),
+		// Same expression as Me() below. It has to be here as well as there,
+		// because login is the ONE path every gated user takes and the SPA does
+		// not call /auth/me after it: useAuth.login does setUser(res.user) and
+		// navigates. Omitting it here left the enrolment banner rendering only
+		// after a manual reload, so a user the gate had just locked out of every
+		// route landed on /vault, watched every query 403, and was shown nothing
+		// telling them to enrol. That silently defeated the escape hatch the
+		// whole gate depends on.
+		TOTPEnrollmentRequired: !totpEnabled && settingBool(r.Context(), h.queries, "require_totp", false),
 	}
 
 	h.setSessionCookie(w, token)
