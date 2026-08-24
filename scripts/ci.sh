@@ -134,8 +134,24 @@ fmt_check() {
 # _test.go and executes none while still printing ok, and a gate labelled "tests
 # compile" was read as "tests pass" for months in a sibling repo. -count=1 disables the
 # test cache, so a green run means this tree is green NOW, not that it was green once.
+#
+# -race, and 30m, because THIS SCRIPT IS NOT THE GATE THAT DECIDES. The pipeline
+# that can refuse a deploy runs, at hephaestus/userworkflows/ci_go.go:838:
+#
+#     go test -race -count=1 -timeout=1800s ./...
+#
+# For as long as this function ran without -race, every "ci.sh is green" statement
+# was made against a strictly weaker gate than the one holding the deploy, and a
+# race-detector failure was structurally invisible until after the push. The
+# timeout matches 1800s for the same reason in the opposite direction: at 20m this
+# script could fail a suite the pipeline would have passed, which teaches people to
+# distrust it. A local gate that is not the deciding gate is worse than no local
+# gate, because it is quoted as evidence.
+#
+# -race needs cgo. If CGO_ENABLED=0 is set in the environment, go fails loudly here
+# rather than silently dropping the detector.
 run_tests() {
-  go test ./... -count=1 -timeout 20m
+  go test -race ./... -count=1 -timeout 30m
 }
 
 # The e2e suite is behind `-tags e2e`, so `go test ./...` above does NOT run it:
