@@ -637,6 +637,12 @@ type Querier interface {
 	// ============================================================================
 	// Admin CRUD
 	// ============================================================================
+	// Owner email + enrolment status ride along so an admin can see, from this
+	// ONE existing list, every identity FetchOwnSecrets will start refusing the
+	// moment require_totp is turned on -- before a boot failure is how anyone
+	// finds out. LEFT JOIN because created_by_user_id is nullable and a deleted
+	// owner must still show up in the list (as unenrolled, which is correct: a
+	// deleted owner's identity is already refused by the owner-liveness check).
 	ListServiceIdentities(ctx context.Context) ([]ListServiceIdentitiesRow, error)
 	ListServiceIdentitiesByUser(ctx context.Context, createdByUserID sql.NullString) ([]ListServiceIdentitiesByUserRow, error)
 	ListUsers(ctx context.Context) ([]ListUsersRow, error)

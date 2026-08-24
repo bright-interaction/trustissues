@@ -104,6 +104,14 @@ func newServiceTestDB(t *testing.T) *sql.DB {
 			remote_ip TEXT NOT NULL DEFAULT '',
 			occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// settingBool reads this table for the require_totp vault policy. Needed
+		// so FetchOwnSecrets' owner-enrolment gate (service_secrets_totp_gate_test.go)
+		// can turn the policy on the same way UpdateVaultPolicy does.
+		`CREATE TABLE settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := dbConn.Exec(s); err != nil {

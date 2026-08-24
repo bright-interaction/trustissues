@@ -135,6 +135,49 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// A service identity has no human to enrol, so it inherits the owner's
+	// enrolment status: while require_totp is on, this fetch is refused for
+	// every identity whose owner has not enrolled TOTP, exactly as it already
+	// is for that owner's own session and X-API-Key requests.
+	//
+	// This route sits OUTSIDE the session-auth group by design (fetch-on-boot
+	// has no cookie and no session), so RequireTOTPEnrollment never runs on
+	// it and cannot be moved to cover it -- see the route comment in
+	// cmd/server/main.go. Without an equivalent check here, X-Service-Key was
+	// a standing, silent exemption from a policy whose UI reads "2FA required
+	// for all users": exactly the credential-class exemption this codebase
+	// already withdrew once for API keys (see RequireTOTPEnrollment's doc
+	// comment). The difference from that withdrawal is that a service
+	// identity cannot enrol on its own behalf, so the fix is not "gate it
+	// like a session" but "bind it to the human who can act": the owner
+	// enrols, every identity they created starts working again, with no
+	// separate revalidation step and nothing for an admin to remember to
+	// re-run.
+	//
+	// This CAN refuse a service container that was working a minute ago, if
+	// an admin flips require_totp while the owner has not enrolled. That is
+	// deliberate and must be loud: the response carries the same
+	// machine-readable code the session/API-key gate uses (so an operator
+	// grepping logs for totp_enrollment_required finds every affected
+	// caller, not two different strings for the same condition), the audit
+	// row and the log line both name the owner so the on-call knows whose
+	// enrolment unblocks it, and ListServiceIdentities now reports each
+	// identity's owner enrolment status so an admin can see every identity
+	// this will affect BEFORE turning the policy on, not after a boot fails.
+	if settingBool(r.Context(), h.queries, "require_totp", false) && owner.TotpEnabled.Int64 != 1 {
+		reason := fmt.Sprintf(
+			"vault policy requires two-factor authentication for all users; owner %s has not enrolled",
+			identity.CreatedByUserID.String)
+		slog.Warn("service_secrets: fetch refused, owner has not enrolled TOTP under require_totp policy",
+			"service", identity.Name, "identity_id", identity.ID,
+			"owner_user_id", identity.CreatedByUserID.String)
+		h.audit(identity.ID, identity.Name, "denied", nil, reason, remoteIP)
+		writeError(w, r, http.StatusForbidden, middleware.TOTPEnrollmentRequiredCode,
+			"service identity owner has not enrolled two-factor authentication, which the vault "+
+				"policy now requires; the owner must enrol to restore this identity's access")
+		return
+	}
+
 	// Parse the allowed_secrets whitelist.
 	var allowed []string
 	if err := json.Unmarshal([]byte(identity.AllowedSecrets), &allowed); err != nil {
@@ -392,6 +435,15 @@ type serviceIdentityListResponse struct {
 	ExpiresAt      *string  `json:"expires_at"`
 	RevokedAt      *string  `json:"revoked_at"`
 	CreatedAt      string   `json:"created_at"`
+	// OwnerEmail and OwnerTOTPEnabled let an admin see, from the list they
+	// already use to manage service identities, which ones FetchOwnSecrets
+	// will start refusing the moment require_totp is turned on: every
+	// identity whose OwnerTOTPEnabled is false. No omitempty on the bool:
+	// this codebase already has a documented latent trap where omitempty on
+	// a status flag silently drops the `false` case, which is exactly the
+	// value that matters here.
+	OwnerEmail       *string `json:"owner_email"`
+	OwnerTOTPEnabled bool    `json:"owner_totp_enabled"`
 }
 
 type serviceIdentityCreateResponse struct {
@@ -529,12 +581,13 @@ func (h *ServiceSecretsHandler) ListServiceIdentities(w http.ResponseWriter, r *
 		var allowed []string
 		_ = json.Unmarshal([]byte(row.AllowedSecrets), &allowed)
 		entry := serviceIdentityListResponse{
-			ID:             row.ID,
-			Name:           row.Name,
-			Description:    row.Description,
-			AllowedSecrets: allowed,
-			KeyPrefix:      row.KeyPrefix,
-			CreatedAt:      row.CreatedAt.Format(time.RFC3339),
+			ID:               row.ID,
+			Name:             row.Name,
+			Description:      row.Description,
+			AllowedSecrets:   allowed,
+			KeyPrefix:        row.KeyPrefix,
+			CreatedAt:        row.CreatedAt.Format(time.RFC3339),
+			OwnerTOTPEnabled: row.OwnerTotpEnabled,
 		}
 		if row.LastUsedAt.Valid {
 			s := row.LastUsedAt.Time.Format(time.RFC3339)
@@ -547,6 +600,10 @@ func (h *ServiceSecretsHandler) ListServiceIdentities(w http.ResponseWriter, r *
 		if row.RevokedAt.Valid {
 			s := row.RevokedAt.Time.Format(time.RFC3339)
 			entry.RevokedAt = &s
+		}
+		if row.OwnerEmail.Valid {
+			s := row.OwnerEmail.String
+			entry.OwnerEmail = &s
 		}
 		out = append(out, entry)
 	}

@@ -22,10 +22,19 @@ WHERE id = ?;
 -- ============================================================================
 
 -- name: ListServiceIdentities :many
-SELECT id, name, description, allowed_secrets, key_prefix,
-       last_used_at, expires_at, revoked_at, created_at
-FROM service_identities
-ORDER BY created_at DESC;
+-- Owner email + enrolment status ride along so an admin can see, from this
+-- ONE existing list, every identity FetchOwnSecrets will start refusing the
+-- moment require_totp is turned on -- before a boot failure is how anyone
+-- finds out. LEFT JOIN because created_by_user_id is nullable and a deleted
+-- owner must still show up in the list (as unenrolled, which is correct: a
+-- deleted owner's identity is already refused by the owner-liveness check).
+SELECT si.id, si.name, si.description, si.allowed_secrets, si.key_prefix,
+       si.last_used_at, si.expires_at, si.revoked_at, si.created_at,
+       u.email AS owner_email,
+       COALESCE(u.totp_enabled, 0) = 1 AS owner_totp_enabled
+FROM service_identities si
+LEFT JOIN users u ON u.id = si.created_by_user_id
+ORDER BY si.created_at DESC;
 
 -- name: GetServiceIdentityByID :one
 SELECT id, name, description, allowed_secrets, key_prefix,
