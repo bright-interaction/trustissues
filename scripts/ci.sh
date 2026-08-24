@@ -72,13 +72,40 @@ IN_MIRROR=1
 #
 # Bumping one of these is a deliberate act: change the version here, run the suite,
 # and land it as its own commit so the diff records which scanner moved.
+# THE PIN HAS TO BE WHAT ACTUALLY RUNS.
+#
+# This used to return any binary of that name already on PATH before it
+# considered the pinned module. So on a developer machine an older -- or planted
+# -- gitleaks decided this repository's verdict while the pin guard reported
+# everything pinned, and the comment above claiming "EVERY MODULE BELOW IS
+# VERSION-PINNED" was true of the source and false of the process. CI runners
+# escaped only by luck: neither scanner happens to be preinstalled there.
+#
+# `go install module@version` is content-addressed and cached, so resolving the
+# pin on every run costs nothing after the first and buys the property the pin
+# was for. Correctness outranks a second of warm-cache install time in a gate
+# whose job is refusing builds.
 tool() {
   local bin="$1" mod="$2" path
-  if command -v "$bin" >/dev/null 2>&1; then command -v "$bin"; return 0; fi
   if [ "${TRUSTISSUES_CI_SKIP_TOOLS:-0}" = "1" ]; then return 99; fi
   go install "$mod" >/dev/null 2>&1 || { echo "could not install $bin from $mod (offline?)" >&2; return 1; }
-  path="$(go env GOPATH)/bin/$bin"
-  [ -x "$path" ] || { echo "installed $bin but $path is not executable" >&2; return 1; }
+  # ASK GO WHERE IT PUT THE BINARY. Do not assume GOPATH/bin.
+  #
+  # `go install` writes to $GOBIN when GOBIN is set, and only falls back to
+  # $GOPATH/bin when it is not. This line used to hardcode the fallback, so with
+  # GOBIN set the pinned scanner was installed to one path and a DIFFERENT
+  # binary -- anything already sitting at $GOPATH/bin -- was the one executed.
+  # The run then printed "ci: all checks passed" and exited 0 with the real,
+  # freshly installed scanners untouched on disk.
+  #
+  # That is strictly worse than the PATH-preference bug this function was changed
+  # to fix, because a skip at least announces itself: this passed silently. Ask
+  # the toolchain rather than predicting it.
+  local gobin
+  gobin="$(go env GOBIN)"
+  [ -n "$gobin" ] || gobin="$(go env GOPATH)/bin"
+  path="$gobin/$bin"
+  [ -x "$path" ] || { echo "installed $bin from $mod but $path is not executable" >&2; return 1; }
   printf '%s\n' "$path"
 }
 
@@ -109,6 +136,21 @@ fmt_check() {
 # test cache, so a green run means this tree is green NOW, not that it was green once.
 run_tests() {
   go test ./... -count=1 -timeout 20m
+}
+
+# The e2e suite is behind `-tags e2e`, so `go test ./...` above does NOT run it:
+# without this step it would compile in nobody's pipeline and prove nothing, which
+# is the exact shape of a sibling repo's regression test that skipped in CI and in
+# the deploy pipeline for months while being cited as coverage.
+#
+# It builds the real server binary and drives it over HTTP, because the question
+# it answers cannot be answered by a handler test: can a person starting from an
+# empty database reach the gated state and get back out of it? The production
+# instance has one admin with totp_enabled=0 and UpdateVaultPolicy refuses to
+# enable require_totp unless the acting admin is enrolled, so the whole feature
+# was unreachable in production while every unit test passed.
+run_e2e() {
+  go test -tags e2e ./internal/e2e/ -count=1 -timeout 10m
 }
 
 # Goose applies migrations in numeric order and records each applied version in its own
@@ -193,6 +235,7 @@ step "vet"                            go vet ./...
 step "gofmt"                          fmt_check
 step "migrations"                     migrations_check
 step "tests (RUN, not just compiled)" run_tests
+step "e2e against the real binary"    run_e2e
 step "frontend build + typecheck"     frontend_build
 step "frontend tests (RUN)"           frontend_tests
 

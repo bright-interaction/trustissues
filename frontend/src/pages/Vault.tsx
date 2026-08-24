@@ -33,7 +33,13 @@ import toast from 'react-hot-toast';
 import clsx from 'clsx';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
-import { api, request, ApiError } from '@/lib/api';
+import { Link } from 'react-router-dom';
+import {
+  api,
+  request,
+  ApiError,
+  TOTP_ENROLLMENT_REQUIRED_CODE,
+} from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import Layout from '@/components/Layout';
 import VaultImportModal from '@/components/VaultImportModal';
@@ -1491,7 +1497,18 @@ export default function Vault() {
   // Id of the collection whose "Leave" button is waiting on confirmation.
   const [confirmLeaveId, setConfirmLeaveId] = useState<string | null>(null);
 
-  const { data: vaultList = [], isLoading: vaultLoading } = useQuery<VaultEntry[]>({
+  // `error` is destructured, and it is not optional.
+  //
+  // Without it a refused list is indistinguishable from an empty one: the query
+  // fails, `vaultList` stays at its `= []` default, and the panel below renders
+  // "No secrets stored. Unlock the vault and add your first secret." A vault
+  // holding five credentials told its owner it was empty -- the single most
+  // alarming thing this product can say, produced by a missing error branch.
+  const {
+    data: vaultList = [],
+    isLoading: vaultLoading,
+    error: vaultError,
+  } = useQuery<VaultEntry[]>({
     queryKey: queryKeys.vault.list(),
     queryFn: vaultApi.list,
   });
@@ -1500,6 +1517,15 @@ export default function Vault() {
     queryKey: queryKeys.collections.list(),
     queryFn: api.collections.list,
   });
+
+  // The enrolment gate refuses with a machine-readable code; anything else is an
+  // ordinary failure. Both must say "we could not load this", never "there is
+  // nothing here", but only the first can tell the user how to fix it.
+  const listRefusedForEnrollment =
+    vaultError instanceof ApiError &&
+    vaultError.status === 403 &&
+    (vaultError.body as { code?: string })?.code ===
+      TOTP_ENROLLMENT_REQUIRED_CODE;
 
   // Auto-lock: drop the decrypted entries after the policy's
   // auto_lock_max_minutes (GET /api/settings/vault-policy). The values only live
@@ -2765,6 +2791,33 @@ export default function Vault() {
             {vaultLoading ? (
               <div className="flex items-center justify-center py-6">
                 <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+              </div>
+            ) : vaultError ? (
+              <div className="py-4 text-center text-sm">
+                {listRefusedForEnrollment ? (
+                  <p className="text-amber-900">
+                    <span className="font-medium">
+                      Your secrets are not shown because two-factor
+                      authentication is required.
+                    </span>{' '}
+                    Nothing has been deleted.{' '}
+                    <Link
+                      to="/settings?tab=account"
+                      className="font-medium underline hover:text-amber-950"
+                    >
+                      Set up 2FA
+                    </Link>{' '}
+                    to get access back.
+                  </p>
+                ) : (
+                  <p className="text-red-700">
+                    <span className="font-medium">
+                      Your secrets could not be loaded.
+                    </span>{' '}
+                    Nothing has been deleted. Reload the page, and if it keeps
+                    failing contact your administrator.
+                  </p>
+                )}
               </div>
             ) : filteredVaultList.length === 0 ? (
               <p className="py-4 text-center text-sm text-slate-500">

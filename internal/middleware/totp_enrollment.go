@@ -8,8 +8,22 @@ import (
 
 // TOTPEnrollmentRequiredCode is the machine-readable error code returned when
 // the vault policy requires two-factor authentication and the caller has not
-// enrolled. The frontend routes on this string, so it is part of the API
-// contract: see FRONTEND-CONTRACT.md.
+// enrolled.
+//
+// The frontend routes on this string, so it is part of the API contract. That
+// sentence used to be here and was false: nothing under frontend/src read
+// `.code` off an ApiError, and FRONTEND-CONTRACT.md's 403 table did not list
+// the code. A contract documented on one side only is worse than none, because
+// it stops the next person checking -- it is why a gated user could sit on
+// /vault watching every query fail with no banner, no redirect, and a page that
+// told them their secrets did not exist.
+//
+// It is true now, and pinned on both sides. The consumer is
+// TOTP_ENROLLMENT_REQUIRED_CODE in frontend/src/lib/api.ts, which invokes the
+// handler AuthProvider registers via setEnrollmentRequiredHandler. It is
+// documented in FRONTEND-CONTRACT.md under "The enrolment gate's 403". And
+// frontend/src/test/enrollment-gate-surface.test.tsx reads THIS line and fails
+// if the two constants drift apart, in either direction.
 const TOTPEnrollmentRequiredCode = "totp_enrollment_required"
 
 // RequireTOTPEnrollment refuses every request from a user who has not enrolled
