@@ -582,6 +582,17 @@ func main() {
 				r.Patch("/me", authHandler.UpdateMe)
 				r.Post("/logout", authHandler.Logout)
 				r.Post("/change-password", authHandler.ChangePassword)
+				// One-time bootstrap for the vault_only password-less redemption
+				// branch (RedeemInvitation in users.go): those accounts have no
+				// password a human ever knew, so this is how they acquire one.
+				// Deliberately in THIS group, not the TOTP-enrolment-gated one
+				// below: a password-less account that has enrolled TOTP but not
+				// yet set a password must still be able to reach this endpoint, or
+				// the P0-2 deadlock just relocates here. Rate-limited with the
+				// other sensitive auth routes (login/register/redeem), not the
+				// ordinary apiLimiter this whole /api group already carries. See
+				// AuthHandler.SetInitialPassword for the anti-bypass refusal.
+				r.With(timw.RateLimit(loginLimiter)).Post("/set-initial-password", authHandler.SetInitialPassword)
 				r.Post("/totp/setup", authHandler.TOTPSetup)
 				r.Post("/totp/verify", authHandler.TOTPVerify)
 				r.Post("/totp/disable", authHandler.TOTPDisable)

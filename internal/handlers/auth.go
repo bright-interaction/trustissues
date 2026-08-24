@@ -61,6 +61,10 @@ type changePasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+type setInitialPasswordRequest struct {
+	Password string `json:"password"`
+}
+
 type authResponse struct {
 	Token        string   `json:"token,omitempty"`
 	User         userInfo `json:"user,omitempty"`
@@ -735,6 +739,110 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		h.setSessionCookie(w, token)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// SetInitialPassword handles POST /api/auth/set-initial-password.
+//
+// This is the other half of P0-2. RedeemInvitation's password-less branch
+// (vault_only extension activation) mints hex(rand 32), hashes it, and
+// discards it: nobody, including the account's own owner, has ever known
+// that password. migration 00043's TOTPVerify fix let those accounts past
+// the enrolment gate without one, but every OTHER password-gated door --
+// vault Unlock/Rotate/ValidateKey (reauthOrRefuse) and TOTPDisable -- still
+// unconditionally demands a password this account cannot supply. This
+// endpoint is the only way such an account ever acquires a real, known
+// password, which is what those doors already assume every caller has.
+//
+// It is deliberately registered inside the /api/auth route group, which
+// sits OUTSIDE RequireTOTPEnrollment (see main.go): a vault_only user who
+// has enrolled TOTP but not yet set a password must still be able to reach
+// this endpoint, or the enrolment gate just relocates the deadlock one step
+// later instead of closing it.
+//
+// SECURITY CRUX: this must never be usable to overwrite a password a human
+// already chose. That is what turns "self-service bootstrap" into "session
+// or API-key theft equals password reset". The refusal below on
+// password_set != 0 is that boundary, and it is unconditional: there is no
+// branch of this function that writes a password hash without having first
+// confirmed the account has none.
+//
+// Credential survival: unlike ChangePassword and the admin reset-password
+// path, this handler does NOT call invalidateCredentials. Those two exist to
+// cut off a credential (a password) that might have been stolen; a
+// password_set=0 account has no such credential to protect against, and the
+// API key that authenticated THIS request is, for these accounts, the extension's
+// only means of ever reaching this endpoint again. Revoking it here would
+// disconnect the extension in the same request meant to finish connecting
+// it -- exactly the trap that makes the admin reset-password remedy so
+// painful for this account shape (see user_offboard.go). So existing
+// sessions and API keys deliberately survive a call to this endpoint.
+func (h *AuthHandler) SetInitialPassword(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
+	userID := middleware.GetUserID(r.Context())
+	if userID == "" {
+		writeUnauthorized(w, r, "not authenticated")
+		return
+	}
+
+	var req setInitialPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, r, "invalid request body")
+		return
+	}
+	if req.Password == "" {
+		writeBadRequest(w, r, "password is required")
+		return
+	}
+	if err := validatePasswordWithPolicy(r.Context(), h.queries, req.Password); err != nil {
+		writeBadRequest(w, r, "password "+err.(*ValidationError).Message)
+		return
+	}
+
+	// The refusal: this endpoint is a bootstrap for accounts that have never
+	// had a password, not a password-reset bypass for one that has. A caller
+	// with a valid session or API key for an account whose owner already
+	// chose a password gets refused here every time, unconditionally, no
+	// matter how the caller came to hold that credential.
+	passwordSet, psErr := h.queries.GetUserPasswordSet(r.Context(), userID)
+	if psErr != nil {
+		logError(r, "set-initial-password: failed to query password-set marker", "error", psErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if passwordSet != 0 {
+		writeError(w, r, http.StatusConflict, "password_already_set",
+			"this account already has a password; use change-password instead")
+		return
+	}
+
+	newHash, err := passwordhash.Hash(req.Password)
+	if err != nil {
+		logError(r, "set-initial-password: failed to hash password", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	// SetPasswordHash sets password_hash and password_set=1 in the same UPDATE
+	// statement, so there is no partial-failure window where the row claims a
+	// password it does not have (or vice versa). See migration 00043.
+	if err := h.queries.SetPasswordHash(r.Context(), db.SetPasswordHashParams{
+		PasswordHash: newHash,
+		ID:           userID,
+	}); err != nil {
+		logError(r, "set-initial-password: failed to set password", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	email, emailErr := h.queries.GetUserEmailByID(r.Context(), userID)
+	if emailErr != nil {
+		logError(r, "set-initial-password: failed to look up email for activity log", "error", emailErr, "user_id", userID)
+		email = userID
+	}
+	LogActivityFromRequest(h.queries, r, "auth.initial_password_set",
+		fmt.Sprintf("Initial password set for %s", email))
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "password set successfully"})
 }
 
 // TOTPSetup handles POST /api/auth/totp/setup - initiates 2FA setup.

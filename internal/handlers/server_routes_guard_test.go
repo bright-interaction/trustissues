@@ -68,6 +68,15 @@ var routeGuardRequirements = []routeGuardRequirement{
 	// role a public invite hands out, the list those four passes exist to
 	// protect, in cleartext, over HTTP.
 	{"/capability-log", "Get", "AdminOnly", "the rows name which secret each agent spent, which is the inventory every at-rest encryption pass exists to withhold"},
+	// P0-2's second half. A password-less vault_only account (RedeemInvitation's
+	// no-password branch) has no other way to ever acquire a password, and
+	// reauthOrRefuse (Unlock/Rotate/ValidateKey) and TOTPDisable both demand
+	// one unconditionally. Rate-limited like the other sensitive auth routes
+	// (login/register/redeem), not the ordinary /api budget: a session or key
+	// thief gets 30 tries per 15 minutes against the password-policy check,
+	// same as everywhere else a credential is minted or changed.
+	{"/set-initial-password", "Post", "loginLimiter",
+		"the account's only route to ever having a real password; losing this silently reopens the P0-2 deadlock this endpoint exists to close"},
 }
 
 // routeGuardForbidden is the other direction, and it is what keeps the check
@@ -78,6 +87,13 @@ var routeGuardRequirements = []routeGuardRequirement{
 // fails loudly if the scoping ever goes fuzzy.
 var routeGuardForbidden = []routeGuardRequirement{
 	{"/vault", "", "VaultOnlyBlock", "vault_only accounts exist to use the vault through the browser extension"},
+	// The whole fix is void if this is wrong: set-initial-password is a
+	// password-less account's only exit from the enrolment gate's aftermath
+	// (it cannot enrol TOTP with a password it does not have, and it cannot
+	// set a password while gated on having enrolled TOTP). It must never be
+	// nested inside the group RequireTOTPEnrollment wraps.
+	{"/set-initial-password", "Post", "RequireTOTPEnrollment",
+		"a password-less account cannot pass this gate (it has no password) and cannot reach the one route that would give it one; that is the P0-2 deadlock relocated, not fixed"},
 }
 
 // TestServerRoutesKeepTheirGuards parses the real router and fails when a route
