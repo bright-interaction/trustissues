@@ -303,6 +303,21 @@ func (q *Queries) GetUserEmailByID(ctx context.Context, id string) (string, erro
 	return email, err
 }
 
+const getUserPasswordSet = `-- name: GetUserPasswordSet :one
+SELECT password_set FROM users WHERE id = ?
+`
+
+// 1 when a human has ever set a password this account's owner could supply;
+// 0 when the stored hash is a server-minted, immediately-discarded value
+// (password-less invitation redemption) that nobody, including the owner,
+// knows. See migration 00043 and TOTPVerify.
+func (q *Queries) GetUserPasswordSet(ctx context.Context, id string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getUserPasswordSet, id)
+	var password_set int64
+	err := row.Scan(&password_set)
+	return password_set, err
+}
+
 const getUserTOTPState = `-- name: GetUserTOTPState :one
 SELECT totp_enabled, totp_secret, totp_recovery_codes
 FROM users WHERE id = ?
@@ -413,6 +428,25 @@ func (q *Queries) ListUsersWithTOTPSecret(ctx context.Context) ([]ListUsersWithT
 	return items, nil
 }
 
+const setPasswordHash = `-- name: SetPasswordHash :exec
+UPDATE users SET password_hash = ?, password_set = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+`
+
+type SetPasswordHashParams struct {
+	PasswordHash string `json:"password_hash"`
+	ID           string `json:"id"`
+}
+
+// Same write as UpdatePasswordHash, plus marking password_set so TOTPVerify
+// knows this account's owner can actually supply a password. Use this from
+// every path where a HUMAN is choosing the new password: change-password,
+// admin reset-password, and invitation redemption when a password was
+// supplied. See migration 00043.
+func (q *Queries) SetPasswordHash(ctx context.Context, arg SetPasswordHashParams) error {
+	_, err := q.db.ExecContext(ctx, setPasswordHash, arg.PasswordHash, arg.ID)
+	return err
+}
+
 const setUserDisabled = `-- name: SetUserDisabled :execresult
 UPDATE users SET disabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
 `
@@ -472,6 +506,10 @@ type UpdatePasswordHashParams struct {
 	ID           string `json:"id"`
 }
 
+// Rewrites the hash only. Its one caller outside SetPasswordHash is the
+// transparent bcrypt-to-argon2id rehash on a successful login: that rewrites
+// the hash of a password the owner just typed, it does not set a new one, so
+// it must not touch password_set. See SetPasswordHash for the paths that do.
 func (q *Queries) UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error {
 	_, err := q.db.ExecContext(ctx, updatePasswordHash, arg.PasswordHash, arg.ID)
 	return err

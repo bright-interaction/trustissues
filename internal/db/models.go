@@ -176,6 +176,7 @@ type User struct {
 	SessionsValidAfter int64          `json:"sessions_valid_after"`
 	CreatedAt          sql.NullTime   `json:"created_at"`
 	UpdatedAt          sql.NullTime   `json:"updated_at"`
+	PasswordSet        int64          `json:"password_set"`
 }
 
 type VaultEntry struct {

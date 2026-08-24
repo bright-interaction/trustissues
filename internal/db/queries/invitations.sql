@@ -37,8 +37,11 @@ WHERE id = ?;
 SELECT id FROM users WHERE email = ?;
 
 -- name: CreateInvitedUser :one
-INSERT INTO users (email, password_hash, name, role)
-VALUES (?, ?, ?, ?)
+-- password_set is 0 for the password-less redemption branch (the shipped
+-- vault_only extension flow, which mints and immediately discards a random
+-- password) and 1 when the invitee supplied their own. See migration 00043.
+INSERT INTO users (email, password_hash, name, role, password_set)
+VALUES (?, ?, ?, ?, ?)
 RETURNING id;
 
 -- name: ListInvitationCodesForRekey :many

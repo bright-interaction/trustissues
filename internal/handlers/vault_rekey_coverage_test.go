@@ -422,6 +422,9 @@ var notKeyedColumns = map[string]string{
 	"users.created_at":           "timestamp",
 	"users.updated_at":           "timestamp",
 	"users.totp_last_step":       "last spent TOTP time step, a replay watermark",
+	"users.password_set": "boolean marker (migration 00043): whether a human ever set a password " +
+		"this account's owner could supply, vs. one minted and discarded by password-less invitation " +
+		"redemption. Not derived from or encrypted with the vault key.",
 
 	// vault_entries: the keyed columns come from the registry. Everything below is
 	// deliberately NOT encrypted, and two of them are worth reading twice.
