@@ -393,22 +393,49 @@ func TestAStrangerCannotHoldTheGateShut(t *testing.T) {
 	}
 
 	// The attacker: a client with no session, who merely knows the address.
+	//
+	// Spray until the LOGIN door actually locks, rather than a fixed five.
+	//
+	// A fixed count binds the constant, not the property: a review mutation that
+	// reintroduced the shared counter but moved the threshold from 5 to 6 left
+	// this test green, because five failures no longer tripped anything at all
+	// and enrolment was never under threat. What must be true is "however many
+	// failures a stranger causes at the public door, the victim's own enrolment
+	// is unaffected" -- so the spray runs until login is demonstrably locked,
+	// and only then is enrolment checked. That holds at any threshold.
+	//
+	// Capped because Login sleeps a graduated 2s, 4s, 6s... from the fourth
+	// failure onward, and this is real wall-clock in an e2e.
 	stranger := srv.newClient()
-	for i := 0; i < 5; i++ {
+	const maxSpray = 12
+	locked := false
+	sprayed := 0
+	for i := 0; i < maxSpray && !locked; i++ {
 		code, _ := stranger.do(http.MethodPost, "/api/auth/login", map[string]any{
 			"email": adminEmail, "password": "definitely-not-the-password",
 		})
-		if code != http.StatusUnauthorized && code != http.StatusTooManyRequests {
-			t.Fatalf("spray %d answered %d, expected 401/429", i+1, code)
+		sprayed++
+		switch code {
+		case http.StatusUnauthorized:
+		case http.StatusTooManyRequests:
+			locked = true
+		default:
+			t.Fatalf("spray %d answered %d, expected 401 or 429", i+1, code)
 		}
 	}
+	if !locked {
+		t.Fatalf("ABORT: %d wrong passwords at the public login endpoint never locked the login "+
+			"door. The spray is not reaching the per-email lockout, so this test cannot show "+
+			"anything about whether enrolment is insulated from it.", sprayed)
+	}
+	t.Logf("login door locked after %d stranger failures; enrolment must still work", sprayed)
 
 	// The victim, holding a valid session, must still be able to enrol -- which
 	// under require_totp is the only way out of a 403 on every other route.
 	code, body := admin.do(http.MethodPost, "/api/auth/totp/setup", nil)
 	if code == http.StatusTooManyRequests {
-		t.Fatalf("a stranger's five wrong passwords at the PUBLIC login endpoint refused "+
-			"the owner's own enrolment setup (429 %v).", body)
+		t.Fatalf("a stranger's %d wrong passwords at the PUBLIC login endpoint refused "+
+			"the owner's own enrolment setup (429 %v).", sprayed, body)
 	}
 	if code != http.StatusOK {
 		t.Fatalf("totp/setup: %d %v", code, body)
@@ -422,11 +449,11 @@ func TestAStrangerCannotHoldTheGateShut(t *testing.T) {
 		"code": otp, "password": adminPass,
 	})
 	if code == http.StatusTooManyRequests {
-		t.Fatalf("a stranger closed the gate's only exit: five wrong passwords at the "+
+		t.Fatalf("a stranger closed the gate's only exit: %d wrong passwords at the "+
 			"public login endpoint refused the owner's enrolment with a valid session, "+
 			"the correct password and a correct live code (429 %v).\n"+
 			"There is no self-heal -- Login enforces the same counter before the password "+
-			"check -- so this holds the entire vault shut, renewably, forever.", body)
+			"check -- so this holds the entire vault shut, renewably, forever.", sprayed, body)
 	}
 	if code != http.StatusOK {
 		t.Fatalf("totp/verify: %d %v", code, body)
