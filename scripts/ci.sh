@@ -111,6 +111,21 @@ run_tests() {
   go test ./... -count=1 -timeout 20m
 }
 
+# The e2e suite is behind `-tags e2e`, so `go test ./...` above does NOT run it:
+# without this step it would compile in nobody's pipeline and prove nothing, which
+# is the exact shape of a sibling repo's regression test that skipped in CI and in
+# the deploy pipeline for months while being cited as coverage.
+#
+# It builds the real server binary and drives it over HTTP, because the question
+# it answers cannot be answered by a handler test: can a person starting from an
+# empty database reach the gated state and get back out of it? The production
+# instance has one admin with totp_enabled=0 and UpdateVaultPolicy refuses to
+# enable require_totp unless the acting admin is enrolled, so the whole feature
+# was unreachable in production while every unit test passed.
+run_e2e() {
+  go test -tags e2e ./internal/e2e/ -count=1 -timeout 10m
+}
+
 # Goose applies migrations in numeric order and records each applied version in its own
 # table, so the FILES and that table have to agree forever. Two things break that
 # agreement silently:
@@ -193,6 +208,7 @@ step "vet"                            go vet ./...
 step "gofmt"                          fmt_check
 step "migrations"                     migrations_check
 step "tests (RUN, not just compiled)" run_tests
+step "e2e against the real binary"    run_e2e
 step "frontend build + typecheck"     frontend_build
 step "frontend tests (RUN)"           frontend_tests
 
