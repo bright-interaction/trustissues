@@ -325,3 +325,38 @@ func TestToolResolvesThePinRatherThanWhateverIsOnPATH(t *testing.T) {
 			"module nobody ran.")
 	}
 }
+
+// tool() must ASK the toolchain where it installed the binary.
+//
+// `go install` writes to $GOBIN when set and only falls back to $GOPATH/bin
+// otherwise. tool() hardcoded the fallback, so on any machine with GOBIN set the
+// pinned scanner was installed to one path while whatever already sat at
+// $GOPATH/bin was executed -- and the run printed "ci: all checks passed" and
+// exited 0. A silent pass is worse than the PATH-preference bug that motivated
+// the previous change to this function, because a skip announces itself.
+//
+// Asserted as the complement of the defect: the resolution must consult GOBIN,
+// and must not derive the path from GOPATH alone.
+func TestToolAsksTheToolchainWhereItInstalled(t *testing.T) {
+	code := ciScriptCode(t)
+	start := strings.Index(code, "tool() {")
+	if start < 0 {
+		t.Fatal("ABORT: tool() not found in scripts/ci.sh; this guard is looking in the wrong place")
+	}
+	end := strings.Index(code[start:], "\n}")
+	if end < 0 {
+		t.Fatal("ABORT: could not find the end of tool()")
+	}
+	body := code[start : start+end]
+
+	if !strings.Contains(body, "go env GOBIN") {
+		t.Error("tool() never consults `go env GOBIN`.\n" +
+			"`go install` honours GOBIN, so on a machine that sets it the pinned binary is " +
+			"installed to one path and a different one is executed -- and the run exits 0.")
+	}
+	// The GOPATH form is still legitimate AS THE FALLBACK, but it must not be the
+	// only thing consulted.
+	if strings.Contains(body, "go env GOPATH") && !strings.Contains(body, "go env GOBIN") {
+		t.Error("tool() derives the install path from GOPATH alone")
+	}
+}

@@ -89,8 +89,23 @@ tool() {
   local bin="$1" mod="$2" path
   if [ "${TRUSTISSUES_CI_SKIP_TOOLS:-0}" = "1" ]; then return 99; fi
   go install "$mod" >/dev/null 2>&1 || { echo "could not install $bin from $mod (offline?)" >&2; return 1; }
-  path="$(go env GOPATH)/bin/$bin"
-  [ -x "$path" ] || { echo "installed $bin but $path is not executable" >&2; return 1; }
+  # ASK GO WHERE IT PUT THE BINARY. Do not assume GOPATH/bin.
+  #
+  # `go install` writes to $GOBIN when GOBIN is set, and only falls back to
+  # $GOPATH/bin when it is not. This line used to hardcode the fallback, so with
+  # GOBIN set the pinned scanner was installed to one path and a DIFFERENT
+  # binary -- anything already sitting at $GOPATH/bin -- was the one executed.
+  # The run then printed "ci: all checks passed" and exited 0 with the real,
+  # freshly installed scanners untouched on disk.
+  #
+  # That is strictly worse than the PATH-preference bug this function was changed
+  # to fix, because a skip at least announces itself: this passed silently. Ask
+  # the toolchain rather than predicting it.
+  local gobin
+  gobin="$(go env GOBIN)"
+  [ -n "$gobin" ] || gobin="$(go env GOPATH)/bin"
+  path="$gobin/$bin"
+  [ -x "$path" ] || { echo "installed $bin from $mod but $path is not executable" >&2; return 1; }
   printf '%s\n' "$path"
 }
 
