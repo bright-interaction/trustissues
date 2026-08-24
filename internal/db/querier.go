@@ -242,7 +242,18 @@ type Querier interface {
 	// Accepted managers only: a pending invitee cannot be the manager that keeps a
 	// collection from being orphaned.
 	CountCollectionManagers(ctx context.Context, collectionID string) (int64, error)
-	CountRecentFailedLoginAttemptsByEmail(ctx context.Context, email string) (int64, error)
+	// Failures at ONE door, for one address.
+	//
+	// Scope is not optional and there is deliberately no unscoped variant: an
+	// unscoped count is what let five wrong passwords at the public login endpoint
+	// refuse the owner's own authenticated enrolment call, which under require_totp
+	// holds the whole vault shut. See migration 00042. Adding a query that counts
+	// across scopes reopens it.
+	CountRecentFailedLoginAttemptsByEmailAndScope(ctx context.Context, arg CountRecentFailedLoginAttemptsByEmailAndScopeParams) (int64, error)
+	// Deliberately scope-BLIND, unlike the per-email counter above: this is the
+	// credential-stuffing brake, keyed on the attacker's own address, so an
+	// outsider can only ever fill it against themselves. Splitting it would weaken
+	// a control without closing anything.
 	CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddress string) (int64, error)
 	// Whether the append-only audit trail records this entry being ADOPTED by a
 	// collection manager, i.e. its custodian moving without its owner moving.
@@ -621,7 +632,7 @@ type Querier interface {
 	// order rows by nonce, which is random. Callers that present entries to a human
 	// sort by the DECRYPTED name in Go (sortEntriesByName).
 	ListProviderEntries(ctx context.Context) ([]ListProviderEntriesRow, error)
-	ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]LoginAttempt, error)
+	ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]ListRecentLoginAttemptsByEmailRow, error)
 	ListRecentServiceSecretAudit(ctx context.Context, limit int64) ([]ServiceSecretAudit, error)
 	// ============================================================================
 	// Admin CRUD

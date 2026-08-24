@@ -341,6 +341,7 @@ var notKeyedColumns = map[string]string{
 	"login_attempts.ip_address": "plaintext",
 	"login_attempts.success":    "boolean",
 	"login_attempts.created_at": "timestamp",
+	"login_attempts.scope":      "which door recorded the attempt; a fixed label, not keyed material",
 
 	// notification_channels: only `config` (+ its nonce) is keyed; those come from
 	// the registry. encryption_version says WHICH derivation sealed the config and

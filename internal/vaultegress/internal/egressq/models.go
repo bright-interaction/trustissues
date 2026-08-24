@@ -106,6 +106,7 @@ type LoginAttempt struct {
 	IpAddress string       `json:"ip_address"`
 	Success   int64        `json:"success"`
 	CreatedAt sql.NullTime `json:"created_at"`
+	Scope     string       `json:"scope"`
 }
 
 type NotificationChannel struct {

@@ -2896,10 +2896,15 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // vault_auto_lock_max_minutes policy served by GET /api/settings/vault-policy
 // (unlock itself is stateless server-side).
 // reauthLocked reports whether the user has too many recent failed re-auth
-// attempts. It shares the login lockout budget (5 failures in 15 minutes) so a
-// stolen session cannot brute-force the account password on the re-auth
-// endpoints (unlock, rotate, validate). Correct re-auths never record a
-// failure, so the frontend's per-mutation re-lock is unaffected. It returns the
+// attempts: 5 failures in 15 minutes, so a stolen session cannot brute-force the
+// account password on the re-auth endpoints (unlock, rotate, validate). Correct
+// re-auths never record a failure, so the frontend's per-mutation re-lock is
+// unaffected.
+//
+// The budget is the same SIZE as login's but is a SEPARATE counter, not a shared
+// one -- it counts only session_reauth rows. It used to be shared, which meant an
+// unauthenticated stranger who knew the address could freeze an already-logged-in
+// session's reveals from the public login endpoint. It returns the
 // user's email so a subsequent failure can be recorded. On lookup error it fails
 // open (not locked) rather than bricking re-auth on a transient DB hiccup.
 func (h *VaultHandler) reauthLocked(ctx context.Context, r *http.Request, userID string) (email string, locked bool) {
@@ -2908,7 +2913,14 @@ func (h *VaultHandler) reauthLocked(ctx context.Context, r *http.Request, userID
 		logError(r, "vault.reauth: email lookup failed", "error", err)
 		return "", false
 	}
-	count, err := h.queries.CountRecentFailedLoginAttemptsByEmail(ctx, email)
+	// Scoped to session_reauth. Re-auth is reachable only with a live session for
+	// this user, so only such a caller can make this counter accrue; failures
+	// sprayed at the public login endpoint by an outsider no longer freeze an
+	// already-logged-in session's reveals. See migration 00042.
+	count, err := h.queries.CountRecentFailedLoginAttemptsByEmailAndScope(ctx,
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: email, Scope: db.LoginAttemptScopeSessionReauth,
+		})
 	if err != nil {
 		logError(r, "vault.reauth: attempt count failed", "error", err)
 		return email, false
@@ -2917,13 +2929,16 @@ func (h *VaultHandler) reauthLocked(ctx context.Context, r *http.Request, userID
 }
 
 // recordReauthFailure logs a failed password re-auth so repeated wrong-password
-// attempts trip the same 5/15m lockout as login.
+// attempts trip the 5/15m re-auth lockout. Scope keeps it off login's counter:
+// guesses made through a stolen session must not lock the real owner out of the
+// login page.
 func (h *VaultHandler) recordReauthFailure(ctx context.Context, r *http.Request, email string) {
 	if email == "" {
 		return
 	}
 	if err := h.queries.CreateLoginAttempt(ctx, db.CreateLoginAttemptParams{
 		Email: email, IpAddress: middleware.ClientIP(r), Success: 0,
+		Scope: db.LoginAttemptScopeSessionReauth,
 	}); err != nil {
 		logError(r, "vault.reauth: failed to record attempt", "error", err)
 	}

@@ -1,12 +1,23 @@
 -- name: CreateLoginAttempt :exec
-INSERT INTO login_attempts (email, ip_address, success)
-VALUES (?, ?, ?);
+INSERT INTO login_attempts (email, ip_address, success, scope)
+VALUES (?, ?, ?, ?);
 
--- name: CountRecentFailedLoginAttemptsByEmail :one
+-- Failures at ONE door, for one address.
+--
+-- Scope is not optional and there is deliberately no unscoped variant: an
+-- unscoped count is what let five wrong passwords at the public login endpoint
+-- refuse the owner's own authenticated enrolment call, which under require_totp
+-- holds the whole vault shut. See migration 00042. Adding a query that counts
+-- across scopes reopens it.
+-- name: CountRecentFailedLoginAttemptsByEmailAndScope :one
 SELECT COUNT(*) FROM login_attempts
-WHERE email = ? AND success = 0
+WHERE email = ? AND scope = ? AND success = 0
   AND created_at > datetime('now', '-15 minutes');
 
+-- Deliberately scope-BLIND, unlike the per-email counter above: this is the
+-- credential-stuffing brake, keyed on the attacker's own address, so an
+-- outsider can only ever fill it against themselves. Splitting it would weaken
+-- a control without closing anything.
 -- name: CountRecentFailedLoginAttemptsByIP :one
 SELECT COUNT(*) FROM login_attempts
 WHERE ip_address = ? AND success = 0

@@ -23,6 +23,7 @@ func TestLoginAttemptsAreActuallySwept(t *testing.T) {
 	// A row inside every reader's window, and one well past retention.
 	if err := queries.CreateLoginAttempt(ctx, db.CreateLoginAttemptParams{
 		Email: "fresh@example.com", IpAddress: "198.51.100.1", Success: 0,
+		Scope: db.LoginAttemptScopePasswordLogin,
 	}); err != nil {
 		t.Fatalf("insert fresh: %v", err)
 	}

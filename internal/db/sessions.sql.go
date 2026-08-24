@@ -10,14 +10,26 @@ import (
 	"database/sql"
 )
 
-const countRecentFailedLoginAttemptsByEmail = `-- name: CountRecentFailedLoginAttemptsByEmail :one
+const countRecentFailedLoginAttemptsByEmailAndScope = `-- name: CountRecentFailedLoginAttemptsByEmailAndScope :one
 SELECT COUNT(*) FROM login_attempts
-WHERE email = ? AND success = 0
+WHERE email = ? AND scope = ? AND success = 0
   AND created_at > datetime('now', '-15 minutes')
 `
 
-func (q *Queries) CountRecentFailedLoginAttemptsByEmail(ctx context.Context, email string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countRecentFailedLoginAttemptsByEmail, email)
+type CountRecentFailedLoginAttemptsByEmailAndScopeParams struct {
+	Email string `json:"email"`
+	Scope string `json:"scope"`
+}
+
+// Failures at ONE door, for one address.
+//
+// Scope is not optional and there is deliberately no unscoped variant: an
+// unscoped count is what let five wrong passwords at the public login endpoint
+// refuse the owner's own authenticated enrolment call, which under require_totp
+// holds the whole vault shut. See migration 00042. Adding a query that counts
+// across scopes reopens it.
+func (q *Queries) CountRecentFailedLoginAttemptsByEmailAndScope(ctx context.Context, arg CountRecentFailedLoginAttemptsByEmailAndScopeParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRecentFailedLoginAttemptsByEmailAndScope, arg.Email, arg.Scope)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -29,6 +41,10 @@ WHERE ip_address = ? AND success = 0
   AND created_at > datetime('now', '-15 minutes')
 `
 
+// Deliberately scope-BLIND, unlike the per-email counter above: this is the
+// credential-stuffing brake, keyed on the attacker's own address, so an
+// outsider can only ever fill it against themselves. Splitting it would weaken
+// a control without closing anything.
 func (q *Queries) CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddress string) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRecentFailedLoginAttemptsByIP, ipAddress)
 	var count int64
@@ -37,18 +53,24 @@ func (q *Queries) CountRecentFailedLoginAttemptsByIP(ctx context.Context, ipAddr
 }
 
 const createLoginAttempt = `-- name: CreateLoginAttempt :exec
-INSERT INTO login_attempts (email, ip_address, success)
-VALUES (?, ?, ?)
+INSERT INTO login_attempts (email, ip_address, success, scope)
+VALUES (?, ?, ?, ?)
 `
 
 type CreateLoginAttemptParams struct {
 	Email     string `json:"email"`
 	IpAddress string `json:"ip_address"`
 	Success   int64  `json:"success"`
+	Scope     string `json:"scope"`
 }
 
 func (q *Queries) CreateLoginAttempt(ctx context.Context, arg CreateLoginAttemptParams) error {
-	_, err := q.db.ExecContext(ctx, createLoginAttempt, arg.Email, arg.IpAddress, arg.Success)
+	_, err := q.db.ExecContext(ctx, createLoginAttempt,
+		arg.Email,
+		arg.IpAddress,
+		arg.Success,
+		arg.Scope,
+	)
 	return err
 }
 
@@ -81,15 +103,23 @@ ORDER BY created_at DESC
 LIMIT 20
 `
 
-func (q *Queries) ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]LoginAttempt, error) {
+type ListRecentLoginAttemptsByEmailRow struct {
+	ID        int64        `json:"id"`
+	Email     string       `json:"email"`
+	IpAddress string       `json:"ip_address"`
+	Success   int64        `json:"success"`
+	CreatedAt sql.NullTime `json:"created_at"`
+}
+
+func (q *Queries) ListRecentLoginAttemptsByEmail(ctx context.Context, email string) ([]ListRecentLoginAttemptsByEmailRow, error) {
 	rows, err := q.db.QueryContext(ctx, listRecentLoginAttemptsByEmail, email)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []LoginAttempt{}
+	items := []ListRecentLoginAttemptsByEmailRow{}
 	for rows.Next() {
-		var i LoginAttempt
+		var i ListRecentLoginAttemptsByEmailRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Email,

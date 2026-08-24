@@ -32,7 +32,8 @@ import (
 // oracle two orders of magnitude faster than /api/auth/login, with the account
 // lockout switched off. Every wrong guess still wrote a login_attempts row, so
 // the same spray locked the real owner out of the login page while the thief
-// kept going.
+// kept going -- that half is now closed from the other side too, by scope: these
+// rows are session_reauth and login counts only password_login.
 //
 // TOTPDisable checks the same counter in the correct order. One property, two
 // doors, fixed at one of them.
@@ -42,7 +43,10 @@ func TestTOTPVerifyLockoutGatesPasswordGuessing(t *testing.T) {
 
 	// Guard the setup: if wrong passwords were not being counted at all, every
 	// assertion below would be vacuous.
-	before, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, "totp-user@example.com")
+	before, err := queries.CountRecentFailedLoginAttemptsByEmailAndScope(ctx,
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: "totp-user@example.com", Scope: db.LoginAttemptScopeSessionReauth,
+		})
 	if err != nil {
 		t.Fatalf("count attempts: %v", err)
 	}
@@ -65,7 +69,10 @@ func TestTOTPVerifyLockoutGatesPasswordGuessing(t *testing.T) {
 		}
 	}
 
-	n, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, "totp-user@example.com")
+	n, err := queries.CountRecentFailedLoginAttemptsByEmailAndScope(ctx,
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: "totp-user@example.com", Scope: db.LoginAttemptScopeSessionReauth,
+		})
 	if err != nil {
 		t.Fatalf("count attempts: %v", err)
 	}
@@ -190,11 +197,17 @@ func TestLoginDoesNotRevealWhichEmailsHaveAccounts(t *testing.T) {
 		}
 	}
 
-	realN, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, real)
+	realN, err := queries.CountRecentFailedLoginAttemptsByEmailAndScope(ctx,
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: real, Scope: db.LoginAttemptScopePasswordLogin,
+		})
 	if err != nil {
 		t.Fatalf("count real: %v", err)
 	}
-	ghostN, err := queries.CountRecentFailedLoginAttemptsByEmail(ctx, ghost)
+	ghostN, err := queries.CountRecentFailedLoginAttemptsByEmailAndScope(ctx,
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: ghost, Scope: db.LoginAttemptScopePasswordLogin,
+		})
 	if err != nil {
 		t.Fatalf("count ghost: %v", err)
 	}

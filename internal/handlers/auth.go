@@ -354,8 +354,19 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-email lockout: 5 failures in 15 minutes
-	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), req.Email)
+	// Per-email lockout: 5 failures in 15 minutes, counting ONLY failures made at
+	// this endpoint.
+	//
+	// The scope filter is the fix for a denial of service, not a tidy-up. This
+	// counter is attacker-writable by design -- anyone who knows an address can
+	// POST wrong passwords here -- so it must gate this endpoint and nothing
+	// else. While it was unscoped, those same five requests also refused the
+	// owner's authenticated TOTP enrolment, which require_totp had just made the
+	// only exit from a 403 on every other route. See migration 00042.
+	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmailAndScope(r.Context(),
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: req.Email, Scope: db.LoginAttemptScopePasswordLogin,
+		})
 	if err != nil {
 		logError(r, "login: failed to query login attempts", "error", err)
 		writeInternalError(w, r, "internal server error")
@@ -394,6 +405,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		// because there is no account to attribute one to.
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: req.Email, IpAddress: ip, Success: 0,
+			Scope: db.LoginAttemptScopePasswordLogin,
 		}); dbErr != nil {
 			logError(r, "login: failed to record failed attempt for an unknown address", "error", dbErr)
 		}
@@ -412,6 +424,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	recordFailure := func() {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: req.Email, IpAddress: ip, Success: 0,
+			Scope: db.LoginAttemptScopePasswordLogin,
 		}); dbErr != nil {
 			logError(r, "login: failed to record failed attempt", "error", dbErr)
 		}
@@ -492,6 +505,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// Record successful login
 	if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 		Email: req.Email, IpAddress: ip, Success: 1,
+		Scope: db.LoginAttemptScopePasswordLogin,
 	}); dbErr != nil {
 		logError(r, "login: failed to record successful login", "error", dbErr)
 	}
@@ -812,8 +826,21 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	//
 	// TOTPDisable checks the same counter in the right order. One property, two
 	// doors, fixed at one of them, which is the shape that keeps recurring here.
+	//
+	// The "locked the real owner out of the login page" half above is closed too,
+	// from the other side: these rows carry scope=session_reauth and login counts
+	// only scope=password_login, so the two doors no longer hold each other shut
+	// in either direction.
+	//
+	// Scoped to session_reauth: only a caller already authenticated AS this user
+	// can write a row this counter sees. An outsider spraying the public login
+	// endpoint no longer refuses the owner's own enrolment, which is what made
+	// this endpoint -- the gate's sole exit -- remotely closable by a stranger.
 	ip := middleware.ClientIP(r)
-	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), userEmail)
+	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmailAndScope(r.Context(),
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: userEmail, Scope: db.LoginAttemptScopeSessionReauth,
+		})
 	if err != nil {
 		logError(r, "totp.verify: failed to query attempts", "error", err)
 	}
@@ -848,6 +875,7 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	if pwErr != nil || !pwOK {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: userEmail, IpAddress: ip, Success: 0,
+			Scope: db.LoginAttemptScopeSessionReauth,
 		}); dbErr != nil {
 			logError(r, "totp.verify: failed to record attempt", "error", dbErr)
 		}
@@ -870,6 +898,7 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	if !totp.ValidateCode(secret, req.Code) {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: userEmail, IpAddress: ip, Success: 0,
+			Scope: db.LoginAttemptScopeSessionReauth,
 		}); dbErr != nil {
 			logError(r, "totp.verify: failed to record attempt", "error", dbErr)
 		}
@@ -930,7 +959,12 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmail(r.Context(), userEmail)
+	// Same scope as TOTPVerify, for the same reason: an already-authenticated
+	// door must not be closable by rows the public login endpoint writes.
+	failCount, err := h.queries.CountRecentFailedLoginAttemptsByEmailAndScope(r.Context(),
+		db.CountRecentFailedLoginAttemptsByEmailAndScopeParams{
+			Email: userEmail, Scope: db.LoginAttemptScopeSessionReauth,
+		})
 	if err != nil {
 		logError(r, "totp.disable: failed to query attempts", "error", err)
 	}
@@ -943,6 +977,7 @@ func (h *AuthHandler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
 	recordFailure := func() {
 		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
 			Email: userEmail, IpAddress: ip, Success: 0,
+			Scope: db.LoginAttemptScopeSessionReauth,
 		}); dbErr != nil {
 			logError(r, "totp.disable: failed to record failed attempt", "error", dbErr)
 		}
