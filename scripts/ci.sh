@@ -72,9 +72,21 @@ IN_MIRROR=1
 #
 # Bumping one of these is a deliberate act: change the version here, run the suite,
 # and land it as its own commit so the diff records which scanner moved.
+# THE PIN HAS TO BE WHAT ACTUALLY RUNS.
+#
+# This used to return any binary of that name already on PATH before it
+# considered the pinned module. So on a developer machine an older -- or planted
+# -- gitleaks decided this repository's verdict while the pin guard reported
+# everything pinned, and the comment above claiming "EVERY MODULE BELOW IS
+# VERSION-PINNED" was true of the source and false of the process. CI runners
+# escaped only by luck: neither scanner happens to be preinstalled there.
+#
+# `go install module@version` is content-addressed and cached, so resolving the
+# pin on every run costs nothing after the first and buys the property the pin
+# was for. Correctness outranks a second of warm-cache install time in a gate
+# whose job is refusing builds.
 tool() {
   local bin="$1" mod="$2" path
-  if command -v "$bin" >/dev/null 2>&1; then command -v "$bin"; return 0; fi
   if [ "${TRUSTISSUES_CI_SKIP_TOOLS:-0}" = "1" ]; then return 99; fi
   go install "$mod" >/dev/null 2>&1 || { echo "could not install $bin from $mod (offline?)" >&2; return 1; }
   path="$(go env GOPATH)/bin/$bin"
