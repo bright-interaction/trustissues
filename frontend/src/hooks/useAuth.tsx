@@ -10,7 +10,11 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
-import { api, setUnauthorizedHandler } from '@/lib/api';
+import {
+  api,
+  setUnauthorizedHandler,
+  setEnrollmentRequiredHandler,
+} from '@/lib/api';
 import type { User, AuthResponse } from '@/lib/types';
 
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
@@ -148,6 +152,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // ignore
     }
   }, []);
+
+  // A 403 from the enrolment gate puts the user where they can actually act.
+  //
+  // Three separate defects shared one cause: the SPA had no way to learn that
+  // the require_totp policy applied to it. /auth/me is read once per page load
+  // and refetchOnWindowFocus is off, so a policy switched on mid-session stayed
+  // invisible to every open tab until a manual reload; the vault page rendered
+  // its refusal as "No secrets stored"; and the gate's machine-readable code was
+  // consumed by nothing despite a server-side comment saying otherwise.
+  //
+  // Routing on the code fixes all three at one point: the tab learns the moment
+  // it touches a gated route, refreshUser() makes the banner truthful, and the
+  // redirect lands on the only tab that still works -- Settings > Account reads
+  // exclusively from /api/auth, which is the group the gate leaves reachable.
+  // Settings is deliberately NOT behind VaultOnlyRedirect, so this destination
+  // is valid for every role including vault_only.
+  const enrollmentRefreshRef = useRef(false);
+  useEffect(() => {
+    setEnrollmentRequiredHandler(() => {
+      // A gated page fires several queries at once and React Query retries each
+      // once, so one navigation produces a burst of identical 403s. Collapse the
+      // burst into a single /auth/me rather than one per refusal. Navigating to
+      // a location already current is a no-op, so it needs no guard of its own.
+      if (!enrollmentRefreshRef.current) {
+        enrollmentRefreshRef.current = true;
+        void refreshUser().finally(() => {
+          enrollmentRefreshRef.current = false;
+        });
+      }
+      navigate('/settings?tab=account');
+    });
+    return () => setEnrollmentRequiredHandler(undefined);
+  }, [navigate, refreshUser]);
 
   // --- Session timeout with auto-logout ---
   const warningTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);

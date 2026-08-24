@@ -66,6 +66,32 @@ export function setUnauthorizedHandler(fn: (() => void) | undefined): void {
   onUnauthorized = fn;
 }
 
+// The machine-readable code the enrolment gate returns with its 403.
+//
+// This MUST match middleware.TOTPEnrollmentRequiredCode in
+// internal/middleware/totp_enrollment.go. That constant's comment claimed "the
+// frontend routes on this string, so it is part of the API contract" while
+// nothing in this app read `.code` off an ApiError at all -- the contract was
+// documented on one side and imaginary on the other, which is why a gated user
+// could sit on /vault watching every query fail with no banner and no redirect.
+export const TOTP_ENROLLMENT_REQUIRED_CODE = 'totp_enrollment_required';
+
+// onEnrollmentRequired is invoked when ANY request is refused by the enrolment
+// gate. AuthProvider registers it, the same way it registers onUnauthorized.
+//
+// This is the live signal the SPA otherwise lacks. /auth/me is read once per
+// page load and refetchOnWindowFocus is off, so an admin turning the policy on
+// mid-session was invisible to every open tab until a manual reload: the user
+// saw their pages break with no explanation. Routing on the gate's own 403 means
+// the tab learns the moment it touches a gated route, instead of never.
+let onEnrollmentRequired: (() => void) | undefined;
+
+export function setEnrollmentRequiredHandler(
+  fn: (() => void) | undefined
+): void {
+  onEnrollmentRequired = fn;
+}
+
 // Core fetch helper. Auth is a server-set HttpOnly session cookie, so every
 // request carries credentials; there is no bearer token in the client.
 export async function request<T>(
@@ -114,6 +140,18 @@ export async function request<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
+
+    // The enrolment gate refuses every route except /api/auth while the
+    // require_totp policy is on and the caller has not enrolled. Surface it as
+    // a routed event rather than as one more red toast, because the user cannot
+    // act on it from where they are standing.
+    if (
+      res.status === 403 &&
+      (body as { code?: string })?.code === TOTP_ENROLLMENT_REQUIRED_CODE
+    ) {
+      onEnrollmentRequired?.();
+    }
+
     throw new ApiError(body.error || res.statusText, res.status, body);
   }
 

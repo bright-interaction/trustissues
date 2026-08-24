@@ -56,6 +56,41 @@ to /vault by `VaultOnlyRedirect` in App.tsx and see only Vault in the sidebar.
   vault-types.ts exists (api.ts cannot import vault-types.ts until it lands).
 - `setApiKey(key | null)`: optional `X-API-Key` header for programmatic
   access. Memory-only, never persisted.
+- `setUnauthorizedHandler(fn | undefined)`: invoked once per `401` so the app
+  can drop session state. `AuthProvider` registers it. A caller that
+  legitimately expects a `401` (the startup `/auth/me` probe on the public
+  `/setup` and `/invite` pages) opts out with `skipAuthRedirect`.
+- `setEnrollmentRequiredHandler(fn | undefined)`: invoked when any request is
+  refused by the TOTP enrolment gate. `AuthProvider` registers it, refreshes
+  the user so the banner becomes truthful, and redirects to
+  `/settings?tab=account`.
+
+### The enrolment gate's 403 (cross-cutting, applies to EVERY route except `/api/auth`)
+
+While the `require_totp` vault policy is on and the caller has not enrolled,
+`internal/middleware/totp_enrollment.go` refuses every route outside
+`/api/auth`:
+
+| status | `code` | when |
+|---|---|---|
+| 403 | `totp_enrollment_required` | the vault policy requires 2FA and this account has not enrolled |
+
+Exported from `src/lib/api.ts` as `TOTP_ENROLLMENT_REQUIRED_CODE`, and pinned
+equal to the Go constant by
+`src/test/enrollment-gate-surface.test.tsx`.
+
+Two rules for anything that renders server data:
+
+1. **Route on the `code`, never on the bare `403`.** An ordinary authorization
+   refusal is also a `403` and must not drag the user to the enrolment page.
+2. **A refused list is not an empty list.** Destructure `error` from the query
+   and give it its own branch. Vault.tsx did neither, so the gate's `403` left
+   the list at its `[]` default and the page told the owner of five credentials
+   *"No secrets stored."* See `src/test/vault-refusal-is-not-emptiness.test.tsx`.
+
+This section exists because the gate's code was declared part of the API
+contract in a Go comment while no frontend file read `.code` off an `ApiError`
+at all, and this table did not list it.
 - Namespaces implemented: `api.auth`, `api.activity`, `api.admin` (users +
   invitations), `api.settings` (vault policy, SMTP, session duration).
 
