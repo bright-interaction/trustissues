@@ -427,7 +427,11 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.queries.UpdatePasswordHash(r.Context(), db.UpdatePasswordHashParams{
+	// SetPasswordHash, not UpdatePasswordHash: an admin choosing this password
+	// on the target's behalf is exactly the kind of human-set password that
+	// TOTPVerify should later accept as proof of identity, including for a
+	// vault_only account that started out password-less. See migration 00043.
+	if err := h.queries.SetPasswordHash(r.Context(), db.SetPasswordHashParams{
 		PasswordHash: hash,
 		ID:           targetID,
 	}); err != nil {
@@ -744,6 +748,14 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 
 	// Use the provided password or generate a random one (vault_only
 	// extension users authenticate with the API key, not the password).
+	//
+	// humanSetPassword records which branch this is BEFORE password gets
+	// overwritten below, and is stored on the row as password_set (migration
+	// 00043). A password minted here is hashed and then discarded a few lines
+	// down: nobody, including the account's own owner, ever learns it, so it
+	// must not be treated as a credential TOTPVerify can demand later. See the
+	// password_set comment on TOTPVerify for why that distinction matters.
+	humanSetPassword := req.Password != ""
 	password := req.Password
 	if password == "" {
 		pwBytes := make([]byte, 32)
@@ -773,11 +785,16 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	passwordSet := int64(0)
+	if humanSetPassword {
+		passwordSet = 1
+	}
 	userID, err := h.queries.CreateInvitedUser(ctx, db.CreateInvitedUserParams{
 		Email:        inv.Email,
 		PasswordHash: passwordHash,
 		Name:         toNullString(inv.Name),
 		Role:         inv.TargetRole,
+		PasswordSet:  passwordSet,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {

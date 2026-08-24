@@ -301,6 +301,9 @@ type Querier interface {
 	// code holds the vault-key ciphertext (resend has to email the original), and
 	// code_hash is what redemption looks up. See migration 00030.
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
+	// password_set is 0 for the password-less redemption branch (the shipped
+	// vault_only extension flow, which mints and immediately discards a random
+	// password) and 1 when the invitee supplied their own. See migration 00043.
 	CreateInvitedUser(ctx context.Context, arg CreateInvitedUserParams) (string, error)
 	CreateLoginAttempt(ctx context.Context, arg CreateLoginAttemptParams) error
 	CreateNotificationChannel(ctx context.Context, arg CreateNotificationChannelParams) (string, error)
@@ -391,6 +394,11 @@ type Querier interface {
 	// Unlock (password re-entry) - returns entries with encrypted data for decryption
 	// ============================================================================
 	GetUserPasswordHash(ctx context.Context, id string) (string, error)
+	// 1 when a human has ever set a password this account's owner could supply;
+	// 0 when the stored hash is a server-minted, immediately-discarded value
+	// (password-less invitation redemption) that nobody, including the owner,
+	// knows. See migration 00043 and TOTPVerify.
+	GetUserPasswordSet(ctx context.Context, id string) (int64, error)
 	GetUserTOTPState(ctx context.Context, id string) (GetUserTOTPStateRow, error)
 	GetVaultAutoLockMaxMinutes(ctx context.Context) (string, error)
 	// ============================================================================
@@ -858,6 +866,12 @@ type Querier interface {
 	// were already safe; it was describing the intent of encrypted_value while
 	// updated_at was still quietly ANDed in.
 	RotateVaultEntryValueUnchecked(ctx context.Context, arg RotateVaultEntryValueUncheckedParams) (sql.Result, error)
+	// Same write as UpdatePasswordHash, plus marking password_set so TOTPVerify
+	// knows this account's owner can actually supply a password. Use this from
+	// every path where a HUMAN is choosing the new password: change-password,
+	// admin reset-password, and invitation redemption when a password was
+	// supplied. See migration 00043.
+	SetPasswordHash(ctx context.Context, arg SetPasswordHashParams) error
 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (sql.Result, error)
 	// Disable that refuses to disable the last active admin. Same reasoning as
 	// UpdateUserRoleIfNotLastAdmin.
@@ -867,6 +881,10 @@ type Querier interface {
 	TouchServiceIdentityLastUsed(ctx context.Context, id string) error
 	UpdateCollection(ctx context.Context, arg UpdateCollectionParams) error
 	UpdateNotificationChannelEnabled(ctx context.Context, arg UpdateNotificationChannelEnabledParams) (sql.Result, error)
+	// Rewrites the hash only. Its one caller outside SetPasswordHash is the
+	// transparent bcrypt-to-argon2id rehash on a successful login: that rewrites
+	// the hash of a password the owner just typed, it does not set a new one, so
+	// it must not touch password_set. See SetPasswordHash for the paths that do.
 	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
 	UpdateRecoveryCodes(ctx context.Context, arg UpdateRecoveryCodesParams) error
 	UpdateUserName(ctx context.Context, arg UpdateUserNameParams) error

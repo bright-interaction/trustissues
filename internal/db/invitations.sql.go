@@ -65,8 +65,8 @@ func (q *Queries) CreateInvitation(ctx context.Context, arg CreateInvitationPara
 }
 
 const createInvitedUser = `-- name: CreateInvitedUser :one
-INSERT INTO users (email, password_hash, name, role)
-VALUES (?, ?, ?, ?)
+INSERT INTO users (email, password_hash, name, role, password_set)
+VALUES (?, ?, ?, ?, ?)
 RETURNING id
 `
 
@@ -75,14 +75,19 @@ type CreateInvitedUserParams struct {
 	PasswordHash string         `json:"password_hash"`
 	Name         sql.NullString `json:"name"`
 	Role         string         `json:"role"`
+	PasswordSet  int64          `json:"password_set"`
 }
 
+// password_set is 0 for the password-less redemption branch (the shipped
+// vault_only extension flow, which mints and immediately discards a random
+// password) and 1 when the invitee supplied their own. See migration 00043.
 func (q *Queries) CreateInvitedUser(ctx context.Context, arg CreateInvitedUserParams) (string, error) {
 	row := q.db.QueryRowContext(ctx, createInvitedUser,
 		arg.Email,
 		arg.PasswordHash,
 		arg.Name,
 		arg.Role,
+		arg.PasswordSet,
 	)
 	var id string
 	err := row.Scan(&id)

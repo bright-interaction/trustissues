@@ -46,7 +46,26 @@ SELECT password_hash FROM users WHERE id = ?;
 SELECT email FROM users WHERE id = ?;
 
 -- name: UpdatePasswordHash :exec
+-- Rewrites the hash only. Its one caller outside SetPasswordHash is the
+-- transparent bcrypt-to-argon2id rehash on a successful login: that rewrites
+-- the hash of a password the owner just typed, it does not set a new one, so
+-- it must not touch password_set. See SetPasswordHash for the paths that do.
 UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+
+-- name: SetPasswordHash :exec
+-- Same write as UpdatePasswordHash, plus marking password_set so TOTPVerify
+-- knows this account's owner can actually supply a password. Use this from
+-- every path where a HUMAN is choosing the new password: change-password,
+-- admin reset-password, and invitation redemption when a password was
+-- supplied. See migration 00043.
+UPDATE users SET password_hash = ?, password_set = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+
+-- name: GetUserPasswordSet :one
+-- 1 when a human has ever set a password this account's owner could supply;
+-- 0 when the stored hash is a server-minted, immediately-discarded value
+-- (password-less invitation redemption) that nobody, including the owner,
+-- knows. See migration 00043 and TOTPVerify.
+SELECT password_set FROM users WHERE id = ?;
 
 -- name: InvalidateUserSessions :exec
 UPDATE users SET sessions_valid_after = ? WHERE id = ?;

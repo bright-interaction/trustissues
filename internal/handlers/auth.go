@@ -699,7 +699,10 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.queries.UpdatePasswordHash(r.Context(), db.UpdatePasswordHashParams{
+	// SetPasswordHash, not UpdatePasswordHash: the owner is choosing this
+	// password themselves, which is exactly what password_set records. See
+	// migration 00043 and TOTPVerify.
+	if err := h.queries.SetPasswordHash(r.Context(), db.SetPasswordHashParams{
 		PasswordHash: newHash,
 		ID:           userID,
 	}); err != nil {
@@ -849,38 +852,61 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ENABLING 2FA requires the password, not just a session.
+	// ENABLING 2FA requires the password -- but only from an account a human
+	// actually set one on.
 	//
 	// Enrolment used to need only a live session or API key. Turning 2FA ON is an
 	// irreversible-by-the-owner act: after it, login demands a code the owner does not
 	// have, TOTPDisable demands a live code they cannot produce, the recovery codes
 	// were returned to whoever enrolled, and no admin route exists to reset another
-	// user's 2FA. So anyone holding a stolen session, or the vault_only extension API
-	// key handed out by the PUBLIC invite-redemption endpoint, could permanently lock
-	// the owner out of their own vault without ever knowing the password.
+	// user's 2FA. So anyone holding a stolen session, or an API key stolen from
+	// someone else's account, could permanently lock the owner out of their own
+	// vault without ever knowing the password.
 	//
 	// Requiring the password here is what makes that impossible: the one credential a
 	// session thief does not have is the one that gates the irreversible action.
 	// Disabling already required it; enabling did not, which was the asymmetry.
-	passwordHash, phErr := h.queries.GetPasswordHashByUserID(r.Context(), userID)
-	if phErr != nil {
-		logError(r, "totp.verify: failed to query password hash", "error", phErr)
+	//
+	// THAT REASONING BREAKS for the vault_only extension's password-less
+	// redemption (RedeemInvitation in users.go): the "password" on that account
+	// is hex(rand 32), hashed and immediately discarded, so nobody -- including
+	// the account's own owner -- has ever known it. Requiring it here does not
+	// stop a thief, because a thief cannot produce it either; it just makes
+	// enrolment permanently impossible for the legitimate owner too, which is
+	// exactly what turned into P0-2: an admin enables require_totp, the
+	// vault_only user is 403 everywhere, and the ONLY exit from that 403 demands
+	// a credential that provably does not exist. For that account the API key
+	// (or session) that already got this request past authentication and past
+	// the session_reauth lockout above IS the whole credential; there is no
+	// second factor a thief could be missing that the password would have
+	// tested for. See migration 00043 and its comment for the full argument.
+	passwordSet, psErr := h.queries.GetUserPasswordSet(r.Context(), userID)
+	if psErr != nil {
+		logError(r, "totp.verify: failed to query password-set marker", "error", psErr)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	pwOK, pwErr := passwordhash.Verify(req.Password, passwordHash)
-	if capacityExhausted(w, r, pwErr, "totp.verify") {
-		return
-	}
-	if pwErr != nil || !pwOK {
-		if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
-			Email: userEmail, IpAddress: ip, Success: 0,
-			Scope: db.LoginAttemptScopeSessionReauth,
-		}); dbErr != nil {
-			logError(r, "totp.verify: failed to record attempt", "error", dbErr)
+	if passwordSet != 0 {
+		passwordHash, phErr := h.queries.GetPasswordHashByUserID(r.Context(), userID)
+		if phErr != nil {
+			logError(r, "totp.verify: failed to query password hash", "error", phErr)
+			writeInternalError(w, r, "internal server error")
+			return
 		}
-		writeUnauthorized(w, r, "your password is required to enable two-factor authentication")
-		return
+		pwOK, pwErr := passwordhash.Verify(req.Password, passwordHash)
+		if capacityExhausted(w, r, pwErr, "totp.verify") {
+			return
+		}
+		if pwErr != nil || !pwOK {
+			if dbErr := h.queries.CreateLoginAttempt(r.Context(), db.CreateLoginAttemptParams{
+				Email: userEmail, IpAddress: ip, Success: 0,
+				Scope: db.LoginAttemptScopeSessionReauth,
+			}); dbErr != nil {
+				logError(r, "totp.verify: failed to record attempt", "error", dbErr)
+			}
+			writeUnauthorized(w, r, "your password is required to enable two-factor authentication")
+			return
+		}
 	}
 
 	secretRow, err := h.queries.GetTOTPSecret(r.Context(), userID)

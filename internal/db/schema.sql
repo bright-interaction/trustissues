@@ -21,7 +21,12 @@ CREATE TABLE users (
   totp_last_step INTEGER,
   sessions_valid_after INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  -- Whether a human ever set a password this account's owner could actually
+  -- supply, as opposed to one minted by the server and discarded. See
+  -- migration 00043.
+  password_set INTEGER NOT NULL DEFAULT 1
+    CHECK (password_set IN (0, 1))
 );
 
 -- 00002_sessions_api_keys.sql
