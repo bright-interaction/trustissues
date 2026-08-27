@@ -92,12 +92,15 @@ export function setEnrollmentRequiredHandler(
   onEnrollmentRequired = fn;
 }
 
-// Core fetch helper. Auth is a server-set HttpOnly session cookie, so every
-// request carries credentials; there is no bearer token in the client.
-export async function request<T>(
+type ApiRequestOptions = RequestInit & { skipAuthRedirect?: boolean };
+
+// Shared authenticated fetch path. Keeping attachment downloads here matters:
+// a raw fetch from an export button would otherwise skip the app-wide 401 and
+// mandatory-2FA handling that protects every JSON request.
+async function apiRequest(
   path: string,
-  opts?: RequestInit & { skipAuthRedirect?: boolean }
-): Promise<T> {
+  opts?: ApiRequestOptions
+): Promise<Response> {
   const { skipAuthRedirect, ...fetchOpts } = opts || {};
   const headers: Record<string, string> = {
     ...(fetchOpts?.headers as Record<string, string>),
@@ -155,11 +158,34 @@ export async function request<T>(
     throw new ApiError(body.error || res.statusText, res.status, body);
   }
 
-  if (res.status === 204) {
-    return undefined as T;
-  }
+  return res;
+}
+
+// Core JSON helper. Auth is a server-set HttpOnly session cookie, so every
+// request carries credentials; there is no bearer token in the client.
+export async function request<T>(
+  path: string,
+  opts?: ApiRequestOptions
+): Promise<T> {
+  const res = await apiRequest(path, opts);
+
+  if (res.status === 204) return undefined as T;
 
   return res.json();
+}
+
+// Binary/attachment counterpart to request(). The caller receives the response
+// filename header alongside the Blob so downloads do not have to invent a name
+// when the server supplied one.
+export async function requestAttachment(
+  path: string,
+  opts?: ApiRequestOptions
+): Promise<{ blob: Blob; contentDisposition: string | null }> {
+  const res = await apiRequest(path, opts);
+  return {
+    blob: await res.blob(),
+    contentDisposition: res.headers.get('content-disposition'),
+  };
 }
 
 export const api = {

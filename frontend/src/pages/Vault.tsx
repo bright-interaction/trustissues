@@ -28,6 +28,7 @@ import {
   UserPlus,
   LogOut,
   Database,
+  Upload,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
@@ -42,6 +43,7 @@ import {
 } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import Layout from '@/components/Layout';
+import VaultExportModal from '@/components/VaultExportModal';
 import VaultImportModal from '@/components/VaultImportModal';
 import RotationManager from '@/components/RotationManager';
 import {
@@ -1349,6 +1351,7 @@ export default function Vault() {
   const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
   const [showAddSecret, setShowAddSecret] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
   const [newSecret, setNewSecret] = useState(BLANK_NEW_SECRET);
   const [newCustomFields, setNewCustomFields] = useState<CustomField[]>([]);
   const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
@@ -1446,6 +1449,7 @@ export default function Vault() {
     setRotatingEntryId(null);
     setRotationPanelId(null);
     setShowAddSecret(false);
+    setShowExportModal(false);
     setNewSecret(BLANK_NEW_SECRET);
     setNewCustomFields([]);
 
@@ -2064,8 +2068,15 @@ export default function Vault() {
                   onClick={() => setShowImportModal(true)}
                   className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
-                  <Download className="h-3.5 w-3.5" />
+                  <Upload className="h-3.5 w-3.5" />
                   Import CSV
+                </button>
+                <button
+                  onClick={() => setShowExportModal(true)}
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Export vault
                 </button>
               </div>
             </div>
@@ -2931,6 +2942,11 @@ export default function Vault() {
           lockVault();
           queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
         }}
+      />
+
+      <VaultExportModal
+        isOpen={showExportModal}
+        onClose={() => setShowExportModal(false)}
       />
 
       {/* New collection modal */}

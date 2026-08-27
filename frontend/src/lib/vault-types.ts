@@ -3,7 +3,7 @@
 // endpoint wrappers are defined here with request<T>() instead of editing
 // api.ts. If frontend-platform later adds an api.vault namespace, fold these in.
 
-import { request } from './api';
+import { request, requestAttachment } from './api';
 
 // A free-form label/value pair stored alongside a vault entry. `secret` is a
 // UI masking hint only; the whole set is encrypted at rest regardless. Present
@@ -253,6 +253,12 @@ export const vaultApi = {
     request<VaultEntry[]>('/vault/unlock', {
       method: 'POST',
       body: JSON.stringify({ password }),
+    }),
+  export: (password: string, signal?: AbortSignal) =>
+    requestAttachment('/vault/export', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+      signal,
     }),
   rotate: (id: string, password: string) =>
     request<VaultEntry & { value: string }>(`/vault/${id}/rotate`, {
