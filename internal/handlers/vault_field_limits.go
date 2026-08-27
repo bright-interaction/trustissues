@@ -24,6 +24,8 @@ const (
 	maxEntryURLLen      = 2048
 	maxEntryUsernameLen = 255
 	maxEntryNotesLen    = 10000
+	minRotationDays     = 1
+	maxRotationDays     = 3650
 )
 
 // vaultEntryFields is the mutable text of one entry, as any write path sees it.
@@ -34,6 +36,95 @@ type vaultEntryFields struct {
 	AliasURL string
 	Username string
 	Notes    string
+}
+
+// vaultEntryTextInput is the JSON-facing form of the mutable text fields. The
+// pointers preserve the distinction Update needs between "not supplied" and
+// "supplied as empty". In particular, an empty Value on Update deliberately
+// means "keep the current secret" and must not be mistaken for Create's
+// required-value rule.
+type vaultEntryTextInput struct {
+	Name     *string
+	Value    *string
+	URL      *string
+	AliasURL *string
+	Username *string
+	Notes    *string
+}
+
+// validateLiveEntryText is the canonical gate for the two JSON write surfaces.
+// Create passes requireName/requireValue; Update passes only the fields present
+// in its patch. Both retain the product's user-friendly normalization contract:
+// identifier-like text is trimmed in place before validation and storage.
+func validateLiveEntryText(in vaultEntryTextInput, requireName, requireValue bool) string {
+	if in.Name == nil {
+		if requireName {
+			return "name is required"
+		}
+	} else {
+		*in.Name = strings.TrimSpace(*in.Name)
+		if *in.Name == "" {
+			return "name is required"
+		}
+		if len(*in.Name) > maxEntryNameLen {
+			return fmt.Sprintf("name must be %d characters or less", maxEntryNameLen)
+		}
+	}
+
+	if in.Value == nil {
+		if requireValue {
+			return "value is required"
+		}
+	} else if *in.Value == "" {
+		if requireValue {
+			return "value is required"
+		}
+		// Update's established contract: an explicitly empty value is a no-op.
+	} else if len(*in.Value) > maxEntryValueLen {
+		return "value must be 64KB or less"
+	}
+
+	for _, field := range []struct {
+		name  string
+		value *string
+		max   int
+	}{
+		{"url", in.URL, maxEntryURLLen},
+		{"alias url", in.AliasURL, maxEntryURLLen},
+		{"username", in.Username, maxEntryUsernameLen},
+	} {
+		if field.value == nil {
+			continue
+		}
+		*field.value = strings.TrimSpace(*field.value)
+		if len(*field.value) > field.max {
+			return fmt.Sprintf("%s must be %d characters or less", field.name, field.max)
+		}
+	}
+	if in.Notes != nil && len(*in.Notes) > maxEntryNotesLen {
+		return fmt.Sprintf("notes must be %d characters or less", maxEntryNotesLen)
+	}
+	return ""
+}
+
+func vaultEntryCategoryValid(category string) bool {
+	switch category {
+	case "", "login", "password", "api_key", "database", "certificate", "credit_card",
+		"ssh_key", "server", "identity", "bank_account", "email", "other":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateRotationIntervalDays(interval *int) string {
+	if interval == nil {
+		return ""
+	}
+	if *interval < minRotationDays || *interval > maxRotationDays {
+		return fmt.Sprintf("rotation_interval_days must be between %d and %d", minRotationDays, maxRotationDays)
+	}
+	return ""
 }
 
 // normalizeAndValidateEntryFields trims what should be trimmed and returns the

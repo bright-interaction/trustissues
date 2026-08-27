@@ -77,13 +77,18 @@ func TestTenantExpansionFailsClosed(t *testing.T) {
 // provider_meta escape the intended host.
 func TestTenantValueCannotWidenThePattern(t *testing.T) {
 	hostile := []string{
-		"evil.com",           // a dot escapes the label
-		"a/../..",            // path traversal
-		"*",                  // the wildcard we just removed
-		"x.supabase.co/../y", // both
-		"a b",                // whitespace
-		"a:443",              // port
-		`a\b`,                // backslash
+		"evil.com",              // a dot escapes the label
+		"a/../..",               // path traversal
+		"*",                     // the wildcard we just removed
+		"x.supabase.co/../y",    // both
+		"a b",                   // whitespace
+		"a\tb",                  // control whitespace
+		"a@b",                   // URL userinfo delimiter
+		"a:443",                 // port
+		`a\b`,                   // backslash
+		"-leading",              // not a DNS label
+		"trailing-",             // not a DNS label
+		strings.Repeat("a", 64), // DNS labels are at most 63 bytes
 	}
 	for _, v := range hostile {
 		got := ExpandCapabilityDestinations([]string{"{project_ref}.supabase.co/*"}, map[string]string{"project_ref": v})

@@ -434,7 +434,7 @@ func TestEditorCannotRedirectAnOrdinarySharedSecretThroughProviderMeta(t *testin
 		// away, which is a product regression dressed as a security fix.
 		if rec := putVault(t, h, editor, "vault_only", entryID, map[string]any{
 			"notes":       "rotated by the on-call rota",
-			"category":    "observability",
+			"category":    "other",
 			"auto_rotate": false,
 		}); rec.Code != http.StatusOK {
 			t.Fatalf("an editor could not save ordinary metadata: %d %s", rec.Code, rec.Body.String())

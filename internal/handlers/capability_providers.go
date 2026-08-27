@@ -108,6 +108,15 @@ var CapabilityDefaults = map[string]struct {
 // and it is expanded at seed time into a single concrete host.
 var tenantPlaceholderRe = regexp.MustCompile(`\{([a-z_]+)\}`)
 
+// tenantDNSLabelRe is deliberately narrower than "does not contain a dot".
+// Placeholder values become the left-most label of a destination host, so they
+// must be an actual DNS label: ASCII letters/digits, optional interior hyphens,
+// no leading/trailing hyphen, and at most 63 bytes. In particular this refuses
+// '@' and control whitespace, both of which previously produced a preset that
+// the explicit destination validator would reject but the seed path still
+// stored.
+var tenantDNSLabelRe = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
 // ExpandCapabilityDestinations substitutes {key} placeholders from the entry's
 // provider_meta.
 //
@@ -128,9 +137,10 @@ func ExpandCapabilityDestinations(patterns []string, meta map[string]string) []s
 		missing := false
 		for _, m := range tenantPlaceholderRe.FindAllStringSubmatch(p, -1) {
 			v := strings.TrimSpace(meta[m[1]])
-			// A tenant id has to be a single DNS label. Anything with a dot or a
-			// slash could widen the pattern past the intended host.
-			if v == "" || strings.ContainsAny(v, "./*: \\") {
+			// A tenant id has to be one complete DNS label. Applying the actual
+			// grammar here is easier to audit than trying to enumerate every byte
+			// that is unsafe in a URL authority.
+			if !tenantDNSLabelRe.MatchString(v) {
 				missing = true
 				break
 			}
@@ -160,6 +170,13 @@ func MarshalCapabilityDefaults(provider string, meta map[string]string) (string,
 	inj, _ := json.Marshal(d.Injection)
 	if len(expanded) == 0 {
 		// Injection spec is still useful; the ceiling stays empty on purpose.
+		return "", string(inj)
+	}
+	expanded = NormalizeDestinationPatterns(expanded)
+	if err := ValidateDestinationPatterns(expanded); err != nil {
+		// Caller-controlled provider metadata participates in tenant presets.
+		// Treat any invalid expansion as no ceiling rather than allowing this
+		// generated write to bypass the validator used for explicit writes.
 		return "", string(inj)
 	}
 	dests, _ := json.Marshal(expanded)

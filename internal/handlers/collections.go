@@ -36,6 +36,30 @@ func validCollectionRole(role string) bool {
 	return role == collRoleViewer || role == collRoleEditor || role == collRoleManager
 }
 
+const (
+	maxCollectionNameLen        = 255
+	maxCollectionDescriptionLen = 10000
+)
+
+// validateLiveCollectionFields is shared by Create and Update so a collection
+// cannot become valid on one surface and uneditable or non-portable on the
+// other. Names retain the API's user-friendly normalization contract and are
+// trimmed in place before validation and storage; descriptions are free text
+// and retain whitespace.
+func validateLiveCollectionFields(name *string, description string) string {
+	*name = strings.TrimSpace(*name)
+	if *name == "" {
+		return "name is required"
+	}
+	if len(*name) > maxCollectionNameLen {
+		return fmt.Sprintf("name must be %d characters or less", maxCollectionNameLen)
+	}
+	if len(description) > maxCollectionDescriptionLen {
+		return fmt.Sprintf("description must be %d characters or less", maxCollectionDescriptionLen)
+	}
+	return ""
+}
+
 // role returns the caller's role in a collection. Instance admins are treated as
 // managers of every collection. The second return is false when the caller is
 // neither a member nor an admin.
@@ -114,13 +138,8 @@ func (h *CollectionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid JSON")
 		return
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		writeBadRequest(w, r, "name is required")
-		return
-	}
-	if len(req.Name) > 255 {
-		writeBadRequest(w, r, "name must be 255 characters or less")
+	if message := validateLiveCollectionFields(&req.Name, req.Description); message != "" {
+		writeBadRequest(w, r, message)
 		return
 	}
 
@@ -202,9 +221,8 @@ func (h *CollectionHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid JSON")
 		return
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		writeBadRequest(w, r, "name is required")
+	if message := validateLiveCollectionFields(&req.Name, req.Description); message != "" {
+		writeBadRequest(w, r, message)
 		return
 	}
 	if err := h.queries.UpdateCollection(r.Context(), db.UpdateCollectionParams{

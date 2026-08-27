@@ -316,8 +316,11 @@ func (h *VaultHandler) urlBlindIndexCandidates(scope, raw string) []string {
 // maxCustomFields caps how many custom fields an entry may carry.
 const maxCustomFields = 50
 
-// validateCustomFields enforces sane limits before storage.
-func validateCustomFields(fields []CustomField) error {
+// validatePortableCustomFields accepts every legacy label shape that earlier
+// TrustIssues versions could export, while retaining the resource limits and
+// response-only withheld guard that make the payload safe to process. Native
+// import and export use this compatibility contract.
+func validatePortableCustomFields(fields []CustomField) error {
 	if len(fields) > maxCustomFields {
 		return fmt.Errorf("too many custom fields (max %d)", maxCustomFields)
 	}
@@ -341,6 +344,21 @@ func validateCustomFields(fields []CustomField) error {
 		}
 	}
 	return nil
+}
+
+// validateCustomFields is the live-write counterpart. Labels are identifiers
+// in the edit UI, so Create, Update, and the CSV importer trim them in place and
+// reject a label that is empty after normalization. Keeping this separate from
+// validatePortableCustomFields lets an old native export restore byte-for-byte
+// without allowing new writes to perpetuate the legacy shape.
+func validateCustomFields(fields []CustomField) error {
+	for i := range fields {
+		fields[i].Label = strings.TrimSpace(fields[i].Label)
+		if fields[i].Label == "" {
+			return fmt.Errorf("custom field label is required")
+		}
+	}
+	return validatePortableCustomFields(fields)
 }
 
 // encryptCustomFields marshals the fields to JSON and encrypts the blob at rest.
@@ -1420,6 +1438,21 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid JSON")
 		return
 	}
+	if msg := validateLiveEntryText(vaultEntryTextInput{
+		Name: &req.Name, Value: &req.Value, URL: &req.URL, AliasURL: &req.AliasURL,
+		Username: &req.Username, Notes: &req.Notes,
+	}, true, true); msg != "" {
+		writeBadRequest(w, r, msg)
+		return
+	}
+	if !vaultEntryCategoryValid(req.Category) {
+		writeBadRequest(w, r, "invalid category")
+		return
+	}
+	if msg := validateRotationIntervalDays(req.RotationIntervalDays); msg != "" {
+		writeBadRequest(w, r, msg)
+		return
+	}
 	if err := validateCustomFields(req.CustomFields); err != nil {
 		writeBadRequest(w, r, err.Error())
 		return
@@ -1435,29 +1468,6 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		collectionID = sql.NullString{String: *req.CollectionID, Valid: true}
-	}
-
-	// One validator for every write path (see vault_field_limits.go). These used
-	// to be literals here, partly duplicated in Update, and entirely absent from
-	// import, which is how import could write a row the edit form then refused
-	// to save.
-	fields := vaultEntryFields{
-		Name: req.Name, Value: req.Value, URL: req.URL,
-		AliasURL: req.AliasURL, Username: req.Username, Notes: req.Notes,
-	}
-	if msg := normalizeAndValidateEntryFields(&fields); msg != "" {
-		writeBadRequest(w, r, msg)
-		return
-	}
-	req.Name, req.URL, req.AliasURL, req.Username = fields.Name, fields.URL, fields.AliasURL, fields.Username
-	validCategories := map[string]bool{
-		"": true, "login": true, "password": true, "api_key": true, "database": true,
-		"certificate": true, "credit_card": true, "ssh_key": true, "server": true,
-		"identity": true, "bank_account": true, "email": true, "other": true,
-	}
-	if !validCategories[req.Category] {
-		writeBadRequest(w, r, "invalid category")
-		return
 	}
 
 	// Encrypt the secret value
@@ -1815,6 +1825,30 @@ func (h *VaultHandler) seedCapabilityDefaults(ctx context.Context, q *db.Queries
 	if dests == "" && inj == "" {
 		return
 	}
+	if dests != "" {
+		patterns := []string{}
+		if err := json.Unmarshal([]byte(dests), &patterns); err != nil || patterns == nil {
+			logError(r, "vault: capability preset not seeded; generated destinations were invalid",
+				"entry_id", entryID, "provider", provider)
+			return
+		}
+		patterns = NormalizeDestinationPatterns(patterns)
+		if err := ValidateDestinationPatterns(patterns); err != nil {
+			// A provider_meta placeholder is caller-controlled. A malformed tenant
+			// must leave the ceiling empty, never bypass the explicit destination
+			// validator merely because this write came from a preset.
+			logError(r, "vault: capability preset not seeded; generated destinations were unsafe",
+				"entry_id", entryID, "provider", provider, "error", err)
+			return
+		}
+		encoded, err := json.Marshal(patterns)
+		if err != nil {
+			logError(r, "vault: capability preset not seeded; generated destinations could not be encoded",
+				"entry_id", entryID, "provider", provider, "error", err)
+			return
+		}
+		dests = string(encoded)
+	}
 	if dests == "" {
 		dests = "[]"
 	}
@@ -1891,6 +1925,29 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid JSON")
 		return
+	}
+	if msg := validateLiveEntryText(vaultEntryTextInput{
+		Name: req.Name, Value: req.Value, URL: req.URL, AliasURL: req.AliasURL,
+		Username: req.Username, Notes: req.Notes,
+	}, false, false); msg != "" {
+		writeBadRequest(w, r, msg)
+		return
+	}
+	if req.Category != nil && !vaultEntryCategoryValid(*req.Category) {
+		writeBadRequest(w, r, "invalid category")
+		return
+	}
+	if req.RotationIntervalDays.Set {
+		if msg := validateRotationIntervalDays(req.RotationIntervalDays.Value); msg != "" {
+			writeBadRequest(w, r, msg)
+			return
+		}
+	}
+	if req.CustomFields != nil {
+		if err := validateCustomFields(*req.CustomFields); err != nil {
+			writeBadRequest(w, r, err.Error())
+			return
+		}
 	}
 
 	// Refuse the whole request if any encrypted column on this entry cannot be
@@ -1998,10 +2055,6 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Custom fields: nil means "unchanged"; a present (even empty) array replaces
 	// the set. Encrypted at rest.
 	if req.CustomFields != nil {
-		if err := validateCustomFields(*req.CustomFields); err != nil {
-			writeBadRequest(w, r, err.Error())
-			return
-		}
 		if enc, cfErr := h.encryptCustomFields(*req.CustomFields); cfErr != nil {
 			logError(r, "vault.update: custom fields encrypt failed", "error", cfErr)
 			writeInternalError(w, r, "internal server error")
@@ -2183,15 +2236,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	//
 	// Done FIRST so a refused rename leaves the rest of the entry untouched.
 	if req.Name != nil {
-		newName := strings.TrimSpace(*req.Name)
-		if newName == "" {
-			writeBadRequest(w, r, "name is required")
-			return
-		}
-		if len(newName) > 255 {
-			writeBadRequest(w, r, "name must be 255 characters or less")
-			return
-		}
+		newName := *req.Name
 		// Who owns the entry decides whether a rename may be attempted at all.
 		//
 		// UNIQUE(user_id, name) is scoped to the entry's CREATOR, and a shared
