@@ -130,6 +130,25 @@ export interface VaultImportPreview {
   source_rows: number;
 }
 
+// A TrustIssues-native export is previewed without returning any of its
+// plaintext entry fields to the UI. The browser only needs these aggregate
+// counts and conflict names to make the import decision; secret values stay in
+// the selected File object and are uploaded again only after reauthentication.
+export interface NativeVaultImportPreview {
+  format: string;
+  version: number;
+  entry_count: number;
+  collection_count: number;
+  conflicts: string[];
+  auto_rotate_disabled: number;
+}
+
+export interface NativeVaultImportResult {
+  imported: number;
+  collections_created: number;
+  auto_rotate_disabled: number;
+}
+
 export interface ServiceIdentity {
   id: string;
   name: string;
@@ -336,7 +355,7 @@ export const vaultApi = {
       body: JSON.stringify(data),
     }),
   // Vault import endpoints
-  importPreview: (file: File, format: string) => {
+  importPreview: (file: File, format: string, signal?: AbortSignal) => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('format', format);
@@ -344,6 +363,7 @@ export const vaultApi = {
     return request<VaultImportPreview>('/vault/import/preview', {
       method: 'POST',
       body: formData,
+      signal,
     });
   },
   importConfirm: (entries: ImportEntry[]) =>
@@ -351,6 +371,27 @@ export const vaultApi = {
       method: 'POST',
       body: JSON.stringify({ entries }),
     }),
+  nativeImportPreview: (file: File, signal?: AbortSignal) => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    return request<NativeVaultImportPreview>('/vault/import/native/preview', {
+      method: 'POST',
+      body: formData,
+      signal,
+    });
+  },
+  nativeImportConfirm: (file: File, password: string, signal?: AbortSignal) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('password', password);
+
+    return request<NativeVaultImportResult>('/vault/import/native/confirm', {
+      method: 'POST',
+      body: formData,
+      signal,
+    });
+  },
 };
 
 // Service identities: machine credentials that fetch a scoped subset of

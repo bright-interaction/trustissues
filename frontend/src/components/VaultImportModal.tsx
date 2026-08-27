@@ -1,9 +1,12 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { FileText, Upload, AlertTriangle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
 import { vaultApi } from '@/lib/vault-types';
-import type { VaultImportPreview } from '@/lib/vault-types';
+import type {
+  NativeVaultImportPreview,
+  VaultImportPreview,
+} from '@/lib/vault-types';
 
 interface VaultImportModalProps {
   isOpen: boolean;
@@ -11,41 +14,115 @@ interface VaultImportModalProps {
   onImportComplete: () => void;
 }
 
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
+
+function isNativeExport(file: File): boolean {
+  return file.name.toLowerCase().endsWith('.json');
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
 export default function VaultImportModal({ isOpen, onClose, onImportComplete }: VaultImportModalProps) {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<VaultImportPreview | null>(null);
+  const [nativePreview, setNativePreview] = useState<NativeVaultImportPreview | null>(null);
+  const [password, setPassword] = useState('');
+  const [nativeError, setNativeError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [selectedFormat, setSelectedFormat] = useState<string>('auto');
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const importAbortRef = useRef<AbortController | null>(null);
+
+  const abortInFlight = useCallback(() => {
+    previewAbortRef.current?.abort();
+    importAbortRef.current?.abort();
+    previewAbortRef.current = null;
+    importAbortRef.current = null;
+  }, []);
+
+  const reset = useCallback(() => {
+    abortInFlight();
+    setFile(null);
+    setPreview(null);
+    setNativePreview(null);
+    setPassword('');
+    setNativeError(null);
+    setIsUploading(false);
+    setIsImporting(false);
+    setSelectedFormat('auto');
+  }, [abortInFlight]);
+
+  useEffect(() => {
+    if (!isOpen) reset();
+  }, [isOpen, reset]);
+
+  useEffect(() => abortInFlight, [abortInFlight]);
+
+  const handleClose = () => {
+    reset();
+    onClose();
+  };
 
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0];
     if (selectedFile) {
-      if (!selectedFile.name.toLowerCase().endsWith('.csv')) {
-        toast.error('Please select a CSV file');
+      const lowerName = selectedFile.name.toLowerCase();
+      if (!lowerName.endsWith('.csv') && !lowerName.endsWith('.json')) {
+        toast.error('Please select a CSV or JSON file');
+        event.currentTarget.value = '';
         return;
       }
-      if (selectedFile.size > 10 * 1024 * 1024) { // 10MB limit
-        toast.error('File size must be less than 10MB');
+      if (selectedFile.size > MAX_IMPORT_BYTES) {
+        toast.error('File size must be 10MB or smaller');
+        event.currentTarget.value = '';
         return;
       }
+      abortInFlight();
       setFile(selectedFile);
       setPreview(null);
+      setNativePreview(null);
+      setPassword('');
+      setNativeError(null);
+      setIsUploading(false);
+      setIsImporting(false);
     }
   };
 
   const handlePreview = async () => {
     if (!file) return;
 
+    previewAbortRef.current?.abort();
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
     setIsUploading(true);
+    setNativeError(null);
     try {
-      const result = await vaultApi.importPreview(file, selectedFormat);
-      setPreview(result);
+      if (isNativeExport(file)) {
+        const result = await vaultApi.nativeImportPreview(file, controller.signal);
+        if (!controller.signal.aborted) setNativePreview(result);
+      } else {
+        const result = await vaultApi.importPreview(file, selectedFormat, controller.signal);
+        if (!controller.signal.aborted) setPreview(result);
+      }
     } catch (error: unknown) {
-      console.error('Import preview error:', error);
-      toast.error(error instanceof Error ? error.message : 'Failed to preview import');
+      if (!isAbortError(error) && !controller.signal.aborted) {
+        if (isNativeExport(file)) {
+          const message = 'Could not validate this TrustIssues export. Check that it is an unmodified version 1 export and try again.';
+          setNativeError(message);
+          toast.error(message);
+        } else {
+          console.error('Import preview error:', error);
+          toast.error(error instanceof Error ? error.message : 'Failed to preview import');
+        }
+      }
     } finally {
-      setIsUploading(false);
+      if (previewAbortRef.current === controller) {
+        previewAbortRef.current = null;
+        setIsUploading(false);
+      }
     }
   };
 
@@ -84,10 +161,52 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
     }
   };
 
-  const reset = () => {
-    setFile(null);
+  const handleNativeImport = async () => {
+    if (!file || !nativePreview || nativePreview.conflicts.length > 0 || password.length === 0) {
+      return;
+    }
+
+    importAbortRef.current?.abort();
+    const controller = new AbortController();
+    importAbortRef.current = controller;
+    const passwordForRequest = password;
+    setPassword('');
+    setNativeError(null);
+    setIsImporting(true);
+
+    try {
+      const result = await vaultApi.nativeImportConfirm(
+        file,
+        passwordForRequest,
+        controller.signal
+      );
+      if (controller.signal.aborted) return;
+
+      toast.success(
+        `Successfully imported ${result.imported} entries and created ${result.collections_created} collections`
+      );
+      reset();
+      onImportComplete();
+      onClose();
+    } catch (error: unknown) {
+      if (!isAbortError(error) && !controller.signal.aborted) {
+        const message = 'Import failed. Your vault was not changed. Check your password and file, then try again.';
+        setNativeError(message);
+        toast.error(message);
+      }
+    } finally {
+      if (importAbortRef.current === controller) {
+        importAbortRef.current = null;
+        setIsImporting(false);
+      }
+    }
+  };
+
+  const handleBack = () => {
     setPreview(null);
-    setSelectedFormat('auto');
+    setNativePreview(null);
+    setPassword('');
+    setNativeError(null);
   };
 
   const toggleSkipEntry = (index: number) => {
@@ -108,17 +227,24 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
       {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black bg-opacity-50"
-        onClick={onClose}
+        onClick={handleClose}
       />
 
       {/* Modal */}
-      <div className="relative z-10 w-full max-w-4xl bg-white rounded-xl shadow-xl mx-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vault-import-title"
+        className="relative z-10 w-full max-w-4xl bg-white rounded-xl shadow-xl mx-4"
+      >
         <div className="flex items-center justify-between p-6 border-b border-slate-200">
-          <h2 className="text-xl font-semibold text-slate-900">
+          <h2 id="vault-import-title" className="text-xl font-semibold text-slate-900">
             Import Password Manager Data
           </h2>
           <button
-            onClick={onClose}
+            type="button"
+            aria-label="Close import"
+            onClick={handleClose}
             className="text-slate-400 hover:text-slate-600"
           >
             ×
@@ -127,11 +253,11 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
 
         <div className="p-6 max-h-[80vh] overflow-y-auto">
           {/* Step 1: File Upload */}
-          {!preview && (
+          {!preview && !nativePreview && (
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">
-                  Select CSV file to import
+                  Select a CSV or TrustIssues JSON file to import
                 </label>
                 <div className="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:border-slate-400 transition-colors">
                   <FileText className="mx-auto h-12 w-12 text-slate-400" />
@@ -142,7 +268,7 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
                       <input
                         type="file"
                         className="sr-only"
-                        accept=".csv"
+                        accept=".csv,.json,text/csv,application/json"
                         onChange={handleFileSelect}
                       />
                     </label>
@@ -153,12 +279,28 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
                     </p>
                   )}
                   <p className="mt-4 text-sm text-slate-500">
-                    Supports 1Password, Bitwarden, and LastPass CSV exports
+                    Supports TrustIssues JSON exports and 1Password, Bitwarden, or LastPass CSV exports
                   </p>
                 </div>
               </div>
 
-              <div>
+              {file && isNativeExport(file) && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <div className="flex items-start">
+                    <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
+                    <div className="ml-3">
+                      <p className="text-sm font-medium text-red-800">
+                        This JSON file contains plaintext vault secrets.
+                      </p>
+                      <p className="text-sm text-red-700 mt-1">
+                        Keep it private and remove every plaintext copy after you verify the import.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {(!file || !isNativeExport(file)) && <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">
                   Format (auto-detection is recommended)
                 </label>
@@ -172,7 +314,13 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
                   <option value="bitwarden">Bitwarden</option>
                   <option value="lastpass">LastPass</option>
                 </select>
-              </div>
+              </div>}
+
+              {nativeError && (
+                <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+                  {nativeError}
+                </div>
+              )}
 
               {file && (
                 <div className="flex justify-end">
@@ -316,7 +464,7 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
               {/* Actions */}
               <div className="flex justify-between">
                 <button
-                  onClick={() => setPreview(null)}
+                  onClick={handleBack}
                   className="px-4 py-2 border border-slate-300 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
                   Back
@@ -330,6 +478,128 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
                   )}
                 >
                   {isImporting ? 'Importing...' : `Import ${preview.entries.filter(e => !e.skip).length} entries`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* TrustIssues-native files are deliberately not rendered as a row
+              table: preview responses contain counts and conflict names only,
+              so plaintext values never get copied into React state or the DOM. */}
+          {nativePreview && (
+            <div className="space-y-4">
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                <p className="text-sm text-blue-800">
+                  TrustIssues export version <strong>{nativePreview.version}</strong>
+                  {' • '}{nativePreview.entry_count} entries in {nativePreview.collection_count}{' '}
+                  {nativePreview.collection_count === 1 ? 'collection' : 'collections'}
+                </p>
+              </div>
+
+              <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                <div className="flex items-start">
+                  <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
+                  <div className="ml-3">
+                    <p className="text-sm font-medium text-red-800">
+                      This file contains plaintext vault secrets.
+                    </p>
+                    <p className="text-sm text-red-700 mt-1">
+                      Anyone who can open it can read them. Keep it private and remove every plaintext copy after you verify the import.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                <div className="flex items-start">
+                  <AlertTriangle className="h-5 w-5 text-amber-500 mt-0.5 shrink-0" />
+                  <div className="ml-3">
+                    <p className="text-sm font-medium text-amber-900">
+                      Imported auto-rotation will be disabled.
+                    </p>
+                    <p className="text-sm text-amber-800 mt-1">
+                      {nativePreview.auto_rotate_disabled > 0
+                        ? `${nativePreview.auto_rotate_disabled} entries requested auto-rotation. Review their provider settings and delivery targets before enabling it again.`
+                        : 'Review provider settings and delivery targets before enabling auto-rotation on imported entries.'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {nativePreview.conflicts.length > 0 && (
+                <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <div className="flex items-start">
+                    <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
+                    <div className="ml-3 min-w-0">
+                      <p className="text-sm font-medium text-red-800">
+                        Import blocked by {nativePreview.conflicts.length} name{' '}
+                        {nativePreview.conflicts.length === 1 ? 'conflict' : 'conflicts'}
+                      </p>
+                      <p className="text-sm text-red-700 mt-1">
+                        Nothing will be imported. Rename the existing or exported entries, then preview the file again.
+                      </p>
+                      <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-sm text-red-800">
+                        {nativePreview.conflicts.slice(0, 20).map((conflict, index) => (
+                          <li key={`${conflict}-${index}`} className="truncate">{conflict}</li>
+                        ))}
+                      </ul>
+                      {nativePreview.conflicts.length > 20 && (
+                        <p className="text-sm text-red-700 mt-1">
+                          and {nativePreview.conflicts.length - 20} more
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label htmlFor="native-import-password" className="block text-sm font-medium text-slate-700 mb-2">
+                  Current account password
+                </label>
+                <input
+                  id="native-import-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  disabled={nativePreview.conflicts.length > 0 || isImporting}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:border-slate-400 disabled:bg-slate-100"
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  Reauthentication is required before the server validates and encrypts every imported secret for this account.
+                </p>
+              </div>
+
+              {nativeError && (
+                <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+                  {nativeError}
+                </div>
+              )}
+
+              <div className="flex justify-between">
+                <button
+                  type="button"
+                  onClick={handleBack}
+                  disabled={isImporting}
+                  className="px-4 py-2 border border-slate-300 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  onClick={handleNativeImport}
+                  disabled={
+                    isImporting ||
+                    nativePreview.conflicts.length > 0 ||
+                    password.length === 0
+                  }
+                  className={clsx(
+                    'px-4 py-2 bg-slate-900 text-white rounded-md text-sm font-medium',
+                    'hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed'
+                  )}
+                >
+                  {isImporting ? 'Importing...' : `Import ${nativePreview.entry_count} entries`}
                 </button>
               </div>
             </div>
