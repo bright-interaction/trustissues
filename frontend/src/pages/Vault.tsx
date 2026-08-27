@@ -47,6 +47,7 @@ import VaultExportModal from '@/components/VaultExportModal';
 import VaultImportModal from '@/components/VaultImportModal';
 import RotationManager from '@/components/RotationManager';
 import CredentialHealth from '@/components/CredentialHealth';
+import SecretValueField from '@/components/SecretValueField';
 import {
   vaultApi,
   serviceIdentitiesApi,
@@ -353,7 +354,7 @@ function CustomFieldsDisplay({ fields }: { fields: CustomField[] }) {
   );
 }
 
-function timeAgo(dateStr: string): string {
+function timeAgo(dateStr: string | null | undefined): string {
   if (!dateStr) return 'never';
   const diff = Date.now() - new Date(dateStr).getTime();
   const seconds = Math.floor(diff / 1000);
@@ -2061,7 +2062,13 @@ export default function Vault() {
               </div>
               <div className="flex gap-2">
                 <button
-                  onClick={() => setShowAddSecret(!showAddSecret)}
+                  onClick={() => {
+                    if (showAddSecret) {
+                      setNewSecret(BLANK_NEW_SECRET);
+                      setNewCustomFields([]);
+                    }
+                    setShowAddSecret(!showAddSecret);
+                  }}
                   className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
                   <Plus className="h-3.5 w-3.5" />
@@ -2198,13 +2205,13 @@ export default function Vault() {
                   <label className="mb-1 block text-xs font-medium text-slate-600">
                     Value *
                   </label>
-                  <input
-                    type="text"
+                  <SecretValueField
                     value={newSecret.value}
-                    onChange={(e) => setNewSecret({ ...newSecret, value: e.target.value })}
+                    onChange={(value) => setNewSecret((secret) => ({ ...secret, value }))}
+                    inputLabel="Secret value"
+                    visibilityLabel="secret value"
                     placeholder="Secret value"
                     required
-                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-mono outline-none focus:border-slate-400"
                   />
                 </div>
                 <div>
@@ -2265,7 +2272,11 @@ export default function Vault() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowAddSecret(false)}
+                    onClick={() => {
+                      setShowAddSecret(false);
+                      setNewSecret(BLANK_NEW_SECRET);
+                      setNewCustomFields([]);
+                    }}
                     className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
                   >
                     Cancel
@@ -2392,12 +2403,12 @@ export default function Vault() {
                           <label className="mb-1 block text-xs font-medium text-slate-600">
                             Value <span className="font-normal text-slate-400">(leave blank to keep current)</span>
                           </label>
-                          <input
-                            type="text"
+                          <SecretValueField
                             value={editForm.value}
-                            onChange={(e) => setEditForm({ ...editForm, value: e.target.value })}
+                            onChange={(value) => setEditForm((form) => ({ ...form, value }))}
+                            inputLabel="Replacement secret value"
+                            visibilityLabel="replacement secret value"
                             placeholder="Enter new value to change"
-                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-mono outline-none focus:border-slate-400"
                           />
                         </div>
                         <div>
@@ -2481,7 +2492,11 @@ export default function Vault() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => setEditingEntryId(null)}
+                            onClick={() => {
+                              setEditingEntryId(null);
+                              setEditForm(BLANK_EDIT_FORM);
+                              setEditCustomFields([]);
+                            }}
                             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
                           >
                             <X className="h-3.5 w-3.5" />
