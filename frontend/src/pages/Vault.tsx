@@ -46,6 +46,7 @@ import Layout from '@/components/Layout';
 import VaultExportModal from '@/components/VaultExportModal';
 import VaultImportModal from '@/components/VaultImportModal';
 import RotationManager from '@/components/RotationManager';
+import CredentialHealth from '@/components/CredentialHealth';
 import {
   vaultApi,
   serviceIdentitiesApi,
@@ -2045,6 +2046,8 @@ export default function Vault() {
             </button>
           </div>
         )}
+
+        {vaultUnlocked && <CredentialHealth entries={vaultEntries} />}
 
         {/* Add secret form */}
         {vaultUnlocked && (
