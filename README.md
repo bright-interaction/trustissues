@@ -31,8 +31,9 @@ cp .env.example .env   # or export the two secrets
 docker compose up -d
 ```
 
-Keep `TRUSTISSUES_VAULT_KEY` safe: rotating or losing it makes every
-encrypted column (vault entries, TOTP seeds) unreadable.
+Keep `TRUSTISSUES_VAULT_KEY` safe: losing it makes every encrypted column
+(vault entries, TOTP seeds) unreadable. Rotation is supported only through the
+documented dual-key procedure; never replace the current key in isolation.
 
 ## Environment variables
 
@@ -108,9 +109,10 @@ openssl rand -hex 32   # TRUSTISSUES_JWT_SECRET
   store separate from your database backups.
 - `TRUSTISSUES_JWT_SECRET` signs sessions. Losing it just forces everyone to log
   in again.
-- Do not rotate `TRUSTISSUES_VAULT_KEY` by editing the env var. There is no
-  in-place re-key in this build, so a changed value orphans all data. See the
-  rotation procedure in `SECURITY.md`.
+- Do not rotate `TRUSTISSUES_VAULT_KEY` by replacing the environment value
+  alone. Put the old value in `TRUSTISSUES_VAULT_KEY_PREVIOUS`, set the new
+  current key, restart, run and verify the transactional re-encryption sweep,
+  then remove the previous key. See the exact procedure in `SECURITY.md`.
 
 ### Run behind TLS (recommended: Caddy)
 
@@ -147,8 +149,8 @@ Caddy adds HSTS for you; if you use nginx/Traefik instead, enable HSTS there.
 ### Backups
 
 A naive `cp` of the database while the server runs can produce a torn snapshot
-(SQLite runs in WAL mode). Use the WAL-safe helper, which wraps SQLite's online
-backup API and writes the snapshot mode 0600:
+(SQLite runs in WAL mode). Use the WAL-safe helper, which creates a compacting
+`VACUUM INTO` snapshot and writes it mode 0600:
 
 ```bash
 # bare metal
@@ -156,7 +158,7 @@ TRUSTISSUES_DATA_DIR=/opt/trustissues/data ./scripts/backup.sh /secure/backups
 
 # docker compose (the data lives in a named volume at /app/data)
 docker compose exec trustissues \
-  sqlite3 /app/data/trustissues.db ".backup '/app/data/backup.db'"
+  sqlite3 /app/data/trustissues.db "VACUUM INTO '/app/data/backup.db'"
 docker compose cp trustissues:/app/data/backup.db ./trustissues-snapshot.db
 docker compose exec trustissues rm -f /app/data/backup.db
 ```
@@ -165,16 +167,18 @@ See `docs/BACKUP.md` for the full backup, restore, and key-custody procedure.
 
 Backup rules (the short version):
 
-- The backup is AES-GCM ciphertext + password hashes. It is safe at rest
-  **without** the key, which is exactly why the key must live somewhere else. A
-  backup and the `TRUSTISSUES_VAULT_KEY` stored together is the same as no
-  encryption.
+- Secret payloads and entry metadata in the backup are AES-GCM ciphertext, but
+  the file also contains password hashes plus account and audit metadata. Treat
+  every snapshot as sensitive and encrypt the whole file before third-party or
+  off-host storage. Keep that wrapping key and `TRUSTISSUES_VAULT_KEY` separate
+  from the snapshots; a backup beside the vault key cancels column encryption.
 - To restore, use `./scripts/restore.sh <snapshot>` (add `--compose` for the
   Compose deploy). It refuses while the service is running and clears the stale
   `-wal`/`-shm` sidecars, which matters: leaving them lets SQLite recover the OLD
   database's tail over your restored file and silently undo the restore. Start
-  with the **same** `TRUSTISSUES_VAULT_KEY`; a different key yields
-  `[decryption error]` on every secret, permanently.
+  with the key (or current+previous keyring) that opens that snapshot. A wrong
+  key makes normal startup refuse before serving data; restore the correct key
+  rather than using the destructive key-mismatch override.
 - **Schedule it.** `sudo ./deploy/systemd/install.sh` installs a daily backup
   timer, a weekly restore drill, retention (keep 7 daily / 4 weekly) and email
   alerting on failure, all driven by `/etc/trustissues/backup.env`. Hosts
@@ -192,12 +196,17 @@ Backup rules (the short version):
 - An in-process `trustissues backup` subcommand and off-host replication are
   still deferred (`DEFERRED.md` section (d)).
 
+Database snapshots are for disaster recovery. The native vault export used to
+move data between Trustissues instances is deliberately plaintext and needs a
+different handling procedure; see `docs/PORTABILITY.md`.
+
 ### File permissions
 
-`TRUSTISSUES_DATA_DIR` is created 0700. The database file itself is currently
-0644, so do not bind-mount the data directory to a shared host path, and
-`chmod 600 "$TRUSTISSUES_DATA_DIR"/trustissues.db*` after first boot on a
-multi-user host.
+The server enforces mode 0700 on `TRUSTISSUES_DATA_DIR` and mode 0600 on every
+regular file inside it, including the database and WAL sidecars, at boot. Keep
+the data directory on a non-shared host path anyway: filesystem permissions do
+not protect against root, the container runtime, or a process running as the
+service account.
 
 ## AI gateway and MCP (use AI while keeping secrets)
 

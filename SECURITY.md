@@ -106,7 +106,11 @@ Take a backup first (see `docs/BACKUP.md`). Then:
 5. Confirm **Settings -> Encryption** reports everything on the current key.
 6. **Remove `TRUSTISSUES_VAULT_KEY_PREVIOUS` and restart.** Until you do, the
    key you are retiring is still loaded and still opens all of this data, which
-   defeats the point of rotating after a compromise.
+   defeats the point of rotating after a compromise. Remove it from the live
+   process, not necessarily from offline custody: every retained pre-sweep
+   snapshot still needs the old key, and a snapshot taken during the sweep may
+   need both keys. Retain retired keys mapped to those snapshots until the
+   snapshots expire, then expire the keys with them. See `docs/BACKUP.md`.
 
 `GET /api/admin/vault-key` returns the same report as the UI: a per-column count
 of how many values are on the current key, on the previous key, stale, or
@@ -178,9 +182,12 @@ Trustissues is pre-1.0. Security fixes land on `main`. Run a recent build.
 ## Known gaps tracked for the next hardening pass
 
 See THREAT-MODEL.md "Residual risks" (R1 through R7) and DEFERRED.md. The
-operator-visible ones: backups are manual (WAL-safe `scripts/backup.sh`, see
-docs/BACKUP.md; scheduling is deferred), the DB file and its `-wal`/`-shm` are
-chmodded to 0600 on boot with the data dir 0700 (still, keep
+operator-visible ones: WAL-safe backups, retention, scheduled restore drills and
+failure alerting ship for systemd and cron hosts (`scripts/backup.sh` and
+`docs/BACKUP.md`); off-host replication, container-internal scheduling, a
+real-key decrypt drill, and monitoring the drill timer remain operator work. The
+DB file and its `-wal`/`-shm` are chmodded to 0600 on boot with the data dir 0700
+(still, keep
 `TRUSTISSUES_DATA_DIR` off a shared mount), the app must bind loopback
 (`TRUSTISSUES_BIND_HOST=127.0.0.1`) behind TLS with
 `TRUSTISSUES_TRUSTED_PROXY_HOPS` set to the real proxy count, and a wrong

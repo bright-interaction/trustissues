@@ -55,8 +55,13 @@ audit: the only `DisableTOTP` call site in the codebase is inside the
 
 ```sh
 docker compose -f docker-compose.prod.yml exec trustissues \
-  sqlite3 /data/trustissues.db ".backup '/data/pre-recovery.db'"
+  sqlite3 /data/trustissues.db "VACUUM INTO '/data/pre-recovery.db'"
 ```
+
+`VACUUM INTO` refuses to overwrite an existing file. Move the snapshot out of
+the container (and remove any stale `/data/pre-recovery.db`) before repeating a
+recovery attempt. It is WAL-safe and, unlike SQLite's page-copy `.backup`, does
+not carry freelist residue into the break-glass snapshot.
 
 The database lives under `TRUSTISSUES_DATA_DIR` (default `./data`). The container
 is named `trustissues` (`docker-compose.prod.yml:35`). Adjust paths to your

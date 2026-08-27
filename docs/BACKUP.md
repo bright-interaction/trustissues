@@ -9,12 +9,13 @@ Three rules sit above everything else on this page:
 1. **Take WAL-safe snapshots.** The database runs in SQLite WAL mode. A plain
    `cp` of `trustissues.db` while the server runs can copy a torn or stale file
    because recent commits live in the `-wal` sidecar until a checkpoint. Always
-   use the online backup below, never a naive copy.
+   use the live WAL-safe `VACUUM INTO` snapshot below, never a naive copy.
 2. **Store the backup and `TRUSTISSUES_VAULT_KEY` in separate places.** The
-   backup is AES-256-GCM ciphertext and is safe at rest without the key. That is
-   the whole point. If the backup and the key ever sit together, you have thrown
-   the encryption away. Losing the key makes every backup permanently
-   unreadable, with no reset and no recovery.
+   secret payloads are AES-256-GCM ciphertext, but the file still contains
+   sensitive identity/audit metadata and password hashes. Encrypt the whole
+   snapshot before it leaves a trusted host, and never store either wrapping
+   key or the vault key beside it. Losing the vault key makes the encrypted
+   payloads permanently unreadable, with no reset and no recovery.
 3. **Do not keep the backups on the database's own disk.** See
    [Where the backups go](#where-the-backups-go). The shipped Compose deploy
    makes this the easy mistake, and it is the difference between surviving a
@@ -29,12 +30,18 @@ A backup is the single SQLite database file. Inside it:
 - Entry metadata (name, URL, username) is encrypted at rest as well; URL lookups
   go through a keyed blind index, so a stolen file does not reveal which sites
   the team has entries for, only that some equal-URL entries exist.
-- Account password hashes are Argon2id. They are one-way and key-independent, so
-  a restore under a different vault key still lets people log in, but every
-  secret comes back as `[decryption error]`.
+- Account password hashes are Argon2id, one-way and key-independent. Normal
+  startup still requires the vault key/keyring that opens the encrypted store;
+  the boot gate refuses a mismatched key before users can log in.
+- Account identifiers, recent login-attempt email/IP data, and portions of the
+  append-only activity trail (including IP address and user agent) are plaintext
+  operational metadata. Password hashes also permit offline guessing attempts.
 
-So the file is useless to a thief who does not also have the vault key. That is
-exactly why the key lives somewhere else.
+Without the vault key, a thief cannot directly open the encrypted secret
+payloads. They can still learn operational metadata and attack password hashes,
+so the database is a sensitive backup, not a public ciphertext blob. Key
+separation limits the worst-case impact; whole-file encryption protects the
+remaining contents.
 
 ## Taking a backup
 
@@ -114,15 +121,16 @@ a path that already exists: if a previous run died before the `rm -f`, clear
 `/app/data/backup.db` first.)
 
 Alternatively stop the container first (`docker compose stop`), then tar the
-volume: with the writer stopped the on-disk file is consistent. The online
-backup is preferred because it needs no downtime.
+volume: with the writer stopped the on-disk file is consistent. The live
+`VACUUM INTO` snapshot is preferred because it needs no downtime and does not
+copy freelist residue.
 
-### Optional: encrypt the whole file for off-site storage
+### Encrypt the whole file before off-site storage
 
-The secret columns are already ciphertext, but the file still contains the
-schema and Argon2 hashes. If you ship backups to third-party storage, wrap the
-snapshot with `age` or `gpg` for defense in depth, and keep that wrapping key
-distinct from the vault key too:
+The secret columns are already ciphertext, but the file still contains account
+and audit metadata, the schema, and Argon2 hashes. Before shipping a backup to
+third-party or off-host storage, wrap the snapshot with `age` or `gpg`, and keep
+that wrapping key distinct from the vault key too:
 
 ```bash
 age -r age1... -o trustissues-YYYY.db.age trustissues-YYYY.db && rm trustissues-YYYY.db
@@ -508,20 +516,24 @@ physically and logically separate from wherever the database backups live.
 - Not in the same object-storage bucket as the backups.
 - Not in the same repo, the same `.env` you also archive, or the same disk image.
 - Back it up once, deliberately. It never changes on its own. If you DO rotate it
-  (see "Rotating the vault key" in `../SECURITY.md`), keep the old key until the
-  re-encrypt sweep reports the store fully on the new one, because every backup
-  taken before that sweep is still sealed under the old key. A restore is a
-  rotation in reverse: restoring a pre-sweep backup means setting the old key as
-  `TRUSTISSUES_VAULT_KEY_PREVIOUS` again. Guard both like a root password.
+  (see "Rotating the vault key" in `../SECURITY.md`), keep the old key in the
+  live process until the re-encrypt sweep reports the store fully current. Then
+  remove it from the live process, but retain it offline, mapped to every
+  pre-sweep snapshot, until those snapshots expire. A snapshot taken while the
+  sweep is in flight can contain rows under both keys and must be restored with
+  the full current+previous keyring. Guard every retained key like a root
+  password; expire snapshots and their retired keys together.
 
 If you only ever remember one sentence from this page: the backup and the key
 must never be recoverable from the same place.
 
 ## Restoring
 
-1. Provision the host with the **same** `TRUSTISSUES_VAULT_KEY` the backup was
-   taken under. Retrieve it from your separate key store. Without it the restore
-   is pointless: every secret returns `[decryption error]` and no tool can
+1. Provision the host with the keyring the snapshot was taken under. A snapshot
+   outside a rotation normally needs its matching `TRUSTISSUES_VAULT_KEY`; a
+   snapshot taken during a rotation can require both that current key and
+   `TRUSTISSUES_VAULT_KEY_PREVIOUS`. Retrieve them from your separate key store.
+   Without the matching key material, normal startup refuses and no tool can
    recover the plaintext.
 2. Stop Trustissues if it is running.
 3. Put the snapshot in place as `trustissues.db` in the data directory, and
@@ -573,15 +585,16 @@ must never be recoverable from the same place.
 4. Start the server with the same key and the same `TRUSTISSUES_DATA_DIR`.
    Embedded migrations run automatically and bring an older schema forward.
 5. **Verify before you trust it.** Log in, unlock the vault, and reveal at least
-   one secret. If it comes back in cleartext, the key and the backup match. If it
-   comes back `[decryption error]`, you restored under the wrong key. Stop, do
-   not overwrite your good backup, and find the correct key.
+   one secret. If startup refuses its key check, stop, do not overwrite the good
+   snapshot, and recover the matching key/keyring. Do not use
+   `TRUSTISSUES_ALLOW_KEY_MISMATCH=1`: that explicit destructive escape hatch can
+   boot into unreadable data and is not a restore procedure.
 
 ## What a restore does not fix
 
-- A wrong or lost vault key. There is no partial recovery: one wrong key means
-  every secret is gone. This is by design (server-side crypto with the key held
-  only in the environment).
+- A lost vault key. There is no partial recovery once the matching key material
+  is actually gone. Merely configuring the wrong key is reversible: normal boot
+  refuses, and putting the correct key/keyring back restores access.
 - Tampering you did not notice before the backup. Restore gives you the state as
   of the snapshot, nothing more.
 
