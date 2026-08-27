@@ -35,9 +35,11 @@ per-email lockout and per-IP throttling on login, constant-time handling of
 unknown accounts, optional TOTP 2FA with hashed single-use recovery codes,
 admin-enforceable team-wide 2FA.
 
-**Sessions.** Stateless HS256 JWT signed with `TRUSTISSUES_JWT_SECRET`, delivered
-as an `HttpOnly; Secure; SameSite=Strict` cookie. Password change revokes all
-prior sessions.
+**Sessions.** HS256 JWT signed with `TRUSTISSUES_JWT_SECRET`, delivered as an
+`HttpOnly; Secure; SameSite=Strict` cookie. The JWT carries a session id that is
+checked against a server-side row on every request, so logout, password changes,
+idle expiry and administrative revocation take effect before the token's signed
+expiry. The token format is JWT; the session is deliberately not stateless.
 
 **Transport.** The app expects to run behind a TLS-terminating proxy. Session
 cookies are `Secure`, so they will not be sent over plain HTTP to a non-loopback

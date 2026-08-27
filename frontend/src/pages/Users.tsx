@@ -11,6 +11,7 @@ import {
   Trash2,
   Users as UsersIcon,
   X,
+  AlertTriangle,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
 import { api, ApiError } from '@/lib/api';
@@ -84,7 +85,7 @@ export default function UsersPage() {
   const [resetTarget, setResetTarget] = useState<ManagedUser | null>(null);
   const [resetPassword, setResetPassword] = useState('');
 
-  const { data: users = [], isLoading: usersLoading } = useQuery<ManagedUser[]>(
+  const { data: users = [], isLoading: usersLoading, isError: usersError, error: usersQueryError, refetch: refetchUsers } = useQuery<ManagedUser[]>(
     {
       queryKey: queryKeys.admin.users(),
       queryFn: api.admin.listUsers,
@@ -254,6 +255,13 @@ export default function UsersPage() {
       {usersLoading ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+        </div>
+      ) : usersError ? (
+        <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-6 py-10 text-center">
+          <AlertTriangle className="mx-auto mb-3 h-8 w-8 text-rose-500" />
+          <p className="text-sm font-medium text-rose-800">Users could not be loaded</p>
+          <p className="mt-1 text-sm text-rose-700">{errorMessage(usersQueryError)}</p>
+          <button onClick={() => void refetchUsers()} className="mt-4 rounded-lg bg-rose-700 px-3 py-2 text-sm font-medium text-white hover:bg-rose-800">Retry</button>
         </div>
       ) : users.length === 0 ? (
         <div className="rounded-xl border border-slate-200 bg-white px-4 py-12 text-center">

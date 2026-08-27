@@ -8,6 +8,7 @@ import {
   Filter,
   Loader2,
   ShieldCheck,
+  AlertTriangle,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { queryKeys } from '@/lib/query-keys';
@@ -109,7 +110,7 @@ export default function CredentialAccess() {
 
   const offset = page * PAGE_SIZE;
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: queryKeys.capabilityLog.list({
       agent: agentFilter,
       event: eventFilter,
@@ -184,6 +185,13 @@ export default function CredentialAccess() {
       {isLoading ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+        </div>
+      ) : isError ? (
+        <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-6 py-10 text-center">
+          <AlertTriangle className="mx-auto mb-3 h-8 w-8 text-rose-500" />
+          <p className="text-sm font-medium text-rose-800">Credential access could not be loaded</p>
+          <p className="mt-1 text-sm text-rose-700">{error instanceof Error ? error.message : 'Try again.'}</p>
+          <button onClick={() => void refetch()} className="mt-4 rounded-lg bg-rose-700 px-3 py-2 text-sm font-medium text-white hover:bg-rose-800">Retry</button>
         </div>
       ) : entries.length === 0 ? (
         // An empty audit surface reads as a broken one unless it says what it
