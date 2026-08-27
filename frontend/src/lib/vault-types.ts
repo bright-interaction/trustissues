@@ -31,7 +31,7 @@ export interface VaultEntry {
   notes: string;
   rotation_interval_days: number | null;
   expires_at: string | null;
-  last_rotated_at: string;
+  last_rotated_at: string | null;
   // 'error' is returned whenever last_rotation_error is set, and the server
   // checks it BEFORE the age branches, so it also replaces 'overdue'. The client
   // type omitted it, which rendered an empty pill: the one state an operator

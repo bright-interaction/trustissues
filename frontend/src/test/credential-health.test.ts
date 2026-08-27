@@ -54,6 +54,19 @@ describe('credential health', () => {
     expect(report.checked).toBe(0);
   });
 
+  it('does not treat an unrelated metadata edit as a password change', () => {
+    const report = analyzeCredentialHealth([
+      entry('metadata-edit', 'R8!md4_Zp2#vL9@qT6', {
+        last_rotated_at: null,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: '2026-08-26T00:00:00Z',
+      }),
+    ], now);
+
+    expect(report.old).toBe(1);
+    expect(report.issues[0]?.reasons).toContain('has not been changed for 969 days');
+  });
+
   it('shows entry names and reasons without rendering plaintext values', async () => {
     const user = userEvent.setup();
     render(createElement(CredentialHealth, {

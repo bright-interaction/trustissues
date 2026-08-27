@@ -59,7 +59,12 @@ function weakReasons(entry: VaultEntry): string[] {
 }
 
 function credentialAgeDays(entry: VaultEntry, now: Date): number | null {
-  const raw = entry.last_rotated_at || entry.updated_at || entry.created_at;
+  // updated_at also moves when somebody edits notes, a URL, provider settings,
+  // or collection metadata. Treating that as a password change lets a cosmetic
+  // edit make an old credential look fresh for another year. last_rotated_at is
+  // the value-change signal; created_at is the conservative fallback for an
+  // entry whose value has never been changed.
+  const raw = entry.last_rotated_at || entry.created_at;
   if (!raw) return null;
   const date = new Date(raw);
   if (Number.isNaN(date.getTime())) return null;
