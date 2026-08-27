@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -108,7 +109,7 @@ func (h *VaultHandler) validateExportCustomFields(stored string) error {
 			return fmt.Errorf("parse %s: response-only withheld marker is stored", vaultFieldCustomFields.Name())
 		}
 	}
-	if err := validateCustomFields(fields); err != nil {
+	if err := validatePortableCustomFields(fields); err != nil {
 		return fmt.Errorf("validate %s: %w", vaultFieldCustomFields.Name(), err)
 	}
 	return nil
@@ -143,6 +144,12 @@ func parseExportDestinationPatterns(raw string) ([]string, error) {
 	if patterns == nil {
 		return nil, fmt.Errorf("parse vault_entries.destination_patterns: expected a JSON array")
 	}
+	if err := ValidateDestinationPatterns(patterns); err != nil {
+		return nil, fmt.Errorf("validate vault_entries.destination_patterns: %w", err)
+	}
+	if !slices.Equal(patterns, NormalizeDestinationPatterns(patterns)) {
+		return nil, fmt.Errorf("validate vault_entries.destination_patterns: expected canonical patterns")
+	}
 	return patterns, nil
 }
 
@@ -157,9 +164,18 @@ func parseExportDestinationPatterns(raw string) ([]string, error) {
 // any attachment bytes are written.
 func (h *VaultHandler) revealAccessibleVaultEntries(r *http.Request, userID, operation string,
 	requireComplete bool) ([]vaultEntryFull, error) {
+	return h.revealAccessibleVaultEntriesWithQueries(r, h.queries, userID, operation, requireComplete)
+}
+
+// revealAccessibleVaultEntriesWithQueries is the transaction-aware form used
+// by native export. Keeping count, reveal, and collection lookup on one read
+// snapshot makes the entry ceiling a guarantee rather than a racy pre-check.
+// Unlock uses the wrapper above and retains its ordinary connection pool path.
+func (h *VaultHandler) revealAccessibleVaultEntriesWithQueries(r *http.Request, queries *db.Queries,
+	userID, operation string, requireComplete bool) ([]vaultEntryFull, error) {
 
 	ctx := r.Context()
-	rows, err := h.queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
+	rows, err := queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
 		ID:       userID,
 		UserID:   userID,
 		UserID_2: userID,
@@ -324,7 +340,7 @@ func makeVaultExportEntries(revealed []vaultEntryFull) []vaultExportEntry {
 // exportCollections returns only scopes referenced by entries that passed the
 // reveal authority. It exports no member list or role: those are live authority
 // in the source instance, not portable vault contents.
-func (h *VaultHandler) exportCollections(r *http.Request,
+func (h *VaultHandler) exportCollections(r *http.Request, queries *db.Queries,
 	entries []vaultEntryFull) ([]vaultExportCollection, error) {
 
 	ids := make(map[string]struct{})
@@ -336,7 +352,7 @@ func (h *VaultHandler) exportCollections(r *http.Request,
 
 	out := make([]vaultExportCollection, 0, len(ids))
 	for id := range ids {
-		collection, err := h.queries.GetCollection(r.Context(), id)
+		collection, err := queries.GetCollection(r.Context(), id)
 		if err != nil {
 			return nil, fmt.Errorf("read referenced collection %s: %w", id, err)
 		}
@@ -394,13 +410,58 @@ func (h *VaultHandler) Export(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	revealed, err := h.revealAccessibleVaultEntries(r, userID, "POST /api/vault/export", true)
+	// Count and reveal inside one snapshot. A standalone count followed by a
+	// pooled list has a TOCTOU gap: entries added between them could make the
+	// supposedly bounded export allocate and decrypt an unbounded result set.
+	// CountAccessibleVaultEntries itself stops after maxImportEntries+1 rows.
+	snapshot, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		logError(r, "vault.export: begin snapshot failed", "error", err)
+		writeInternalError(w, r, "vault export could not be completed")
+		return
+	}
+	defer func() { _ = snapshot.Rollback() }()
+	qtx := h.queries.WithTx(snapshot)
+	preflight, err := qtx.CountAccessibleVaultEntries(r.Context(), db.CountAccessibleVaultEntriesParams{
+		ID: userID, UserID: userID, UserID_2: userID, MaxRows: maxImportEntries + 1,
+	})
+	if err != nil {
+		logError(r, "vault.export: count failed", "error", err)
+		writeInternalError(w, r, "vault export could not be completed")
+		return
+	}
+	if preflight.EntryCount > maxImportEntries {
+		writeError(w, r, http.StatusRequestEntityTooLarge, "native_export_too_large",
+			fmt.Sprintf("native export supports at most %d accessible entries", maxImportEntries))
+		return
+	}
+	// This is a conservative lower bound computed from ciphertext lengths and
+	// unencrypted portable fields. If even the minimum representation is over
+	// the file ceiling, no amount of JSON compaction can make it importable. Stop
+	// here, before the bulk query allocates or any secret is decrypted.
+	if preflight.MinimumPortableBytes > MaxNativeVaultFileBytes {
+		writeError(w, r, http.StatusRequestEntityTooLarge, "native_export_too_large",
+			fmt.Sprintf("native export exceeds the %d MiB portable file limit",
+				MaxNativeVaultFileBytes/(1<<20)))
+		return
+	}
+
+	revealed, err := h.revealAccessibleVaultEntriesWithQueries(r, qtx, userID,
+		"POST /api/vault/export", true)
 	if err != nil {
 		logError(r, "vault.export: reveal failed", "error", err)
 		writeInternalError(w, r, "vault export could not be completed")
 		return
 	}
-	collections, err := h.exportCollections(r, revealed)
+	// This should be implied by the snapshot count. Keep the postcondition next
+	// to the plaintext slice so a future query-scope drift fails closed.
+	if len(revealed) > maxImportEntries {
+		logError(r, "vault.export: bounded count/reveal scope mismatch", "count", preflight.EntryCount,
+			"revealed", len(revealed))
+		writeInternalError(w, r, "vault export could not be completed")
+		return
+	}
+	collections, err := h.exportCollections(r, qtx, revealed)
 	if err != nil {
 		logError(r, "vault.export: collection query failed", "error", err)
 		writeInternalError(w, r, "vault export could not be completed")
@@ -415,13 +476,43 @@ func (h *VaultHandler) Export(w http.ResponseWriter, r *http.Request) {
 		Collections: collections,
 		Entries:     makeVaultExportEntries(revealed),
 	}
-	payload, err := json.MarshalIndent(document, "", "  ")
+	// The importer owns the executable native-v1 schema contract. Applying that
+	// same validator here catches any legacy stored shape or future exporter
+	// drift before we claim to have produced a restorable backup. Name conflicts
+	// are reported in the returned plan, not as validation errors, because they
+	// depend on the destination vault and do not make the document malformed.
+	if _, err := validateNativeImportDocument(document); err != nil {
+		logError(r, "vault.export: native document validation failed", "error", err)
+		writeInternalError(w, r, "vault export could not be completed")
+		return
+	}
+	encoded, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
 		logError(r, "vault.export: encoding failed", "error", err)
 		writeInternalError(w, r, "vault export could not be completed")
 		return
 	}
-	payload = append(payload, '\n')
+	// Marshal and append may use different backing arrays. Wipe both so the
+	// complete plaintext vault does not wait for a later garbage collection on
+	// either a refused export or a successful response.
+	defer clear(encoded)
+	payload := append(encoded, '\n')
+	defer clear(payload)
+	if len(payload) > MaxNativeVaultFileBytes {
+		writeError(w, r, http.StatusRequestEntityTooLarge, "native_export_too_large",
+			fmt.Sprintf("native export exceeds the %d MiB portable file limit",
+				MaxNativeVaultFileBytes/(1<<20)))
+		return
+	}
+	// End the read transaction before the required activity insert takes a write
+	// lock. Commit is only a snapshot close here (the transaction performed no
+	// writes); spelling the boundary explicitly also keeps later pool-backed work
+	// outside the transaction scope enforced by tx_scope_test.go.
+	if err := snapshot.Commit(); err != nil {
+		logError(r, "vault.export: close snapshot failed", "error", err)
+		writeInternalError(w, r, "vault export could not be completed")
+		return
+	}
 
 	filename := "trustissues-vault-" + now.Format("20060102-150405") + ".json"
 	// No entry names, usernames, URLs, provider configuration or secret values

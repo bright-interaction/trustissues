@@ -63,6 +63,101 @@ func (q *Queries) AddCollectionMember(ctx context.Context, arg AddCollectionMemb
 	return err
 }
 
+const countAccessibleVaultEntries = `-- name: CountAccessibleVaultEntries :one
+WITH accessible AS (
+  SELECT e.id FROM vault_entries e
+  WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
+    AND ((e.collection_id IS NULL AND e.user_id = ?)
+     OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
+  LIMIT ?4
+), accessible_rows AS (
+  SELECT e.id, e.collection_id, e.encrypted_value, e.name, e.url,
+         e.alias_url, e.username, e.category, e.notes, e.provider
+  FROM vault_entries e
+  WHERE e.id IN (SELECT id FROM accessible)
+), entry_stats AS (
+  SELECT COUNT(*) AS entry_count,
+    COALESCE(SUM(
+      length(CAST(e.id AS BLOB)) +
+      length(CAST(COALESCE(e.collection_id, '') AS BLOB)) +
+      MAX(length(e.encrypted_value) - 16, 0) +
+      CASE WHEN substr(e.name, 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.name) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(e.name AS BLOB)) END +
+      CASE WHEN substr(COALESCE(e.url, ''), 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.url) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(COALESCE(e.url, '') AS BLOB)) END +
+      CASE WHEN substr(COALESCE(e.alias_url, ''), 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.alias_url) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(COALESCE(e.alias_url, '') AS BLOB)) END +
+      CASE WHEN substr(COALESCE(e.username, ''), 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.username) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(COALESCE(e.username, '') AS BLOB)) END +
+      CASE WHEN substr(COALESCE(e.category, ''), 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.category) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(COALESCE(e.category, '') AS BLOB)) END +
+      CASE WHEN substr(COALESCE(e.notes, ''), 1, 7) = 'enc:v1:'
+        THEN MAX(((length(e.notes) - 7) / 4) * 3 - 30, 0)
+        ELSE length(CAST(COALESCE(e.notes, '') AS BLOB)) END +
+      length(CAST(COALESCE(e.provider, '') AS BLOB))
+    ), 0) AS minimum_portable_bytes
+  FROM accessible_rows e
+), collection_stats AS (
+  SELECT COALESCE(SUM(
+    length(CAST(c.id AS BLOB)) +
+    length(CAST(c.name AS BLOB)) +
+    length(CAST(COALESCE(c.description, '') AS BLOB))
+  ), 0) AS minimum_portable_bytes
+  FROM collections c
+  WHERE c.id IN (
+    SELECT DISTINCT collection_id FROM accessible_rows WHERE collection_id IS NOT NULL
+  )
+)
+SELECT entry_stats.entry_count AS entry_count,
+       entry_stats.minimum_portable_bytes + collection_stats.minimum_portable_bytes AS minimum_portable_bytes
+FROM entry_stats CROSS JOIN collection_stats
+`
+
+type CountAccessibleVaultEntriesParams struct {
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	UserID_2 string `json:"user_id_2"`
+	MaxRows  int64  `json:"max_rows"`
+}
+
+type CountAccessibleVaultEntriesRow struct {
+	EntryCount           int64 `json:"entry_count"`
+	MinimumPortableBytes int64 `json:"minimum_portable_bytes"`
+}
+
+// Export preflight twin of ListAccessibleVaultEntries. Keep the disabled-user
+// and accepted-membership predicate byte-identical so the cheap count never
+// promises a bulk reveal whose row query has a different scope. The caller
+// passes the first disallowed count (currently 5,001), so this preflight cannot
+// scan an attacker-sized vault just to learn that it is over the export cap.
+//
+// minimum_portable_bytes is deliberately a LOWER bound, not an estimate. For
+// the entry value AES-GCM adds exactly a 16-byte tag. A sealed metadata column
+// is enc:v1: + base64(nonce || ciphertext); base64 can carry at most two padding
+// bytes, so floor(encoded/4)*3 - 30 is no greater than its plaintext byte count
+// (12-byte nonce + 16-byte tag + at most 2 padding bytes). JSON never represents
+// a string in fewer bytes than its UTF-8 input. Fields export may redact or
+// reserialize smaller (provider_meta, custom_fields, destination_patterns) are
+// intentionally excluded. Therefore a result over the native file ceiling can
+// be refused before any row is decrypted without rejecting a document that
+// could fit.
+func (q *Queries) CountAccessibleVaultEntries(ctx context.Context, arg CountAccessibleVaultEntriesParams) (CountAccessibleVaultEntriesRow, error) {
+	row := q.db.QueryRowContext(ctx, countAccessibleVaultEntries,
+		arg.ID,
+		arg.UserID,
+		arg.UserID_2,
+		arg.MaxRows,
+	)
+	var i CountAccessibleVaultEntriesRow
+	err := row.Scan(&i.EntryCount, &i.MinimumPortableBytes)
+	return i, err
+}
+
 const countCollectionEntries = `-- name: CountCollectionEntries :one
 SELECT COUNT(*) FROM vault_entries WHERE collection_id = ?
 `
@@ -1030,6 +1125,23 @@ type RemoveCollectionMemberParams struct {
 
 func (q *Queries) RemoveCollectionMember(ctx context.Context, arg RemoveCollectionMemberParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, removeCollectionMember, arg.CollectionID, arg.UserID)
+}
+
+const restoreNativeImportedCollectionTimestamps = `-- name: RestoreNativeImportedCollectionTimestamps :exec
+UPDATE collections SET created_at = ?, updated_at = ? WHERE id = ?
+`
+
+type RestoreNativeImportedCollectionTimestampsParams struct {
+	CreatedAt sql.NullTime `json:"created_at"`
+	UpdatedAt sql.NullTime `json:"updated_at"`
+	ID        string       `json:"id"`
+}
+
+// Native imports create a private copy with a fresh id and fresh authority, but
+// retain the source document's content timestamps for portable history.
+func (q *Queries) RestoreNativeImportedCollectionTimestamps(ctx context.Context, arg RestoreNativeImportedCollectionTimestampsParams) error {
+	_, err := q.db.ExecContext(ctx, restoreNativeImportedCollectionTimestamps, arg.CreatedAt, arg.UpdatedAt, arg.ID)
+	return err
 }
 
 const setVaultEntryCollection = `-- name: SetVaultEntryCollection :exec

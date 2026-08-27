@@ -383,6 +383,37 @@ func (q *Queries) DeleteVaultEntry(ctx context.Context, id string) (sql.Result, 
 	return q.db.ExecContext(ctx, deleteVaultEntry, id)
 }
 
+const finalizeNativeImportedVaultEntry = `-- name: FinalizeNativeImportedVaultEntry :exec
+UPDATE vault_entries
+SET collection_id = ?, custom_fields = ?, last_rotated_at = ?,
+    created_at = ?, updated_at = ?
+WHERE id = ?
+`
+
+type FinalizeNativeImportedVaultEntryParams struct {
+	CollectionID  sql.NullString `json:"collection_id"`
+	CustomFields  string         `json:"custom_fields"`
+	LastRotatedAt sql.NullTime   `json:"last_rotated_at"`
+	CreatedAt     sql.NullTime   `json:"created_at"`
+	UpdatedAt     sql.NullTime   `json:"updated_at"`
+	ID            string         `json:"id"`
+}
+
+// These are all egress-neutral fields. Provider/provider_meta and the
+// destination ceiling are intentionally absent: native import writes those
+// only through internal/vaultegress with an egressgate ticket.
+func (q *Queries) FinalizeNativeImportedVaultEntry(ctx context.Context, arg FinalizeNativeImportedVaultEntryParams) error {
+	_, err := q.db.ExecContext(ctx, finalizeNativeImportedVaultEntry,
+		arg.CollectionID,
+		arg.CustomFields,
+		arg.LastRotatedAt,
+		arg.CreatedAt,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	return err
+}
+
 const getUserPasswordHash = `-- name: GetUserPasswordHash :one
 
 SELECT password_hash FROM users WHERE id = ?

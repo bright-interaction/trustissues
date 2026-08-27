@@ -101,7 +101,7 @@ var theExitList = map[string]exitSite{
 	},
 
 	// ── back to a principal ──────────────────────────────────────────────
-	"vault_export.go:VaultHandler.revealAccessibleVaultEntries": {
+	"vault_export.go:VaultHandler.revealAccessibleVaultEntriesWithQueries": {
 		secret:  "every entry in an unlock or native-export response",
 		chooser: "the caller (a read question, not a destination question)",
 		why: "both callers password-re-verify above; this shared exit asks the second half, whether " +

@@ -55,6 +55,7 @@ func TestBodyLimitsExactBoundaries(t *testing.T) {
 	}{
 		{"default", "/api/vault/", defaultBodyLimit},
 		{"import", "/api/vault/import/preview", importBodyLimit},
+		{"native import", "/api/vault/import/native/preview", nativeImportBodyLimit},
 		{"proxy", "/proxy/api.example.com/v1/x", proxyBodyLimit},
 		// Derived from the handler's constant, not restated. If the two ever
 		// disagree by a single byte this fails, which is precisely what
@@ -115,6 +116,20 @@ func TestAIBudgetIsTheHandlersConstant(t *testing.T) {
 	}
 }
 
+// TestNativeImportBudgetCanCarryTheLargestPortableFile guards the two ceilings
+// as one contract. The file decoder accepts at most MaxNativeVaultFileBytes;
+// the HTTP request also carries multipart framing and (on confirm) a password,
+// so its route budget must be strictly larger than that file ceiling.
+func TestNativeImportBudgetCanCarryTheLargestPortableFile(t *testing.T) {
+	if nativeImportBodyLimit <= int64(handlers.MaxNativeVaultFileBytes) {
+		t.Fatalf("native import request budget %d must exceed portable file ceiling %d",
+			nativeImportBodyLimit, handlers.MaxNativeVaultFileBytes)
+	}
+	if got := nativeImportBodyLimit - int64(handlers.MaxNativeVaultFileBytes); got < 1<<20 {
+		t.Fatalf("native import multipart allowance = %d bytes, want at least 1 MiB", got)
+	}
+}
+
 // TestContentLengthDoesNotDecideTheLimit proves the header is not consulted, in
 // both directions. This is what makes removing it from the other cases safe to
 // rely on rather than merely tidy.
@@ -153,8 +168,10 @@ func TestBodyLimitsPerPathBudget(t *testing.T) {
 		{name: "default: under 1 MiB passes", path: "/api/vault/", bytes: MiB / 2},
 		{name: "default: over 1 MiB is blocked", path: "/api/vault/", bytes: 3 * MiB / 2, wantBlock: true},
 
-		{name: "import: 5 MiB is under the 10 MiB import budget", path: "/api/vault/import/preview", bytes: 5 * MiB},
-		{name: "import: 11 MiB exceeds the 10 MiB import budget", path: "/api/vault/import/preview", bytes: 11 * MiB, wantBlock: true},
+		{name: "CSV import: 5 MiB is under the 10 MiB budget", path: "/api/vault/import/preview", bytes: 5 * MiB},
+		{name: "CSV import: 11 MiB exceeds the 10 MiB budget", path: "/api/vault/import/preview", bytes: 11 * MiB, wantBlock: true},
+		{name: "native import: 10 MiB file plus framing fits the 11 MiB budget", path: "/api/vault/import/native/preview", bytes: 10*MiB + MiB/2},
+		{name: "native import: 12 MiB exceeds the 11 MiB budget", path: "/api/vault/import/native/preview", bytes: 12 * MiB, wantBlock: true},
 
 		{name: "proxy: 15 MiB is under the 17 MiB proxy budget", path: "/proxy/api.example.com/v1/x", bytes: 15 * MiB},
 		{name: "proxy: 18 MiB exceeds the 17 MiB proxy budget", path: "/proxy/api.example.com/v1/x", bytes: 18 * MiB, wantBlock: true},

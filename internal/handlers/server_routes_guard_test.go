@@ -79,6 +79,8 @@ var routeGuardRequirements = []routeGuardRequirement{
 		"the account's only route to ever having a real password; losing this silently reopens the P0-2 deadlock this endpoint exists to close"},
 	{"/export", "Post", "unlockLimiter",
 		"a native vault export bulk-releases plaintext and must share Unlock's password-guess budget"},
+	{"/import/native/confirm", "Post", "unlockLimiter",
+		"native confirm re-verifies the password and must share the re-auth password-guess budget"},
 }
 
 // routeGuardForbidden is the other direction, and it is what keeps the check

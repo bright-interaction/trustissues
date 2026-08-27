@@ -2079,7 +2079,7 @@ export default function Vault() {
                   className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
                   <Upload className="h-3.5 w-3.5" />
-                  Import CSV
+                  Import vault
                 </button>
                 <button
                   onClick={() => setShowExportModal(true)}

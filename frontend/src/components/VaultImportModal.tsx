@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { FileText, Upload, AlertTriangle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import clsx from 'clsx';
+import { ApiError } from '@/lib/api';
 import { vaultApi } from '@/lib/vault-types';
 import type {
   NativeVaultImportPreview,
@@ -22,6 +23,14 @@ function isNativeExport(file: File): boolean {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function conflictNames(error: unknown): string[] | null {
+  if (!(error instanceof ApiError) || error.status !== 409 || !error.body) return null;
+  const body = error.body as { conflicts?: unknown };
+  if (!Array.isArray(body.conflicts)) return null;
+  const names = body.conflicts.filter((name): name is string => typeof name === 'string');
+  return names.length > 0 ? names : null;
 }
 
 export default function VaultImportModal({ isOpen, onClose, onImportComplete }: VaultImportModalProps) {
@@ -190,6 +199,22 @@ export default function VaultImportModal({ isOpen, onClose, onImportComplete }: 
       onClose();
     } catch (error: unknown) {
       if (!isAbortError(error) && !controller.signal.aborted) {
+        const lateConflicts = conflictNames(error);
+        if (lateConflicts) {
+          // A name can be created after Preview but before Confirm. Promote the
+          // server's atomic 409 back into the same blocked state as Preview so
+          // the user sees what changed instead of being told to retry a password
+          // that was already correct.
+          setNativePreview((current) => current && {
+            ...current,
+            conflicts: lateConflicts,
+          });
+          setNativeError(null);
+          toast.error(
+            `Import blocked by ${lateConflicts.length} name conflict${lateConflicts.length === 1 ? '' : 's'}. No entries were imported.`
+          );
+          return;
+        }
         const message = 'Import failed. Your vault was not changed. Check your password and file, then try again.';
         setNativeError(message);
         toast.error(message);

@@ -224,6 +224,23 @@ type Querier interface {
 	// Affects zero rows when the step has already been used (or an older one is being
 	// replayed), which is how a captured code stops being reusable inside its own window.
 	ClaimTOTPStep(ctx context.Context, arg ClaimTOTPStepParams) (sql.Result, error)
+	// Export preflight twin of ListAccessibleVaultEntries. Keep the disabled-user
+	// and accepted-membership predicate byte-identical so the cheap count never
+	// promises a bulk reveal whose row query has a different scope. The caller
+	// passes the first disallowed count (currently 5,001), so this preflight cannot
+	// scan an attacker-sized vault just to learn that it is over the export cap.
+	//
+	// minimum_portable_bytes is deliberately a LOWER bound, not an estimate. For
+	// the entry value AES-GCM adds exactly a 16-byte tag. A sealed metadata column
+	// is enc:v1: + base64(nonce || ciphertext); base64 can carry at most two padding
+	// bytes, so floor(encoded/4)*3 - 30 is no greater than its plaintext byte count
+	// (12-byte nonce + 16-byte tag + at most 2 padding bytes). JSON never represents
+	// a string in fewer bytes than its UTF-8 input. Fields export may redact or
+	// reserialize smaller (provider_meta, custom_fields, destination_patterns) are
+	// intentionally excluded. Therefore a result over the native file ceiling can
+	// be refused before any row is decrypted without rejecting a document that
+	// could fit.
+	CountAccessibleVaultEntries(ctx context.Context, arg CountAccessibleVaultEntriesParams) (CountAccessibleVaultEntriesRow, error)
 	CountActivityEntries(ctx context.Context) (int64, error)
 	CountActivityEntriesByAction(ctx context.Context, action string) (int64, error)
 	// Backs the "vault.*" style category filters. The UI has always offered them,
@@ -351,6 +368,10 @@ type Querier interface {
 	// activity" rather than "the filter is broken", which is the worst possible
 	// failure for an audit surface.
 	ExportActivityEntries(ctx context.Context, arg ExportActivityEntriesParams) ([]ExportActivityEntriesRow, error)
+	// These are all egress-neutral fields. Provider/provider_meta and the
+	// destination ceiling are intentionally absent: native import writes those
+	// only through internal/vaultegress with an egressgate ticket.
+	FinalizeNativeImportedVaultEntry(ctx context.Context, arg FinalizeNativeImportedVaultEntryParams) error
 	GetCollection(ctx context.Context, id string) (Collection, error)
 	// Authorization lookup: a PENDING membership returns no row, so it grants
 	// neither read nor write anywhere entryAccess or canWriteCollection is used.
@@ -799,6 +820,9 @@ type Querier interface {
 	// anything, it only narrowed. Returning the name lets the caller narrow on
 	// exactly what it narrowed on before.
 	ResolveVaultReference(ctx context.Context) ([]ResolveVaultReferenceRow, error)
+	// Native imports create a private copy with a fresh id and fresh authority, but
+	// retain the source document's content timestamps for portable history.
+	RestoreNativeImportedCollectionTimestamps(ctx context.Context, arg RestoreNativeImportedCollectionTimestampsParams) error
 	// Revocation by flag, not by DELETE, so the audit trail survives the incident.
 	// COALESCE keeps the call idempotent: revoking an already-revoked key does not
 	// move its timestamp and still reports a row, so a repeated incident-response

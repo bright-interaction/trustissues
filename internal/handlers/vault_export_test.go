@@ -320,6 +320,83 @@ END`); err != nil {
 	}
 }
 
+func TestVaultExportRefusesDocumentsTheNativeImporterCannotBound(t *testing.T) {
+	t.Run("entry ceiling is checked before bulk reveal", func(t *testing.T) {
+		h, queries := newCollectionAuthzEnv(t)
+		ctx := context.Background()
+		const password = "correct-over-count-export-password"
+		caller := mustUser(t, queries, "export-over-count@example.com", "user", password)
+
+		// Deliberately store invalid ciphertext. A correct preflight returns 413
+		// from the bounded count without ever trying to reveal one of these rows;
+		// moving the check after bulk reveal turns this into a 500 instead.
+		if _, err := h.db.ExecContext(ctx, `WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+)
+INSERT INTO vault_entries
+  (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, encryption_version)
+SELECT printf('entry-export-over-count-%06d', n), ?, ?,
+       printf('Export over count %06d', n), x'00', x'00', 2
+FROM seq`, maxImportEntries+1, caller, caller); err != nil {
+			t.Fatalf("seed over-count vault: %v", err)
+		}
+
+		rec := exportVaultAs(h, caller, "user", password)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("over-count export: got HTTP %d, want 413: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"code":"native_export_too_large"`) {
+			t.Errorf("over-count response lost stable error code: %s", rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Disposition"); got != "" {
+			t.Errorf("over-count response was presented as an attachment: %q", got)
+		}
+		if rows, err := queries.ListActivityEntriesByAction(ctx, db.ListActivityEntriesByActionParams{
+			Action: "vault.exported", Limit: 10, Offset: 0,
+		}); err != nil {
+			t.Fatalf("read export audit rows: %v", err)
+		} else if len(rows) != 0 {
+			t.Fatalf("refused over-count export wrote %d success audit rows", len(rows))
+		}
+	})
+
+	t.Run("stored-size lower bound is checked before decryption or audit", func(t *testing.T) {
+		h, queries := newCollectionAuthzEnv(t)
+		ctx := context.Background()
+		const password = "correct-over-bytes-export-password"
+		caller := mustUser(t, queries, "export-over-bytes@example.com", "user", password)
+		mustEntry(t, h, queries, "entry-export-over-bytes", caller, "Oversized legacy login", "small")
+		// zeroblob keeps the test fixture cheap while making the stored ciphertext
+		// one byte too large to yield a portable plaintext value. Its nonce and
+		// contents are deliberately invalid: a 413 proves the size lower-bound ran
+		// before OpenEntrySecret; attempting decryption would return 500 instead.
+		if _, err := h.db.ExecContext(ctx, `UPDATE vault_entries
+SET encrypted_value = zeroblob(?), nonce = x'00'
+WHERE id = ?`, MaxNativeVaultFileBytes+17, "entry-export-over-bytes"); err != nil {
+			t.Fatalf("seed oversized stored value: %v", err)
+		}
+
+		rec := exportVaultAs(h, caller, "user", password)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("over-byte export: got HTTP %d, want 413: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"code":"native_export_too_large"`) {
+			t.Errorf("over-byte response lost stable error code: %s", rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Disposition"); got != "" {
+			t.Errorf("over-byte response was presented as an attachment: %q", got)
+		}
+		if rows, err := queries.ListActivityEntriesByAction(ctx, db.ListActivityEntriesByActionParams{
+			Action: "vault.exported", Limit: 10, Offset: 0,
+		}); err != nil {
+			t.Fatalf("read export audit rows: %v", err)
+		} else if len(rows) != 0 {
+			t.Fatalf("refused over-byte export wrote %d success audit rows", len(rows))
+		}
+	})
+}
+
 func TestVaultExportRejectsLossyStoredShapes(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -342,6 +419,16 @@ func TestVaultExportRejectsLossyStoredShapes(t *testing.T) {
 			name:   "null destination array",
 			column: "destination_patterns",
 			value:  func(_ *testing.T, _ *VaultHandler) string { return "null" },
+		},
+		{
+			name:   "unsafe destination pattern",
+			column: "destination_patterns",
+			value:  func(_ *testing.T, _ *VaultHandler) string { return `["*"]` },
+		},
+		{
+			name:   "non-canonical destination pattern",
+			column: "destination_patterns",
+			value:  func(_ *testing.T, _ *VaultHandler) string { return `[" api.example.test/* "]` },
 		},
 		{
 			name:   "non-object provider metadata",

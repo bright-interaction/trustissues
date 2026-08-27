@@ -39,9 +39,10 @@ var Version = "dev"
 // capability proxy, and the AI gateway get larger budgets (the proxy handler
 // additionally caps forwarded bodies at 16 MiB internally).
 const (
-	defaultBodyLimit = int64(1 << 20)
-	importBodyLimit  = int64(10 << 20)
-	proxyBodyLimit   = int64(17 << 20)
+	defaultBodyLimit      = int64(1 << 20)
+	importBodyLimit       = int64(10 << 20)
+	nativeImportBodyLimit = int64(11 << 20)
+	proxyBodyLimit        = int64(17 << 20)
 )
 
 // bodyLimits applies http.MaxBytesReader with a per-path budget. A single
@@ -52,6 +53,11 @@ func bodyLimits(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := defaultBodyLimit
 		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/vault/import/native/"):
+			// Native-v1 files may be exactly handlers.MaxNativeVaultFileBytes.
+			// Leave a separate MiB for multipart framing and the re-auth password;
+			// otherwise an export at the advertised file ceiling cannot be restored.
+			limit = nativeImportBodyLimit
 		case strings.HasPrefix(r.URL.Path, "/api/vault/import/"):
 			limit = importBodyLimit
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
@@ -893,6 +899,11 @@ func newRouter(d routerDeps) *chi.Mux {
 					r.Put("/{id}/collection", d.vaultHandler.MoveToCollection)
 					r.Post("/import/preview", d.vaultImportHandler.ImportPreview)
 					r.Post("/import/confirm", d.vaultImportHandler.ImportConfirm)
+					// Preview has no password to guess and stays on the inherited API
+					// budget. Confirm re-verifies the account password and therefore
+					// shares Unlock's dedicated brute-force budget.
+					r.Post("/import/native/preview", d.vaultImportHandler.NativeImportPreview)
+					r.With(timw.RateLimit(d.unlockLimiter)).Post("/import/native/confirm", d.vaultImportHandler.NativeImportConfirm)
 				})
 
 				// Shared team vaults (collections) + membership. Any authenticated

@@ -59,6 +59,15 @@ FROM vault_entries WHERE id = ?;
 -- name: UpdateVaultEntryCustomFields :exec
 UPDATE vault_entries SET custom_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: FinalizeNativeImportedVaultEntry :exec
+-- These are all egress-neutral fields. Provider/provider_meta and the
+-- destination ceiling are intentionally absent: native import writes those
+-- only through internal/vaultegress with an egressgate ticket.
+UPDATE vault_entries
+SET collection_id = ?, custom_fields = ?, last_rotated_at = ?,
+    created_at = ?, updated_at = ?
+WHERE id = ?;
+
 -- ============================================================================
 -- Update entry - encrypted value (re-encrypt + rotate timestamp)
 -- ============================================================================

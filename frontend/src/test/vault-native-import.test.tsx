@@ -30,6 +30,7 @@ vi.mock('@/lib/vault-types', async (importOriginal) => {
 });
 
 import VaultImportModal from '@/components/VaultImportModal';
+import { ApiError } from '@/lib/api';
 
 const nativePreview = {
   format: 'trustissues-vault',
@@ -142,6 +143,24 @@ describe('TrustIssues native vault import', () => {
     });
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('turns a confirm-time name race back into an actionable blocked preview', async () => {
+    nativeConfirmMock.mockRejectedValue(new ApiError(
+      'native vault import has name conflicts',
+      409,
+      { conflicts: ['GitHub created after preview'] }
+    ));
+    render(<Harness />);
+    const { user } = await uploadAndPreview();
+
+    await user.type(screen.getByLabelText('Current account password'), 'correct horse');
+    await user.click(screen.getByRole('button', { name: 'Import 3 entries' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Import blocked by 1 name conflict');
+    expect(screen.getByRole('alert')).toHaveTextContent('GitHub created after preview');
+    expect(screen.getByLabelText('Current account password')).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Import 3 entries' })).toBeDisabled();
   });
 
   it('clears the selected file and password on close and after success', async () => {
