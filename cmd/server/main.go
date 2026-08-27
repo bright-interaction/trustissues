@@ -875,6 +875,10 @@ func newRouter(d routerDeps) *chi.Mux {
 					r.Get("/providers", d.vaultHandler.Providers)
 					r.Get("/match", d.vaultHandler.Match)
 					r.With(timw.RateLimit(d.unlockLimiter)).Post("/unlock", d.vaultHandler.Unlock)
+					// A native export reveals the same bulk plaintext as Unlock and
+					// reuses both its password re-auth chokepoint and its dedicated
+					// brute-force budget.
+					r.With(timw.RateLimit(d.unlockLimiter)).Post("/export", d.vaultHandler.Export)
 					r.Put("/{id}", d.vaultHandler.Update)
 					r.Delete("/{id}", d.vaultHandler.Delete)
 					r.With(timw.RateLimit(d.sensitiveOpLimiter)).Post("/{id}/rotate", d.vaultHandler.Rotate)

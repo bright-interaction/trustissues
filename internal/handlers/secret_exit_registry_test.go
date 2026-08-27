@@ -101,11 +101,12 @@ var theExitList = map[string]exitSite{
 	},
 
 	// ── back to a principal ──────────────────────────────────────────────
-	"vault.go:VaultHandler.Unlock": {
-		secret:  "every entry in the unlock response",
+	"vault_export.go:VaultHandler.revealAccessibleVaultEntries": {
+		secret:  "every entry in an unlock or native-export response",
 		chooser: "the caller (a read question, not a destination question)",
-		why: "password-re-verified above; the exit asks the second half, whether each entry's owner " +
-			"admits this caller. A list query that widened by accident is refused row by row.",
+		why: "both callers password-re-verify above; this shared exit asks the second half, whether " +
+			"each entry's owner admits this caller. A list query that widened by accident is refused " +
+			"row by row, and strict export fails before writing a partial attachment.",
 	},
 	"vault.go:VaultHandler.customFieldsForCaller": {
 		secret:  "every secret:true custom field of the entry being rendered",

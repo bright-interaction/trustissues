@@ -2997,76 +2997,14 @@ func (h *VaultHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reveal spans personal entries plus entries in the user's collections.
-	rows, err := h.queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
-		ID:       userID,
-		UserID:   userID,
-		UserID_2: userID,
-	})
+	// Reveal spans personal entries plus entries in the user's collections. The
+	// same path backs the native export, so both surfaces ask the same row-level
+	// secret-exit authority before returning plaintext.
+	entries, err := h.revealAccessibleVaultEntries(r, userID, "POST /api/vault/unlock", false)
 	if err != nil {
-		logError(r, "vault.unlock: query failed", "error", err)
+		logError(r, "vault.unlock: reveal failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
-	}
-
-	entries := []vaultEntryFull{}
-	for _, row := range rows {
-		// Hoisted so the redaction and the derived pending-revoke status read the
-		// SAME plaintext. Deriving from a second decrypt would let the two
-		// disagree if the column changed between them.
-		raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
-		e := vaultEntryFull{
-			vaultEntryMeta: vaultEntryMeta{
-				ID:                   row.ID,
-				CollectionID:         nullStringPtr(row.CollectionID),
-				Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
-				URL:                  h.decryptColumnOrLog(row.Url.String, "", vaultFieldURL),
-				AliasURL:             h.decryptColumnOrLog(row.AliasUrl.String, "", vaultFieldAliasURL),
-				Username:             h.decryptColumnOrLog(row.Username.String, "", vaultFieldUsername),
-				Category:             h.decryptColumnOrLog(row.Category.String, "", vaultFieldCategory),
-				Notes:                h.decryptColumnOrLog(row.Notes.String, "", vaultFieldNotes),
-				AutoLogin:            row.AutoLogin != 0,
-				RotationIntervalDays: nullInt64ToIntPtr(row.RotationIntervalDays),
-				ExpiresAt:            nullTimePtr(row.ExpiresAt),
-				LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
-				Provider:             row.Provider.String,
-				ProviderMeta:         redactReservedProviderMetaKeys(raw),
-				AutoRotate:           row.AutoRotate.Int64 != 0,
-				LastRotationError:    row.LastRotationError.String,
-				PendingRevoke:        pendingRevokeStatusFrom(raw),
-				// Through the exit, like the entry's own value below. A
-				// secret:true custom field is a credential the operator
-				// deposited here and it rides out in this same body.
-				CustomFields:        h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, userID),
-				DestinationPatterns: parseDestinationPatterns(row.DestinationPatterns),
-				CreatedAt:           nullTimePtr(row.CreatedAt),
-				UpdatedAt:           nullTimePtr(row.UpdatedAt),
-			},
-		}
-
-		// THE ONE EXIT, caller form. Unlock is password-re-verified above, and
-		// this asks the second half: does the OWNER of each entry admit this
-		// caller to it? A list query that widened by accident would otherwise
-		// hand over rows the caller may not read, and the exit is the one place
-		// that cannot be widened by accident.
-		// Version 2: this query only ever returns rows this build wrote, which
-		// matches the h.decrypt call it replaces.
-		decrypted, err := h.OpenEntrySecret(row.EncryptedValue, row.Nonce, 2,
-			entryOrigin(row.ID, row.Name))
-		if err == nil {
-			var value string
-			_, value, err = secretexit.ExitString(ctx, decrypted,
-				secretexit.ToCaller("POST /api/vault/unlock", userID))
-			decrypted.Wipe()
-			e.Value = value
-		}
-		if err != nil {
-			logError(r, "vault.unlock: value not released", "name", e.Name, "error", err)
-			e.Value = "[decryption error]"
-		}
-
-		e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
-		entries = append(entries, e)
 	}
 
 	LogActivityFromRequest(h.queries, r, "vault.unlocked", fmt.Sprintf("Vault unlocked (user: %s)", userID))

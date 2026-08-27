@@ -297,6 +297,33 @@ func LogActivityFromRequest(q *db.Queries, r *http.Request, action, detail strin
 	logActivityInternal(q, userPtr, action, detail, middleware.ClientIP(r), r.Header.Get("User-Agent"))
 }
 
+// logActivityFromRequestRequired is the fail-closed counterpart used by a
+// response that bulk-releases plaintext. Ordinary activity writes are best
+// effort so an audit outage does not take the application down. Vault export
+// has the opposite safety tradeoff: if the append-only trail cannot record the
+// release, the attachment must not leave the process.
+//
+// The row is deliberately committed before response headers are written. This
+// can over-report an export if the client disconnects immediately afterwards,
+// but it guarantees the important direction: a delivered export never lacks
+// its audit row.
+func logActivityFromRequestRequired(q *db.Queries, r *http.Request, action, detail string) error {
+	userID := middleware.GetUserID(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	detail = truncateAudit(detail, maxAuditDetailLen)
+	ipAddress := truncateAudit(middleware.ClientIP(r), maxAuditIPLen)
+	userAgent := truncateAudit(r.Header.Get("User-Agent"), maxAuditUserAgentLen)
+	return q.InsertActivity(ctx, db.InsertActivityParams{
+		UserID:    sql.NullString{String: userID, Valid: userID != ""},
+		Action:    action,
+		Detail:    sql.NullString{String: detail, Valid: detail != ""},
+		IpAddress: sql.NullString{String: ipAddress, Valid: ipAddress != ""},
+		UserAgent: sql.NullString{String: userAgent, Valid: userAgent != ""},
+	})
+}
+
 // Bounds on the attacker-influenced audit columns.
 //
 // user_agent came straight from the request header with nothing truncating it
