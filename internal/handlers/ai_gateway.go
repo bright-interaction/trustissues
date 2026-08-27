@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 	"github.com/bright-interaction/trustissues/internal/reflectguard"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/shield"
@@ -142,21 +144,66 @@ func (h *AIGatewayHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the provider key: an admin points a setting at a vault entry that
-	// holds the key. It is decrypted server-side and never returned to the caller.
-	entryID, _ := h.queries.GetSetting(ctx, p.settingKey)
-	if entryID == "" {
-		writeError(w, r, http.StatusBadGateway, "provider_not_configured",
-			fmt.Sprintf("no %s key configured; an admin must set it in Settings > AI gateway", providerName))
+	// Resolve the binding, its access policy and the encrypted value from one
+	// read snapshot. A collection can change policy while requests are in flight;
+	// separate pooled statements let a public request approve the old standard
+	// policy and then open the newly fully-private row.
+	tx, err := h.vault.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "ai_gateway: provider snapshot failed", "provider", providerName, "error", err)
+		writeInternalError(w, r, "provider key is not available")
 		return
 	}
-	pt, err := h.vault.EntrySecretByID(ctx, entryID)
+	defer tx.Rollback()
+	queries := h.queries.WithTx(tx)
+	entryID, settingErr := queries.GetSetting(ctx, p.settingKey)
+	providerNotConfigured := func() {
+		writeError(w, r, http.StatusBadGateway, "provider_not_configured",
+			fmt.Sprintf("no %s key configured; an admin must set it in Settings > AI gateway", providerName))
+	}
+	if settingErr == sql.ErrNoRows || entryID == "" {
+		providerNotConfigured()
+		return
+	}
+	if settingErr != nil {
+		logError(r, "ai_gateway: provider setting resolve failed", "provider", providerName, "error", settingErr)
+		writeInternalError(w, r, "provider key is not available")
+		return
+	}
+	policy, found, policyErr := entryPrivateAccessPolicy(ctx, queries, entryID)
+	if policyErr != nil {
+		logError(r, "ai_gateway: provider key policy resolve failed", "provider", providerName, "error", policyErr)
+		writeInternalError(w, r, "provider key is not available")
+		return
+	}
+	if !found || (!middleware.IsPrivateIngress(ctx) && policy == privateaccess.PolicyFullyPrivate) {
+		// A fully-private binding is indistinguishable from an unconfigured one
+		// on public ingress; neither the status nor the error body reveals it.
+		providerNotConfigured()
+		return
+	}
+	if !enforcePrivateAccessPolicy(w, r, policy, privateAccessSensitive, true, "vault entry not found") {
+		return
+	}
+	row, err := queries.GetVaultEntryForRotation(ctx, entryID)
 	if err != nil {
 		logError(r, "ai_gateway: provider key resolve failed", "provider", providerName, "error", err)
 		writeInternalError(w, r, "provider key is not available")
 		return
 	}
+	pt, err := h.vault.OpenEntrySecret(row.EncryptedValue, row.Nonce, int(row.EncryptionVersion.Int64),
+		entryOrigin(entryID, row.Name))
+	if err != nil {
+		logError(r, "ai_gateway: provider key decrypt failed", "provider", providerName, "error", err)
+		writeInternalError(w, r, "provider key is not available")
+		return
+	}
 	defer pt.Wipe()
+	if err := tx.Commit(); err != nil {
+		logError(r, "ai_gateway: provider snapshot commit failed", "provider", providerName, "error", err)
+		writeInternalError(w, r, "provider key is not available")
+		return
+	}
 	// THE ONE EXIT. The destination is fixed by the DEPLOYMENT and by nothing
 	// else: p.baseURL is a compile-time constant in the aiProviders table and the
 	// entry is named by an AdminOnly settings row, so no caller and nobody who
@@ -543,8 +590,65 @@ type aiConfigResponse struct {
 // the connection URLs + status to wire a client). It never returns key values.
 func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	anth, _ := h.queries.GetSetting(ctx, "ai_key_anthropic")
-	oai, _ := h.queries.GetSetting(ctx, "ai_key_openai")
+	// Repeated inside the handler as defense in depth: this response describes
+	// instance-wide AI providers and Shield posture, while vault_only callers
+	// are deliberately barred from both the AI gateway and MCP. It is unrelated
+	// to any client collection they can reach.
+	if middleware.IsVaultOnly(ctx) {
+		writeForbidden(w, r, "access denied for vault-only users")
+		return
+	}
+	tx, err := h.vault.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "ai_gateway: config snapshot failed", "error", err)
+		writeInternalError(w, r, "private access policy could not be verified")
+		return
+	}
+	defer tx.Rollback()
+	queries := h.queries.WithTx(tx)
+	readVisibleSetting := func(key string) (string, bool) {
+		entryID, err := queries.GetSetting(ctx, key)
+		if err == sql.ErrNoRows || entryID == "" {
+			return "", true
+		}
+		if err != nil {
+			logError(r, "ai_gateway: config setting lookup failed", "key", key, "error", err)
+			writeInternalError(w, r, "private access policy could not be verified")
+			return "", false
+		}
+		policy, found, err := entryPrivateAccessPolicy(ctx, queries, entryID)
+		if err != nil {
+			logError(r, "ai_gateway: config entry policy lookup failed", "key", key, "error", err)
+			writeInternalError(w, r, "private access policy could not be verified")
+			return "", false
+		}
+		if !found {
+			// A dangling setting is not a configured provider, and must not expose
+			// an opaque id that no longer names a vault entry.
+			return "", true
+		}
+		if !middleware.IsPrivateIngress(ctx) && policy == privateaccess.PolicyFullyPrivate {
+			// This is a shared status endpoint rather than an operation on a
+			// caller-selected resource. Render a fully-private provider exactly
+			// like an unconfigured one so the public response is not an existence
+			// oracle.
+			return "", true
+		}
+		return entryID, true
+	}
+	anth, ok := readVisibleSetting("ai_key_anthropic")
+	if !ok {
+		return
+	}
+	oai, ok := readVisibleSetting("ai_key_openai")
+	if !ok {
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "ai_gateway: config snapshot commit failed", "error", err)
+		writeInternalError(w, r, "private access policy could not be verified")
+		return
+	}
 	// The entry ids point at the vault entries holding the team LLM keys. Every
 	// authenticated user needs the connection URLs and the configured flags to
 	// wire a client, but only an admin needs (or should see) which entry holds
@@ -553,6 +657,10 @@ func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	if middleware.IsAdmin(ctx) {
 		entryAnth, entryOAI = anth, oai
 	}
+	baseURL := h.cfg.BaseURL
+	if middleware.IsPrivateIngress(ctx) && h.cfg.PrivateBaseURL != "" {
+		baseURL = h.cfg.PrivateBaseURL
+	}
 	writeJSON(w, http.StatusOK, aiConfigResponse{
 		AnthropicConfigured: anth != "",
 		OpenAIConfigured:    oai != "",
@@ -560,8 +668,8 @@ func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		OpenAIEntryID:       entryOAI,
 		ShieldEnabled:       h.cfg.ShieldEnabled(),
 		ShieldHintLevel:     h.cfg.ShieldHintLevel,
-		GatewayBaseURL:      strings.TrimRight(h.cfg.BaseURL, "/") + "/api/ai",
-		MCPURL:              strings.TrimRight(h.cfg.BaseURL, "/") + "/api/mcp",
+		GatewayBaseURL:      strings.TrimRight(baseURL, "/") + "/api/ai",
+		MCPURL:              strings.TrimRight(baseURL, "/") + "/api/mcp",
 	})
 }
 
@@ -570,6 +678,15 @@ func (h *AIGatewayHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 // the provider. A non-empty id must reference an existing vault entry.
 func (h *AIGatewayHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// When the deployment has a private origin, AI provider binding is always a
+	// private control-plane operation. Making this depend only on configuration
+	// (which /health already reports), rather than on whether a hidden provider
+	// is currently bound, prevents a public no-op PUT from recovering that
+	// otherwise-hidden existence bit.
+	if h.cfg.PrivateBaseURL != "" && !middleware.IsPrivateIngress(ctx) {
+		writePrivateIngressRequired(w, r)
+		return
+	}
 	var req struct {
 		AnthropicEntryID *string `json:"anthropic_entry_id"`
 		OpenAIEntryID    *string `json:"openai_entry_id"`
@@ -578,17 +695,64 @@ func (h *AIGatewayHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) 
 		writeBadRequest(w, r, "invalid JSON")
 		return
 	}
+	tx, err := h.vault.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "ai_gateway: config transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback()
+	queries := h.queries.WithTx(tx)
+
+	requireEntry := func(id string) bool {
+		if id == "" {
+			return true
+		}
+		policy, found, err := entryPrivateAccessPolicy(ctx, queries, id)
+		if err != nil {
+			logError(r, "ai_gateway: config entry policy lookup failed", "entry", id, "error", err)
+			writeInternalError(w, r, "private access policy could not be verified")
+			return false
+		}
+		if !found {
+			writeBadRequest(w, r, "the selected vault entry does not exist")
+			return false
+		}
+		if !middleware.IsPrivateIngress(ctx) && policy == privateaccess.PolicyFullyPrivate {
+			// This endpoint describes a caller-selected id as invalid with 400.
+			// Use the exact same response for a hidden fully-private id instead
+			// of turning it into a 404 oracle distinct from a genuinely missing id.
+			writeBadRequest(w, r, "the selected vault entry does not exist")
+			return false
+		}
+		return enforcePrivateAccessPolicy(w, r, policy, privateAccessSensitive, true, "vault entry not found")
+	}
 	set := func(settingKey string, id *string) bool {
 		if id == nil {
 			return true
 		}
+		current, currentErr := queries.GetSetting(ctx, settingKey)
+		if currentErr != nil && currentErr != sql.ErrNoRows {
+			logError(r, "ai_gateway: current setting lookup failed", "key", settingKey, "error", currentErr)
+			writeInternalError(w, r, "internal server error")
+			return false
+		}
+		// Clearing or replacing a protected provider binding is itself an
+		// operation on that protected secret, so both the old and new side of
+		// the change must authorize on this ingress.
+		if currentErr == nil && current != "" && !requireEntry(current) {
+			return false
+		}
 		if *id != "" {
-			if _, err := h.queries.GetVaultEntryForRotation(ctx, *id); err != nil {
+			if _, err := queries.GetVaultEntryForRotation(ctx, *id); err != nil {
 				writeBadRequest(w, r, "the selected vault entry does not exist")
 				return false
 			}
+			if !requireEntry(*id) {
+				return false
+			}
 		}
-		if err := h.queries.UpsertSetting(ctx, db.UpsertSettingParams{Key: settingKey, Value: *id}); err != nil {
+		if err := queries.UpsertSetting(ctx, db.UpsertSettingParams{Key: settingKey, Value: *id}); err != nil {
 			logError(r, "ai_gateway: setting update failed", "key", settingKey, "error", err)
 			writeInternalError(w, r, "internal server error")
 			return false
@@ -599,6 +763,11 @@ func (h *AIGatewayHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if !set("ai_key_openai", req.OpenAIEntryID) {
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "ai_gateway: config commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
 		return
 	}
 	LogActivityFromRequest(h.queries, r, "ai.config_updated", "AI gateway provider keys updated")

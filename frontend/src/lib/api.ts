@@ -1,6 +1,7 @@
 import type {
   AuthResponse,
   AuthStatus,
+  InvitationRedemptionResponse,
   User,
   ManagedUser,
   ActivityListResponse,
@@ -22,6 +23,8 @@ import type {
   Collection,
   CollectionMember,
   CollectionRole,
+  CollectionPrivateAccessPolicy,
+  IngressHealth,
   CollectionInviteResult,
   PendingInvite,
   OwnershipReport,
@@ -76,6 +79,18 @@ export function setUnauthorizedHandler(fn: (() => void) | undefined): void {
 // could sit on /vault watching every query fail with no banner and no redirect.
 export const TOTP_ENROLLMENT_REQUIRED_CODE = 'totp_enrollment_required';
 
+// Stable code returned when an authenticated request reached the ordinary
+// listener but the collection policy requires the optional private listener.
+// Keep this aligned with middleware.PrivateIngressRequiredCode.
+export const PRIVATE_INGRESS_REQUIRED_CODE = 'private_ingress_required';
+
+// All existing mutation surfaces already toast ApiError.message. Translating
+// the machine code once here makes reveal, export, rotation, membership, and
+// collection-policy refusals actionable without each screen growing a subtly
+// different interpretation of the same authorization result.
+export const PRIVATE_INGRESS_REQUIRED_MESSAGE =
+  'This action requires the private TrustIssues URL. Connect to your team\'s Tailscale, Headscale, or other private network and open that URL. Ask your administrator for the exact address if you do not have it. Sign-in, MFA, and permissions still apply.';
+
 // onEnrollmentRequired is invoked when ANY request is refused by the enrolment
 // gate. AuthProvider registers it, the same way it registers onUnauthorized.
 //
@@ -90,6 +105,18 @@ export function setEnrollmentRequiredHandler(
   fn: (() => void) | undefined
 ): void {
   onEnrollmentRequired = fn;
+}
+
+// The vault page registers this while mounted so a protected refusal from any
+// nested surface (rotation targets, export, collection membership, etc.) can
+// seal its decrypted in-memory state immediately instead of waiting for the
+// next health poll. The error still reaches the caller for its normal toast.
+let onPrivateIngressRequired: (() => void) | undefined;
+
+export function setPrivateIngressRequiredHandler(
+  fn: (() => void) | undefined
+): void {
+  onPrivateIngressRequired = fn;
 }
 
 type ApiRequestOptions = RequestInit & { skipAuthRedirect?: boolean };
@@ -143,6 +170,7 @@ async function apiRequest(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
+    const errorBody = body as { error?: string; code?: string };
 
     // The enrolment gate refuses every route except /api/auth while the
     // require_totp policy is on and the caller has not enrolled. Surface it as
@@ -150,12 +178,22 @@ async function apiRequest(
     // act on it from where they are standing.
     if (
       res.status === 403 &&
-      (body as { code?: string })?.code === TOTP_ENROLLMENT_REQUIRED_CODE
+      errorBody.code === TOTP_ENROLLMENT_REQUIRED_CODE
     ) {
       onEnrollmentRequired?.();
     }
+    if (
+      res.status === 403 &&
+      errorBody.code === PRIVATE_INGRESS_REQUIRED_CODE
+    ) {
+      onPrivateIngressRequired?.();
+    }
 
-    throw new ApiError(body.error || res.statusText, res.status, body);
+    const message =
+      res.status === 403 && errorBody.code === PRIVATE_INGRESS_REQUIRED_CODE
+        ? PRIVATE_INGRESS_REQUIRED_MESSAGE
+        : errorBody.error || res.statusText;
+    throw new ApiError(message, res.status, body);
   }
 
   return res;
@@ -188,7 +226,43 @@ export async function requestAttachment(
   };
 }
 
+// /health deliberately lives outside /api and is unauthenticated. Keeping the
+// path relative is security-relevant: a page loaded from the private hostname
+// must verify and call that SAME origin, never a public URL compiled into the
+// bundle. The response carries no secret, but no-store avoids a cached private
+// stamp masking a connector/routing change.
+export async function requestIngressHealth(): Promise<IngressHealth> {
+  const controller = new AbortController();
+  // A disconnected overlay can leave a browser fetch pending for far longer
+  // than the vault's 10-second verification cadence. Bound it so a protected
+  // unlocked page actually reaches the fail-closed error path promptly.
+  const timeout = globalThis.setTimeout(() => controller.abort(), 5_000);
+  let res: Response;
+  try {
+    res = await fetch('/health', {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } catch {
+    throw new Error('Could not verify this TrustIssues ingress');
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+  if (!res.ok) {
+    throw new ApiError('Could not verify this TrustIssues ingress', res.status);
+  }
+  const health = await res.json() as IngressHealth;
+  if (health.ingress !== 'public' && health.ingress !== 'private') {
+    throw new Error('TrustIssues returned an invalid ingress stamp');
+  }
+  return health;
+}
+
 export const api = {
+  system: {
+    health: requestIngressHealth,
+  },
   auth: {
     status: () =>
       request<AuthStatus>('/auth/status', { skipAuthRedirect: true }),
@@ -209,14 +283,11 @@ export const api = {
         body: JSON.stringify({ email, password, name }),
       }),
     redeemInvitation: (code: string, password: string) =>
-      request<{ user: { id: string; email: string; name: string; role: Role } }>(
-        '/invitations/redeem',
-        {
-          method: 'POST',
-          body: JSON.stringify({ code, password }),
-          skipAuthRedirect: true,
-        }
-      ),
+      request<InvitationRedemptionResponse>('/invitations/redeem', {
+        method: 'POST',
+        body: JSON.stringify({ code, password }),
+        skipAuthRedirect: true,
+      }),
     me: () => request<User>('/auth/me', { skipAuthRedirect: true }),
     changePassword: (currentPassword: string, newPassword: string) =>
       request<{ message: string }>('/auth/change-password', {
@@ -418,8 +489,9 @@ export const api = {
       }),
   },
 
-  // AI + MCP settings. Reading is open to any signed-in user (they need the
-  // connection URLs); updating provider keys is admin-only server-side (403).
+  // AI + MCP settings. Reading is open to signed-in non-vault-only users (they
+  // need the connection URLs); updating provider keys is admin-only server-side
+  // (403). External/client vault_only accounts are barred from both surfaces.
   ai: {
     getConfig: () => request<AIConfig>('/settings/ai'),
     updateConfig: (data: {
@@ -450,12 +522,20 @@ export const api = {
   collections: {
     list: () => request<Collection[]>('/collections'),
     get: (id: string) => request<Collection>(`/collections/${id}`),
-    create: (data: { name: string; description: string }) =>
+    create: (data: {
+      name: string;
+      description: string;
+      private_access_policy?: CollectionPrivateAccessPolicy;
+    }) =>
       request<Collection>('/collections', {
         method: 'POST',
         body: JSON.stringify(data),
       }),
-    update: (id: string, data: { name: string; description: string }) =>
+    update: (id: string, data: {
+      name: string;
+      description: string;
+      private_access_policy?: CollectionPrivateAccessPolicy;
+    }) =>
       request<Collection>(`/collections/${id}`, {
         method: 'PUT',
         body: JSON.stringify(data),

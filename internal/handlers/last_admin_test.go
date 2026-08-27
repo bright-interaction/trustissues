@@ -107,7 +107,10 @@ func TestLastAdminGuardRefusesOnlyTheLastOne(t *testing.T) {
 	}
 
 	// Deleting is the third verb.
-	delres, err := queries.DeleteUserIfNotLastAdmin(ctx, a)
+	delres, err := queries.DeleteUserIfNotLastAdmin(ctx, db.DeleteUserIfNotLastAdminParams{
+		ID:             a,
+		PrivateIngress: 1,
+	})
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}

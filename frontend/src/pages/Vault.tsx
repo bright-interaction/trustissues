@@ -39,6 +39,8 @@ import {
   api,
   request,
   ApiError,
+  PRIVATE_INGRESS_REQUIRED_CODE,
+  setPrivateIngressRequiredHandler,
   TOTP_ENROLLMENT_REQUIRED_CODE,
 } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
@@ -48,15 +50,21 @@ import VaultImportModal from '@/components/VaultImportModal';
 import RotationManager from '@/components/RotationManager';
 import CredentialHealth from '@/components/CredentialHealth';
 import SecretValueField from '@/components/SecretValueField';
+import CollectionPrivateAccessPolicyField, {
+  CollectionAccessBadge,
+  normalizeCollectionPrivateAccessPolicy,
+} from '@/components/CollectionPrivateAccessPolicyField';
 import {
   vaultApi,
   serviceIdentitiesApi,
   serviceIdentityKeys,
 } from '@/lib/vault-types';
 import type { VaultEntry, ServiceIdentity, ServiceIdentityWithKey, CustomField } from '@/lib/vault-types';
+import { mergeUnlockedVaultEntry } from '@/lib/vault-cache';
 import type {
   Collection,
   CollectionMember,
+  CollectionPrivateAccessPolicy,
   CollectionRole,
   PendingInvite,
 } from '@/lib/types';
@@ -968,12 +976,16 @@ function PendingInvitesCard() {
 // unknown email) surface through the mutation error toasts.
 function CollectionManageModal({
   collection,
+  isPrivateIngress,
   onClose,
   onDeleted,
+  onAccessPolicyChanged,
 }: {
   collection: Collection;
+  isPrivateIngress: boolean;
   onClose: () => void;
   onDeleted: () => void;
+  onAccessPolicyChanged: () => void;
 }) {
   const queryClient = useQueryClient();
   const [addForm, setAddForm] = useState<{ email: string; role: CollectionRole }>({
@@ -983,10 +995,17 @@ function CollectionManageModal({
   const [details, setDetails] = useState({
     name: collection.name,
     description: collection.description,
+    private_access_policy: normalizeCollectionPrivateAccessPolicy(
+      collection.private_access_policy
+    ),
   });
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  const { data: members = [], isLoading } = useQuery<CollectionMember[]>({
+  const {
+    data: members = [],
+    isLoading,
+    error: membersError,
+  } = useQuery<CollectionMember[]>({
     queryKey: queryKeys.collections.members(collection.id),
     queryFn: () => api.collections.listMembers(collection.id),
   });
@@ -1000,11 +1019,29 @@ function CollectionManageModal({
   // count is stale by the time they click confirm, the server refusing is the
   // correct outcome, not a bug: it means the collection changed since the
   // human looked at it, which is exactly when they should stop and look again.
-  const { data: freshCollection } = useQuery<Collection>({
+  const {
+    data: freshCollection,
+    error: collectionDetailError,
+  } = useQuery<Collection>({
     queryKey: queryKeys.collections.detail(collection.id),
     queryFn: () => api.collections.get(collection.id),
   });
   const displayedEntryCount = freshCollection?.entry_count;
+  const currentPolicy = normalizeCollectionPrivateAccessPolicy(
+    collection.private_access_policy
+  );
+  const detailsRequirePrivate =
+    currentPolicy !== 'standard' || details.private_access_policy !== 'standard';
+  const detailsBlockedByIngress = detailsRequirePrivate && !isPrivateIngress;
+  const collectionActionsBlocked =
+    currentPolicy !== 'standard' && !isPrivateIngress;
+
+  function loadErrorMessage(error: unknown): string {
+    if (error instanceof ApiError && error.status === 404) {
+      return 'This collection is no longer available on this URL. It may now be private-only, your access may have changed, or it may have been removed. Nothing is being reported as empty or deleted.';
+    }
+    return `${errorMessage(error)} Nothing is being reported as empty or deleted.`;
+  }
 
   function invalidateMembers() {
     queryClient.invalidateQueries({ queryKey: queryKeys.collections.members(collection.id) });
@@ -1053,10 +1090,19 @@ function CollectionManageModal({
   });
 
   const updateCollectionMutation = useMutation({
-    mutationFn: (data: { name: string; description: string }) =>
+    mutationFn: (data: Parameters<typeof api.collections.update>[1]) =>
       api.collections.update(collection.id, data),
-    onSuccess: () => {
+    onSuccess: (updated) => {
       toast.success('Collection updated');
+      if (
+        normalizeCollectionPrivateAccessPolicy(updated.private_access_policy) !==
+        currentPolicy
+      ) {
+        // A policy change invalidates the authorization context under which
+        // the decrypted array was released. The parent clears that array and
+        // the mutation cache immediately rather than waiting for a poll.
+        onAccessPolicyChanged();
+      }
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
     },
     onError: (err) => toast.error(errorMessage(err)),
@@ -1104,6 +1150,7 @@ function CollectionManageModal({
             <h3 className="text-sm font-semibold text-slate-900">
               Manage collection: {collection.name}
             </h3>
+            <CollectionAccessBadge policy={collection.private_access_policy} />
           </div>
           <button onClick={onClose} className="rounded p-1 text-slate-400 hover:text-slate-600">
             <X className="h-4 w-4" />
@@ -1118,10 +1165,16 @@ function CollectionManageModal({
               updateCollectionMutation.mutate({
                 name: details.name.trim(),
                 description: details.description.trim(),
+                private_access_policy: details.private_access_policy,
               });
             }}
             className="space-y-3 rounded-lg border border-slate-100 bg-slate-50 p-4"
           >
+            {collectionDetailError && (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+                {loadErrorMessage(collectionDetailError)}
+              </div>
+            )}
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-600">Name</label>
@@ -1142,10 +1195,33 @@ function CollectionManageModal({
                 />
               </div>
             </div>
+            <CollectionPrivateAccessPolicyField
+              name={`private_access_policy_${collection.id}`}
+              value={details.private_access_policy}
+              onChange={(private_access_policy) =>
+                setDetails((current) => ({ ...current, private_access_policy }))
+              }
+              disabled={
+                updateCollectionMutation.isPending ||
+                (!isPrivateIngress && currentPolicy !== 'standard')
+              }
+              canSelectProtected={isPrivateIngress}
+            />
+            {detailsBlockedByIngress && (
+              <p className="text-xs font-medium text-amber-800">
+                Open the private TrustIssues URL to change this collection. Ask
+                your administrator for the exact address if needed.
+              </p>
+            )}
             <div className="flex items-center justify-between">
               <button
                 type="submit"
-                disabled={updateCollectionMutation.isPending || !details.name.trim()}
+                disabled={
+                  updateCollectionMutation.isPending ||
+                  !details.name.trim() ||
+                  detailsBlockedByIngress ||
+                  Boolean(collectionDetailError)
+                }
                 className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-50"
               >
                 {updateCollectionMutation.isPending ? (
@@ -1167,7 +1243,11 @@ function CollectionManageModal({
                   <button
                     type="button"
                     onClick={() => deleteCollectionMutation.mutate(displayedEntryCount)}
-                    disabled={deleteCollectionMutation.isPending || typeof displayedEntryCount !== 'number'}
+                    disabled={
+                      deleteCollectionMutation.isPending ||
+                      typeof displayedEntryCount !== 'number' ||
+                      collectionActionsBlocked
+                    }
                     className="rounded-lg bg-rose-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50"
                   >
                     Confirm delete
@@ -1184,6 +1264,7 @@ function CollectionManageModal({
                 <button
                   type="button"
                   onClick={() => setConfirmDelete(true)}
+                  disabled={collectionActionsBlocked || Boolean(collectionDetailError)}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-rose-50 hover:text-rose-600"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
@@ -1201,6 +1282,10 @@ function CollectionManageModal({
             {isLoading ? (
               <div className="flex items-center justify-center py-6 text-slate-400">
                 <Loader2 className="h-5 w-5 animate-spin" />
+              </div>
+            ) : membersError ? (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-3 text-sm leading-5 text-red-700">
+                {loadErrorMessage(membersError)}
               </div>
             ) : members.length === 0 ? (
               <p className="py-4 text-center text-sm text-slate-400">No members yet.</p>
@@ -1242,7 +1327,11 @@ function CollectionManageModal({
                         }
                         // Changing a role is addressed by email, and a pending
                         // seat only carries one for the manager who typed it.
-                        disabled={addMemberMutation.isPending || !m.email}
+                        disabled={
+                          addMemberMutation.isPending ||
+                          !m.email ||
+                          collectionActionsBlocked
+                        }
                         className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs outline-none focus:border-slate-400 disabled:opacity-50"
                       >
                         {COLLECTION_ROLES.map((r) => (
@@ -1260,7 +1349,8 @@ function CollectionManageModal({
                         disabled={
                           removeMemberMutation.isPending ||
                           rescindInviteMutation.isPending ||
-                          (m.pending && !m.email)
+                          (m.pending && !m.email) ||
+                          collectionActionsBlocked
                         }
                         title={m.pending ? 'Withdraw invitation' : 'Remove member'}
                         className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
@@ -1287,20 +1377,26 @@ function CollectionManageModal({
             }}
             className="space-y-2 rounded-lg border border-slate-100 bg-slate-50 p-4"
           >
-            <label className="block text-xs font-medium text-slate-600">
+            <label
+              htmlFor={`collection_member_email_${collection.id}`}
+              className="block text-xs font-medium text-slate-600"
+            >
               Invite a member by email
             </label>
             <div className="flex flex-col gap-2 sm:flex-row">
               <input
+                id={`collection_member_email_${collection.id}`}
                 type="email"
                 value={addForm.email}
                 onChange={(e) => setAddForm((f) => ({ ...f, email: e.target.value }))}
                 placeholder="teammate@example.com"
+                disabled={collectionActionsBlocked || Boolean(membersError)}
                 className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-slate-400"
               />
               <select
                 value={addForm.role}
                 onChange={(e) => setAddForm((f) => ({ ...f, role: e.target.value as CollectionRole }))}
+                disabled={collectionActionsBlocked || Boolean(membersError)}
                 className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm outline-none focus:border-slate-400"
               >
                 {COLLECTION_ROLES.map((r) => (
@@ -1311,7 +1407,12 @@ function CollectionManageModal({
               </select>
               <button
                 type="submit"
-                disabled={addMemberMutation.isPending || !addForm.email.trim()}
+                disabled={
+                  addMemberMutation.isPending ||
+                  !addForm.email.trim() ||
+                  collectionActionsBlocked ||
+                  Boolean(membersError)
+                }
                 className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
               >
                 {addMemberMutation.isPending ? (
@@ -1339,6 +1440,21 @@ function CollectionManageModal({
 // exactly the kind of thing that quietly stops being identical.
 const BLANK_NEW_SECRET = { name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '' };
 const BLANK_EDIT_FORM = { name: '', value: '', url: '', alias_url: '', username: '', category: '', notes: '', rotation_interval_days: '', expires_at: '', collection_id: '', destination_patterns: '' };
+const BLANK_NEW_COLLECTION: {
+  name: string;
+  description: string;
+  private_access_policy: CollectionPrivateAccessPolicy;
+} = { name: '', description: '', private_access_policy: 'standard' };
+
+interface UnlockedAccessSnapshot {
+  // Scope recorded when plaintext was released. If a later metadata refresh
+  // moves or omits one of these rows, the old plaintext is no longer kept.
+  entryCollections: Map<string, string | null>;
+  collectionPolicies: Map<string, CollectionPrivateAccessPolicy>;
+  requiresPrivate: boolean;
+  vaultListData: VaultEntry[] | undefined;
+  collectionsData: Collection[] | undefined;
+}
 
 export default function Vault() {
   const queryClient = useQueryClient();
@@ -1366,6 +1482,8 @@ export default function Vault() {
   // what stops a slow rotate or unlock from silently re-filling the vault
   // after the auto-lock timer or the Lock button already fired.
   const sealEpochRef = useRef(0);
+  const unlockedAccessRef = useRef<UnlockedAccessSnapshot | null>(null);
+  const accessInvalidationInProgressRef = useRef(false);
 
   // lockVault is the ONLY way to re-lock, because there are six places that do
   // it and every one of them cleared a different subset of the secret-bearing
@@ -1438,6 +1556,7 @@ export default function Vault() {
     setVaultEntries([]);
     setRevealedSecrets(new Set());
     setRotatedValue(null);
+    unlockedAccessRef.current = null;
 
     // The account password, wherever this component was holding it in the
     // clear before (or instead of) sending it.
@@ -1451,6 +1570,10 @@ export default function Vault() {
     setRotatingEntryId(null);
     setRotationPanelId(null);
     setShowAddSecret(false);
+    // Import previews can contain every CSV credential in plaintext and native
+    // import state owns both the file and its password. Closing the modal makes
+    // its reset effect abort in-flight requests and drop those references.
+    setShowImportModal(false);
     setShowExportModal(false);
     setNewSecret(BLANK_NEW_SECRET);
     setNewCustomFields([]);
@@ -1498,7 +1621,7 @@ export default function Vault() {
   // Collection filter: 'all' | 'personal' | a collection id.
   const [collectionFilter, setCollectionFilter] = useState<string>('all');
   const [showNewCollection, setShowNewCollection] = useState(false);
-  const [newCollection, setNewCollection] = useState({ name: '', description: '' });
+  const [newCollection, setNewCollection] = useState(BLANK_NEW_COLLECTION);
   const [manageCollectionId, setManageCollectionId] = useState<string | null>(null);
   // Id of the collection whose "Leave" button is waiting on confirmation.
   const [confirmLeaveId, setConfirmLeaveId] = useState<string | null>(null);
@@ -1510,19 +1633,66 @@ export default function Vault() {
   // "No secrets stored. Unlock the vault and add your first secret." A vault
   // holding five credentials told its owner it was empty -- the single most
   // alarming thing this product can say, produced by a missing error branch.
+  const vaultListQuery = useQuery<VaultEntry[]>({
+    queryKey: queryKeys.vault.list(),
+    queryFn: vaultApi.list,
+    // While plaintext is resident, watch the metadata scope that authorized
+    // it. This catches a move, deletion, membership removal, or fully-private
+    // promotion performed in another tab without making ordinary locked/public
+    // browsing poll continuously.
+    refetchInterval: vaultUnlocked ? 10_000 : false,
+    refetchOnWindowFocus: true,
+  });
   const {
     data: vaultList = [],
     isLoading: vaultLoading,
     error: vaultError,
-  } = useQuery<VaultEntry[]>({
-    queryKey: queryKeys.vault.list(),
-    queryFn: vaultApi.list,
-  });
+  } = vaultListQuery;
 
-  const { data: collections = [] } = useQuery<Collection[]>({
+  const collectionsQuery = useQuery<Collection[]>({
     queryKey: queryKeys.collections.list(),
     queryFn: api.collections.list,
+    refetchInterval: vaultUnlocked ? 10_000 : false,
+    refetchOnWindowFocus: true,
   });
+  const { data: collections = [], error: collectionsError } = collectionsQuery;
+
+  const ingressQuery = useQuery({
+    queryKey: queryKeys.ingress.health(),
+    queryFn: api.system.health,
+    retry: false,
+    refetchInterval: vaultUnlocked ? 10_000 : 30_000,
+    refetchOnWindowFocus: true,
+  });
+  const isPrivateIngress =
+    ingressQuery.isSuccess && ingressQuery.data.ingress === 'private';
+
+  useEffect(() => {
+    setPrivateIngressRequiredHandler(() => {
+      // The callback is global to the shared API helper, but the snapshot ref
+      // exists only while this page actually holds decrypted entries.
+      if (
+        !unlockedAccessRef.current ||
+        accessInvalidationInProgressRef.current
+      ) {
+        return;
+      }
+      accessInvalidationInProgressRef.current = true;
+      lockVault();
+      toast.error(
+        'Vault locked because this URL no longer has private access. Nothing was deleted.'
+      );
+    });
+    return () => setPrivateIngressRequiredHandler(undefined);
+  }, [lockVault]);
+
+  // Navigating to another SPA page unmounts Vault and cancels its auto-lock
+  // timer. Without an unmount seal, the component DOM disappeared but the
+  // app-wide TanStack mutation cache retained the decrypted unlock response
+  // and account password for its normal GC window. Use the same chokepoint so
+  // navigation, route guards, and future layout changes cannot create a second
+  // class of "hidden but still reachable" plaintext.
+  useEffect(() => () => lockVault(), [lockVault]);
 
   // The enrolment gate refuses with a machine-readable code; anything else is an
   // ordinary failure. Both must say "we could not load this", never "there is
@@ -1532,6 +1702,118 @@ export default function Vault() {
     vaultError.status === 403 &&
     (vaultError.body as { code?: string })?.code ===
       TOTP_ENROLLMENT_REQUIRED_CODE;
+  const listRefusedForPrivateIngress =
+    vaultError instanceof ApiError &&
+    vaultError.status === 403 &&
+    (vaultError.body as { code?: string })?.code ===
+      PRIVATE_INGRESS_REQUIRED_CODE;
+
+  // Plaintext is released under a collection/scope snapshot. Reconcile that
+  // snapshot against lightweight metadata while the vault is unlocked. This
+  // cannot erase a value already copied by a user, but it does remove every
+  // app-reachable plaintext reference when access tightens, a row moves or
+  // disappears, or a private page stops reaching the private listener.
+  useEffect(() => {
+    if (!vaultUnlocked || accessInvalidationInProgressRef.current) return;
+    const snapshot = unlockedAccessRef.current;
+    if (!snapshot) return;
+
+    let reason: 'scope' | 'private' | null = null;
+
+    if (
+      collectionsQuery.isSuccess &&
+      collectionsQuery.data !== snapshot.collectionsData
+    ) {
+      for (const [entryId, expectedCollectionID] of snapshot.entryCollections) {
+        if (!expectedCollectionID) continue;
+        const currentCollection = collections.find(
+          (collection) => collection.id === expectedCollectionID
+        );
+        if (!currentCollection) {
+          reason = 'scope';
+          break;
+        }
+        const currentPolicy = normalizeCollectionPrivateAccessPolicy(
+          currentCollection.private_access_policy
+        );
+        const previousPolicy = snapshot.collectionPolicies.get(
+          expectedCollectionID
+        );
+        if (previousPolicy && previousPolicy !== currentPolicy) {
+          reason = 'scope';
+          break;
+        }
+        if (!previousPolicy) {
+          snapshot.collectionPolicies.set(expectedCollectionID, currentPolicy);
+        }
+        if (currentPolicy !== 'standard') snapshot.requiresPrivate = true;
+
+        // Keep the loop tied to an entry that was actually released. This also
+        // makes a locally removed row fail closed before the metadata poll.
+        if (!vaultEntries.some((entry) => entry.id === entryId)) {
+          reason = 'scope';
+          break;
+        }
+      }
+      snapshot.collectionsData = collectionsQuery.data;
+    }
+
+    if (
+      !reason &&
+      vaultListQuery.isSuccess &&
+      vaultListQuery.data !== snapshot.vaultListData
+    ) {
+      const currentEntries = new Map(
+        vaultList.map((entry) => [entry.id, entry.collection_id] as const)
+      );
+      for (const [entryId, expectedCollectionID] of snapshot.entryCollections) {
+        if (
+          !currentEntries.has(entryId) ||
+          currentEntries.get(entryId) !== expectedCollectionID
+        ) {
+          reason = 'scope';
+          break;
+        }
+      }
+      snapshot.vaultListData = vaultListQuery.data;
+    }
+
+    if (!reason && snapshot.requiresPrivate) {
+      if (
+        ingressQuery.isError ||
+        collectionsQuery.isError ||
+        vaultListQuery.isError ||
+        (ingressQuery.isSuccess && ingressQuery.data.ingress !== 'private')
+      ) {
+        reason = 'private';
+      }
+    }
+
+    if (!reason) return;
+    accessInvalidationInProgressRef.current = true;
+    lockVault();
+    toast.error(
+      reason === 'private'
+        ? 'Vault locked because private access could no longer be verified. Nothing was deleted.'
+        : 'Vault locked because collection access changed. Nothing was deleted.'
+    );
+  }, [
+    vaultUnlocked,
+    vaultEntries,
+    vaultList,
+    collections,
+    vaultListQuery.isSuccess,
+    vaultListQuery.isError,
+    vaultListQuery.dataUpdatedAt,
+    collectionsQuery.isSuccess,
+    collectionsQuery.isError,
+    collectionsQuery.dataUpdatedAt,
+    ingressQuery.isSuccess,
+    ingressQuery.isError,
+    ingressQuery.data,
+    ingressQuery.dataUpdatedAt,
+    lockVault,
+  ]);
 
   // Auto-lock: drop the decrypted entries after the policy's
   // auto_lock_max_minutes (GET /api/settings/vault-policy). The values only live
@@ -1552,6 +1834,89 @@ export default function Vault() {
     setConfirmLeaveId((id) => (id && id !== collectionFilter ? null : id));
   }, [collectionFilter]);
 
+  // Kept outside unlockVaultMutation.onSuccess so the asynchronous verifier
+  // closes over this render's query observers, not over the callback activation
+  // that received the decrypted `data` array.
+  function verifyReleasedSnapshot(releasedSnapshot: UnlockedAccessSnapshot) {
+    void Promise.all([
+      vaultListQuery.refetch(),
+      collectionsQuery.refetch(),
+      ingressQuery.refetch(),
+    ]).then(([latestVault, latestCollections, latestIngress]) => {
+      if (
+        unlockedAccessRef.current !== releasedSnapshot ||
+        accessInvalidationInProgressRef.current
+      ) {
+        return;
+      }
+
+      let reason: 'scope' | 'private' | null = null;
+      if (latestCollections.isSuccess) {
+        for (const [, collectionID] of releasedSnapshot.entryCollections) {
+          if (!collectionID) continue;
+          const current = latestCollections.data.find(
+            (candidate) => candidate.id === collectionID
+          );
+          if (!current) {
+            reason = 'scope';
+            break;
+          }
+          const policy = normalizeCollectionPrivateAccessPolicy(
+            current.private_access_policy
+          );
+          const prior = releasedSnapshot.collectionPolicies.get(collectionID);
+          if (prior && prior !== policy) {
+            reason = 'scope';
+            break;
+          }
+          releasedSnapshot.collectionPolicies.set(collectionID, policy);
+          if (policy !== 'standard') releasedSnapshot.requiresPrivate = true;
+        }
+        releasedSnapshot.collectionsData = latestCollections.data;
+      }
+
+      if (!reason && latestVault.isSuccess) {
+        const currentEntries = new Map(
+          latestVault.data.map((entry) => [entry.id, entry.collection_id] as const)
+        );
+        for (const [entryID, collectionID] of releasedSnapshot.entryCollections) {
+          if (
+            !currentEntries.has(entryID) ||
+            currentEntries.get(entryID) !== collectionID
+          ) {
+            reason = 'scope';
+            break;
+          }
+        }
+        releasedSnapshot.vaultListData = latestVault.data;
+      }
+
+      if (
+        !reason &&
+        releasedSnapshot.requiresPrivate &&
+        (!latestIngress.isSuccess || latestIngress.data.ingress !== 'private')
+      ) {
+        reason = 'private';
+      }
+      if (
+        !reason &&
+        releasedSnapshot.requiresPrivate &&
+        (latestCollections.isError || latestVault.isError)
+      ) {
+        reason = 'private';
+      }
+      if (!reason) return;
+
+      accessInvalidationInProgressRef.current = true;
+      lockVault();
+      toast.error(
+        reason === 'private'
+          ? 'Vault locked because private access could no longer be verified. Nothing was deleted.'
+          : 'Vault locked because collection access changed. Nothing was deleted.'
+      );
+    });
+  }
+
   const unlockVaultMutation = useMutation({
     mutationFn: (password: string) => vaultApi.unlock(password),
     // Capture the seal epoch at request time so onSuccess can tell whether a
@@ -1571,8 +1936,48 @@ export default function Vault() {
       }
       setVaultUnlocked(true);
       setVaultEntries(data);
+      const collectionPolicies = new Map<
+        string,
+        CollectionPrivateAccessPolicy
+      >();
+      let requiresPrivate = false;
+      if (collectionsQuery.isSuccess) {
+        for (const entry of data) {
+          if (!entry.collection_id) continue;
+          const collection = collections.find(
+            (candidate) => candidate.id === entry.collection_id
+          );
+          if (!collection) continue;
+          const policy = normalizeCollectionPrivateAccessPolicy(
+            collection.private_access_policy
+          );
+          collectionPolicies.set(collection.id, policy);
+          if (policy !== 'standard') requiresPrivate = true;
+        }
+      }
+      const releasedSnapshot: UnlockedAccessSnapshot = {
+        entryCollections: new Map(
+          data.map((entry) => [entry.id, entry.collection_id] as const)
+        ),
+        collectionPolicies,
+        requiresPrivate,
+        vaultListData: vaultListQuery.data,
+        collectionsData: collectionsQuery.data,
+      };
+      unlockedAccessRef.current = releasedSnapshot;
+      accessInvalidationInProgressRef.current = false;
       setVaultPassword('');
       toast.success('Vault unlocked');
+
+      // Do not let a pre-unlock cache snapshot become the permanent baseline.
+      // This matters when a promotion commits between the list and unlock
+      // transactions: an already-admitted unlock may finish with plaintext
+      // after the newer metadata list has already hidden that row. Force one
+      // coherent post-release verification and inspect its results directly;
+      // structural sharing may keep the same array reference when an omitted
+      // result remains omitted, so the polling effect alone cannot prove that
+      // this first verification happened.
+      verifyReleasedSnapshot(releasedSnapshot);
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -1641,27 +2046,12 @@ export default function Vault() {
       setVaultEntries((entries) =>
         entries.map((e) =>
           e.id === data.id
-            ? {
-                ...e,
-                value: data.value ?? e.value,
-                last_rotated_at: data.last_rotated_at ?? e.last_rotated_at,
-                rotation_status: data.rotation_status ?? e.rotation_status,
-                // NOT `?? ''`: an absent field must keep whatever the row already
-                // had rather than being blanked, and a present one must survive.
-                last_rotation_error:
-                  data.last_rotation_error ?? e.last_rotation_error ?? '',
-                // A manual rotate here is the retry point for a PREVIOUS stranded
-                // key too (see internal/handlers: a failed delete keeps the old
-                // key's coordinates and retries them at the next rotation), so
-                // this response is authoritative on whether one is still
-                // outstanding: explicit null means the server just cleared it,
-                // an object means one exists (possibly a NEW one, replacing the
-                // old). Only fall back to the prior value if the field is
-                // missing from the response altogether (`undefined`), same
-                // "absent vs explicit" distinction as last_rotation_error above.
-                pending_revoke:
-                  data.pending_revoke !== undefined ? data.pending_revoke : e.pending_revoke,
-              }
+            // Rotate returns an ordinary write echo: its new primary value is
+            // revealed, but secondary custom/provider credentials are blanked
+            // and marked withheld. Merge those markers against the entry this
+            // password-gated session already revealed instead of resealing the
+            // unlocked cache. Explicit null/empty fields remain authoritative.
+            ? mergeUnlockedVaultEntry(e, data)
             : e
         )
       );
@@ -1682,27 +2072,26 @@ export default function Vault() {
   });
 
   const createCollectionMutation = useMutation({
-    mutationFn: (data: { name: string; description: string }) => api.collections.create(data),
+    mutationFn: (data: Parameters<typeof api.collections.create>[0]) =>
+      api.collections.create(data),
     onSuccess: () => {
       toast.success('Collection created');
       setShowNewCollection(false);
-      setNewCollection({ name: '', description: '' });
+      setNewCollection(BLANK_NEW_COLLECTION);
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
     },
     onError: (err: Error) => toast.error(err.message),
   });
 
-  // Moving an entry is a dedicated endpoint, not part of the entry update. We
-  // patch the in-memory unlocked list so the badge updates without re-locking.
+  // Moving an entry changes the authorization/policy scope under which its
+  // plaintext was released. Re-lock instead of carrying that plaintext across
+  // collection boundaries (including into or out of private policy).
   const moveToCollectionMutation = useMutation({
     mutationFn: ({ id, collectionId }: { id: string; collectionId: string | null }) =>
       vaultApi.moveToCollection(id, collectionId),
     onSuccess: (_data, variables) => {
       toast.success(variables.collectionId ? 'Moved to collection' : 'Moved to personal');
-      setVaultEntries((prev) =>
-        prev.map((e) => (e.id === variables.id ? { ...e, collection_id: variables.collectionId } : e))
-      );
-      setEditForm((f) => ({ ...f, collection_id: variables.collectionId ?? '' }));
+      lockVault();
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
     },
@@ -1715,13 +2104,14 @@ export default function Vault() {
   // as-is rather than second-guessed here.
   const leaveCollectionMutation = useMutation({
     mutationFn: (collectionId: string) => api.collections.declineInvite(collectionId),
-    onSuccess: (_data, collectionId) => {
+    onSuccess: () => {
       toast.success('You left the collection');
       setConfirmLeaveId(null);
       setCollectionFilter('all');
-      // Drop the collection's entries from the decrypted in-memory list so the
-      // view matches the new access without forcing a re-unlock.
-      setVaultEntries((prev) => prev.filter((e) => e.collection_id !== collectionId));
+      // Membership withdrawal invalidates the snapshot that released the
+      // collection's plaintext. Filtering the rendered array was insufficient:
+      // the unlock mutation cache still retained the full decrypted response.
+      lockVault();
       queryClient.invalidateQueries({ queryKey: queryKeys.collections.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });
     },
@@ -1762,10 +2152,29 @@ export default function Vault() {
     collectionFilter !== 'all' && collectionFilter !== 'personal'
       ? collectionById(collectionFilter)
       : undefined;
-  const manageCollection = manageCollectionId ? collectionById(manageCollectionId) : undefined;
+  const requestedManageCollection = manageCollectionId
+    ? collectionById(manageCollectionId)
+    : undefined;
+  // Re-check on every collection refresh. If another manager changes this
+  // user's role while the dialog is open, manager controls disappear instead
+  // of lingering until a request eventually receives 403.
+  const manageCollection =
+    requestedManageCollection?.role === 'manager'
+      ? requestedManageCollection
+      : undefined;
 
   const filteredEntries = vaultEntries.filter(matchesFilter);
   const filteredVaultList = vaultList.filter(matchesFilter);
+  const unlockedEntryIds = new Set(vaultEntries.map((entry) => entry.id));
+  const filteredPrivateOnlyEntries = vaultList.filter((entry) => {
+    if (unlockedEntryIds.has(entry.id) || !matchesFilter(entry)) return false;
+    const collection = collectionById(entry.collection_id);
+    return Boolean(
+      collection &&
+        normalizeCollectionPrivateAccessPolicy(collection.private_access_policy) !==
+          'standard'
+    );
+  });
 
   function startEditing(entry: VaultEntry) {
     setEditingEntryId(entry.id);
@@ -1853,6 +2262,23 @@ export default function Vault() {
             <div className="flex items-center gap-2">
               <Folder className="h-4 w-4 text-slate-500" />
               <h3 className="text-sm font-semibold text-slate-900">Collections</h3>
+              {ingressQuery.isSuccess && (
+                <span
+                  className={clsx(
+                    'rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                    isPrivateIngress
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : 'bg-slate-100 text-slate-600'
+                  )}
+                  title={
+                    isPrivateIngress
+                      ? 'This page is connected to the application-verified private listener.'
+                      : 'This page is connected to the ordinary public listener.'
+                  }
+                >
+                  {isPrivateIngress ? 'Private URL' : 'Public URL'}
+                </span>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {selectedFilterCollection?.role === 'manager' && (
@@ -1901,6 +2327,7 @@ export default function Vault() {
                 ))}
               <button
                 onClick={() => setShowNewCollection(true)}
+                disabled={Boolean(collectionsError)}
                 className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
               >
                 <FolderPlus className="h-3.5 w-3.5" />
@@ -1908,6 +2335,13 @@ export default function Vault() {
               </button>
             </div>
           </div>
+          {collectionsError && (
+            <div role="alert" className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+              <span className="font-semibold">Collections could not be loaded.</span>{' '}
+              {errorMessage(collectionsError)} Nothing is being reported as
+              empty or deleted; reload this page before managing collections.
+            </div>
+          )}
           <div className="flex flex-wrap gap-1.5">
             {[
               { key: 'all', label: 'All' },
@@ -1941,6 +2375,10 @@ export default function Vault() {
                   )}
                 >
                   {c.name}
+                  <CollectionAccessBadge
+                    policy={c.private_access_policy}
+                    inverted={active}
+                  />
                   {typeof c.entry_count === 'number' && (
                     <span
                       className={clsx(
@@ -2285,10 +2723,35 @@ export default function Vault() {
               </form>
             )}
 
+            {filteredPrivateOnlyEntries.length > 0 && (
+              <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-900">
+                  Protected internal entries stay locked on this URL.
+                </p>
+                <p className="mt-1 text-xs text-amber-800">
+                  Your personal and standard/client entries are still usable.
+                  {ingressQuery.isSuccess &&
+                  !ingressQuery.data.private_ingress_enabled
+                    ? ' Private ingress is not currently configured; ask your administrator to restore it before these entries can be used.'
+                    : ' Open your team\'s private Tailscale or Headscale URL and unlock there to use the protected entries. Ask your administrator for the exact address if needed.'}
+                </p>
+                <ul className="mt-2 space-y-1 text-xs text-amber-900">
+                  {filteredPrivateOnlyEntries.map((entry) => (
+                    <li key={entry.id} className="flex items-center justify-between gap-3">
+                      <span className="font-medium">{entry.name}</span>
+                      <span>{collectionName(entry.collection_id)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             {/* Secrets list (unlocked with values) */}
             {filteredEntries.length === 0 ? (
               <p className="py-4 text-center text-sm text-slate-500">
-                {vaultEntries.length === 0
+                {filteredPrivateOnlyEntries.length > 0
+                  ? 'No personal or standard/client secrets in this view.'
+                  : vaultEntries.length === 0
                   ? 'No secrets in the vault yet. Add one to get started.'
                   : 'No secrets in this view. Try a different collection filter.'}
               </p>
@@ -2838,6 +3301,13 @@ export default function Vault() {
                     </Link>{' '}
                     to get access back.
                   </p>
+                ) : listRefusedForPrivateIngress ? (
+                  <p className="text-amber-900">
+                    <span className="font-medium">
+                      Your secrets are not shown on this URL.
+                    </span>{' '}
+                    Nothing has been deleted. {errorMessage(vaultError)}
+                  </p>
                 ) : (
                   <p className="text-red-700">
                     <span className="font-medium">
@@ -2993,6 +3463,7 @@ export default function Vault() {
                   createCollectionMutation.mutate({
                     name: newCollection.name.trim(),
                     description: newCollection.description.trim(),
+                    private_access_policy: newCollection.private_access_policy,
                   });
                 }
               }}
@@ -3020,6 +3491,15 @@ export default function Vault() {
                   className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm outline-none focus:border-slate-400"
                 />
               </div>
+              <CollectionPrivateAccessPolicyField
+                name="new_collection_private_access_policy"
+                value={newCollection.private_access_policy}
+                onChange={(private_access_policy) =>
+                  setNewCollection((current) => ({ ...current, private_access_policy }))
+                }
+                disabled={createCollectionMutation.isPending}
+                canSelectProtected={isPrivateIngress}
+              />
               <div className="flex justify-end gap-2 pt-1">
                 <button
                   type="button"
@@ -3030,7 +3510,12 @@ export default function Vault() {
                 </button>
                 <button
                   type="submit"
-                  disabled={createCollectionMutation.isPending || !newCollection.name.trim()}
+                  disabled={
+                    createCollectionMutation.isPending ||
+                    !newCollection.name.trim() ||
+                    (newCollection.private_access_policy !== 'standard' &&
+                      !isPrivateIngress)
+                  }
                   className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
                 >
                   {createCollectionMutation.isPending ? (
@@ -3051,11 +3536,14 @@ export default function Vault() {
       {manageCollection && (
         <CollectionManageModal
           collection={manageCollection}
+          isPrivateIngress={isPrivateIngress}
           onClose={() => setManageCollectionId(null)}
           onDeleted={() => {
+            lockVault();
             setManageCollectionId(null);
             setCollectionFilter('all');
           }}
+          onAccessPolicyChanged={lockVault}
         />
       )}
     </Layout>

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 )
 
 // THE AUTH_TOKEN QUESTION, ASKED WHERE SOMEBODY IS LOOKING.
@@ -57,6 +59,30 @@ type authTokenRefusal struct {
 }
 
 func (r authTokenRefusal) empty() bool { return r.Reason == "" }
+
+// rotationTargetReferencesNeedPrivate reports whether a public target-management
+// response/write cannot safely resolve every Forgejo auth_token to a standard
+// entry. Missing, ambiguous, inaccessible, corrupt and protected references all
+// deliberately collapse to the same answer: requiring private ingress. That
+// prevents `missing name saves, hidden name returns 403` from becoming a
+// fully-private name oracle, and it prevents GET from returning a name that was
+// stored before its referenced entry became protected.
+func (h *VaultHandler) rotationTargetReferencesNeedPrivate(ctx context.Context, targets []RotationTarget) bool {
+	for _, target := range targets {
+		if target.Type != "forgejo_secret" || strings.TrimSpace(target.AuthToken) == "" {
+			continue
+		}
+		row, err := h.resolvePublicVaultReferenceRowFor(ctx, target.AuthToken, target.ConfiguredBy)
+		if err != nil {
+			return true
+		}
+		policy, found, err := entryPrivateAccessPolicy(ctx, h.queries, row.ID)
+		if err != nil || !found || policy != privateaccess.PolicyStandard {
+			return true
+		}
+	}
+	return false
+}
 
 // checkAuthTokenAuthority answers "may configuredBy spend the entry named by
 // this target's auth_token as a bearer token?".

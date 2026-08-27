@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -34,6 +36,24 @@ type Config struct {
 	// behind one Caddy, hence the default of 1.
 	// Env: TRUSTISSUES_TRUSTED_PROXY_HOPS (default 1).
 	TrustedProxyHops int
+	// TrustedProxyPeers is the comma-separated set of direct peer IPs/CIDRs that
+	// may supply forwarding headers. Private address space is intentionally not
+	// trusted wholesale because container networks are often shared.
+	// Env: TRUSTISSUES_TRUSTED_PROXY_PEERS (default loopback only).
+	TrustedProxyPeers string
+	// PrivateSocketPath enables the optional private-ingress listener when set.
+	// It is a Unix-domain socket rather than a TCP port so only a local overlay
+	// connector explicitly given filesystem access can reach it. Requests on
+	// this listener are application-stamped private; no header, Host value, or
+	// source IP can select that trust zone.
+	// Env: TRUSTISSUES_PRIVATE_SOCKET_PATH (default empty/disabled).
+	PrivateSocketPath string
+	// PrivateBaseURL is the HTTPS browser origin routed by the optional overlay
+	// connector to PrivateSocketPath. Keeping it distinct in configuration lets
+	// CSRF accept the private SPA without also accepting that origin on public
+	// ingress (or accepting the public origin on private ingress).
+	// Env: TRUSTISSUES_PRIVATE_BASE_URL (required when the private socket is set).
+	PrivateBaseURL string
 	// JWTSecret signs session JWTs. Env: TRUSTISSUES_JWT_SECRET (required).
 	JWTSecret string
 	// VaultKey is the symmetric key protecting encrypted columns (vault
@@ -94,19 +114,22 @@ type Config struct {
 // optional). All other fields have defaults.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:             envInt("TRUSTISSUES_PORT", 8080),
-		BindHost:         envStr("TRUSTISSUES_BIND_HOST", "127.0.0.1"),
-		TrustedProxyHops: envInt("TRUSTISSUES_TRUSTED_PROXY_HOPS", 1),
-		JWTSecret:        os.Getenv("TRUSTISSUES_JWT_SECRET"),
-		VaultKey:         os.Getenv("TRUSTISSUES_VAULT_KEY"),
-		VaultKeyPrevious: os.Getenv("TRUSTISSUES_VAULT_KEY_PREVIOUS"),
-		RekeyOnBoot:      envBool("TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT", false),
-		BaseURL:          envStr("TRUSTISSUES_BASE_URL", "http://localhost:8080"),
-		DataDir:          envStr("TRUSTISSUES_DATA_DIR", "./data"),
-		FrontendDir:      envStr("TRUSTISSUES_FRONTEND_DIR", "./frontend/dist"),
-		LogLevel:         envStr("TRUSTISSUES_LOG_LEVEL", "info"),
-		ShieldKey:        os.Getenv("TRUSTISSUES_SHIELD_KEY"),
-		ShieldHintLevel:  envStr("TRUSTISSUES_SHIELD_HINT_LEVEL", "full"),
+		Port:              envInt("TRUSTISSUES_PORT", 8080),
+		BindHost:          envStr("TRUSTISSUES_BIND_HOST", "127.0.0.1"),
+		TrustedProxyHops:  envInt("TRUSTISSUES_TRUSTED_PROXY_HOPS", 1),
+		TrustedProxyPeers: envStrAllowEmpty("TRUSTISSUES_TRUSTED_PROXY_PEERS", "127.0.0.1/32,::1/128"),
+		PrivateSocketPath: os.Getenv("TRUSTISSUES_PRIVATE_SOCKET_PATH"),
+		PrivateBaseURL:    os.Getenv("TRUSTISSUES_PRIVATE_BASE_URL"),
+		JWTSecret:         os.Getenv("TRUSTISSUES_JWT_SECRET"),
+		VaultKey:          os.Getenv("TRUSTISSUES_VAULT_KEY"),
+		VaultKeyPrevious:  os.Getenv("TRUSTISSUES_VAULT_KEY_PREVIOUS"),
+		RekeyOnBoot:       envBool("TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT", false),
+		BaseURL:           envStr("TRUSTISSUES_BASE_URL", "http://localhost:8080"),
+		DataDir:           envStr("TRUSTISSUES_DATA_DIR", "./data"),
+		FrontendDir:       envStr("TRUSTISSUES_FRONTEND_DIR", "./frontend/dist"),
+		LogLevel:          envStr("TRUSTISSUES_LOG_LEVEL", "info"),
+		ShieldKey:         os.Getenv("TRUSTISSUES_SHIELD_KEY"),
+		ShieldHintLevel:   envStr("TRUSTISSUES_SHIELD_HINT_LEVEL", "full"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -225,7 +248,6 @@ func (c *Config) Validate() error {
 			errs = append(errs, "TRUSTISSUES_SHIELD_KEY looks like a placeholder or low-entropy value")
 		}
 	}
-
 	if c.BindHost == "" {
 		errs = append(errs, "TRUSTISSUES_BIND_HOST is required (default 127.0.0.1)")
 	}
@@ -234,12 +256,55 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("TRUSTISSUES_TRUSTED_PROXY_HOPS must be zero or greater (got %d)", c.TrustedProxyHops))
 	}
 
+	if c.PrivateSocketPath != "" {
+		switch {
+		case strings.TrimSpace(c.PrivateSocketPath) != c.PrivateSocketPath:
+			errs = append(errs, "TRUSTISSUES_PRIVATE_SOCKET_PATH must not have leading or trailing whitespace")
+		case !filepath.IsAbs(c.PrivateSocketPath):
+			errs = append(errs, "TRUSTISSUES_PRIVATE_SOCKET_PATH must be an absolute path")
+		case filepath.Clean(c.PrivateSocketPath) != c.PrivateSocketPath:
+			errs = append(errs, "TRUSTISSUES_PRIVATE_SOCKET_PATH must be a clean absolute path (without . or .. components)")
+		case len([]byte(c.PrivateSocketPath)) > 100:
+			// sockaddr_un is 104 bytes on macOS and 108 on Linux. A 100-byte
+			// ceiling leaves room for the terminating NUL on every supported
+			// deployment platform instead of accepting a path that only fails
+			// after the rest of startup has completed.
+			errs = append(errs, "TRUSTISSUES_PRIVATE_SOCKET_PATH must be at most 100 bytes for portable Unix-socket support")
+		}
+	}
+	if c.PrivateSocketPath == "" && c.PrivateBaseURL != "" {
+		errs = append(errs, "TRUSTISSUES_PRIVATE_BASE_URL is set but TRUSTISSUES_PRIVATE_SOCKET_PATH is empty; private ingress is disabled")
+	}
+	if c.PrivateSocketPath != "" {
+		if c.PrivateBaseURL == "" {
+			errs = append(errs, "TRUSTISSUES_PRIVATE_BASE_URL is required when TRUSTISSUES_PRIVATE_SOCKET_PATH enables private ingress")
+		} else if err := validatePrivateBaseURL(c.PrivateBaseURL); err != nil {
+			errs = append(errs, "TRUSTISSUES_PRIVATE_BASE_URL "+err.Error())
+		}
+	}
+
 	if c.BaseURL != "" {
 		u, err := url.Parse(c.BaseURL)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("TRUSTISSUES_BASE_URL is invalid: %v", err))
 		} else if u.Scheme != "http" && u.Scheme != "https" {
 			errs = append(errs, "TRUSTISSUES_BASE_URL must use http or https scheme")
+		} else if u.Hostname() == "" {
+			errs = append(errs, "TRUSTISSUES_BASE_URL must include a hostname")
+		} else if c.PrivateSocketPath != "" && c.PrivateBaseURL != "" {
+			privateURL, privateErr := url.Parse(c.PrivateBaseURL)
+			if privateErr == nil && privateURL.Hostname() != "" {
+				publicHost, publicCanonical := privateBoundaryHostname(u.Hostname())
+				privateHost, privateCanonical := privateBoundaryHostname(privateURL.Hostname())
+				switch {
+				case !publicCanonical || !privateCanonical:
+					errs = append(errs, "public/private hostnames must use ASCII (punycode) and canonical IP spelling so browser cookie-origin equivalence can be checked safely")
+				case !hasCanonicalBrowserPort(u) || !hasCanonicalBrowserPort(privateURL):
+					errs = append(errs, "public/private URL ports must use canonical decimal spelling in the range 1-65535 so browser origins match CSRF configuration")
+				case publicHost == privateHost:
+					errs = append(errs, "TRUSTISSUES_PRIVATE_BASE_URL must use a different hostname from TRUSTISSUES_BASE_URL; ports do not isolate host-only session cookies")
+				}
+			}
 		}
 	}
 
@@ -254,6 +319,114 @@ func (c *Config) Validate() error {
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed:\n  - " + strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// privateBoundaryHostname canonicalizes the hostname properties browsers use
+// for host-only cookie/storage isolation. A trailing DNS root dot is routing-
+// equivalent and cannot manufacture a second boundary. Unicode is refused when
+// the private feature is enabled because browsers convert it to IDNA/punycode;
+// asking operators to spell that ASCII form keeps this comparison explicit
+// without maintaining a second IDNA implementation in configuration code.
+//
+// IP literals need a second normalization step. Browsers serialize equivalent
+// IPv6 spellings to one host and accept legacy IPv4 spellings such as 127.1,
+// 0177.0.0.1 and 0x7f000001. Go's net/url intentionally leaves those spellings
+// alone, so comparing its Hostname strings directly could accept two configured
+// URLs that the browser collapses to one origin. netip gives canonical modern
+// IP spelling; legacy numeric IPv4 forms are rejected rather than reimplemented.
+func privateBoundaryHostname(host string) (string, bool) {
+	for _, r := range host {
+		if r > 127 {
+			return "", false
+		}
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Zone() != "" {
+			return "", false
+		}
+		canonical := addr.String()
+		if host != canonical {
+			return "", false
+		}
+		return canonical, true
+	}
+	if strings.Contains(host, ":") || looksLikeLegacyIPv4(host) {
+		return "", false
+	}
+	return host, true
+}
+
+// looksLikeLegacyIPv4 recognizes the numeric host grammar browsers may treat
+// as IPv4 even when it is not a canonical dotted quad. A normal DNS name can
+// contain digits; it is considered numeric only when every label is decimal or
+// explicitly hexadecimal. Rejecting these rare spellings is safer than trying
+// to duplicate the evolving WHATWG host parser in security configuration.
+func looksLikeLegacyIPv4(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		digits := part
+		base := byte(10)
+		if len(digits) > 2 && strings.HasPrefix(digits, "0x") {
+			digits = digits[2:]
+			base = 16
+		}
+		if digits == "" {
+			return false
+		}
+		for i := 0; i < len(digits); i++ {
+			c := digits[i]
+			if c >= '0' && c <= '9' {
+				continue
+			}
+			if base == 16 && c >= 'a' && c <= 'f' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func hasCanonicalBrowserPort(u *url.URL) bool {
+	port := u.Port()
+	if port == "" {
+		return true
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
+}
+
+func validatePrivateBaseURL(raw string) error {
+	if strings.TrimSpace(raw) != raw {
+		return errors.New("must not have leading or trailing whitespace")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		if err == nil {
+			err = errors.New("URL has no host")
+		}
+		return fmt.Errorf("is invalid: %v", err)
+	}
+	if u.Scheme != "https" {
+		return errors.New("must use https so Secure session cookies and credentials are never sent in cleartext")
+	}
+	if _, canonical := privateBoundaryHostname(u.Hostname()); !canonical {
+		return errors.New("must use an ASCII (punycode) hostname and canonical IP spelling")
+	}
+	if !hasCanonicalBrowserPort(u) {
+		return errors.New("port must use canonical decimal spelling in the range 1-65535")
+	}
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("must be an origin only (https://host[:port], with no credentials, path, query, or fragment)")
 	}
 	return nil
 }
@@ -299,6 +472,17 @@ func isWeakSecret(s string) bool {
 // envStr returns the value of an environment variable or a default.
 func envStr(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
+// envStrAllowEmpty distinguishes an unset variable from an explicitly empty
+// one. The trusted-proxy peer parser gives empty a security-relevant meaning
+// (trust nobody), so silently replacing it with loopback trust would widen an
+// operator's stated trust boundary.
+func envStrAllowEmpty(key, defaultVal string) string {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return defaultVal

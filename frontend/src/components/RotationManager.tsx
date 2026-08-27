@@ -22,6 +22,7 @@ import { api } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import { vaultApi, providerKeys } from '@/lib/vault-types';
 import type { VaultEntry, RotationTarget, ProviderInfo } from '@/lib/vault-types';
+import { mergeUnlockedVaultEntry } from '@/lib/vault-cache';
 
 // Parses provider_meta (a JSON-encoded object) into a flat string map for the
 // form. Anything that is not a JSON object of strings is treated as empty
@@ -237,13 +238,21 @@ export default function RotationManager({
   }
 
   const saveProvider = useMutation({
-    mutationFn: () =>
-      vaultApi.update(entry.id, {
-        provider: providerName,
-        provider_meta: JSON.stringify(providerMeta),
-      }),
-    onSuccess: (updated) => {
-      toast.success(providerName ? `Rotation provider set to ${selectedProvider?.label ?? providerName}` : 'Rotation provider cleared');
+    mutationFn: async () => {
+      // Snapshot the submitted values. The form remains editable while the
+      // request is in flight, so reading React state later in onSuccess could
+      // merge a different credential than the one the server just accepted.
+      const submittedProvider = providerName;
+      const submittedProviderMeta = JSON.stringify(providerMeta);
+      const updated = await vaultApi.update(entry.id, {
+        provider: submittedProvider,
+        provider_meta: submittedProviderMeta,
+      });
+      return { updated, submittedProvider, submittedProviderMeta };
+    },
+    onSuccess: ({ updated, submittedProvider, submittedProviderMeta }) => {
+      const submittedProviderInfo = providers.find((p) => p.name === submittedProvider);
+      toast.success(submittedProvider ? `Rotation provider set to ${submittedProviderInfo?.label ?? submittedProvider}` : 'Rotation provider cleared');
       // Forward what the server ACTUALLY said rather than assuming a save
       // clears the markers. It drops them only when the PROVIDER CHANGED
       // (reconcileProviderMetaForStorage's `keep` is literally
@@ -251,9 +260,13 @@ export default function RotationManager({
       // unchanged-provider save used to be reported to the parent as
       // all-clear for a key still live at the provider.
       applyPendingRevoke(updated.pending_revoke ?? null);
+      const merged = mergeUnlockedVaultEntry(
+        { ...entry, provider: submittedProvider, provider_meta: submittedProviderMeta },
+        updated
+      );
       onProviderSaved?.({
-        provider: updated.provider ?? providerName,
-        provider_meta: updated.provider_meta ?? JSON.stringify(providerMeta),
+        provider: merged.provider ?? submittedProvider,
+        provider_meta: merged.provider_meta ?? submittedProviderMeta,
         pending_revoke: updated.pending_revoke ?? null,
       });
       queryClient.invalidateQueries({ queryKey: queryKeys.vault.all });

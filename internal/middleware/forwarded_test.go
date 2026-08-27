@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -11,9 +13,14 @@ import (
 // withProxyConfig sets the package-level trust configuration for one test.
 func withProxyConfig(t *testing.T, hops int, xRealIP bool) {
 	t.Helper()
-	oldHops, oldXRI := trustedProxyHops, trustXRealIP
+	oldHops, oldXRI, oldPeers := trustedProxyHops, trustXRealIP, trustedProxyPeers
 	trustedProxyHops, trustXRealIP = hops, xRealIP
-	t.Cleanup(func() { trustedProxyHops, trustXRealIP = oldHops, oldXRI })
+	if err := ConfigureTrustedProxyPeers("127.0.0.1,::1"); err != nil {
+		t.Fatalf("configure loopback proxy: %v", err)
+	}
+	t.Cleanup(func() {
+		trustedProxyHops, trustXRealIP, trustedProxyPeers = oldHops, oldXRI, oldPeers
+	})
 }
 
 // req builds a request from a trusted peer (loopback) carrying the given
@@ -148,6 +155,68 @@ func TestClientIPIgnoresForwardedHeadersFromAnUntrustedPeer(t *testing.T) {
 	}
 }
 
+// A private socket peer is not synonymous with our reverse proxy. Production
+// runs on a shared RFC1918 bridge, so trusting the whole address class lets any
+// neighbouring container choose its audit identity and a fresh limiter bucket.
+func TestClientIPIgnoresForwardedHeadersFromUnlistedPrivatePeer(t *testing.T) {
+	withProxyConfig(t, 2, true)
+	r := req("9.9.9.9", "8.8.8.8")
+	r.RemoteAddr = "10.0.6.99:5555"
+	r.Header.Set("X-Real-IP", "9.9.9.9")
+	if got := clientIP(r); got != "10.0.6.99" {
+		t.Fatalf("clientIP = %q, want the unlisted private socket peer 10.0.6.99", got)
+	}
+	if ForwardedProtoHTTPS(r) {
+		t.Fatal("an unlisted private peer was allowed to assert X-Forwarded-Proto")
+	}
+}
+
+func TestConfiguredPrivateProxyMayForward(t *testing.T) {
+	withProxyConfig(t, 1, false)
+	if err := ConfigureTrustedProxyPeers("10.0.6.17/32"); err != nil {
+		t.Fatal(err)
+	}
+	r := req("203.0.113.9")
+	r.RemoteAddr = "10.0.6.17:5555"
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if got := clientIP(r); got != "203.0.113.9" {
+		t.Fatalf("clientIP = %q, want forwarded client", got)
+	}
+	if !ForwardedProtoHTTPS(r) {
+		t.Fatal("the explicitly configured proxy could not report HTTPS")
+	}
+}
+
+func TestConfigureTrustedProxyPeersRejectsPartialMalformedSet(t *testing.T) {
+	withProxyConfig(t, 1, false)
+	before := append([]netip.Prefix(nil), trustedProxyPeers...)
+	if err := ConfigureTrustedProxyPeers("10.0.6.17, definitely-not-an-ip"); err == nil {
+		t.Fatal("malformed proxy set was accepted")
+	}
+	if !reflect.DeepEqual(trustedProxyPeers, before) {
+		t.Fatalf("malformed proxy set partially applied: got %v want %v", trustedProxyPeers, before)
+	}
+}
+
+func TestConfigureTrustedProxyPeersEmptyTrustsNobody(t *testing.T) {
+	withProxyConfig(t, 1, false)
+	if err := ConfigureTrustedProxyPeers(""); err != nil {
+		t.Fatalf("configure empty proxy set: %v", err)
+	}
+	if len(trustedProxyPeers) != 0 {
+		t.Fatalf("empty proxy set installed %v, want no trusted peers", trustedProxyPeers)
+	}
+
+	r := req("203.0.113.9")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if got := clientIP(r); got != "127.0.0.1" {
+		t.Fatalf("empty proxy set accepted X-Forwarded-For: got %q", got)
+	}
+	if ForwardedProtoHTTPS(r) {
+		t.Fatal("empty proxy set accepted X-Forwarded-Proto")
+	}
+}
+
 // TestForwardedProtoCannotBeAssertedByTheCaller covers the same defect on the
 // other forwarded header.
 //
@@ -262,9 +331,12 @@ func TestForwardedChainDropsEmptyElements(t *testing.T) {
 func TestForwardedProtoAtEveryHopCount(t *testing.T) {
 	for _, hops := range []int{0, 1, 2, 3} {
 		withProxyConfig(t, hops, false)
+		if err := ConfigureTrustedProxyPeers("10.0.6.1/32"); err != nil {
+			t.Fatal(err)
+		}
 
-		// Exactly what the public path delivers: private peer (Caddy on the
-		// container network), a two-entry XFF, and a ONE-entry XFP.
+		// Exactly what the public path delivers: explicitly configured Caddy
+		// peer, a two-entry XFF, and a ONE-entry XFP.
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = "10.0.6.1:44444"
 		r.Header.Set("X-Forwarded-For", "84.55.97.134, 10.0.6.1")

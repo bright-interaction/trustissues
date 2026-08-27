@@ -110,8 +110,9 @@ func TestPasswordSetMarkerDefaultsToSetForExistingRowsAndSurvivesADownUpCycle(t 
 		t.Fatal("password_set is missing after the up/down/up cycle")
 	}
 
-	// And the column still takes the write the password-less redemption path
-	// makes: an explicit 0.
+	// And the column still represents an explicit legacy password-less account.
+	// Current invitation redemption always writes 1; retaining 0 is what lets an
+	// administrator repair an account created by an older binary.
 	mustExec(t, conn,
 		`INSERT INTO users (id, email, password_hash, name, role, password_set) VALUES (?, ?, ?, ?, ?, 0)`,
 		"cycle-passwordless-user", "cycle-passwordless@example.com", "discarded-hash", "Cycle Passwordless", "vault_only")

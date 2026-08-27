@@ -54,6 +54,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      '/health': {
+        // The SPA uses the listener-stamped root health response to distinguish
+        // public from private ingress. Proxy it in development just like /api
+        // so protected-policy controls do not fail closed merely because Vite
+        // answered the request itself.
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      },
       '/api': {
         // Trustissues backend default port (TRUSTISSUES_PORT). Keep in sync
         // with internal/config. See FRONTEND-CONTRACT.md.

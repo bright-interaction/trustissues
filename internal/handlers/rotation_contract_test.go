@@ -479,13 +479,13 @@ func installRotationFakes(t *testing.T) *alertRecorder {
 	// is a false finding pointing at working code.
 	rec := &alertRecorder{}
 	prevAlert, prevFail, prevOK := dispatchRotationAlert, dispatchRotationFailure, dispatchRotationSuccess
-	dispatchRotationAlert = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+	dispatchRotationAlert = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, _, detail string) {
 		rec.record("partial: " + detail)
 	}
-	dispatchRotationFailure = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+	dispatchRotationFailure = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, _, detail string) {
 		rec.record("failed: " + detail)
 	}
-	dispatchRotationSuccess = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, detail string) {
+	dispatchRotationSuccess = func(_ context.Context, _ *db.Queries, _ alerts.ConfigDecrypter, _, _, detail string) {
 		rec.record("succeeded: " + detail)
 	}
 	t.Cleanup(func() {

@@ -4,8 +4,10 @@ import { KeyRound, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 
-// Public page where an invited colleague redeems an invitation code, sets a
-// password, and is logged straight in. Link form: /invite?code=ABC123.
+// Public, same-origin page where an invited colleague redeems an invitation
+// code, sets a password, and is logged straight in. Link form:
+// /invite?code=ABC123. The response deliberately carries no extension API key:
+// that key is minted later from the authenticated Settings page.
 export default function Invite() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -24,8 +26,11 @@ export default function Invite() {
     try {
       const res = await api.auth.redeemInvitation(code.trim(), password);
       // Account created; log in with the invite's email + chosen password.
-      await login(res.user.email, password);
-      navigate(res.user.role === 'vault_only' ? '/vault' : '/', {
+      const auth = await login(res.user.email, password);
+      if (!auth.user) {
+        throw new Error('Account created, but sign-in needs additional verification');
+      }
+      navigate(res.user.role === 'vault_only' ? '/client-onboarding' : '/', {
         replace: true,
       });
     } catch (err) {

@@ -60,6 +60,16 @@ UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 -- supplied. See migration 00043.
 UPDATE users SET password_hash = ?, password_set = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
+-- name: SetInitialPasswordHash :execresult
+-- Atomic one-time bootstrap. The handler's early password_set read is only a
+-- cheap way to avoid hashing an already-initialized account; it cannot be the
+-- authority because two holders of the invitation-minted API key can both read
+-- zero before either expensive hash finishes. This compare-and-set makes one
+-- request the winner and prevents the later request overwriting its password.
+UPDATE users
+SET password_hash = ?, password_set = 1, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND password_set = 0;
+
 -- name: GetUserPasswordSet :one
 -- 1 when a human has ever set a password this account's owner could supply;
 -- 0 when the stored hash is a server-minted, immediately-discarded value
@@ -163,12 +173,45 @@ WHERE users.id = ?
     OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
   );
 
+-- name: UserHasProtectedCollectionImpact :one
+-- Hard delete removes memberships and reassigns shared rows held by the target.
+-- This cheap preflight avoids doing credential-revocation side effects before
+-- the authoritative conditional DELETE below refuses a public request.
+SELECT EXISTS (
+  SELECT 1
+  FROM collection_members cm
+  JOIN collections c ON c.id = cm.collection_id
+  WHERE cm.user_id = sqlc.arg('user_id') AND c.private_access_policy != 'standard'
+  UNION ALL
+  SELECT 1
+  FROM vault_entries e
+  JOIN collections c ON c.id = e.collection_id
+  WHERE e.user_id = sqlc.arg('user_id') AND c.private_access_policy != 'standard'
+);
+
 -- name: DeleteUserIfNotLastAdmin :execresult
--- Hard delete that refuses to remove the last active admin.
+-- Hard delete refuses both the last active admin and, on public ingress, a user
+-- whose removal would mutate protected collection authority or custody. The
+-- policy predicate is on the DELETE itself so a concurrent policy promotion
+-- cannot slip between a handler preflight and this destructive write.
 DELETE FROM users
-WHERE users.id = ?
+WHERE users.id = sqlc.arg('id')
   AND (
     users.role != 'admin'
     OR users.disabled = 1
     OR (SELECT COUNT(*) FROM users AS a WHERE a.role = 'admin' AND a.disabled = 0) > 1
+  )
+  AND (
+    sqlc.arg('private_ingress') = 1
+    OR NOT EXISTS (
+      SELECT 1
+      FROM collection_members cm
+      JOIN collections c ON c.id = cm.collection_id
+      WHERE cm.user_id = users.id AND c.private_access_policy != 'standard'
+      UNION ALL
+      SELECT 1
+      FROM vault_entries e
+      JOIN collections c ON c.id = e.collection_id
+      WHERE e.user_id = users.id AND c.private_access_policy != 'standard'
+    )
   );

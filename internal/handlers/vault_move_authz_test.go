@@ -118,8 +118,16 @@ func mustEntry(t *testing.T, h *VaultHandler, queries *db.Queries, id, ownerID, 
 func placeInCollection(t *testing.T, queries *db.Queries, entryID, collectionID string) {
 	t.Helper()
 	target := sql.NullString{String: collectionID, Valid: collectionID != ""}
+	// This low-level fixture intentionally preserves whatever index shape the
+	// test seeded (including legacy tokens). Production moves recompute the
+	// destination scope token in VaultHandler.MoveToCollection.
+	meta, err := queries.GetVaultEntryMeta(context.Background(), entryID)
+	if err != nil {
+		t.Fatalf("read entry %s before fixture move: %v", entryID, err)
+	}
 	if err := queries.SetVaultEntryCollection(context.Background(), db.SetVaultEntryCollectionParams{
 		CollectionID: target,
+		NameBidx:     meta.NameBidx,
 		ID:           entryID,
 	}); err != nil {
 		t.Fatalf("place entry in collection: %v", err)
@@ -440,8 +448,28 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 		`"secret_name":"CI_KEY","auth_token":"OWNER_PERSONAL_2"}]`
 	mustEntry(t, h, queries, "entry-personal-2", owner, "OWNER_PERSONAL_2", "owner-only-value-2")
 	rec = putTargets(t, h, editor, "user", entryID, swapped)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), timw.PrivateIngressRequiredCode) {
+		t.Fatalf("public auth_token guess was not normalized behind private ingress: HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	// On private ingress the operator may repair/inspect legacy targets without
+	// turning the public endpoint into a name oracle. Preserve the original
+	// attribution assertion on that surface.
+	loaded := httptest.NewRecorder()
+	servePrivate(loaded, http.HandlerFunc(h.GetTargets),
+		vaultAuthzRequest(http.MethodGet, "/api/vault/"+entryID+"/targets", editor, "user", entryID, ""))
+	var privateView struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(loaded.Body.Bytes(), &privateView); err != nil || privateView.Version == "" {
+		t.Fatalf("load private target version: HTTP %d version=%q err=%v body=%s",
+			loaded.Code, privateView.Version, err, loaded.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	servePrivate(rec, http.HandlerFunc(h.UpdateTargets),
+		vaultAuthzRequest(http.MethodPut, "/api/vault/"+entryID+"/targets?version="+privateView.Version,
+			editor, "user", entryID, swapped))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("editor could not change the auth_token: HTTP %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("editor could not change the auth_token privately: HTTP %d: %s", rec.Code, rec.Body.String())
 	}
 	stored = readStored()
 	if stored[0].ConfiguredBy != editor {
@@ -462,12 +490,33 @@ func TestUpdateTargetsStampsConfiguringUser(t *testing.T) {
 	// someone with the widening right may create one.
 	newBody := fmt.Sprintf(`[{"type":"forgejo_secret","instance":"https://git.example.com","repo":"o/r",`+
 		`"secret_name":"OTHER_KEY","auth_token":"OWNER_PERSONAL","configured_by":%q}]`, editor)
-	rec = putTargets(t, h, editor, "user", entryID, newBody)
+	// The stored target now contains a reference the editor cannot resolve, so
+	// the public GET is deliberately hidden behind private ingress. Exercise the
+	// underlying egress right on that private management surface.
+	privatePut := func(userID, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		loaded := httptest.NewRecorder()
+		servePrivate(loaded, http.HandlerFunc(h.GetTargets),
+			vaultAuthzRequest(http.MethodGet, "/api/vault/"+entryID+"/targets", userID, "user", entryID, ""))
+		var view struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(loaded.Body.Bytes(), &view); err != nil || view.Version == "" {
+			t.Fatalf("load private target version for %s: HTTP %d version=%q err=%v body=%s",
+				userID, loaded.Code, view.Version, err, loaded.Body.String())
+		}
+		out := httptest.NewRecorder()
+		servePrivate(out, http.HandlerFunc(h.UpdateTargets),
+			vaultAuthzRequest(http.MethodPut, "/api/vault/"+entryID+"/targets?version="+view.Version,
+				userID, "user", entryID, body))
+		return out
+	}
+	rec = privatePut(editor, newBody)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("an editor added a NEW delivery destination on somebody else's secret: HTTP %d (%s)",
 			rec.Code, rec.Body.String())
 	}
-	rec = putTargets(t, h, owner, "user", entryID, newBody)
+	rec = privatePut(owner, newBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner could not set a new target: HTTP %d: %s", rec.Code, rec.Body.String())
 	}

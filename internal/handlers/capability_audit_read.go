@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"net/http"
 	"strconv"
 
@@ -51,10 +52,22 @@ type capabilityLogResponse struct {
 //
 // Query params: ?agent_id=&event=&secret_id=&limit=50&offset=0
 func (h *CapabilityHandler) ListCapabilityLog(w http.ResponseWriter, r *http.Request) {
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 	ctx := r.Context()
 	// The bridge holds a *sql.DB rather than a *db.Queries (it is mostly a proxy,
 	// not a CRUD surface). Wrapping it is a struct literal, not a connection.
-	queries := db.New(h.db)
+	tx, queries, err := beginQueriesTx(ctx, db.New(h.db), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "capability_log.list: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
 
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -126,6 +139,11 @@ func (h *CapabilityHandler) ListCapabilityLog(w http.ResponseWriter, r *http.Req
 			e.StatusCode = &v
 		}
 		entries = append(entries, e)
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "capability_log.list: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, capabilityLogResponse{

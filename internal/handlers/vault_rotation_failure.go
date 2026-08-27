@@ -104,7 +104,7 @@ func recordRotationFailure(
 	LogActivity(queries, actorID, "vault.rotation_failed",
 		fmt.Sprintf("%s failed for vault secret: %s (provider: %s) - %s", kind, entryName, providerName, reason))
 
-	dispatchRotationFailure(ctx, queries, decrypter, entryName, reason)
+	dispatchRotationFailure(ctx, queries, decrypter, entryID, entryName, reason)
 }
 
 // dispatchRotationFailure fires alerts.EventRotationFailed. It mirrors
@@ -120,14 +120,21 @@ func recordRotationFailure(
 // swaps only one of them reports "nobody was told" for a path that did tell them.
 var dispatchRotationFailure = dispatchRotationFailureReal
 
-func dispatchRotationFailureReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+func dispatchRotationFailureReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter,
+	entryID, entryName, detail string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("vault rotation: failure alert dispatch panicked", "recover", r)
 		}
 	}()
-	alerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(
+	if !entryAllowsExternalNotificationMetadata(ctx, queries, entryID) {
+		slog.Info("vault rotation: external failure notification suppressed by fully-private policy",
+			"entry_id", entryID)
+		return
+	}
+	alerts.NewChannelDispatcher(ctx, queries, decrypter).DispatchGuarded(
 		alerts.EventRotationFailed, "", "",
 		map[string]string{"secret": entryName, "detail": detail},
+		entryExternalNotificationDeliveryGuard(queries, entryID),
 	)
 }

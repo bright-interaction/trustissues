@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 )
 
 func nativeTime(value string) *string { return &value }
@@ -23,12 +24,14 @@ func nativeCollectionRef(value string) *string { return &value }
 
 func nativeImportDocumentFixture() vaultExportDocument {
 	return vaultExportDocument{
-		Format:     vaultExportFormat,
-		Version:    vaultExportVersion,
-		ExportedAt: "2026-08-20T10:11:12Z",
+		Format:       vaultExportFormat,
+		Version:      vaultExportVersion,
+		ExportedAt:   "2026-08-20T10:11:12Z",
+		IngressScope: vaultExportScopePublic,
 		Collections: []vaultExportCollection{{
 			SourceID: "source-collection", Name: "Imported team vault", Description: "portable collection",
-			CreatedAt: nativeTime("2025-01-02T03:04:05Z"), UpdatedAt: nativeTime("2025-06-07T08:09:10Z"),
+			PrivateAccessPolicy: privateaccess.PolicyStandard,
+			CreatedAt:           nativeTime("2025-01-02T03:04:05Z"), UpdatedAt: nativeTime("2025-06-07T08:09:10Z"),
 		}},
 		Entries: []vaultExportEntry{
 			{
@@ -444,7 +447,7 @@ FROM vault_entries ORDER BY id`)
 		if storedName == name || (storedURL != "" && !strings.HasPrefix(storedURL, vaultColumnEncPrefix)) {
 			t.Errorf("client metadata was not sealed at rest: name=%q url=%q", storedName, storedURL)
 		}
-		if nameBidx != vault.nameBlindIndex(userID, name) {
+		if nameBidx != vault.scopedNameBlindIndex(bidxScope(userID, collectionID), name) {
 			t.Errorf("name blind index mismatch for %q", name)
 		}
 		plain, err := vault.openVersionForTest(ciphertext, nonce, version)

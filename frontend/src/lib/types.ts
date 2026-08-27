@@ -36,6 +36,21 @@ export interface AuthStatus {
   setup_required: boolean;
 }
 
+// Public invitation redemption creates an account, but it never bootstraps a
+// browser-extension credential. Vault-only users sign in with the password
+// they chose, accept the collection invitation in the web vault, and mint a
+// named API key from their authenticated Settings page. Keeping that secret
+// out of this response type prevents the public invite flow from becoming an
+// alternate API-key issuance surface again.
+export interface InvitationRedemptionResponse {
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    role: Role;
+  };
+}
+
 export interface TOTPSetupResponse {
   secret: string;
   qr_uri: string;
@@ -184,12 +199,36 @@ export interface ApiKeyCreated {
 // collection itself.
 export type CollectionRole = 'viewer' | 'editor' | 'manager';
 
+// Optional network-admission layer for a shared collection. `standard` keeps
+// the existing authenticated HTTPS behaviour; the private policies add an
+// application-verified private-ingress requirement on top of normal auth,
+// MFA, collection roles, and auditing.
+export type CollectionPrivateAccessPolicy =
+  | 'standard'
+  | 'sensitive_private'
+  | 'fully_private';
+
+// Root /health response. The ingress value is stamped by the application
+// listener, not inferred from Host or proxy headers, so the SPA can detect a
+// private page that was accidentally re-routed to the public listener.
+export interface IngressHealth {
+  status: string;
+  version: string;
+  ingress: 'public' | 'private';
+  base_url: string;
+  private_ingress_enabled: boolean;
+}
+
 // A shared-team-vault collection. The `role` is the CURRENT user's role on it.
 // Admins get every collection with role "manager"; others only get theirs.
 export interface Collection {
   id: string;
   name: string;
   description: string;
+  // Current servers always return this. It remains optional in the client type
+  // so cached data and older test fixtures safely normalize to the compatible
+  // `standard` policy during a rolling frontend/backend upgrade.
+  private_access_policy?: CollectionPrivateAccessPolicy;
   role: CollectionRole;
   member_count?: number;
   entry_count?: number;

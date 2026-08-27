@@ -68,13 +68,22 @@ func newVaultTestDB(t *testing.T) *sql.DB {
 		custom_fields TEXT NOT NULL DEFAULT '',
 		UNIQUE(user_id, name)
 	);
-	-- collection_id and collection_members are required, not optional extras:
-	-- entryAccessFor reads both, and every authorization decision in this package
-	-- now routes through it. A fixture missing them makes GetVaultEntryAccess
+	-- collections, collection_id and collection_members are required, not
+	-- optional extras: entryAccessFor reads membership, and reference resolution
+	-- LEFT JOINs the collection policy before it opens a candidate name. A
+	-- fixture missing any of them makes an otherwise-personal lookup fail closed
+	-- for a reason production never has.
+	--
+	-- Every authorization decision in this package now routes through these
+	-- tables. A fixture missing them makes GetVaultEntryAccess
 	-- error, which fails closed, so tests would "pass" by denying access for a
 	-- reason production never has. This hand-rolled schema had already drifted
 	-- once; when the real schema gains an authorization-relevant column, add it
 	-- here in the same commit.
+	CREATE TABLE collections (
+		id TEXT PRIMARY KEY,
+		private_access_policy TEXT NOT NULL DEFAULT 'standard'
+	);
 	CREATE TABLE collection_members (
 		collection_id TEXT NOT NULL,
 		user_id TEXT NOT NULL,

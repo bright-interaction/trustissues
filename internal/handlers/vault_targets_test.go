@@ -305,6 +305,10 @@ func targetsRequest(h *VaultHandler, userID, role, entryID, body string) *http.R
 // type accepted at set time but undeliverable, or vice versa), this fails.
 func TestUpdateTargetsValidationSetMatchesDelivery(t *testing.T) {
 	h, queries, userID, entryID := newTestVaultEnv(t)
+	// Public target management accepts a resolvable standard-vault token. A
+	// missing token is now deliberately refused on public ingress because it
+	// must be indistinguishable from a fully-private token with the same name.
+	mustEntry(t, h, queries, "forgejo-token-entry", userID, "forgejo-token", "token-value")
 
 	// The full supported set is accepted and persisted encrypted.
 	valid := `[

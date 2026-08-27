@@ -16,7 +16,8 @@ export interface CustomField {
   // Set by the server when a secret:true field was NOT released to this caller.
   // The value comes back blank in that case, so a form that dropped this flag on
   // save would write the blank over the real secret. It is carried back on every
-  // save and the server refuses any array containing one.
+  // save; the server accepts only the narrow secret:true/value:"" marker and
+  // preserves the stored value at that same field position.
   withheld?: boolean;
 }
 
@@ -39,6 +40,10 @@ export interface VaultEntry {
   rotation_status: 'fresh' | 'due_soon' | 'overdue' | 'expired' | 'error';
   provider?: string;
   provider_meta?: string;
+  // Credential-bearing provider metadata keys removed from an ordinary
+  // response. The values are still present in a password-unlocked entry and
+  // must be retained when that response is merged into the unlocked cache.
+  provider_meta_withheld?: string[];
   auto_rotate?: boolean;
   last_rotation_error?: string;
   // Which shared collection the entry lives in, or null for a personal entry.

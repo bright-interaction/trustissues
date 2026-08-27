@@ -126,11 +126,13 @@ var vaultFieldNotes = vaultfield.Declare(
 // ── operator configuration returned to callers who may already write it ─────
 
 var vaultFieldProviderMeta = vaultfield.Declare(
-	"vault_entries.provider_meta", vaultfield.NotACredential, "",
-	"the provider binding (site, tenant, project_ref, the key id a rotation minted). Encrypted at rest "+
-		"because account and key identifiers are worth not leaking from a stolen file. It is returned in "+
-		"every entry response, and it is also a HOST-CHOOSING column, so who may WRITE it is the question "+
-		"that matters and vaultegress answers it.")
+	"vault_entries.provider_meta", vaultfield.ThroughTheExit,
+	"vault.go:VaultHandler.providerMetaForCaller",
+	"most of the provider binding is metadata (site, tenant, project_ref and key ids), but Datadog's "+
+		"app_key is a separate live credential used to manage the API key stored as the entry value. "+
+		"Ordinary responses redact provider-scoped credential keys; password-gated unlock/export releases "+
+		"each one through providerMetaForCaller and the entry-owner secret exit. Internal provider adapter "+
+		"use remains in-process, while vaultegress still governs the column's host-choosing writes.")
 
 var vaultFieldRotationTargets = vaultfield.Declare(
 	"vault_entries.rotation_targets", vaultfield.NotACredential, "",

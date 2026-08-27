@@ -92,7 +92,7 @@ func TestCapabilityBridgeAppliesTheInferenceAllowlist(t *testing.T) {
 		// would only move the bypass one step.
 		signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 		tok, err := capability.Sign(capability.Token{
-			Secret: "team-openai", SecretID: secretID, Agent: agentID,
+			Secret: "team-openai", SecretID: secretID, Issuer: client, Agent: agentID,
 			Dests: []string{dest}, Method: method,
 		}, signingKey, time.Minute)
 		if err != nil {
@@ -162,7 +162,7 @@ func TestCapabilityBridgeAppliesTheInferenceAllowlist(t *testing.T) {
 			client, []byte("cf-secret"), []byte("n"), `["api.cloudflare.com/*"]`, `{"type":"bearer"}`)
 		signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 		tok, err := capability.Sign(capability.Token{
-			Secret: "cf-token", SecretID: "secret-cf", Agent: agentID,
+			Secret: "cf-token", SecretID: "secret-cf", Issuer: client, Agent: agentID,
 			Dests: []string{"api.cloudflare.com/*"}, Method: "*",
 		}, signingKey, time.Minute)
 		if err != nil {

@@ -28,7 +28,14 @@ ORDER BY a.created_at DESC;
 
 -- name: ListUsersWithEntryCount :many
 SELECT u.id, u.email, u.name, u.role, u.disabled, u.totp_enabled, u.created_at,
-       (SELECT COUNT(*) FROM vault_entries v WHERE v.user_id = u.id) AS entry_count
+       (SELECT COUNT(*) FROM vault_entries v
+        WHERE v.user_id = u.id
+          AND (sqlc.arg(private_ingress) = 1
+            OR v.collection_id IS NULL
+            OR EXISTS (
+              SELECT 1 FROM collections c
+              WHERE c.id = v.collection_id AND c.private_access_policy != 'fully_private'
+            ))) AS entry_count
 FROM users u
 ORDER BY u.created_at ASC;
 

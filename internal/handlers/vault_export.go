@@ -14,13 +14,17 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultfield"
 )
 
 const (
-	vaultExportFormat  = "trustissues-vault"
-	vaultExportVersion = 1
+	vaultExportFormat        = "trustissues-vault"
+	vaultExportLegacyVersion = 1
+	vaultExportVersion       = 2
+	vaultExportScopePublic   = "public"
+	vaultExportScopePrivate  = "private"
 )
 
 // vaultExportDocument is the native, versioned TrustIssues interchange format.
@@ -31,19 +35,21 @@ const (
 // IDs are retained only so a future importer can map references without having to
 // preserve those IDs in the destination instance.
 type vaultExportDocument struct {
-	Format      string                  `json:"format"`
-	Version     int                     `json:"version"`
-	ExportedAt  string                  `json:"exported_at"`
-	Collections []vaultExportCollection `json:"collections"`
-	Entries     []vaultExportEntry      `json:"entries"`
+	Format       string                  `json:"format"`
+	Version      int                     `json:"version"`
+	ExportedAt   string                  `json:"exported_at"`
+	IngressScope string                  `json:"ingress_scope,omitempty"`
+	Collections  []vaultExportCollection `json:"collections"`
+	Entries      []vaultExportEntry      `json:"entries"`
 }
 
 type vaultExportCollection struct {
-	SourceID    string  `json:"source_id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	CreatedAt   *string `json:"created_at"`
-	UpdatedAt   *string `json:"updated_at"`
+	SourceID            string               `json:"source_id"`
+	Name                string               `json:"name"`
+	Description         string               `json:"description"`
+	PrivateAccessPolicy privateaccess.Policy `json:"private_access_policy,omitempty"`
+	CreatedAt           *string              `json:"created_at"`
+	UpdatedAt           *string              `json:"updated_at"`
 }
 
 // vaultExportEntry is intentionally separate from vaultEntryFull. An API
@@ -176,9 +182,10 @@ func (h *VaultHandler) revealAccessibleVaultEntriesWithQueries(r *http.Request, 
 
 	ctx := r.Context()
 	rows, err := queries.ListAccessibleVaultEntriesWithSecrets(ctx, db.ListAccessibleVaultEntriesWithSecretsParams{
-		ID:       userID,
-		UserID:   userID,
-		UserID_2: userID,
+		ID:             userID,
+		UserID:         userID,
+		UserID_2:       userID,
+		PrivateIngress: privateIngressSQLFlag(ctx),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list accessible vault entries: %w", err)
@@ -197,6 +204,11 @@ func (h *VaultHandler) revealAccessibleVaultEntriesWithQueries(r *http.Request, 
 			if err := validateExportProviderMeta(rawProviderMeta); err != nil {
 				return nil, fmt.Errorf("entry %s metadata is invalid: %w", row.ID, err)
 			}
+		}
+		visibleProviderMeta, providerMetaWithheld := h.providerMetaForCaller(ctx, row.ID, row.Name,
+			row.Provider.String, rawProviderMeta, userID)
+		if requireComplete && len(providerMetaWithheld) > 0 {
+			return nil, fmt.Errorf("provider metadata credentials of entry %s were not released", row.ID)
 		}
 
 		name, err := h.revealMetadataColumn(row.Name, "", vaultFieldName, requireComplete)
@@ -229,7 +241,7 @@ func (h *VaultHandler) revealAccessibleVaultEntriesWithQueries(r *http.Request, 
 				return nil, fmt.Errorf("entry %s custom fields are invalid: %w", row.ID, err)
 			}
 		}
-		customFields := h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, userID)
+		customFields := h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, userID, true)
 		if requireComplete {
 			for _, field := range customFields {
 				if field.Withheld {
@@ -260,7 +272,8 @@ func (h *VaultHandler) revealAccessibleVaultEntriesWithQueries(r *http.Request, 
 				ExpiresAt:            nullTimePtr(row.ExpiresAt),
 				LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 				Provider:             row.Provider.String,
-				ProviderMeta:         redactReservedProviderMetaKeys(rawProviderMeta),
+				ProviderMeta:         redactReservedProviderMetaKeys(visibleProviderMeta),
+				ProviderMetaWithheld: providerMetaWithheld,
 				AutoRotate:           row.AutoRotate.Int64 != 0,
 				LastRotationError:    row.LastRotationError.String,
 				PendingRevoke:        pendingRevokeStatusFrom(rawProviderMeta),
@@ -356,12 +369,17 @@ func (h *VaultHandler) exportCollections(r *http.Request, queries *db.Queries,
 		if err != nil {
 			return nil, fmt.Errorf("read referenced collection %s: %w", id, err)
 		}
+		policy, ok := privateaccess.Parse(collection.PrivateAccessPolicy)
+		if !ok {
+			return nil, fmt.Errorf("collection %s has invalid private access policy", id)
+		}
 		out = append(out, vaultExportCollection{
-			SourceID:    collection.ID,
-			Name:        collection.Name,
-			Description: collection.Description,
-			CreatedAt:   nullTimePtr(collection.CreatedAt),
-			UpdatedAt:   nullTimePtr(collection.UpdatedAt),
+			SourceID:            collection.ID,
+			Name:                collection.Name,
+			Description:         collection.Description,
+			PrivateAccessPolicy: policy,
+			CreatedAt:           nullTimePtr(collection.CreatedAt),
+			UpdatedAt:           nullTimePtr(collection.UpdatedAt),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -423,7 +441,8 @@ func (h *VaultHandler) Export(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = snapshot.Rollback() }()
 	qtx := h.queries.WithTx(snapshot)
 	preflight, err := qtx.CountAccessibleVaultEntries(r.Context(), db.CountAccessibleVaultEntriesParams{
-		ID: userID, UserID: userID, UserID_2: userID, MaxRows: maxImportEntries + 1,
+		ID: userID, UserID: userID, UserID_2: userID,
+		PrivateIngress: privateIngressSQLFlag(r.Context()), MaxRows: maxImportEntries + 1,
 	})
 	if err != nil {
 		logError(r, "vault.export: count failed", "error", err)
@@ -469,12 +488,17 @@ func (h *VaultHandler) Export(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+	ingressScope := vaultExportScopePublic
+	if middleware.IsPrivateIngress(r.Context()) {
+		ingressScope = vaultExportScopePrivate
+	}
 	document := vaultExportDocument{
-		Format:      vaultExportFormat,
-		Version:     vaultExportVersion,
-		ExportedAt:  now.Format(time.RFC3339Nano),
-		Collections: collections,
-		Entries:     makeVaultExportEntries(revealed),
+		Format:       vaultExportFormat,
+		Version:      vaultExportVersion,
+		ExportedAt:   now.Format(time.RFC3339Nano),
+		IngressScope: ingressScope,
+		Collections:  collections,
+		Entries:      makeVaultExportEntries(revealed),
 	}
 	// The importer owns the executable native-v1 schema contract. Applying that
 	// same validator here catches any legacy stored shape or future exporter

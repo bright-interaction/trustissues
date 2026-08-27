@@ -28,18 +28,21 @@ WHERE code_hash = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP;
 UPDATE invitations SET status = 'expired'
 WHERE status = 'pending' AND expires_at <= CURRENT_TIMESTAMP;
 
--- name: MarkInvitationRedeemed :exec
+-- name: MarkInvitationRedeemedIfPending :execresult
 UPDATE invitations
 SET status = 'redeemed', redeemed_by = ?, redeemed_at = CURRENT_TIMESTAMP
-WHERE id = ?;
+WHERE id = ?
+  AND code_hash = ?
+  AND status = 'pending'
+  AND expires_at > CURRENT_TIMESTAMP;
 
 -- name: GetUserIDByEmailForInvite :one
 SELECT id FROM users WHERE email = ?;
 
 -- name: CreateInvitedUser :one
--- password_set is 0 for the password-less redemption branch (the shipped
--- vault_only extension flow, which mints and immediately discards a random
--- password) and 1 when the invitee supplied their own. See migration 00043.
+-- Current invitation redemption always supplies a real password and writes 1.
+-- The column still accepts 0 only so pre-00043 legacy password-less accounts
+-- remain representable until an administrator resets their password.
 INSERT INTO users (email, password_hash, name, role, password_set)
 VALUES (?, ?, ?, ?, ?)
 RETURNING id;

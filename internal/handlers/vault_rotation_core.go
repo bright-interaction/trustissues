@@ -427,7 +427,7 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 			"entry", rec.EntryName, "status", status, "total_targets", len(rec.Targets))
 		if status != "success" {
 			slog.Error("vault rotation: delivery had failures", "entry", rec.EntryName, "detail", errSummary)
-			dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, errSummary)
+			dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName, errSummary)
 		}
 	}
 
@@ -437,7 +437,7 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 		// the email and the column agree. It was the bare const, which meant an
 		// operator holding two alerts about two different stranded keys could not
 		// tell them apart.
-		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, revokeStillLiveMsgFor(rec.RevokeKeyIDs))
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName, revokeStillLiveMsgFor(rec.RevokeKeyIDs))
 	}
 
 	// Folded AFTER the revoke and BEFORE the notify-target success dispatch, so a
@@ -448,7 +448,7 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 		// The warning itself, not a const chosen here: MetaWriteWarn is already one
 		// of the two static strings, and picking a fixed one would make the alert
 		// contradict the column on the branch that did not choose it.
-		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, rec.MetaWriteWarn)
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName, rec.MetaWriteWarn)
 	}
 
 	// Honour a "Notify only" target. It transmits nothing, so the delivery loop
@@ -460,7 +460,7 @@ func recordRotationOutcome(ctx context.Context, deps rotationDeps, rec rotationR
 	// Only on a clean success: a partial or failed rotation already alarms above, and
 	// firing both would tell the operator it worked and did not work.
 	if status == "success" && hasNotifyTarget(rec.Targets) {
-		dispatchRotationSuccess(ctx, deps.queries, deps.vault, rec.EntryName,
+		dispatchRotationSuccess(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName,
 			"rotated successfully; update any consumer you manage yourself")
 	}
 
@@ -633,7 +633,7 @@ const undeliverableMsg = "rotated but NOT delivered: rotation_targets could not 
 func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, rec rotationRecord) {
 	slog.Error("vault rotation: target list unreadable, the new key was delivered to nobody",
 		"entry", rec.EntryName)
-	dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, undeliverableMsg)
+	dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName, undeliverableMsg)
 
 	// A write-back failure survives this path too. Both facts are true at once and
 	// this function is the only writer of the column on it, so folding here is the
@@ -645,7 +645,7 @@ func recordRotationOutcomeUndeliverable(ctx context.Context, deps rotationDeps, 
 	summary := undeliverableMsg
 	if rec.MetaWriteWarn != "" {
 		summary = summary + "; " + rec.MetaWriteWarn
-		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryName, rec.MetaWriteWarn)
+		dispatchRotationAlert(ctx, deps.queries, deps.vault, rec.EntryID, rec.EntryName, rec.MetaWriteWarn)
 	}
 
 	if err := deps.queries.UpdateVaultEntryRotationError(ctx, db.UpdateVaultEntryRotationErrorParams{
@@ -728,15 +728,22 @@ func appendRotationLog(ctx context.Context, queries *db.Queries, entryID, entryN
 // A var, like the other two dispatchers, so the rotation matrix can observe it.
 var dispatchRotationSuccess = dispatchRotationSuccessReal
 
-func dispatchRotationSuccessReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+func dispatchRotationSuccessReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter,
+	entryID, entryName, detail string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("vault rotation: success notification panicked", "recover", r)
 		}
 	}()
-	alerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(
+	if !entryAllowsExternalNotificationMetadata(ctx, queries, entryID) {
+		slog.Info("vault rotation: external success notification suppressed by fully-private policy",
+			"entry_id", entryID)
+		return
+	}
+	alerts.NewChannelDispatcher(ctx, queries, decrypter).DispatchGuarded(
 		alerts.EventRotationSucceeded, "", "",
 		map[string]string{"secret": entryName, "detail": detail},
+		entryExternalNotificationDeliveryGuard(queries, entryID),
 	)
 }
 

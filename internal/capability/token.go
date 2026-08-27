@@ -42,6 +42,7 @@ type Token struct {
 	V        int      `json:"v"`         // schema version
 	Secret   string   `json:"secret"`    // vault entry name
 	SecretID string   `json:"secret_id"` // vault entry id (immutable; defends against rename races)
+	Issuer   string   `json:"issuer"`    // user id that was authorised to mint; rechecked at spend time
 	Agent    string   `json:"agent"`     // requesting agent_id
 	Dests    []string `json:"dests"`     // allowed host+path globs (e.g. "api.cloudflare.com/*")
 	Method   string   `json:"method"`    // allowed HTTP method, "*" for any
@@ -89,13 +90,13 @@ func NewNonce() (string, error) {
 // are base64url-without-padding. Mutates t.IAT/EXP/Nonce only when they
 // are zero so callers can pre-fill them for tests; production callers
 // pass an empty Token and let Sign default everything but the
-// caller-controlled fields (Secret, SecretID, Agent, Dests, Method).
+// caller-controlled fields (Secret, SecretID, Issuer, Agent, Dests, Method).
 func Sign(t Token, key SigningKey, ttl time.Duration) (string, error) {
 	if t.V == 0 {
 		t.V = 1
 	}
-	if t.Secret == "" || t.SecretID == "" || t.Agent == "" {
-		return "", errors.New("capability: secret, secret_id, and agent are required")
+	if t.Secret == "" || t.SecretID == "" || t.Issuer == "" || t.Agent == "" {
+		return "", errors.New("capability: secret, secret_id, issuer, and agent are required")
 	}
 	if len(t.Dests) == 0 {
 		return "", errors.New("capability: at least one destination pattern required")
@@ -177,6 +178,13 @@ func Verify(signed string, key SigningKey, now time.Time) (Token, error) {
 	}
 	if t.V != 1 {
 		return Token{}, ErrWrongVersion
+	}
+	// Tokens are deliberately short-lived, so a deploy may invalidate the old
+	// issuer-less shape instead of preserving a revocation bypass for up to ten
+	// minutes. Issuer is signed and is the principal whose live account and
+	// collection access the proxy rechecks before opening the current secret.
+	if t.Issuer == "" {
+		return Token{}, fmt.Errorf("%w: issuer is required", ErrMalformed)
 	}
 	nowUnix := now.Unix()
 	if nowUnix >= t.EXP {

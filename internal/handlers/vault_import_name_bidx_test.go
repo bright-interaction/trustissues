@@ -138,10 +138,10 @@ func TestImportRefusesANameTheUserAlreadyHas(t *testing.T) {
 //
 // The backfill runs on every boot and seals whatever is still cleartext. It used
 // to `return` on any UPDATE failure, so ONE row whose recomputed name_bidx
-// collides with another of the same user's entries aborted the sweep for every
-// row after it, on every boot, permanently. Rows written before the import path
-// sealed its names are exactly that shape: cleartext name, empty name_bidx,
-// sitting outside the partial unique index, free to duplicate.
+// collides with another entry in the same scope aborted the sweep for every row
+// after it, on every boot. Rows written before the import path sealed names are
+// exactly that shape: cleartext name, empty name_bidx, sitting outside the
+// partial unique index and free to duplicate.
 //
 // So this is not only a repair concern. It is a denial of at-rest encryption for
 // the whole table that anyone who could reach the import could plant.
@@ -176,13 +176,26 @@ func TestOneDuplicateNameCannotWedgeTheAtRestBackfill(t *testing.T) {
 			"encryption for the whole table, on every boot, forever", err)
 	}
 
-	var bystander string
-	if err := h.db.QueryRow(`SELECT name FROM vault_entries WHERE id = ?`,
-		"00000000000000000000000000000002").Scan(&bystander); err != nil {
-		t.Fatalf("raw read: %v", err)
-	}
-	if !vaultfield.IsSealedColumn(bystander) {
-		t.Errorf("A ROW AFTER THE COLLIDING ONE WAS NEVER SEALED: %q. The sweep stopped at the "+
-			"duplicate instead of skipping it, which is the wedge", bystander)
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{"00000000000000000000000000000001", metadataBackfillDuplicateName("Collides", "00000000000000000000000000000001", 1)},
+		{"00000000000000000000000000000002", "Innocent Bystander"},
+	} {
+		var stored, token string
+		if err := h.db.QueryRow(`SELECT name, name_bidx FROM vault_entries WHERE id = ?`, tc.id).
+			Scan(&stored, &token); err != nil {
+			t.Fatalf("raw read %s: %v", tc.id, err)
+		}
+		if !vaultfield.IsSealedColumn(stored) {
+			t.Errorf("ROW %s WAS NEVER SEALED: %q", tc.id, stored)
+		}
+		if got := h.EntryNamePlain(stored); got != tc.want {
+			t.Errorf("row %s repaired name = %q, want %q", tc.id, got, tc.want)
+		}
+		if token == "" {
+			t.Errorf("row %s remained outside the name uniqueness index", tc.id)
+		}
 	}
 }

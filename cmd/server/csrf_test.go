@@ -12,7 +12,10 @@ import (
 // SameSite=Strict on cookie-authenticated state-changing routes. The headline
 // case is a blind cross-site POST to first-run register.
 func TestCSRFOriginCheck(t *testing.T) {
-	const baseURL = "https://vault.example.com"
+	const (
+		baseURL        = "https://vault.example.com"
+		privateBaseURL = "https://vault-internal.example.ts.net"
+	)
 
 	cases := []struct {
 		name       string
@@ -22,6 +25,7 @@ func TestCSRFOriginCheck(t *testing.T) {
 		headers    map[string]string
 		withCookie bool
 		wantBlock  bool
+		zone       timw.IngressZone
 	}{
 		{
 			name: "GET is never blocked", method: http.MethodGet, path: "/api/auth/status",
@@ -36,10 +40,30 @@ func TestCSRFOriginCheck(t *testing.T) {
 			withCookie: true,
 		},
 		{
-			name: "origin matches the request host when BaseURL is stale", method: http.MethodPost, path: "/api/vault/",
+			name: "request Host cannot hide stale BaseURL", method: http.MethodPost, path: "/api/vault/",
 			host:       "other.internal",
 			headers:    map[string]string{"Origin": "https://other.internal"},
 			withCookie: true,
+			wantBlock:  true,
+		},
+		{
+			name: "private SPA accepts only private origin", method: http.MethodPost, path: "/api/vault/",
+			headers:    map[string]string{"Origin": privateBaseURL, "Sec-Fetch-Site": "same-origin"},
+			withCookie: true,
+			zone:       timw.IngressPrivate,
+		},
+		{
+			name: "public origin is blocked on private ingress", method: http.MethodPost, path: "/api/vault/",
+			headers:    map[string]string{"Origin": baseURL, "Sec-Fetch-Site": "same-origin"},
+			withCookie: true,
+			zone:       timw.IngressPrivate,
+			wantBlock:  true,
+		},
+		{
+			name: "private origin is blocked on public ingress", method: http.MethodPost, path: "/api/vault/",
+			headers:    map[string]string{"Origin": privateBaseURL, "Sec-Fetch-Site": "same-origin"},
+			withCookie: true,
+			wantBlock:  true,
 		},
 		{
 			name: "cross-site register is blocked", method: http.MethodPost, path: "/api/auth/register",
@@ -103,10 +127,11 @@ func TestCSRFOriginCheck(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var reached bool
-			h := csrfOriginCheck(baseURL)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			h := csrfOriginCheck(baseURL, privateBaseURL)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				reached = true
 				w.WriteHeader(http.StatusOK)
 			}))
+			h = timw.StampIngressZone(tc.zone)(h)
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
 			req.Host = "vault.example.com"
@@ -133,6 +158,22 @@ func TestCSRFOriginCheck(t *testing.T) {
 				t.Fatalf("request should have passed through, got status %d body=%s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestOriginOfURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://Vault.Example.com/path?q=1", "https://vault.example.com"},
+		{"https://vault.example.com:443", "https://vault.example.com"},
+		{"http://localhost:80/path", "http://localhost"},
+		{"https://[fd7a:115c:a1e0::1]:8443/path", "https://[fd7a:115c:a1e0::1]:8443"},
+		{"null", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := originOfURL(tc.in); got != tc.want {
+			t.Errorf("originOfURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
@@ -146,7 +146,10 @@ async function unlock(user: ReturnType<typeof userEvent.setup>) {
 beforeEach(() => {
   unlockMock.mockReset().mockResolvedValue([entry()]);
   rotateMock.mockReset().mockResolvedValue({ ...entry(), value: ROTATED_VALUE });
-  listMock.mockReset().mockResolvedValue([]);
+  // The locked metadata endpoint contains the same row without plaintext.
+  // Returning [] here would now (correctly) look like the entry was deleted or
+  // access was removed after unlock, which makes the page seal itself.
+  listMock.mockReset().mockResolvedValue([{ ...entry(), value: '' }]);
   collectionsListMock.mockReset().mockResolvedValue([]);
   pendingInvitesMock.mockReset().mockResolvedValue([]);
   requestMock.mockReset().mockImplementation((path: string) => {
@@ -252,6 +255,17 @@ describe('locking the vault clears the real mutation cache, not just component s
     // and the orphaned mutation must not have found its way back into the
     // live cache.
     expect(document.body.textContent).not.toContain(ROTATED_VALUE);
+    expect(mutationSnapshot(qc)).toEqual([]);
+  });
+
+  it('unmounting the vault route seals the app-wide mutation cache', async () => {
+    const user = userEvent.setup();
+    const qc = renderVault();
+    await unlock(user);
+
+    expect(JSON.stringify(mutationSnapshot(qc))).toContain(DECRYPTED_VALUE);
+    cleanup();
+
     expect(mutationSnapshot(qc)).toEqual([]);
   });
 });

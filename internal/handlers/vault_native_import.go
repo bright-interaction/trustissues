@@ -20,6 +20,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
 
@@ -54,6 +55,7 @@ type nativeImportPlan struct {
 type nativeImportPreview struct {
 	Format             string   `json:"format"`
 	Version            int      `json:"version"`
+	IngressScope       string   `json:"ingress_scope"`
 	EntryCount         int      `json:"entry_count"`
 	CollectionCount    int      `json:"collection_count"`
 	Conflicts          []string `json:"conflicts"`
@@ -65,6 +67,19 @@ type nativeImportConflictError struct {
 	Code      string   `json:"code"`
 	RequestID string   `json:"request_id,omitempty"`
 	Conflicts []string `json:"conflicts"`
+}
+
+func requireNativeImportIngress(w http.ResponseWriter, r *http.Request, plan nativeImportPlan) bool {
+	if middleware.IsPrivateIngress(r.Context()) {
+		return true
+	}
+	for _, collection := range plan.document.Collections {
+		if collection.PrivateAccessPolicy != privateaccess.PolicyStandard {
+			writePrivateIngressRequired(w, r)
+			return false
+		}
+	}
+	return true
 }
 
 type nativeImportUpload struct {
@@ -192,6 +207,8 @@ func decodeNativeCollection(decoder *json.Decoder) (vaultExportCollection, error
 			bit, target = 1<<1, &collection.Name
 		case "description":
 			bit, target = 1<<2, &collection.Description
+		case "private_access_policy":
+			bit, target = 1<<5, &collection.PrivateAccessPolicy
 		case "created_at":
 			bit, target = 1<<3, &collection.CreatedAt
 		case "updated_at":
@@ -209,7 +226,7 @@ func decodeNativeCollection(decoder *json.Decoder) (vaultExportCollection, error
 	if err := nativeJSONEnd(decoder, '}'); err != nil {
 		return collection, err
 	}
-	if seen != 1<<5-1 {
+	if seen&(1<<5-1) != 1<<5-1 || seen & ^uint64(1<<6-1) != 0 {
 		return collection, errNativeJSONMalformed
 	}
 	return collection, nil
@@ -470,6 +487,11 @@ func decodeNativeDocument(decoder *json.Decoder) (vaultExportDocument, error) {
 				return document, err
 			}
 			err = nativeJSONDecodeNonNull(decoder, &document.ExportedAt)
+		case "ingress_scope":
+			if err := nativeJSONOnce(&seen, 1<<5); err != nil {
+				return document, err
+			}
+			err = nativeJSONDecodeNonNull(decoder, &document.IngressScope)
 		case "collections":
 			if err := nativeJSONOnce(&seen, 1<<3); err != nil {
 				return document, err
@@ -490,7 +512,7 @@ func decodeNativeDocument(decoder *json.Decoder) (vaultExportDocument, error) {
 	if err := nativeJSONEnd(decoder, '}'); err != nil {
 		return document, err
 	}
-	if seen != 1<<5-1 {
+	if seen&(1<<5-1) != 1<<5-1 || seen & ^uint64(1<<6-1) != 0 {
 		return document, errNativeJSONMalformed
 	}
 	return document, nil
@@ -592,8 +614,18 @@ func parseNativeProviderMeta(raw string) (string, map[string]string, error) {
 
 func validateNativeImportDocument(document vaultExportDocument) (nativeImportPlan, error) {
 	plan := nativeImportPlan{document: document}
-	if document.Format != vaultExportFormat || document.Version != vaultExportVersion {
+	if document.Format != vaultExportFormat ||
+		(document.Version != vaultExportLegacyVersion && document.Version != vaultExportVersion) {
 		return plan, fmt.Errorf("unsupported native vault format or version")
+	}
+	if document.Version == vaultExportLegacyVersion {
+		if document.IngressScope != "" {
+			return plan, fmt.Errorf("native v1 document must not contain ingress_scope")
+		}
+		document.IngressScope = vaultExportScopePublic
+		plan.document = document
+	} else if document.IngressScope != vaultExportScopePublic && document.IngressScope != vaultExportScopePrivate {
+		return plan, fmt.Errorf("ingress_scope must be public or private")
 	}
 	if _, err := time.Parse(time.RFC3339Nano, document.ExportedAt); err != nil {
 		return plan, fmt.Errorf("exported_at must be RFC3339")
@@ -626,6 +658,22 @@ func validateNativeImportDocument(document vaultExportDocument) (nativeImportPla
 		}
 		allSourceIDs[collection.SourceID] = struct{}{}
 		collectionIndex[collection.SourceID] = i
+		if collection.PrivateAccessPolicy == "" {
+			if document.Version != vaultExportLegacyVersion {
+				return plan, fmt.Errorf("collection %d is missing private_access_policy", i+1)
+			}
+			// Native v1 predates private ingress, so it can only represent the
+			// compatibility-standard policy.
+			collection.PrivateAccessPolicy = privateaccess.PolicyStandard
+			document.Collections[i].PrivateAccessPolicy = privateaccess.PolicyStandard
+		}
+		policy, ok := privateaccess.Parse(string(collection.PrivateAccessPolicy))
+		if !ok {
+			return plan, fmt.Errorf("collection %d has an invalid private_access_policy", i+1)
+		}
+		if document.IngressScope == vaultExportScopePublic && policy != privateaccess.PolicyStandard {
+			return plan, fmt.Errorf("a public-scope export cannot contain protected collections")
+		}
 		if collection.Name == "" || strings.TrimSpace(collection.Name) != collection.Name {
 			return plan, fmt.Errorf("collection %d has invalid fields", i+1)
 		}
@@ -639,9 +687,10 @@ func validateNativeImportDocument(document vaultExportDocument) (nativeImportPla
 		}
 		plan.collectionTimes[i] = nativeImportTimes{created: created, updated: updated}
 	}
+	plan.document = document
 
 	referencedCollections := make(map[string]struct{}, len(document.Collections))
-	seenNames := make(map[string]struct{}, len(document.Entries))
+	seenNames := make(map[string]map[string]struct{}, len(document.Collections)+1)
 	intraConflicts := make(map[string]struct{})
 	plan.entryPlans = make([]nativeImportEntryPlan, len(document.Entries))
 	for i, entry := range document.Entries {
@@ -708,10 +757,17 @@ func validateNativeImportDocument(document vaultExportDocument) (nativeImportPla
 		plan.entryPlans[i] = nativeImportEntryPlan{expiresAt: expires, lastRotatedAt: lastRotated,
 			createdAt: created, updatedAt: updated, providerRaw: providerRaw, providerMeta: meta,
 			knownProvider: knownProvider}
-		if _, duplicate := seenNames[entry.Name]; duplicate {
+		nameScope := "personal"
+		if entry.CollectionID != nil {
+			nameScope = "collection:" + *entry.CollectionID
+		}
+		if seenNames[nameScope] == nil {
+			seenNames[nameScope] = make(map[string]struct{})
+		}
+		if _, duplicate := seenNames[nameScope][entry.Name]; duplicate {
 			intraConflicts[entry.Name] = struct{}{}
 		}
-		seenNames[entry.Name] = struct{}{}
+		seenNames[nameScope][entry.Name] = struct{}{}
 		if entry.AutoRotate {
 			plan.autoRotateDisabled++
 		}
@@ -729,23 +785,21 @@ func validateNativeImportDocument(document vaultExportDocument) (nativeImportPla
 
 func (h *VaultImportHandler) findNativeImportConflicts(ctx *http.Request, q *db.Queries,
 	userID string, entries []vaultExportEntry, intra []string) ([]string, error) {
-	names, err := q.ListVaultEntryNamesByUser(ctx.Context(), userID)
+	existing, err := h.personalImportNameSet(ctx.Context(), q, userID)
 	if err != nil {
-		return nil, fmt.Errorf("list existing entry names: %w", err)
-	}
-	existing := make(map[string]struct{}, len(names))
-	for _, stored := range names {
-		plain, err := h.handler.decryptColumn(stored, vaultFieldName)
-		if err != nil {
-			return nil, fmt.Errorf("open an existing entry name: %w", err)
-		}
-		existing[plain] = struct{}{}
+		return nil, fmt.Errorf("list existing personal entry names: %w", err)
 	}
 	conflicts := make(map[string]struct{}, len(intra))
 	for _, name := range intra {
 		conflicts[name] = struct{}{}
 	}
 	for _, entry := range entries {
+		// Every collection in a native document is created with a fresh id, so
+		// it cannot conflict with an existing collection scope. Personal entries
+		// alone share an existing destination scope.
+		if entry.CollectionID != nil {
+			continue
+		}
 		if _, found := existing[entry.Name]; found {
 			conflicts[entry.Name] = struct{}{}
 		}
@@ -796,6 +850,9 @@ func (h *VaultImportHandler) NativeImportPreview(w http.ResponseWriter, r *http.
 		writeValidationError(w, r, err.Error())
 		return
 	}
+	if !requireNativeImportIngress(w, r, plan) {
+		return
+	}
 	conflicts, err := h.findNativeImportConflicts(r, h.handler.queries, userID,
 		plan.document.Entries, plan.intraConflicts)
 	if err != nil {
@@ -804,7 +861,8 @@ func (h *VaultImportHandler) NativeImportPreview(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, nativeImportPreview{Format: plan.document.Format,
-		Version: plan.document.Version, EntryCount: len(plan.document.Entries),
+		Version: plan.document.Version, IngressScope: plan.document.IngressScope,
+		EntryCount:      len(plan.document.Entries),
 		CollectionCount: len(plan.document.Collections), Conflicts: conflicts,
 		AutoRotateDisabled: plan.autoRotateDisabled})
 }
@@ -868,9 +926,10 @@ func (h *VaultImportHandler) executeNativeImport(r *http.Request, userID string,
 	acceptedAt := sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	for i, collection := range plan.document.Collections {
 		id := collectionIDs[collection.SourceID]
-		if err := qtx.CreateCollection(r.Context(), db.CreateCollectionParams{ID: id,
+		if err := qtx.CreateCollectionWithPolicy(r.Context(), db.CreateCollectionWithPolicyParams{ID: id,
 			Name: collection.Name, Description: collection.Description,
-			CreatedBy: sql.NullString{String: userID, Valid: true}}); err != nil {
+			CreatedBy:           sql.NullString{String: userID, Valid: true},
+			PrivateAccessPolicy: string(collection.PrivateAccessPolicy)}); err != nil {
 			return fmt.Errorf("create collection: %w", err)
 		}
 		if err := qtx.AddCollectionMember(r.Context(), db.AddCollectionMemberParams{
@@ -934,7 +993,8 @@ func (h *VaultImportHandler) executeNativeImport(r *http.Request, userID string,
 			ExpiresAt: entryPlan.expiresAt, Provider: toNullString(entry.Provider), ProviderMeta: toNullString(encProviderMeta),
 			AutoRotate: sql.NullInt64{Int64: 0, Valid: true}, UrlBidx: h.handler.urlBlindIndex(scope, entry.URL),
 			AliasUrlBidx: h.handler.urlBlindIndex(scope, entry.AliasURL),
-			NameBidx:     h.handler.nameBlindIndex(userID, entry.Name),
+			NameBidx:     h.handler.scopedNameBlindIndex(scope, entry.Name),
+			CollectionID: collectionID,
 		}); err != nil {
 			// A concurrent writer can claim this exact name after the preflight
 			// read but before this transaction acquires SQLite's write lock. The
@@ -988,7 +1048,7 @@ func (h *VaultImportHandler) executeNativeImport(r *http.Request, userID string,
 			return fmt.Errorf("store destination patterns: %w", err)
 		}
 		if err := qtx.FinalizeNativeImportedVaultEntry(r.Context(), db.FinalizeNativeImportedVaultEntryParams{
-			CollectionID: collectionID, CustomFields: encCustomFields, LastRotatedAt: entryPlan.lastRotatedAt,
+			CustomFields: encCustomFields, LastRotatedAt: entryPlan.lastRotatedAt,
 			CreatedAt: sql.NullTime{Time: entryPlan.createdAt, Valid: true},
 			UpdatedAt: sql.NullTime{Time: entryPlan.updatedAt, Valid: true}, ID: id,
 		}); err != nil {
@@ -1052,6 +1112,9 @@ func (h *VaultImportHandler) NativeImportConfirm(w http.ResponseWriter, r *http.
 	plan, err := validateNativeImportDocument(document)
 	if err != nil {
 		writeValidationError(w, r, err.Error())
+		return
+	}
+	if !requireNativeImportIngress(w, r, plan) {
 		return
 	}
 	conflicts, err := h.findNativeImportConflicts(r, h.handler.queries, userID,

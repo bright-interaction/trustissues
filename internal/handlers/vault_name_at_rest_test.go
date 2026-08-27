@@ -226,11 +226,10 @@ func TestTheListIsOrderedByTheDecryptedName(t *testing.T) {
 	}
 }
 
-// TestAdoptionMovesTheNameIndexToTheAdopter. The index is keyed by the
-// custodian, so the two statements that change a custodian have to re-derive it.
-// Carrying the old token across would leave a departed owner's namespace
-// enforcing uniqueness on a row that now belongs to somebody else's.
-func TestAdoptionMovesTheNameIndexToTheAdopter(t *testing.T) {
+// TestAdoptionConvergesTheNameIndexToTheCollection. Adoption changes the
+// custodian, not the shared vault namespace. It also gives legacy rows a chance
+// to converge from a pre-00045 custodian token to the collection token.
+func TestAdoptionConvergesTheNameIndexToTheCollection(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 	ctx := context.Background()
 	creator := mustUser(t, queries, "adopt-from@example.com", "user", "")
@@ -266,23 +265,22 @@ func TestAdoptionMovesTheNameIndexToTheAdopter(t *testing.T) {
 		t.Fatalf("ABORT: the entry was not adopted (custodian = %q), so this test is not about what "+
 			"it says", custodian)
 	}
-	if want := h.nameBlindIndex(manager, "ci-token-adopted"); bidx != want {
-		t.Errorf("THE NAME INDEX STAYED IN THE OLD CUSTODIAN'S NAMESPACE: got %q, want the "+
-			"adopter's %q. The adopter cannot then create an entry under a name they can see is "+
-			"free, and two of theirs could collide unnoticed", bidx, want)
+	want := h.scopedNameBlindIndex(bidxScope(manager,
+		sql.NullString{String: "coll-adopt", Valid: true}), "ci-token-adopted")
+	if bidx != want {
+		t.Errorf("THE NAME INDEX DID NOT CONVERGE TO THE COLLECTION: got %q, want %q", bidx, want)
 	}
-	// And it is NOT the value the departed creator's namespace would produce.
+	// And it is NOT the pre-00045 value the departed creator's personal scope
+	// would produce.
 	if stale := h.nameBlindIndex(creator, "ci-token-adopted"); bidx == stale {
 		t.Errorf("the index is still derived under the departed creator")
 	}
 }
 
-// TestMovingAnEntryBetweenCollectionsKeepsItsName is the other side of the
-// adoption rule. A move changes collection_id and never user_id, so the name and
-// its index must be passed through untouched. The move path shares an UPDATE
-// statement with the backfill, and that statement writes every column it names,
-// so a caller that did not pass the name through would blank it.
-func TestMovingAnEntryBetweenCollectionsKeepsItsName(t *testing.T) {
+// TestMovingAnEntryChangesItsNameScopeButKeepsItsName is the other side of the
+// adoption rule. A move changes the namespace even though user_id stays fixed,
+// so the opened name stays the same while every scope-keyed token changes.
+func TestMovingAnEntryChangesItsNameScopeButKeepsItsName(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 	owner := mustUser(t, queries, "mover@example.com", "user", "")
 	mustCollection(t, queries, "coll-move-a", owner, map[string]string{owner: collRoleManager})
@@ -304,9 +302,26 @@ func TestMovingAnEntryBetweenCollectionsKeepsItsName(t *testing.T) {
 		Scan(&bidx); err != nil {
 		t.Fatalf("read back: %v", err)
 	}
+	wantCollection := h.scopedNameBlindIndex(bidxScope(owner,
+		sql.NullString{String: "coll-move-a", Valid: true}), "keep-this-name")
+	if bidx != wantCollection {
+		t.Errorf("the move left the wrong name scope: got %q, want collection token %q", bidx, wantCollection)
+	}
+	if bidx == before {
+		t.Error("the move left the personal-vault name token on a collection entry")
+	}
+
+	back := httptest.NewRecorder()
+	h.MoveToCollection(back, moveRequest(owner, "user", "entry-move", `{"collection_id":null}`))
+	if back.Code != http.StatusNoContent {
+		t.Fatalf("move back to personal: HTTP %d: %s", back.Code, back.Body.String())
+	}
+	if err := h.db.QueryRow(`SELECT name_bidx FROM vault_entries WHERE id = ?`, "entry-move").
+		Scan(&bidx); err != nil {
+		t.Fatalf("read back after personal move: %v", err)
+	}
 	if bidx != before {
-		t.Errorf("the move changed the name index (%q -> %q); the custodian did not change, so "+
-			"uniqueness should be exactly where it was", before, bidx)
+		t.Errorf("moving back did not restore the personal scope: got %q want %q", bidx, before)
 	}
 }
 

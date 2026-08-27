@@ -4,9 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
-	"strings"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/emailidentity"
 )
 
 // claimCollectionInvitations turns the collection seats recorded for an email
@@ -39,9 +39,10 @@ import (
 // consented to, and a brand-new account silently joining a stranger's collection
 // is exactly what the consent rule refuses.
 func claimCollectionInvitations(ctx context.Context, queries *db.Queries, userID, email string) (int, error) {
-	// Seats are stored lower-cased by every writer; match that here rather than
-	// relying on SQLite collation, which is case-sensitive for users.email too.
-	seats, err := queries.ListCollectionInvitationsForEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
+	// Seats and account identities use one canonical representation. Matching
+	// through the shared helper keeps Unicode addresses on the same path as the
+	// ASCII addresses SQLite's built-in lower() happens to understand.
+	seats, err := queries.ListCollectionInvitationsForEmail(ctx, emailidentity.Canonical(email))
 	if err != nil {
 		return 0, err
 	}

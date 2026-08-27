@@ -67,6 +67,12 @@ type ConfigDecrypter interface {
 	DecryptInstanceConfig(ciphertext, nonce []byte, encVersion int) ([]byte, error)
 }
 
+// DeliveryGuard is evaluated in the delivery goroutine immediately before a
+// notification is sent. It lets callers revalidate mutable authorization or
+// disclosure policy after Dispatch has queued asynchronous work, without
+// holding a database transaction open across external network I/O.
+type DeliveryGuard func(context.Context) bool
+
 // NotificationChannel represents a configured notification channel.
 type NotificationChannel struct {
 	ID     string      `json:"id"`
@@ -174,6 +180,19 @@ func (d *ChannelDispatcher) decryptConfig(config string, nonce []byte, encVersio
 // host, may be empty). Sends run in goroutines; Dispatch never blocks on
 // delivery.
 func (d *ChannelDispatcher) Dispatch(event, source, host string, data map[string]string) {
+	d.dispatch(event, source, host, data, nil)
+}
+
+// DispatchGuarded is Dispatch with a final, per-channel delivery check. The
+// guard runs after channel lookup/config decryption and inside the asynchronous
+// delivery goroutine, directly before the send. A false result suppresses that
+// channel. Use Dispatch for instance-wide events that have no entry-scoped
+// disclosure policy.
+func (d *ChannelDispatcher) DispatchGuarded(event, source, host string, data map[string]string, guard DeliveryGuard) {
+	d.dispatch(event, source, host, data, guard)
+}
+
+func (d *ChannelDispatcher) dispatch(event, source, host string, data map[string]string, guard DeliveryGuard) {
 	// Detach from the caller's context, then re-bound it.
 	//
 	// Delivery is asynchronous but the context was not: every rotation call site
@@ -219,7 +238,7 @@ func (d *ChannelDispatcher) Dispatch(event, source, host string, data map[string
 			continue
 		}
 
-		go d.sendToChannel(base, ch, event, source, host, data)
+		go d.sendToChannel(base, ch, event, source, host, data, guard)
 	}
 }
 
@@ -246,11 +265,16 @@ func (d *ChannelDispatcher) DispatchTest(row db.GetNotificationChannelRow) error
 	})
 }
 
-func (d *ChannelDispatcher) sendToChannel(base context.Context, ch NotificationChannel, event, source, host string, data map[string]string) {
+func (d *ChannelDispatcher) sendToChannel(base context.Context, ch NotificationChannel, event, source, host string, data map[string]string, guard DeliveryGuard) {
 	// Per-send bound. The parent is detached, so this timeout is the only thing
 	// limiting how long a send may outlive the caller.
 	ctx, cancel := context.WithTimeout(base, 15*time.Second)
 	defer cancel()
+	if guard != nil && !guard(ctx) {
+		slog.Info("channel dispatcher: notification suppressed by delivery policy",
+			"channel", ch.Name, "type", ch.Type, "event", event)
+		return
+	}
 	err := d.send(ctx, ch, event, source, host, data)
 
 	if err != nil {

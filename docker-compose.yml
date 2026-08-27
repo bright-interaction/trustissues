@@ -42,6 +42,20 @@ services:
       - TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT=${TRUSTISSUES_VAULT_KEY_REKEY_ON_BOOT:-}
       - TRUSTISSUES_BASE_URL=${TRUSTISSUES_BASE_URL:-http://localhost:8080}
       - TRUSTISSUES_TRUSTED_PROXY_HOPS=${TRUSTISSUES_TRUSTED_PROXY_HOPS:-1}
+      # Only these direct socket peers may supply X-Forwarded-* headers. Do
+      # not use an entire shared Docker bridge. Loopback is the fail-closed
+      # default; when host Caddy uses the published port, override this with
+      # this container network's exact bridge-gateway /32. If Caddy shares the
+      # network, use Caddy's exact container /32 instead. The `-` (not `:-`)
+      # preserves an explicitly empty value, which means trust no proxy peers.
+      - TRUSTISSUES_TRUSTED_PROXY_PEERS=${TRUSTISSUES_TRUSTED_PROXY_PEERS-127.0.0.1/32,::1/128}
+      # Optional overlay/private listener. Both empty keeps the feature off.
+      # In an override, mount a dedicated socket-only directory at
+      # /run/trustissues into both this service and the connector. Never mount
+      # trustissues_data into a VPN connector. Headscale can use a same-user TLS
+      # reverse proxy. See docs/PRIVATE-INGRESS.md before enabling enforcement.
+      - TRUSTISSUES_PRIVATE_SOCKET_PATH=${TRUSTISSUES_PRIVATE_SOCKET_PATH:-}
+      - TRUSTISSUES_PRIVATE_BASE_URL=${TRUSTISSUES_PRIVATE_BASE_URL:-}
       - TRUSTISSUES_LOG_LEVEL=${TRUSTISSUES_LOG_LEVEL:-info}
       # Error reporting + liveness beacon to the house Flare instance. Absent
       # until 2026-07-31, so trustissues had a provisioned Flare project that

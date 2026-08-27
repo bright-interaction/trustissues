@@ -425,6 +425,8 @@ type entrySecretSource interface {
 // rather than forgotten, and a classification of something that no longer exists
 // fails too.
 //
-// Two fields are classified as going through the exit: encrypted_value, which is
-// what this whole construction is about, and custom_fields, which is now routed
-// through VaultHandler.customFieldsForCaller.
+// Three fields are classified as going through the exit: encrypted_value;
+// custom_fields, routed through VaultHandler.customFieldsForCaller; and the
+// credential-bearing subset of provider_meta, routed through
+// VaultHandler.providerMetaForCaller. Ordinary provider metadata remains
+// visible, while Datadog's separate app_key does not.

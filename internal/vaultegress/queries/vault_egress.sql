@@ -21,8 +21,8 @@
 -- caught rather than merely discouraged.
 
 -- name: CreateVaultEntry :exec
-INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, name_bidx, encryption_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
+INSERT INTO vault_entries (id, user_id, secret_owner_user_id, name, encrypted_value, nonce, url, alias_url, username, category, notes, auto_login, rotation_interval_days, expires_at, provider, provider_meta, auto_rotate, url_bidx, alias_url_bidx, name_bidx, collection_id, encryption_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 
 -- name: TransferVaultEntrySecretOwner :execresult
 -- THE ONLY STATEMENT IN THE MODULE THAT MOVES secret_owner_user_id AFTER
@@ -30,10 +30,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 -- so that "change whose authority governs this plaintext" is not something a
 -- handler can express.
 --
--- It writes BOTH columns, deliberately. A transfer that moved the exit's owner
--- and left the custodian behind would put UNIQUE(user_id, name) in one person's
--- namespace and the widening right in another's, which is the split this column
--- exists to make impossible to create by accident.
+-- It writes BOTH ownership columns, deliberately. A transfer that moved the
+-- exit's owner and left the custodian behind would put listing/recovery rights
+-- in one person's hands and the widening right in another's, which is the split
+-- this column exists to make impossible to create by accident.
 --
 -- Its one caller is the hard-delete offboarding path: an instance admin deleting
 -- a user re-owns the entries that person created inside shared collections, so
@@ -41,21 +41,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2);
 -- every entry (grantFor row 3), so this hands them nothing they did not have,
 -- and the activity log names the transfer.
 --
--- name_bidx MOVES WITH user_id, and this statement is why it has to.
+-- name_bidx is supplied with user_id. Personal entries move to u:<new user>;
+-- collection entries remain c:<collection>, but supplying a freshly derived
+-- token also upgrades pre-00045 custodian-scoped rows.
 --
--- 00040 encrypted vault_entries.name, which made the inline UNIQUE(user_id, name)
--- vacuous on purpose (a fresh nonce per seal means two equal names no longer
--- produce equal ciphertext) and moved per-user name uniqueness to the partial
--- unique index over name_bidx. That token is an HMAC keyed by the CUSTODIAN, so
--- an UPDATE that changes user_id and leaves name_bidx alone leaves the row
--- indexed under the PREVIOUS owner: uniqueness stops being enforced for it, and
--- the new owner can silently end up holding two entries with the same name.
+-- 00040's name token was keyed by CUSTODIAN. Since 00045, shared rows instead
+-- use c:<collection>; an UPDATE that changes user_id and leaves a legacy token
+-- alone keeps the row outside the collection namespace, so a duplicate can land
+-- without either row's token colliding.
 --
--- It also broke the caller's collision handling. Offboarding renames an incoming
--- entry when the new owner already has one by that name, and it detected that
--- case by catching the UNIQUE constraint error. After 00040 the constraint no
--- longer fired, so the rename branch went dead and the duplicates it existed to
--- prevent started landing instead.
+-- Offboarding renames an incoming entry only when that collection already has
+-- the name. A same-named PERSONAL entry is a different scope and must not make
+-- the shared entry rename or reveal that personal name through an error.
 UPDATE vault_entries SET user_id = ?, secret_owner_user_id = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryProvider :exec

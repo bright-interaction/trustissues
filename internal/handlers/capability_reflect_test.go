@@ -96,6 +96,7 @@ func newReflectEnv(t *testing.T, rt *reflectingTransport) *egressEnv {
 	env.cap.SetHTTPClient(&http.Client{Timeout: 5 * time.Second, Transport: rt})
 
 	owner := mustUser(t, env.queries, "reflect-owner@example.com", "user", "")
+	env.testIssuer = owner
 	mustEntry(t, env.vault, env.queries, reflectEntryID, owner, "cloudflare-token", theReflectedKey)
 	if _, err := env.vault.db.Exec(`UPDATE vault_entries SET injection_spec = ? WHERE id = ?`,
 		`{"type":"bearer"}`, reflectEntryID); err != nil {
@@ -109,7 +110,7 @@ func newReflectEnv(t *testing.T, rt *reflectingTransport) *egressEnv {
 
 func (e *egressEnv) spendOnce(t *testing.T, agent string) *httptest.ResponseRecorder {
 	t.Helper()
-	tok := signToken(t, "cloudflare-token", reflectEntryID, agent, reflectDest, "*")
+	tok := signToken(t, e.testIssuer, "cloudflare-token", reflectEntryID, agent, reflectDest, "*")
 	return e.proxy(t, http.MethodPost, reflectHost, "/client/v4/user/tokens/verify", tok)
 }
 
@@ -449,7 +450,7 @@ func TestProxyAbortsWhenTheReflectionIsPastTheHoldBack(t *testing.T) {
 	// Driven inline rather than through spendOnce so the recorder survives the
 	// panic and can be inspected: what the caller actually received is the only
 	// assertion that matters here.
-	tok := signToken(t, "cloudflare-token", reflectEntryID, "streaming-agent", reflectDest, "*")
+	tok := signToken(t, env.testIssuer, "cloudflare-token", reflectEntryID, "streaming-agent", reflectDest, "*")
 	req := httptest.NewRequest(http.MethodPost, "/proxy/"+reflectHost+"/client/v4/user/tokens/verify", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Capability "+tok)
 	rec := httptest.NewRecorder()

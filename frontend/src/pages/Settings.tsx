@@ -27,6 +27,7 @@ import { useAuth } from '@/hooks/useAuth';
 import type {
   SMTPConfig,
   VaultPolicy,
+  ApiKey,
   ApiKeyCreated,
   AIConfig,
   RestoredOwnership,
@@ -519,7 +520,7 @@ function PolicyTab() {
             className={inputClass}
           />
           <p className="mt-1 text-xs text-slate-400">
-            The vault relocks itself after this much inactivity
+            Absolute maximum since unlock, even while the vault is in use
           </p>
         </div>
         <div>
@@ -1541,7 +1542,55 @@ function OwnershipTab() {
   );
 }
 
-function ApiKeysTab() {
+type ApiKeyState = 'live' | 'revoked' | 'expired';
+
+// Revocation wins over expiry: both make the bearer credential unusable, but
+// an explicit revocation is the stronger and more useful incident record. A
+// malformed non-null expiry also fails closed in the presentation instead of
+// being labelled Live while the server refuses it.
+export function apiKeyState(key: ApiKey, now = Date.now()): ApiKeyState {
+  if (key.revoked_at) return 'revoked';
+  if (key.expires_at) {
+    const expiresAt = Date.parse(key.expires_at);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return 'expired';
+  }
+  return 'live';
+}
+
+function formatApiKeyDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'date unavailable';
+  return date.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+function ApiKeyStatePill({ apiKey }: { apiKey: ApiKey }) {
+  const state = apiKeyState(apiKey);
+  const styles: Record<ApiKeyState, string> = {
+    live: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+    revoked: 'bg-red-50 text-red-700 ring-red-200',
+    expired: 'bg-amber-50 text-amber-800 ring-amber-200',
+  };
+  const labels: Record<ApiKeyState, string> = {
+    live: 'Live',
+    revoked: 'Revoked',
+    expired: 'Expired',
+  };
+
+  return (
+    <span
+      aria-label={`${apiKey.name} status`}
+      className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 ${styles[state]}`}
+    >
+      {labels[state]}
+    </span>
+  );
+}
+
+export function ApiKeysTab() {
   const queryClient = useQueryClient();
   const [name, setName] = useState('');
   const [created, setCreated] = useState<ApiKeyCreated | null>(null);
@@ -1649,31 +1698,57 @@ function ApiKeysTab() {
           <p className="mt-3 text-sm text-slate-500">No API keys yet.</p>
         ) : (
           <ul className="mt-3 divide-y divide-slate-100">
-            {keys.map((k) => (
-              <li
-                key={k.id}
-                className="flex items-center justify-between py-3"
-              >
-                <div>
-                  <p className="text-sm font-medium text-slate-900">{k.name}</p>
-                  <p className="font-mono text-xs text-slate-400">
-                    ti_{k.key_prefix}...
-                    {k.last_used_at
-                      ? ` last used ${new Date(k.last_used_at).toLocaleDateString()}`
-                      : ' never used'}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => deleteMutation.mutate(k.id)}
-                  disabled={deleteMutation.isPending}
-                  className="text-slate-400 transition-colors hover:text-red-600"
-                  title="Revoke key"
+            {keys.map((k) => {
+              const state = apiKeyState(k);
+              return (
+                <li
+                  key={k.id}
+                  className="flex items-center justify-between gap-4 py-3"
                 >
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </li>
-            ))}
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-medium text-slate-900">{k.name}</p>
+                      <ApiKeyStatePill apiKey={k} />
+                    </div>
+                    <p className="mt-0.5 font-mono text-xs text-slate-400">
+                      ti_{k.key_prefix}...
+                      {k.last_used_at
+                        ? ` last used ${formatApiKeyDate(k.last_used_at)}`
+                        : ' never used'}
+                    </p>
+                    <p className="mt-0.5 text-xs text-slate-500">
+                      {k.expires_at ? (
+                        <time dateTime={k.expires_at}>
+                          Expires {formatApiKeyDate(k.expires_at)}
+                        </time>
+                      ) : (
+                        'No expiry'
+                      )}
+                      {k.revoked_at && (
+                        <>
+                          {' · '}
+                          <time dateTime={k.revoked_at}>
+                            Revoked {formatApiKeyDate(k.revoked_at)}
+                          </time>
+                        </>
+                      )}
+                    </p>
+                  </div>
+                  {state === 'live' && (
+                    <button
+                      type="button"
+                      onClick={() => deleteMutation.mutate(k.id)}
+                      disabled={deleteMutation.isPending}
+                      className="flex-shrink-0 text-slate-400 transition-colors hover:text-red-600 disabled:opacity-50"
+                      title="Revoke key"
+                      aria-label={`Revoke ${k.name}`}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

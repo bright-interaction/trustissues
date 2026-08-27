@@ -70,7 +70,7 @@ func TestProxy_RejectsPathTraversal(t *testing.T) {
 
 	signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 	tok, err := capability.Sign(capability.Token{
-		Secret: "scoped_key", SecretID: secretID, Agent: agentID,
+		Secret: "scoped_key", SecretID: secretID, Issuer: userID, Agent: agentID,
 		Dests:  []string{host + "/v1/*"},
 		Method: "POST",
 	}, signingKey, time.Minute)

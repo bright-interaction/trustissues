@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,36 @@ import (
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 )
+
+type failedInviteEntropy struct{}
+
+func (failedInviteEntropy) Read([]byte) (int, error) {
+	return 0, errors.New("entropy source unavailable")
+}
+
+func TestInvitationCreationFailsClosedWhenEntropyFails(t *testing.T) {
+	vh, queries := newCollectionAuthzEnv(t)
+	uh := NewUserHandler(queries, &config.Config{VaultKey: strings.Repeat("k", 32)})
+	uh.SetVault(vh)
+	uh.inviteRandom = failedInviteEntropy{}
+	admin := mustUser(t, queries, "entropy-admin@example.com", "admin", "")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
+		strings.NewReader(`{"email":"client@example.com","role":"vault_only"}`))
+	req = req.WithContext(context.WithValue(req.Context(), middleware.UserIDKey, admin))
+	uh.CreateInvitation(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("entropy failure got HTTP %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	var count int
+	if err := vh.db.QueryRow(`SELECT COUNT(*) FROM invitations`).Scan(&count); err != nil {
+		t.Fatalf("count invitations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("entropy failure persisted %d invitation(s)", count)
+	}
+}
 
 // TestLeakedDatabaseHasNoRedeemableInviteCode is the regression test for the
 // only bearer credential this product stored in cleartext.

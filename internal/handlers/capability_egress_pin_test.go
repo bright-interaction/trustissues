@@ -33,6 +33,9 @@ type egressEnv struct {
 	cap     *CapabilityHandler
 	wire    *recordingTransport
 	router  http.Handler
+	// testIssuer is populated by fixtures that hide their generated owner id but
+	// mint direct tokens to exercise the proxy authority.
+	testIssuer string
 }
 
 func newEgressEnv(t *testing.T) *egressEnv {
@@ -94,14 +97,14 @@ func (e *egressEnv) issue(t *testing.T, userID string, req issueRequest) *httpte
 // proxy is the authority: a mint-time refusal the delivery path does not back
 // only moves the bypass one step, and this is how the test proves the delivery
 // path itself refuses.
-func signToken(t *testing.T, name, entryID, agent, dest, method string) string {
+func signToken(t *testing.T, issuer, name, entryID, agent, dest, method string) string {
 	t.Helper()
 	key, err := capability.DeriveSigningKey(testEgressVaultKey)
 	if err != nil {
 		t.Fatalf("derive signing key: %v", err)
 	}
 	tok, err := capability.Sign(capability.Token{
-		Secret: name, SecretID: entryID, Agent: agent,
+		Secret: name, SecretID: entryID, Issuer: issuer, Agent: agent,
 		Dests: []string{dest}, Method: method,
 	}, key, time.Minute)
 	if err != nil {
@@ -264,7 +267,7 @@ func TestEditorCannotRepointAProviderKeyAtAHostTheyChose(t *testing.T) {
 		// A token this server would sign, for a destination the stored ceiling
 		// now allows, spent against the real proxy. Both destination checks say
 		// yes here; only the pin refuses.
-		tok := signToken(t, "team-openai", entryID, "attacker-agent-3", attackerDest, "*")
+		tok := signToken(t, operator, "team-openai", entryID, "attacker-agent-3", attackerDest, "*")
 		rec := env.proxy(t, http.MethodPost, attackerHost, "/collect", tok)
 		env.assertKeyNeverLeft(t, theKey)
 		if rec.Code != http.StatusForbidden {
@@ -292,7 +295,7 @@ func TestEditorCannotRepointAProviderKeyAtAHostTheyChose(t *testing.T) {
 	t.Run("the legitimate inference call still delivers the key", func(t *testing.T) {
 		// The positive control. Without it, a fix that simply broke the bridge
 		// would pass every assertion above.
-		tok := signToken(t, "team-openai", entryID, "good-agent", "api.openai.com/*", "POST")
+		tok := signToken(t, operator, "team-openai", entryID, "good-agent", "api.openai.com/*", "POST")
 		rec := env.proxy(t, http.MethodPost, "api.openai.com", "/v1/chat/completions", tok)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("the allowed inference call: HTTP %d, want 200 (body: %s)", rec.Code, rec.Body.String())

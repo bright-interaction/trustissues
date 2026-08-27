@@ -41,10 +41,14 @@ Endpoints the shell relies on:
 - `POST /api/auth/totp/verify` `{ code }` -> `{ recovery_codes: string[] }`
 - `POST /api/auth/totp/disable` `{ password, code }`
 - `POST /api/invitations/redeem` `{ code, password }` -> `{ user }` (account
-  created; the UI then logs in with email + chosen password)
+  created; the UI then logs in with email + chosen password). A `vault_only`
+  invitee continues to `/client-onboarding`; no response API key is consumed or
+  persisted.
 
-Roles: `admin` | `user` | `vault_only`. vault_only users are hard-redirected
-to /vault by `VaultOnlyRedirect` in App.tsx and see only Vault in the sidebar.
+Roles: `admin` | `user` | `vault_only`. `vault_only` users can reach Vault and
+Settings (Account + API keys only); `VaultOnlyRedirect` keeps them out of the
+activity, credential-access, and user-management pages. Server middleware is
+the authorization boundary.
 
 ## API client (src/lib/api.ts)
 
@@ -118,10 +122,13 @@ never re-implement session handling.
 - `Layout` (src/components/Layout.tsx): wrap every authenticated page:
   `<Layout>...page content...</Layout>`. Renders the fixed 224px sidebar and
   a centered max-w-7xl content column. The vault page must use it too.
-- Sidebar items: Vault, Activity, Users (admin only), Settings. vault_only
-  sees only Vault.
+- Sidebar items: Vault, Activity, Users (admin only), Settings. `vault_only`
+  sees Vault and Settings so a password-authenticated session can manage its
+  own account and mint/revoke a named extension API key.
 - App.tsx routes: `/login`, `/setup`, `/invite` public; `/` redirects to
-  `/vault`; `/vault`, `/activity`, `/users`, `/settings` behind AuthGuard.
+  `/vault`; `/client-onboarding`, `/vault`, `/activity`, `/users`, `/settings`
+  behind AuthGuard. The client checklist redirects non-`vault_only` users back
+  to Vault.
   All non-vault routes are additionally wrapped in VaultOnlyRedirect.
 - `src/pages/Vault.tsx` MUST `export default` a React component taking no
   props. It is lazy-loaded via `import('@/pages/Vault')`, so keep the default

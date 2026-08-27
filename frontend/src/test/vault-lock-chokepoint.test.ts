@@ -131,8 +131,6 @@ describe('vault re-lock has exactly one chokepoint', () => {
 // Non-secret component state. None of these ever hold a decrypted vault value
 // or the account password, so lockVault deliberately leaves them alone.
 const ALLOWED_UNSEALED_STATE = new Set([
-  'setShowImportModal', // an open/closed flag; VaultImportModal owns and
-  // clears its OWN file/preview/format state on submit (see its `reset()`)
   'setCollectionFilter', // a view filter: which collection tab is selected
   'setShowNewCollection', // open/closed flag for the new-collection modal
   'setNewCollection', // collection name + description, not a vault secret

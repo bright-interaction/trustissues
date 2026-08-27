@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,15 +19,17 @@ import (
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/bright-interaction/trustissues/internal/totp"
 )
 
-// The second half of P0-2. The first half (migration 00043 + TOTPVerify's
-// password_set gate) let a password-less vault_only account past the
+// Legacy recovery for P0-2. The password_set gate lets an account created by a
+// pre-web-first release past the
 // enrolment gate. It still could not read a secret: reauthOrRefuse
 // (vault.go, backing Unlock/Rotate/ValidateKey) unconditionally demands a
 // password this account never had. POST /api/auth/set-initial-password is
-// the only way such an account ever acquires one.
+// the only way such a migrated account ever acquires one. New invitation
+// redemption always requires a human password and never enters this state.
 //
 // setInitialPasswordEnv wires a real chi router with the SAME topology as
 // cmd/server/main.go's /api group: set-initial-password sits in the
@@ -36,7 +42,6 @@ type setInitialPasswordEnv struct {
 	srv     *httptest.Server
 	queries *db.Queries
 	vh      *VaultHandler
-	uh      *UserHandler
 	ah      *AuthHandler
 }
 
@@ -44,16 +49,11 @@ func newSetInitialPasswordEnv(t *testing.T) *setInitialPasswordEnv {
 	t.Helper()
 	vh, queries := newCollectionAuthzEnv(t)
 	cfg := &config.Config{VaultKey: strings.Repeat("k", 32), JWTSecret: strings.Repeat("j", 32)}
-	uh := NewUserHandler(queries, cfg)
-	uh.SetVault(vh)
 	ah := NewAuthHandler(queries, cfg)
 	ah.SetVault(vh)
 
 	r := chi.NewRouter()
 	r.Route("/api", func(r chi.Router) {
-		// Public, matches main.go: no auth required to redeem an invitation.
-		r.Post("/invitations/redeem", uh.RedeemInvitation)
-
 		r.Group(func(r chi.Router) {
 			r.Use(timw.JWTOrAPIKeyAuth(cfg.JWTSecret, vh.db))
 
@@ -77,7 +77,7 @@ func newSetInitialPasswordEnv(t *testing.T) *setInitialPasswordEnv {
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	return &setInitialPasswordEnv{srv: srv, queries: queries, vh: vh, uh: uh, ah: ah}
+	return &setInitialPasswordEnv{srv: srv, queries: queries, vh: vh, ah: ah}
 }
 
 func (e *setInitialPasswordEnv) do(t *testing.T, method, path, apiKey, body string) (*http.Response, string) {
@@ -102,53 +102,42 @@ func (e *setInitialPasswordEnv) do(t *testing.T, method, path, apiKey, body stri
 	return resp, string(data)
 }
 
-// createVaultOnlyInvite mints a vault_only invitation the way an admin would,
-// and returns its redemption code.
-func (e *setInitialPasswordEnv) createVaultOnlyInvite(t *testing.T, email string) string {
+// seedLegacyPasswordlessAPIKey models an account created by a release that
+// generated and discarded its password while returning an API key. Current
+// invitation redemption cannot create this state; direct seeding keeps the
+// compatibility test honest and prevents the legacy path from becoming an
+// onboarding API again.
+func (e *setInitialPasswordEnv) seedLegacyPasswordlessAPIKey(t *testing.T, email string) (string, string) {
 	t.Helper()
-	admin := mustUser(t, e.queries, "admin-"+email, "admin", "AdminPassw0rd!")
-	rec := httptest.NewRecorder()
-	req := withUser(httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
-		strings.NewReader(`{"email":"`+email+`","name":"Client","role":"vault_only"}`)), admin)
-	e.uh.CreateInvitation(rec, req)
-	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
-		t.Fatalf("create invitation: %d %s", rec.Code, rec.Body.String())
+	userID := seedLegacyPasswordlessUser(t, e.queries, email)
+	fullKey := "ti_" + randomHex(32)
+	hash := sha256.Sum256([]byte(fullKey))
+	if err := e.queries.CreateAPIKeyForUser(context.Background(), db.CreateAPIKeyForUserParams{
+		ID:        randomHex(16),
+		UserID:    userID,
+		Name:      "Legacy extension key",
+		KeyHash:   hex.EncodeToString(hash[:]),
+		KeyPrefix: strings.TrimPrefix(fullKey, "ti_")[:8],
+		ExpiresAt: sql.NullTime{},
+		CreatedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+	}); err != nil {
+		t.Fatalf("seed legacy API key: %v", err)
 	}
-	var invited struct {
-		Code string `json:"code"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &invited); err != nil || invited.Code == "" {
-		t.Fatalf("no invitation code returned: %s", rec.Body.String())
-	}
-	return invited.Code
+	return userID, fullKey
 }
 
-// TestSetInitialPasswordFullJourney is the mandatory end-to-end proof: a
-// vault_only extension user who redeemed a password-less invitation can walk
+// TestSetInitialPasswordLegacyRecoveryJourney is the end-to-end proof: a
+// migrated vault_only extension user with password_set=0 can walk
 // all the way from "holds only an API key" to "read back a real secret"
 // through /api/vault/unlock, with require_totp switched on throughout.
-func TestSetInitialPasswordFullJourney(t *testing.T) {
+func TestSetInitialPasswordLegacyRecoveryJourney(t *testing.T) {
 	e := newSetInitialPasswordEnv(t)
 	ctx := context.Background()
 
-	// 1. Password-less redemption: THE EXTENSION'S ACTUAL FLOW, POST {code},
-	// no password. See bright-vault-extension/src/options/Options.tsx:104-111.
-	code := e.createVaultOnlyInvite(t, "journey-client@example.com")
-	resp, body := e.do(t, http.MethodPost, "/api/invitations/redeem", "", `{"code":"`+code+`"}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("redeem: %d %s", resp.StatusCode, body)
-	}
-	var redeemed struct {
-		APIKey string `json:"api_key"`
-		User   struct {
-			ID string `json:"id"`
-		} `json:"user"`
-	}
-	if err := json.Unmarshal([]byte(body), &redeemed); err != nil || redeemed.User.ID == "" || redeemed.APIKey == "" {
-		t.Fatalf("ABORT: redemption did not return an API key and user id: %s", body)
-	}
-	clientID := redeemed.User.ID
-	apiKey := redeemed.APIKey
+	// 1. Explicit legacy fixture. No live product route can create it.
+	clientID, apiKey := e.seedLegacyPasswordlessAPIKey(t, "journey-client@example.com")
+	var resp *http.Response
+	var body string
 
 	if got, err := e.queries.GetUserPasswordSet(ctx, clientID); err != nil || got != 0 {
 		t.Fatalf("ABORT: fixture is not password-less (password_set=%d err=%v)", got, err)
@@ -189,7 +178,7 @@ func TestSetInitialPasswordFullJourney(t *testing.T) {
 	}
 	resp, body = e.do(t, http.MethodPost, "/api/auth/totp/verify", apiKey, `{"code":"`+genCode(0)+`"}`)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PASSWORDLESS USER COULD NOT ENROL (%d %s)", resp.StatusCode, body)
+		t.Fatalf("LEGACY PASSWORDLESS USER COULD NOT ENROL (%d %s)", resp.StatusCode, body)
 	}
 
 	// 5. STILL BROKEN AT THIS POINT, which is exactly the finding this test
@@ -271,6 +260,90 @@ func TestSetInitialPasswordRefusesAccountThatAlreadyHasAPassword(t *testing.T) {
 	}
 }
 
+// Two requests for one migrated password_set=0 account can reach this endpoint.
+// Hold both after their fast-path read so they race the final write
+// deterministically: exactly one human password may ever win, and the slower
+// request must receive the same conflict as every later request.
+func TestSetInitialPasswordConcurrentBootstrapHasExactlyOneWinner(t *testing.T) {
+	e := newSetInitialPasswordEnv(t)
+	ctx := context.Background()
+	userID := seedLegacyPasswordlessUser(t, e.queries, "concurrent-bootstrap@example.com")
+
+	enteredHasher := make(chan struct{}, 2)
+	releaseHasher := make(chan struct{})
+	e.ah.initialPasswordHasher = func(password string) (string, error) {
+		enteredHasher <- struct{}{}
+		<-releaseHasher
+		return passwordhash.Hash(password)
+	}
+
+	passwords := []string{"FirstConcurrentPassw0rd!", "SecondConcurrentPassw0rd!"}
+	type result struct {
+		password string
+		code     int
+		body     string
+	}
+	results := make(chan result, len(passwords))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, password := range passwords {
+		password := password
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := httptest.NewRecorder()
+			req := withUser(httptest.NewRequest(http.MethodPost, "/api/auth/set-initial-password",
+				strings.NewReader(`{"password":"`+password+`"}`)), userID)
+			e.ah.SetInitialPassword(rec, req)
+			results <- result{password: password, code: rec.Code, body: rec.Body.String()}
+		}()
+	}
+	close(start)
+	<-enteredHasher
+	<-enteredHasher
+	close(releaseHasher)
+	wg.Wait()
+	close(results)
+
+	winner := ""
+	conflicts := 0
+	for got := range results {
+		switch got.code {
+		case http.StatusOK:
+			if winner != "" {
+				t.Fatalf("both concurrent passwords won (%q and %q)", winner, got.password)
+			}
+			winner = got.password
+		case http.StatusConflict:
+			conflicts++
+			if !strings.Contains(got.body, "password_already_set") {
+				t.Fatalf("loser conflict lacks stable code: %s", got.body)
+			}
+		default:
+			t.Fatalf("concurrent bootstrap got HTTP %d: %s", got.code, got.body)
+		}
+	}
+	if winner == "" || conflicts != 1 {
+		t.Fatalf("winner=%q conflicts=%d, want one of each", winner, conflicts)
+	}
+	stored, err := e.queries.GetPasswordHashByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("read winning hash: %v", err)
+	}
+	if ok, err := passwordhash.Verify(winner, stored); err != nil || !ok {
+		t.Fatalf("stored hash does not belong to the HTTP winner (ok=%v err=%v)", ok, err)
+	}
+	for _, password := range passwords {
+		if password == winner {
+			continue
+		}
+		if ok, err := passwordhash.Verify(password, stored); err != nil || ok {
+			t.Fatalf("losing password verifies after CAS (ok=%v err=%v)", ok, err)
+		}
+	}
+}
+
 // TestStolenAPIKeyCannotUseSetInitialPasswordToTakeOverANormalAccount proves
 // the attack this endpoint must never enable: an attacker holding a session's
 // or an API key's worth of access to a NORMAL, password-having account cannot
@@ -288,13 +361,16 @@ func TestStolenAPIKeyCannotUseSetInitialPasswordToTakeOverANormalAccount(t *test
 		t.Fatalf("ABORT: victim fixture has password_set=%d (err=%v), want 1", got, err)
 	}
 
-	// Mint a real API key for the victim, the way the extension-connect flow
-	// does, then treat its plaintext as "stolen" -- from here on this test
+	// Mint a real API key from an explicitly stamped interactive session, then
+	// treat its plaintext as "stolen" -- from here on this test
 	// only ever uses the key, never the victim's actual password.
 	apiKeyHandler := NewAPIKeyHandler(e.queries)
 	createRec := httptest.NewRecorder()
-	apiKeyHandler.Create(createRec, withUser(httptest.NewRequest(http.MethodPost, "/api/api-keys",
-		strings.NewReader(`{"name":"stolen-key"}`)), victim))
+	createReq := withUser(httptest.NewRequest(http.MethodPost, "/api/api-keys",
+		strings.NewReader(`{"name":"stolen-key"}`)), victim)
+	createReq = createReq.WithContext(context.WithValue(createReq.Context(),
+		timw.PrincipalKindKey, timw.PrincipalSession))
+	apiKeyHandler.Create(createRec, createReq)
 	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
 		t.Fatalf("mint victim api key: %d %s", createRec.Code, createRec.Body.String())
 	}
@@ -341,26 +417,14 @@ func TestSetInitialPasswordReachableWithoutTOTPEnrolment(t *testing.T) {
 	e := newSetInitialPasswordEnv(t)
 	ctx := context.Background()
 
-	code := e.createVaultOnlyInvite(t, "gate-probe@example.com")
-	resp, body := e.do(t, http.MethodPost, "/api/invitations/redeem", "", `{"code":"`+code+`"}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("redeem: %d %s", resp.StatusCode, body)
-	}
-	var redeemed struct {
-		APIKey string `json:"api_key"`
-		User   struct {
-			ID string `json:"id"`
-		} `json:"user"`
-	}
-	if err := json.Unmarshal([]byte(body), &redeemed); err != nil || redeemed.APIKey == "" {
-		t.Fatalf("no api key: %s", body)
-	}
-	apiKey := redeemed.APIKey
+	userID, apiKey := e.seedLegacyPasswordlessAPIKey(t, "gate-probe@example.com")
+	var resp *http.Response
+	var body string
 
 	if err := e.queries.UpsertSetting(ctx, db.UpsertSettingParams{Key: "require_totp", Value: "true"}); err != nil {
 		t.Fatalf("enable require_totp: %v", err)
 	}
-	if enabled, err := e.queries.GetUserTOTPState(ctx, redeemed.User.ID); err != nil || nullInt64Is1(enabled.TotpEnabled) {
+	if enabled, err := e.queries.GetUserTOTPState(ctx, userID); err != nil || nullInt64Is1(enabled.TotpEnabled) {
 		t.Fatalf("ABORT: fixture user already has TOTP enabled (err=%v)", err)
 	}
 

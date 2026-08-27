@@ -1111,8 +1111,9 @@ func readMigrations() (string, error) {
 // So this pins the CALLER SET from the AST, exactly the way
 // TestRawAESIsReachedFromExactlyOnePlace pins decryptWithKey's. decryptCustomFields
 // is the raw door: it returns the plaintext of every field including the ones
-// the operator marked secret. Exactly one production function may open it, and
-// that function is the one that asks the exit.
+// the operator marked secret. Two production functions may open it: the
+// response function that asks the exit, and the storage-only merge that replaces
+// a withheld marker with the value it immediately re-encrypts.
 func TestOnlyTheCustomFieldExitDecryptsCustomFields(t *testing.T) {
 	fset := token.NewFileSet()
 	parsed := parseModule(t, fset)
@@ -1150,14 +1151,14 @@ func TestOnlyTheCustomFieldExitDecryptsCustomFields(t *testing.T) {
 	}
 	sort.Strings(callers)
 
-	const want = "vault.go:customFieldsForCaller"
-	if len(callers) != 1 || callers[0] != want {
-		t.Errorf("decryptCustomFields is called from %v, want exactly [%s].\n"+
+	want := []string{"vault.go:customFieldsForCaller", "vault.go:mergeWithheldCustomFields"}
+	if len(callers) != len(want) || callers[0] != want[0] || callers[1] != want[1] {
+		t.Errorf("decryptCustomFields is called from %v, want exactly %v.\n"+
 			"  It returns the plaintext of every custom field, including the ones an operator marked\n"+
-			"  secret:true. Those are credentials on the same row as the entry's own value, and they\n"+
-			"  leave in the same response body, so they go through secretexit.Exit. The one function\n"+
-			"  entitled to the raw plaintext is the one that asks. Anything rendering custom fields\n"+
-			"  into a response calls customFieldsForCaller.", callers, want)
+			"  secret:true. Anything rendering those credentials into a response goes through\n"+
+			"  secretexit.Exit. The only other consumer is the storage-only withheld merge; it may\n"+
+			"  copy an existing value back into ciphertext and must never put it in a response.\n"+
+			"  Anything rendering custom fields into a response calls customFieldsForCaller.", callers, want)
 	}
 }
 

@@ -85,7 +85,7 @@ func RotateVaultKeys(dbConn *sql.DB, queries *db.Queries, vaultHandler *VaultHan
 		slog.Error("vault rotation: query failed", "error", err)
 		LogActivity(queries, nil, "vault.rotation_failed",
 			"Auto-rotation pass skipped: could not list entries due for rotation (details in server logs)")
-		dispatchRotationFailure(ctx, queries, vaultHandler, "",
+		dispatchRotationFailure(ctx, queries, vaultHandler, "", "",
 			"auto-rotation pass skipped: could not list entries due for rotation (details in server logs)")
 		return
 	}

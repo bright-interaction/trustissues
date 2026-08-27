@@ -14,78 +14,51 @@ import (
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/bright-interaction/trustissues/internal/totp"
 )
 
-// P0-2 regression: a vault_only user who activated the browser extension
-// through the password-less invitation-redemption path must be able to enrol
-// TOTP once an admin turns require_totp on, using only the live API key /
-// session the gate already let through plus a correct code. Demanding a
-// password from this account demands a credential that provably does not
-// exist: RedeemInvitation minted hex(rand 32), hashed it, and discarded the
-// plaintext, so nobody -- including the account's own owner -- has ever known
-// it. Before the fix this was a permanent deadlock: 403 on every route,
-// require_totp's sole exit (TOTPVerify) demanding an unknowable password.
+func seedLegacyPasswordlessUser(t *testing.T, queries *db.Queries, email string) string {
+	t.Helper()
+	hash, err := passwordhash.Hash("LegacyServerGeneratedPasswordThatNobodyReceived!1")
+	if err != nil {
+		t.Fatalf("hash legacy unknown password: %v", err)
+	}
+	userID, err := queries.CreateInvitedUser(context.Background(), db.CreateInvitedUserParams{
+		Email: email, PasswordHash: hash, Name: toNullString("Legacy client"),
+		Role: "vault_only", PasswordSet: 0,
+	})
+	if err != nil {
+		t.Fatalf("seed legacy password_set=0 user: %v", err)
+	}
+	return userID
+}
+
+// P0-2 legacy-recovery regression: releases before web-first onboarding could
+// create vault_only accounts whose random password was never disclosed. Such a
+// migrated password_set=0 account must still be able to enrol TOTP once an
+// admin turns require_totp on. New invitations always require a human password;
+// this fixture is deliberately seeded directly so the compatibility path does
+// not become a second account-creation path.
 //
 // See ops/audits/trustissues-AUDIT-2026-08-24.md P0-2 and migration 00043.
-func TestPasswordlessVaultOnlyUserCanEnrolAfterRequireTOTPIsTurnedOn(t *testing.T) {
+func TestLegacyPasswordlessVaultOnlyUserCanEnrolAfterRequireTOTPIsTurnedOn(t *testing.T) {
 	vh, queries := newCollectionAuthzEnv(t)
-	uh := NewUserHandler(queries, &config.Config{VaultKey: strings.Repeat("k", 32)})
-	uh.SetVault(vh)
 	ah := NewAuthHandler(queries, &config.Config{
 		JWTSecret: strings.Repeat("j", 32), VaultKey: strings.Repeat("k", 32),
 	})
 	ctx := context.Background()
 
-	// An admin invites a client for vault_only (browser-extension) access.
-	admin := mustUser(t, queries, "p02-admin@example.com", "admin", "AdminPassw0rd!")
-	createRec := httptest.NewRecorder()
-	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
-		strings.NewReader(`{"email":"client@example.com","name":"Client","role":"vault_only"}`))
-	createReq = withUser(createReq, admin)
-	uh.CreateInvitation(createRec, createReq)
-	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
-		t.Fatalf("create invitation: %d %s", createRec.Code, createRec.Body.String())
-	}
-	var invited struct {
-		Code string `json:"code"`
-	}
-	if err := json.Unmarshal(createRec.Body.Bytes(), &invited); err != nil || invited.Code == "" {
-		t.Fatalf("no invitation code returned: %s", createRec.Body.String())
-	}
-
-	// THE EXTENSION'S ACTUAL FLOW: POST {code}, no password.
-	// See bright-vault-extension/src/options/Options.tsx:104-111.
-	redeemRec := httptest.NewRecorder()
-	redeemReq := httptest.NewRequest(http.MethodPost, "/api/invitations/redeem",
-		strings.NewReader(`{"code":"`+invited.Code+`"}`))
-	uh.RedeemInvitation(redeemRec, redeemReq)
-	if redeemRec.Code != http.StatusOK {
-		t.Fatalf("redeem: %d %s", redeemRec.Code, redeemRec.Body.String())
-	}
-	var redeemed struct {
-		APIKey string `json:"api_key"`
-		User   struct {
-			ID string `json:"id"`
-		} `json:"user"`
-	}
-	if err := json.Unmarshal(redeemRec.Body.Bytes(), &redeemed); err != nil || redeemed.User.ID == "" {
-		t.Fatalf("redeem did not return a user: %s", redeemRec.Body.String())
-	}
-	if redeemed.APIKey == "" {
-		t.Fatal("ABORT: vault_only redemption did not mint an API key, so this is not the extension flow")
-	}
-	clientID := redeemed.User.ID
+	clientID := seedLegacyPasswordlessUser(t, queries, "legacy-client@example.com")
 
 	// Pin the mechanism: the marker this whole fix hinges on must read
-	// password-less right after redemption.
+	// password-less for the directly seeded legacy row.
 	passwordSet, err := queries.GetUserPasswordSet(ctx, clientID)
 	if err != nil {
 		t.Fatalf("read password_set: %v", err)
 	}
 	if passwordSet != 0 {
-		t.Fatalf("ABORT: password-less redemption produced password_set=%d, want 0; the test is not "+
-			"exercising the password-less path", passwordSet)
+		t.Fatalf("ABORT: legacy fixture has password_set=%d, want 0", passwordSet)
 	}
 
 	// An admin turns on the vault policy.
@@ -121,17 +94,15 @@ func TestPasswordlessVaultOnlyUserCanEnrolAfterRequireTOTPIsTurnedOn(t *testing.
 		t.Fatalf("generate code: %v", err)
 	}
 
-	// THE SOLE EXIT. No password field: the extension never had one to send.
+	// The legacy recovery exception: no human ever received this row's password.
 	verifyRec := httptest.NewRecorder()
 	verifyBody := `{"code":"` + code + `"}`
 	ah.TOTPVerify(verifyRec,
 		withUser(httptest.NewRequest(http.MethodPost, "/api/auth/totp/verify", strings.NewReader(verifyBody)), clientID))
 	if verifyRec.Code != http.StatusOK {
-		t.Fatalf("PASSWORDLESS USER COULD NOT ENROL (%d %s).\n"+
-			"That is the P0-2 deadlock: the account's password was minted and discarded by "+
-			"RedeemInvitation, nobody has ever known it, and TOTPVerify is the gate's only exit from "+
-			"the 403 every other route now returns. Recovery would need an admin reset-password, "+
-			"which also revokes the extension's API key.",
+		t.Fatalf("LEGACY PASSWORDLESS USER COULD NOT ENROL (%d %s).\n"+
+			"A migrated password_set=0 account has no known password, and TOTPVerify is the gate's "+
+			"only exit from the 403 every gated route returns.",
 			verifyRec.Code, verifyRec.Body.String())
 	}
 	var out struct {
@@ -195,9 +166,9 @@ func TestPasswordHavingAccountMarkerIsSetAndStillRequiresThePassword(t *testing.
 	}
 }
 
-// A redemption that DOES supply a password must record password_set=1, not
-// inherit the password-less default. Missing this branch would leave an
-// invitee who chose their own password unable to prove they hold it later.
+// Every current redemption supplies a password and must record password_set=1.
+// Missing the marker would misclassify a normal web-first invitee as a legacy
+// recovery account and weaken later password checks.
 func TestRedemptionWithASuppliedPasswordSetsTheMarker(t *testing.T) {
 	vh, queries := newCollectionAuthzEnv(t)
 	uh := NewUserHandler(queries, &config.Config{VaultKey: strings.Repeat("k", 32)})
@@ -240,12 +211,12 @@ func TestRedemptionWithASuppliedPasswordSetsTheMarker(t *testing.T) {
 		t.Fatalf("read password_set: %v", err)
 	}
 	if passwordSet != 1 {
-		t.Errorf("redemption WITH a supplied password produced password_set=%d, want 1", passwordSet)
+		t.Errorf("web-first redemption produced password_set=%d, want 1", passwordSet)
 	}
 }
 
-// TOTPDisable must NOT be weakened by this fix. A password-less account that
-// has enrolled 2FA (the flow the two tests above just proved works) still
+// TOTPDisable must NOT be weakened by the legacy recovery exception. A migrated
+// password_set=0 account that has enrolled 2FA still
 // cannot disable it through this endpoint, because TOTPDisable unconditionally
 // requires the password and this account's password is unknowable by
 // construction. This is deliberate, not an oversight: disabling 2FA is a
@@ -254,34 +225,14 @@ func TestRedemptionWithASuppliedPasswordSetsTheMarker(t *testing.T) {
 // one documented at TOTPVerify. The only route out for this account is an
 // admin reset-password, which is the same costly-but-available remedy the
 // audit already priced in for P0-2.
-func TestPasswordlessAccountStillCannotSelfDisable2FA(t *testing.T) {
-	vh, queries := newCollectionAuthzEnv(t)
-	uh := NewUserHandler(queries, &config.Config{VaultKey: strings.Repeat("k", 32)})
-	uh.SetVault(vh)
+func TestLegacyPasswordlessAccountStillCannotSelfDisable2FA(t *testing.T) {
+	_, queries := newCollectionAuthzEnv(t)
 	ah := NewAuthHandler(queries, &config.Config{
 		JWTSecret: strings.Repeat("j", 32), VaultKey: strings.Repeat("k", 32),
 	})
 	ctx := context.Background()
 
-	admin := mustUser(t, queries, "p02-admin3@example.com", "admin", "AdminPassw0rd!")
-	createRec := httptest.NewRecorder()
-	uh.CreateInvitation(createRec, withUser(httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
-		strings.NewReader(`{"email":"client3@example.com","name":"Client3","role":"vault_only"}`)), admin))
-	var invited struct {
-		Code string `json:"code"`
-	}
-	_ = json.Unmarshal(createRec.Body.Bytes(), &invited)
-
-	redeemRec := httptest.NewRecorder()
-	uh.RedeemInvitation(redeemRec, httptest.NewRequest(http.MethodPost, "/api/invitations/redeem",
-		strings.NewReader(`{"code":"`+invited.Code+`"}`)))
-	var redeemed struct {
-		User struct {
-			ID string `json:"id"`
-		} `json:"user"`
-	}
-	_ = json.Unmarshal(redeemRec.Body.Bytes(), &redeemed)
-	clientID := redeemed.User.ID
+	clientID := seedLegacyPasswordlessUser(t, queries, "legacy-disable@example.com")
 
 	setupRec := httptest.NewRecorder()
 	ah.TOTPSetup(setupRec, withUser(httptest.NewRequest(http.MethodPost, "/api/auth/totp/setup", nil), clientID))
@@ -292,7 +243,7 @@ func TestPasswordlessAccountStillCannotSelfDisable2FA(t *testing.T) {
 	ah.TOTPVerify(verifyRec, withUser(httptest.NewRequest(http.MethodPost, "/api/auth/totp/verify",
 		strings.NewReader(`{"code":"`+code+`"}`)), clientID))
 	if verifyRec.Code != http.StatusOK {
-		t.Fatalf("ABORT: could not enrol this password-less account, so disable cannot be tested: %d %s",
+		t.Fatalf("ABORT: could not enrol this legacy password-less account, so disable cannot be tested: %d %s",
 			verifyRec.Code, verifyRec.Body.String())
 	}
 
@@ -303,12 +254,12 @@ func TestPasswordlessAccountStillCannotSelfDisable2FA(t *testing.T) {
 	}
 	disableRec := httptest.NewRecorder()
 	// No password known to supply: try the empty string, exactly what a
-	// password-less owner has.
+	// legacy password-less owner has.
 	disableBody := `{"password":"","code":"` + code2 + `"}`
 	ah.TOTPDisable(disableRec, withUser(httptest.NewRequest(http.MethodPost, "/api/auth/totp/disable",
 		strings.NewReader(disableBody)), clientID))
 	if disableRec.Code == http.StatusOK {
-		t.Fatal("TOTPDisable succeeded with no password on a password-less account; " +
+		t.Fatal("TOTPDisable succeeded with no password on a legacy password-less account; " +
 			"this test exists to DOCUMENT that it should still fail, not to celebrate it failing")
 	}
 
@@ -318,7 +269,7 @@ func TestPasswordlessAccountStillCannotSelfDisable2FA(t *testing.T) {
 	}
 }
 
-// The admin remedy: after ResetPassword gives a password-less account a real,
+// The admin remedy: after ResetPassword gives a legacy password-less account a real,
 // human-chosen password, password_set must flip to 1 and TOTPVerify must
 // start requiring that password again. A ResetPassword that forgot to use
 // SetPasswordHash (falling back to the marker-blind UpdatePasswordHash) would
@@ -336,27 +287,10 @@ func TestAdminResetPasswordSetsTheMarkerAndReclosesTheDoor(t *testing.T) {
 	ctx := context.Background()
 
 	admin := mustUser(t, queries, "p02-admin4@example.com", "admin", "AdminPassw0rd!")
-	createRec := httptest.NewRecorder()
-	uh.CreateInvitation(createRec, withUser(httptest.NewRequest(http.MethodPost, "/api/admin/invitations",
-		strings.NewReader(`{"email":"client4@example.com","name":"Client4","role":"vault_only"}`)), admin))
-	var invited struct {
-		Code string `json:"code"`
-	}
-	_ = json.Unmarshal(createRec.Body.Bytes(), &invited)
-
-	redeemRec := httptest.NewRecorder()
-	uh.RedeemInvitation(redeemRec, httptest.NewRequest(http.MethodPost, "/api/invitations/redeem",
-		strings.NewReader(`{"code":"`+invited.Code+`"}`)))
-	var redeemed struct {
-		User struct {
-			ID string `json:"id"`
-		} `json:"user"`
-	}
-	_ = json.Unmarshal(redeemRec.Body.Bytes(), &redeemed)
-	clientID := redeemed.User.ID
+	clientID := seedLegacyPasswordlessUser(t, queries, "legacy-reset@example.com")
 
 	if got, err := queries.GetUserPasswordSet(ctx, clientID); err != nil || got != 0 {
-		t.Fatalf("ABORT: fixture is not password-less before the reset (got=%d err=%v)", got, err)
+		t.Fatalf("ABORT: legacy fixture is not password-less before the reset (got=%d err=%v)", got, err)
 	}
 
 	const newPassword = "AdminChosenForClient1!"

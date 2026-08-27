@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/mail"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/bright-interaction/trustissues/internal/emailidentity"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 )
 
@@ -80,6 +80,7 @@ func nullInt64Is1(ni sql.NullInt64) bool {
 // writeJSON encodes a value as JSON and writes it to the response.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Error("failed to encode JSON response", "error", err)
@@ -186,12 +187,13 @@ func (e *ValidationError) Error() string {
 	return e.Field + ": " + e.Message
 }
 
-// ValidateEmail validates an email address using net/mail.
+// ValidateEmail validates an email address using the same strict parser and
+// IDNA rules as account storage. Display-name forms remain accepted.
 func ValidateEmail(email string) error {
 	if email == "" {
 		return nil // Empty is allowed; use ValidateRequired for mandatory fields
 	}
-	if _, err := mail.ParseAddress(email); err != nil {
+	if _, err := emailidentity.CanonicalStrict(email); err != nil {
 		return &ValidationError{Field: "email", Message: "invalid email address format"}
 	}
 	return nil

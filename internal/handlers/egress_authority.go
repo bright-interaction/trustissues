@@ -546,6 +546,129 @@ func egressInfluencingMetaKeys() []string {
 var reservedProviderMetaKeys = []string{pendingRevokeMethod, pendingRevokeURL, pendingRevokeAuth,
 	pendingRevokeKeyID, pendingRevokeStranded, "last_revoke_error"}
 
+// credentialProviderMetaKeys are credentials stored beside the entry's primary
+// value rather than identifiers or routing configuration. Datadog is currently
+// the only adapter with this shape: creating and deleting an API key requires a
+// separate Application Key, and the adapter reads it from provider_meta.
+//
+// Keep this list explicit and provider-scoped. Names such as key_id, account_id
+// and client_id are identifiers needed to render and edit a provider binding;
+// guessing from substrings ("key", "token", "secret") would redact those and
+// make legitimate configurations impossible to maintain.
+var credentialProviderMetaKeys = map[string][]string{
+	"datadog": {"app_key"},
+}
+
+// credentialMetaKeysFor classifies provider names defensively. Interactive UI
+// writes use registry-canonical lowercase names, but Create and the portable
+// importer deliberately retain unknown/historical provider strings. Treating
+// "Datadog" as unrelated would turn app_key back into ordinary metadata and
+// hand it to every list caller. This normalization affects redaction only; it
+// does not make an unknown spelling eligible for provider execution.
+func credentialMetaKeysFor(provider string) []string {
+	return credentialProviderMetaKeys[strings.ToLower(strings.TrimSpace(provider))]
+}
+
+// redactCredentialProviderMetaKeys removes secondary credentials from an
+// ordinary metadata response. It returns the keys it withheld as a sibling
+// response field so clients can distinguish "not configured" from "present but
+// password-gated" without receiving the value.
+//
+// A malformed object for a provider known to carry credentials fails closed to
+// an empty object. Returning the raw bytes in that case could return an app_key
+// this parser failed to identify, which is the opposite of safe degradation on
+// a non-reauthenticated endpoint.
+func redactCredentialProviderMetaKeys(provider, raw string) (string, []string) {
+	keys := credentialMetaKeysFor(provider)
+	if len(keys) == 0 {
+		return raw, []string{}
+	}
+	if raw == "" {
+		raw = "{}"
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || fields == nil {
+		return "{}", append([]string(nil), keys...)
+	}
+	withheld := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := fields[key]; !ok {
+			continue
+		}
+		delete(fields, key)
+		withheld = append(withheld, key)
+	}
+	if len(withheld) == 0 {
+		return raw, []string{}
+	}
+	sort.Strings(withheld)
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return "{}", withheld
+	}
+	return string(out), withheld
+}
+
+// preserveCredentialProviderMetaForStorage merges values withheld from a
+// metadata response back into a client-supplied full-column replacement. A
+// missing, null, or empty credential means "the server did not show it; keep the
+// current value". A non-empty string explicitly replaces it. A change to a
+// different canonical provider does not call this helper, so credentials never
+// follow an entry to another vendor; a case/whitespace normalization of the same
+// historical provider tag does preserve it.
+//
+// This is intentionally a storage-only operation. It never returns the merged
+// object to the caller, and the response path redacts it again. Its job is to
+// make a no-op edit by an API-key-authenticated client non-destructive without
+// turning that client into a reveal oracle.
+func preserveCredentialProviderMetaForStorage(provider, raw string,
+	stored map[string]string) (string, bool, error) {
+
+	keys := credentialMetaKeysFor(provider)
+	if len(keys) == 0 {
+		return raw, false, nil
+	}
+	if raw == "" {
+		raw = "{}"
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || fields == nil {
+		return raw, false, fmt.Errorf("provider_meta must be a JSON object")
+	}
+
+	changed := false
+	for _, key := range keys {
+		encoded, present := fields[key]
+		explicit := ""
+		if present && string(encoded) != "null" {
+			if err := json.Unmarshal(encoded, &explicit); err != nil {
+				return raw, false, fmt.Errorf("provider_meta %s must be a string", key)
+			}
+		}
+		if explicit != "" {
+			continue
+		}
+		current := stored[key]
+		if current == "" {
+			continue
+		}
+		marshaled, err := json.Marshal(current)
+		if err != nil {
+			return raw, false, fmt.Errorf("encode stored provider_meta %s: %w", key, err)
+		}
+		fields[key] = marshaled
+		changed = true
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return raw, false, fmt.Errorf("encode provider_meta: %w", err)
+	}
+	return string(out), true, nil
+}
+
 // rejectReservedProviderMetaKeys reports the first server-owned key found in a
 // client-supplied provider_meta, if any.
 func rejectReservedProviderMetaKeys(meta map[string]string) (string, bool) {

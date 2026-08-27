@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/egressgate"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
@@ -160,11 +163,302 @@ func (h *UserHandler) disposeVaultEntriesOnDelete(r *http.Request, targetID, ema
 	}
 }
 
+// verifyHardDeleteCleanup turns the older best-effort cleanup helpers into an
+// atomic hard-delete contract. Disable and password reset deliberately keep
+// their best-effort behaviour because refusing the incident-response action can
+// be worse than leaving cosmetic cleanup behind. A hard delete is different:
+// committing the user DELETE while a shared entry still names that user makes
+// the ciphertext unreachable, and committing while one of their delivery
+// targets survives leaves a dead principal's endpoint attached to future
+// rotations.
+//
+// Delete calls this on the SAME write transaction as the policy check and user
+// DELETE. Any residue therefore aborts and rolls back the entire offboarding,
+// including personal-vault deletion and ownership transfers already attempted.
+func (h *UserHandler) verifyHardDeleteCleanup(ctx context.Context, targetID string) error {
+	if h.vault == nil {
+		return fmt.Errorf("vault handler is not wired")
+	}
+
+	var heldEntries int64
+	if err := h.queries.Handle().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM vault_entries WHERE user_id = ?`, targetID).Scan(&heldEntries); err != nil {
+		return fmt.Errorf("verify departing user's vault: %w", err)
+	}
+	if heldEntries != 0 {
+		return fmt.Errorf("%d vault entries still name the departing user", heldEntries)
+	}
+
+	identities, err := h.queries.ListServiceIdentitiesByUser(ctx,
+		sql.NullString{String: targetID, Valid: true})
+	if err != nil {
+		return fmt.Errorf("verify service identity revocation: %w", err)
+	}
+	if len(identities) != 0 {
+		return fmt.Errorf("%d live service identities still name the departing user", len(identities))
+	}
+
+	rows, err := h.queries.ListAllVaultEntryTargets(ctx)
+	if err != nil {
+		return fmt.Errorf("verify rotation target purge: %w", err)
+	}
+	for _, row := range rows {
+		raw, openErr := h.vault.decryptColumn(row.RotationTargets.String, vaultFieldRotationTargets)
+		if openErr != nil {
+			return fmt.Errorf("open rotation targets for entry %s: %w", row.ID, openErr)
+		}
+		var targets []RotationTarget
+		if raw != "" {
+			if decodeErr := json.Unmarshal([]byte(raw), &targets); decodeErr != nil {
+				return fmt.Errorf("decode rotation targets for entry %s: %w", row.ID, decodeErr)
+			}
+		}
+		for _, target := range targets {
+			if target.ConfiguredBy == targetID {
+				return fmt.Errorf("entry %s still has a rotation target configured by the departing user", row.ID)
+			}
+		}
+	}
+	return nil
+}
+
+type hardDeleteSummary struct {
+	serviceNames  []string
+	targetCount   int
+	targetEntries []string
+	sharedMoved   int
+	sharedRenamed []string
+	personalGone  int64
+}
+
+// hardDeleteCleanup is the fail-closed counterpart to invalidateCredentials
+// and disposeVaultEntriesOnDelete. Those helpers remain intentionally
+// best-effort for reversible incident-response actions. A hard delete has no
+// such escape hatch: it runs this on the caller's transaction and any failed
+// credential revocation, target purge, transfer or erasure aborts the delete.
+func (h *UserHandler) hardDeleteCleanup(ctx context.Context, targetID, email, newOwnerID string) (hardDeleteSummary, error) {
+	var out hardDeleteSummary
+	if h.vault == nil {
+		return out, fmt.Errorf("vault handler is not wired")
+	}
+
+	if err := h.queries.InvalidateUserSessions(ctx, db.InvalidateUserSessionsParams{
+		SessionsValidAfter: time.Now().Unix(), ID: targetID,
+	}); err != nil {
+		return out, fmt.Errorf("invalidate user sessions: %w", err)
+	}
+	if err := h.queries.RevokeUserSessions(ctx, targetID); err != nil {
+		return out, fmt.Errorf("revoke user sessions: %w", err)
+	}
+	if err := h.queries.RevokeAPIKeysByUser(ctx, targetID); err != nil {
+		return out, fmt.Errorf("revoke user API keys: %w", err)
+	}
+
+	identities, err := h.queries.ListServiceIdentitiesByUser(ctx,
+		sql.NullString{String: targetID, Valid: true})
+	if err != nil {
+		return out, fmt.Errorf("list service identities: %w", err)
+	}
+	if len(identities) > 0 {
+		result, revokeErr := h.queries.RevokeServiceIdentitiesByUser(ctx,
+			sql.NullString{String: targetID, Valid: true})
+		if revokeErr != nil {
+			return out, fmt.Errorf("revoke service identities: %w", revokeErr)
+		}
+		affected, affectedErr := result.RowsAffected()
+		if affectedErr != nil || affected != int64(len(identities)) {
+			return out, fmt.Errorf("service identity revocation affected %d of %d rows (count error: %v)",
+				affected, len(identities), affectedErr)
+		}
+		out.serviceNames = make([]string, 0, len(identities))
+		for _, identity := range identities {
+			out.serviceNames = append(out.serviceNames, identity.Name)
+		}
+	}
+
+	out.targetCount, out.targetEntries, err = h.purgeTargetsForHardDelete(ctx, targetID)
+	if err != nil {
+		return out, err
+	}
+	out.sharedMoved, out.sharedRenamed, err = h.reassignCollectionEntriesForHardDelete(
+		ctx, targetID, email, newOwnerID)
+	if err != nil {
+		return out, err
+	}
+	deleted, err := h.queries.DeletePersonalVaultEntriesForUser(ctx, targetID)
+	if err != nil {
+		return out, fmt.Errorf("delete personal vault entries: %w", err)
+	}
+	out.personalGone, err = deleted.RowsAffected()
+	if err != nil {
+		return out, fmt.Errorf("count deleted personal vault entries: %w", err)
+	}
+	return out, nil
+}
+
+func (h *UserHandler) purgeTargetsForHardDelete(ctx context.Context, targetID string) (int, []string, error) {
+	rows, err := h.queries.ListAllVaultEntryTargets(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("list rotation targets: %w", err)
+	}
+	dropped := 0
+	entries := make([]string, 0)
+	for _, row := range rows {
+		raw, openErr := h.vault.decryptColumn(row.RotationTargets.String, vaultFieldRotationTargets)
+		if openErr != nil {
+			return 0, nil, fmt.Errorf("open rotation targets for entry %s: %w", row.ID, openErr)
+		}
+		targets := make([]RotationTarget, 0)
+		if raw != "" {
+			if decodeErr := json.Unmarshal([]byte(raw), &targets); decodeErr != nil {
+				return 0, nil, fmt.Errorf("decode rotation targets for entry %s: %w", row.ID, decodeErr)
+			}
+		}
+		kept := make([]RotationTarget, 0, len(targets))
+		removed := 0
+		for _, target := range targets {
+			if target.ConfiguredBy == targetID {
+				removed++
+				continue
+			}
+			kept = append(kept, target)
+		}
+		if removed == 0 {
+			continue
+		}
+		encoded, encodeErr := json.Marshal(kept)
+		if encodeErr != nil {
+			return 0, nil, fmt.Errorf("encode purged targets for entry %s: %w", row.ID, encodeErr)
+		}
+		sealed, sealErr := h.vault.encryptColumn(string(encoded))
+		if sealErr != nil {
+			return 0, nil, fmt.Errorf("seal purged targets for entry %s: %w", row.ID, sealErr)
+		}
+		ticket, ticketErr := egressgate.Decide(egressgate.Request{
+			EntryID: row.ID,
+			What:    egressFieldRotationTarget,
+			Before:  deliveryDestinations(targets),
+			After:   deliveryDestinations(kept),
+		})
+		if ticketErr != nil {
+			return 0, nil, fmt.Errorf("prove target purge for entry %s is narrowing: %w", row.ID, ticketErr)
+		}
+		if writeErr := vaultegress.SetRotationTargets(ctx, h.queries, ticket,
+			vaultegress.RotationTargetsParams{RotationTargets: toNullString(sealed), ID: row.ID}); writeErr != nil {
+			return 0, nil, fmt.Errorf("persist target purge for entry %s: %w", row.ID, writeErr)
+		}
+		name, nameErr := h.vault.decryptColumn(row.Name, vaultFieldName)
+		if nameErr != nil {
+			return 0, nil, fmt.Errorf("open target-bearing entry name %s: %w", row.ID, nameErr)
+		}
+		dropped += removed
+		entries = append(entries, name)
+	}
+	return dropped, entries, nil
+}
+
+func (h *UserHandler) reassignCollectionEntriesForHardDelete(ctx context.Context,
+	targetID, email, newOwnerID string) (int, []string, error) {
+
+	rows, err := h.queries.ListCollectionVaultEntriesForUser(ctx, targetID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("list shared vault entries: %w", err)
+	}
+	actor, err := h.queries.GetUserByID(ctx, newOwnerID)
+	if err != nil || actor.Disabled != 0 || actor.Role != middleware.RoleAdmin {
+		return 0, nil, fmt.Errorf("the deleting principal is not a live instance admin")
+	}
+	moved := 0
+	renamed := make([]string, 0)
+	for _, row := range rows {
+		plainName, openErr := h.vault.decryptColumn(row.Name, vaultFieldName)
+		if openErr != nil {
+			return 0, nil, fmt.Errorf("open shared entry name %s: %w", row.ID, openErr)
+		}
+		nameScope := bidxScope(newOwnerID, row.CollectionID)
+		proof, proofErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
+			EntryID: row.ID, Actor: newOwnerID, ActorIsInstanceAdmin: true, To: newOwnerID,
+			Why: "hard delete of " + email + ": the team keeps the shared entries they created",
+		})
+		if proofErr != nil {
+			return 0, nil, fmt.Errorf("authorize shared entry transfer %s: %w", row.ID, proofErr)
+		}
+		_, transferErr := vaultegress.TransferSecretOwnership(ctx, h.queries, proof,
+			vaultegress.TransferOwnershipParams{
+				NewOwnerUserID: newOwnerID,
+				ID:             row.ID,
+				NameBidx:       h.vault.scopedNameBlindIndex(nameScope, plainName),
+			})
+		if transferErr == nil {
+			moved++
+			continue
+		}
+		if !strings.Contains(transferErr.Error(), "UNIQUE constraint") {
+			return 0, nil, fmt.Errorf("transfer shared entry %s: %w", row.ID, transferErr)
+		}
+
+		dedup := plainName + " (from " + email + ")"
+		sealedName, sealErr := h.vault.encryptColumn(dedup)
+		if sealErr != nil {
+			return 0, nil, fmt.Errorf("seal de-duplicated entry name %s: %w", row.ID, sealErr)
+		}
+		if renameErr := h.queries.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{
+			Name: sealedName, NameBidx: h.vault.scopedNameBlindIndex(nameScope, dedup), ID: row.ID,
+		}); renameErr != nil {
+			return 0, nil, fmt.Errorf("de-duplicate shared entry %s: %w", row.ID, renameErr)
+		}
+		retry, retryErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
+			EntryID: row.ID, Actor: newOwnerID, ActorIsInstanceAdmin: true, To: newOwnerID,
+			Why: "hard delete of " + email + ": re-own after a name de-duplication",
+		})
+		if retryErr != nil {
+			return 0, nil, fmt.Errorf("authorize de-duplicated shared entry transfer %s: %w", row.ID, retryErr)
+		}
+		if _, retryErr = vaultegress.TransferSecretOwnership(ctx, h.queries, retry,
+			vaultegress.TransferOwnershipParams{
+				NewOwnerUserID: newOwnerID,
+				ID:             row.ID,
+				NameBidx:       h.vault.scopedNameBlindIndex(nameScope, dedup),
+			}); retryErr != nil {
+			return 0, nil, fmt.Errorf("transfer de-duplicated shared entry %s: %w", row.ID, retryErr)
+		}
+		moved++
+		renamed = append(renamed, plainName+" -> "+dedup)
+	}
+	return moved, renamed, nil
+}
+
+func (h *UserHandler) logHardDeleteSummary(r *http.Request, email string, summary hardDeleteSummary) {
+	if len(summary.serviceNames) > 0 {
+		LogActivityFromRequest(h.queries, r, "admin.service_identities_revoked",
+			fmt.Sprintf("Deleting %s: revoked %d service key(s), these services must be re-provisioned: %v",
+				email, len(summary.serviceNames), summary.serviceNames))
+	}
+	if summary.targetCount > 0 {
+		LogActivityFromRequest(h.queries, r, "admin.user_targets_purged",
+			fmt.Sprintf("Deleting %s: removed %d rotation delivery target(s) they had configured on: %v",
+				email, summary.targetCount, h.sealSecretNames(r, summary.targetEntries)))
+	}
+	if summary.sharedMoved > 0 {
+		detail := fmt.Sprintf("Deleting %s: re-owned %d shared collection secret(s) so the team keeps them",
+			email, summary.sharedMoved)
+		if len(summary.sharedRenamed) > 0 {
+			detail += fmt.Sprintf("; renamed %d to avoid a name clash: %v", len(summary.sharedRenamed),
+				h.sealSecretNames(r, summary.sharedRenamed))
+		}
+		LogActivityFromRequest(h.queries, r, "admin.entries_reassigned", detail)
+	}
+	if summary.personalGone > 0 {
+		LogActivityFromRequest(h.queries, r, "admin.entries_deleted_with_user",
+			fmt.Sprintf("Deleting %s: removed %d personal secret(s)", email, summary.personalGone))
+	}
+}
+
 // reassignCollectionEntries re-owns the leaver's shared entries ONE AT A TIME.
 //
-// A single blanket UPDATE was all-or-nothing. vault_entries still carries
-// UNIQUE(user_id, name), and generic names ("GitHub", "AWS", "Stripe") collide
-// constantly in a password manager, so one clash aborted the whole statement:
+// A single blanket UPDATE was all-or-nothing. Generic names ("GitHub", "AWS",
+// "Stripe") collide constantly in a password manager, so one collection-scoped
+// clash while converging a legacy token aborted the whole statement:
 // every shared entry kept the deleted user's id, no activity row was written,
 // and the confirmation dialog had just promised the team would keep them. The
 // failure was invisible and the entries were left orphaned, which is exactly the
@@ -196,9 +490,9 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 	}
 	// Re-owning needs the vault handler for three things it cannot fake: opening
 	// the stored name, sealing the de-duplicated one, and deriving the blind
-	// index under the new custodian. Refusing here leaves the entries with the
+	// index under the shared collection. Refusing here leaves the entries with the
 	// departing user, which the caller reports and an admin can repair; guessing
-	// would write rows indexed under the wrong person and a name nobody can read.
+	// would write a wrong-scope index and a name nobody can read.
 	if h.vault == nil {
 		slog.Error("offboard: no vault handler wired, refusing to re-own collection entries",
 			"user", targetID, "entries", len(rows))
@@ -231,14 +525,14 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		// ListCollectionVaultEntriesForUser returns what is STORED, and 00040
 		// made that ciphertext. Three separate things here need the plaintext:
 		// the operator-facing lists, the de-duplicated name this builds, and the
-		// blind index that carries per-user uniqueness across the transfer.
+		// blind index that carries collection uniqueness across the transfer.
 		// Reading row.Name directly gave all three the wrong value.
 		plainName := h.vault.EntryNamePlain(row.Name)
-		// Recomputed under the NEW custodian, because the token is keyed by
-		// user_id and the transfer is what changes it. Without this the row
-		// stays indexed under the departing user and its name stops being
-		// constrained at all.
-		newBidx := h.vault.nameBlindIndex(newOwnerID, plainName)
+		// Shared names are keyed to c:<collection>, not to either custodian. We
+		// still recompute here so a pre-00045 user-scoped token converges while the
+		// row is already being touched.
+		nameScope := bidxScope(newOwnerID, row.CollectionID)
+		newBidx := h.vault.scopedNameBlindIndex(nameScope, plainName)
 		proof, pErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
 			EntryID:              row.ID,
 			Actor:                newOwnerID,
@@ -278,7 +572,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 		}
 		if rErr := h.queries.UpdateVaultEntryName(r.Context(), db.UpdateVaultEntryNameParams{
 			Name:     sealedDedup,
-			NameBidx: h.vault.nameBlindIndex(newOwnerID, dedup),
+			NameBidx: h.vault.scopedNameBlindIndex(nameScope, dedup),
 			ID:       row.ID,
 		}); rErr != nil {
 			slog.Error("offboard: could not de-duplicate entry name", "entry", row.ID, "error", rErr)
@@ -301,7 +595,7 @@ func (h *UserHandler) reassignCollectionEntries(r *http.Request, targetID, email
 			vaultegress.TransferOwnershipParams{
 				NewOwnerUserID: newOwnerID,
 				ID:             row.ID,
-				NameBidx:       h.vault.nameBlindIndex(newOwnerID, dedup),
+				NameBidx:       h.vault.scopedNameBlindIndex(nameScope, dedup),
 			}); uErr2 != nil {
 			slog.Error("offboard: re-own failed after rename", "entry", row.ID, "error", uErr2)
 			failed = append(failed, plainName)

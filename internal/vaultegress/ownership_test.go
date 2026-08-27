@@ -66,7 +66,8 @@ func TestTransferSecretOwnershipRefusesAProofThatDoesNotAuthorise(t *testing.T) 
 	// POSITIVE CONTROL. A gate that refuses everything is not a fix: the product
 	// has a genuine transfer and it has to keep working.
 	if _, err := TransferSecretOwnership(ctx, q, good,
-		TransferOwnershipParams{NewOwnerUserID: "admin-1", ID: testEntryID}); err != nil {
+		TransferOwnershipParams{NewOwnerUserID: "admin-1", ID: testEntryID,
+			NameBidx: "destination-scoped-name-token"}); err != nil {
 		t.Fatalf("the authorised transfer was refused: %v", err)
 	}
 	if now := readOwner(t, conn); now != "admin-1" {

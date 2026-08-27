@@ -1,10 +1,13 @@
 package middleware
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,13 @@ import (
 var (
 	trustedProxyHops = 1
 	trustXRealIP     = false
+	// Trust loopback only until startup installs the operator's explicit set.
+	// In particular, RFC1918 is not a proxy identity: shared container bridges
+	// routinely contain workloads that must not be allowed to forge XFF.
+	trustedProxyPeers = []netip.Prefix{
+		netip.MustParsePrefix("127.0.0.1/32"),
+		netip.MustParsePrefix("::1/128"),
+	}
 )
 
 // ConfigureProxy sets how the rate limiter derives the client IP from the
@@ -29,6 +39,41 @@ func ConfigureProxy(hops int, trustRealIP bool) {
 	}
 	trustedProxyHops = hops
 	trustXRealIP = trustRealIP
+}
+
+// ConfigureTrustedProxyPeers sets the direct socket peers that may supply
+// forwarding headers. Entries may be CIDRs or bare IP addresses. An empty
+// specification trusts nobody; malformed input leaves the previous set intact.
+// Hop count and peer identity are deliberately separate: hops describes the
+// chain shape, while this set decides whether the chain is believed at all.
+func ConfigureTrustedProxyPeers(spec string) error {
+	prefixes, err := parseTrustedProxyPeers(spec)
+	if err != nil {
+		return err
+	}
+	trustedProxyPeers = prefixes
+	return nil
+}
+
+func parseTrustedProxyPeers(spec string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0)
+	for _, raw := range strings.Split(spec, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(raw); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(raw)
+		if err != nil || addr.Zone() != "" {
+			return nil, fmt.Errorf("TRUSTISSUES_TRUSTED_PROXY_PEERS: %q is neither a CIDR nor an unzoned IP address", raw)
+		}
+		addr = addr.Unmap()
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
 }
 
 // visitor tracks the request count and window start time for a single IP.
@@ -306,7 +351,7 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 // limiting. It derives the client from the RIGHTMOST untrusted hop of the
 // forwarding chain, never the client-controlled leftmost X-Forwarded-For entry
 // and never a bare X-Real-IP. Proxy headers are honored only when the direct
-// socket peer is loopback/private (i.e. our own reverse proxy) AND a positive
+// socket peer is in the operator's explicit proxy allowlist AND a positive
 // trusted-hop count is configured; otherwise the socket peer is the client.
 //
 // The full hop chain, closest-to-us last, is [xff..., RemoteAddr]. RemoteAddr

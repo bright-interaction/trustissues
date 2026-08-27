@@ -234,7 +234,6 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 			"returning stored vault_entries.name to the model provider")
 		return "could not list secrets", true
 	}
-
 	// Scope note: the capability minting path (lookupSecretByName) resolves only
 	// the caller's OWN entries, so advertising collection secrets here would list
 	// names the agent can never obtain a token for, and would leak the names of
@@ -244,7 +243,7 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 	// removed from a collection still saw the shared entry offered to their agent
 	// (and, before the lookup fix, could still mint for it).
 	stored, err := h.queries.ListAccessibleVaultEntryNames(ctx, db.ListAccessibleVaultEntryNamesParams{
-		UserID: userID, UserID_2: userID,
+		UserID: userID, UserID_2: userID, PrivateIngress: privateIngressSQLFlag(ctx),
 	})
 	if err != nil {
 		return "could not list secrets", true
@@ -267,10 +266,10 @@ func (h *MCPHandler) toolListSecrets(ctx context.Context, userID string) (string
 	names := make([]string, 0, len(stored))
 	dropped := 0
 	for _, raw := range stored {
-		// EntryNamePlain returns an UNSEALED value unchanged, which is what
-		// keeps the rows the boot sweep deliberately leaves cleartext with an
-		// empty name_bidx listed here, and it returns "" when a sealed value
-		// will not open under the current key.
+		// EntryNamePlain returns an UNSEALED value unchanged, which keeps a
+		// pre-backfill or interrupted legacy row with an empty/stale name_bidx
+		// listed until the boot repair converges it, and it returns "" when a
+		// sealed value will not open under the current key.
 		plain := opener.EntryNamePlain(raw)
 		if plain == "" {
 			dropped++

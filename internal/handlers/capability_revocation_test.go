@@ -40,7 +40,7 @@ func TestClearingTheAllowListRevokesOutstandingTokens(t *testing.T) {
 	signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 	mint := func(nonceSuffix string) string {
 		tok, _ := capability.Sign(capability.Token{
-			Secret: "stripe", SecretID: secretID, Agent: agentID,
+			Secret: "stripe", SecretID: secretID, Issuer: userID, Agent: agentID,
 			Dests:  []string{"api.stripe.com/*"},
 			Method: "POST",
 		}, signingKey, time.Minute)

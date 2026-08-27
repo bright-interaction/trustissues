@@ -35,23 +35,15 @@ const (
 	// SessionIDKey is the context key for the validated server-side session id
 	// (the JWT jti). Empty on the API-key path, which has no session.
 	SessionIDKey contextKey = "session_id"
-	// APIKeyExpiryKey carries the expiry of the API key that authenticated this
-	// request, so a handler minting a NEW credential can refuse to let it
-	// outlive the one presented. Absent on the JWT path (an interactive login is
-	// not itself time-boxed this way) and absent for a key with no expiry.
-	APIKeyExpiryKey contextKey = "api_key_expires_at"
 	// PrincipalKindKey records WHICH credential authenticated this request:
 	// PrincipalSession for an interactive JWT login, PrincipalAPIKey for the
 	// X-API-Key path.
 	//
-	// It exists because the two facts that could already be used to infer this
-	// are both unreliable. APIKeyExpiryKey is only set when the key HAS an
-	// expiry, so a non-expiring key is indistinguishable from a session by that
-	// signal. SessionIDKey happens to be empty on the API-key path today, but
-	// that is a side effect of there being no jti to record, not a statement
-	// anybody made on purpose, and reading it as one means a future auth path
-	// that also lacks a session id silently joins whichever branch it was never
-	// considered for. This key says the thing directly.
+	// It exists because SessionIDKey happens to be empty on the API-key path
+	// today, but that is a side effect of there being no jti to record, not a
+	// statement anybody made on purpose. Reading it as one means a future auth
+	// path that also lacks a session id silently joins whichever branch it was
+	// never considered for. This key says the thing directly.
 	PrincipalKindKey contextKey = "principal_kind"
 )
 
@@ -81,13 +73,6 @@ func PrincipalKind(ctx context.Context) string {
 		return v
 	}
 	return ""
-}
-
-// APIKeyExpiry returns the authenticating API key's expiry, and ok=false when
-// the request was not authenticated by a time-boxed API key.
-func APIKeyExpiry(ctx context.Context) (time.Time, bool) {
-	v, ok := ctx.Value(APIKeyExpiryKey).(time.Time)
-	return v, ok
 }
 
 // GetUserID extracts the authenticated user ID from the request context.
@@ -222,16 +207,14 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 				// UTC, so this compares correctly whatever wrote the row.
 				var userID string
 				var expired, revoked bool
-				var keyExpiresAt sql.NullTime
 				err := db.QueryRowContext(
 					r.Context(),
 					`SELECT user_id,
 					        expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now'),
-					        revoked_at IS NOT NULL,
-					        expires_at
+					        revoked_at IS NOT NULL
 					 FROM api_keys WHERE key_hash = ?`,
 					keyHash,
-				).Scan(&userID, &expired, &revoked, &keyExpiresAt)
+				).Scan(&userID, &expired, &revoked)
 
 				if err != nil {
 					if err == sql.ErrNoRows {
@@ -261,11 +244,6 @@ func JWTOrAPIKeyAuth(jwtSecret string, db *sql.DB) func(http.Handler) http.Handl
 
 				ctx := context.WithValue(r.Context(), UserIDKey, userID)
 				ctx = context.WithValue(ctx, PrincipalKindKey, PrincipalAPIKey)
-				// Carry this key's own expiry so a handler minting another
-				// credential cannot hand out one that outlives it.
-				if keyExpiresAt.Valid {
-					ctx = context.WithValue(ctx, APIKeyExpiryKey, keyExpiresAt.Time.UTC())
-				}
 				// API-key auth: no JWT session, so session revocation does not apply.
 				ctx, _, reject := enrichUserContext(ctx, db, userID)
 				if reject != "" {

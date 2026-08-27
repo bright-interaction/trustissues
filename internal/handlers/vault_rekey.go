@@ -17,6 +17,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/columncrypto"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/egressgate"
+	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 	"github.com/bright-interaction/trustissues/internal/vaultfield"
@@ -169,7 +170,7 @@ var rekeySurfaces = []keyedSurface{
 	{Table: "vault_entries", Column: "alias_url_bidx", Family: familyBlindIndex,
 		Why: "same, for the alias host"},
 	{Table: "vault_entries", Column: "name_bidx", Family: familyBlindIndex,
-		Why: "per-user name uniqueness token; a stale one stops colliding, so a rotation that " +
+		Why: "per-vault-scope name uniqueness token; a stale one stops colliding, so a rotation that " +
 			"skipped it would let two entries share a name and neither would be reported"},
 	{Table: "invitations", Column: "code", Family: familyVaultColumn, Field: vaultFieldRekeyInvitationCode,
 		Why: "the pending invite code, kept recoverable so it can be re-sent"},
@@ -309,6 +310,11 @@ var ErrRekeyNoPreviousKey = errors.New("TRUSTISSUES_VAULT_KEY_PREVIOUS is not se
 // ErrRekeyInProgress reports a concurrent sweep.
 var ErrRekeyInProgress = errors.New("a re-encrypt sweep is already running")
 
+// errRekeyPrivateIngressRequired is returned only by the HTTP-bound wrapper.
+// Boot-time rekey is server-initiated work and deliberately calls RekeyVault,
+// which does not pretend an ingress transport exists.
+var errRekeyPrivateIngressRequired = errors.New("private ingress required for a protected-vault rekey")
+
 // vaultKeyFingerprint returns a short, non-reversible label for a master key.
 //
 // It is salted with a fixed context string so it is not a bare sha256 of the
@@ -418,12 +424,12 @@ type rekeyEntryWrite struct {
 	// therefore grants it with nothing added and never consults the authority
 	// oracle, which is what a re-encryption pass should look like at the gate.
 	ticket egressgate.Ticket
-	// userID and storedNameBidx exist for the ONE write that can be refused by a
-	// constraint rather than by a bug: the per-user name index. userID is what
-	// the operator needs in the log line, and storedNameBidx is what the retry
+	// nameScope and storedNameBidx exist for the ONE write that can be refused by
+	// a constraint rather than by a bug: the per-vault name index. nameScope is
+	// what the operator needs in the log line, and storedNameBidx is what the retry
 	// puts back so a refused index does not cost the row its re-encryption. See
 	// applyPlan.
-	userID         string
+	nameScope      string
 	storedNameBidx string
 }
 
@@ -480,6 +486,17 @@ func (h *VaultHandler) RekeyStatus(ctx context.Context) (*RekeyReport, error) {
 // Idempotent: a second run finds everything already on the current key and
 // writes nothing. Safe to run when no rotation is in flight.
 func (h *VaultHandler) RekeyVault(ctx context.Context) (*RekeyReport, error) {
+	return h.rekeyVault(ctx, false)
+}
+
+// rekeyVaultForIngress is the admin HTTP form. The global private-access scan
+// happens inside the very transaction that plans and rewrites every keyed row,
+// so a promotion cannot commit between admission and the sweep.
+func (h *VaultHandler) rekeyVaultForIngress(ctx context.Context) (*RekeyReport, error) {
+	return h.rekeyVault(ctx, true)
+}
+
+func (h *VaultHandler) rekeyVault(ctx context.Context, enforceIngress bool) (*RekeyReport, error) {
 	rekeyMu.Lock()
 	if rekeyRunning {
 		rekeyMu.Unlock()
@@ -504,6 +521,15 @@ func (h *VaultHandler) RekeyVault(ctx context.Context) (*RekeyReport, error) {
 	// to defer unconditionally (same pattern as MigrateEncryption).
 	defer tx.Rollback()
 	qtx := h.queries.WithTx(tx)
+	if enforceIngress && !middleware.IsPrivateIngress(ctx) {
+		required, policyErr := globalProtectedPrivateAccessRequired(ctx, qtx)
+		if policyErr != nil {
+			return nil, fmt.Errorf("verify global private-access policy: %w", policyErr)
+		}
+		if required {
+			return nil, errRekeyPrivateIngressRequired
+		}
+	}
 
 	// 1. Plan.
 	rep, plan, err := h.scanAndPlan(ctx, qtx)
@@ -709,9 +735,9 @@ func (h *VaultHandler) applyPlan(ctx context.Context, q *db.Queries, plan *rekey
 			retry := e.params
 			retry.NameBidx = e.storedNameBidx
 			slog.Error("vault: re-encrypt sweep could not write an entry's name index because "+
-				"another entry of the same user holds it; the entry was re-encrypted without it, "+
+				"another entry in the same vault scope holds it; the entry was re-encrypted without it, "+
 				"rename one of the two and the next sweep will seal it",
-				"id", e.params.ID, "user", e.userID)
+				"id", e.params.ID, "scope", e.nameScope)
 			err = vaultegress.RekeyEntry(ctx, q, e.ticket, retry)
 		}
 		if err != nil {
@@ -953,6 +979,24 @@ func (h *VaultHandler) classifyBlindIndex(stored, want, scope, plain string) key
 	return keyAgeStale
 }
 
+// classifyNameBlindIndex is deliberately separate from classifyBlindIndex.
+// URL tokens normalize a host through blindIndexWith; name tokens preserve the
+// exact label and use their own domain separator. Reusing the URL classifier
+// made every previous-key name token look stale unless the label happened to be
+// a parseable host, which defeated dual-key compatibility during rotation.
+func (h *VaultHandler) classifyNameBlindIndex(stored, want, scope, plain string) keyAge {
+	if stored == "" && want == "" {
+		return keyAgeEmpty
+	}
+	if stored == want {
+		return keyAgeCurrent
+	}
+	if h.previous != nil && stored != "" && stored == nameBlindIndexWith(h.previous.bidx, scope, plain) {
+		return keyAgePrevious
+	}
+	return keyAgeStale
+}
+
 // legacyKeyFor re-derives the v1 key from a master key string.
 //
 // It does NOT read h.legacyKey, on purpose: MigrateEncryption zeroes that field
@@ -995,10 +1039,10 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 	// THE NAME INDEX IS THE ONE SURFACE WITH A CONSTRAINT ON IT, SO IT IS THE ONE
 	// THE SWEEP CAN BE REFUSED AT.
 	//
-	// idx_vault_entries_user_name_bidx is UNIQUE(user_id, name_bidx) WHERE
-	// name_bidx != ''. Rows written before the import path sealed its names carry
+	// The personal and collection partial indexes are unique within their
+	// respective vault scopes. Rows written before the import path sealed names carry
 	// a CLEARTEXT name and an EMPTY index, which puts them outside that partial
-	// index: a user can already hold two entries whose names are equal, one
+	// index: one scope can already hold two entries whose names are equal, one
 	// sealed and one not, because the inline UNIQUE(user_id, name) compares
 	// randomized ciphertext against cleartext and never fires.
 	//
@@ -1021,7 +1065,8 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 	claimedNameBidx := make(map[string]string, len(rows))
 	for _, row := range rows {
 		if row.NameBidx != "" {
-			claimedNameBidx[row.UserID+"|"+row.NameBidx] = row.ID
+			nameScope := bidxScope(row.UserID, row.CollectionID)
+			claimedNameBidx[nameScope+"|"+row.NameBidx] = row.ID
 		}
 	}
 	// WHICH ROW OF A COLLIDING PAIR KEEPS THE INDEX IS NOT A COIN TOSS.
@@ -1134,14 +1179,14 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		sc.record(sc.surface("vault_entries", "url_bidx", ""), urlBidxAge, "vault_entries", "url_bidx", "", row.ID)
 		sc.record(sc.surface("vault_entries", "alias_url_bidx", ""), aliasBidxAge, "vault_entries", "alias_url_bidx", "", row.ID)
 
-		// The name index, on the same rule and for the same reason, but keyed by
-		// the CUSTODIAN rather than by bidxScope: it stands in for UNIQUE(user_id,
-		// name), which is per user whether or not the entry is in a collection.
+		// The name index uses the same personal/collection scope as the URL index.
+		// A collection label must not constrain, or be probed through, the
+		// custodian's personal vault or an unrelated collection.
 		// A stale one is quieter than a stale url index, because it does not merely
 		// stop matching a lookup: it stops COLLIDING, so two entries silently share
 		// a name and the constraint that was supposed to prevent it reports nothing.
-		wantNameBidx := h.nameBlindIndex(row.UserID, plains["name"])
-		nameBidxAge := h.classifyBlindIndex(row.NameBidx, wantNameBidx, row.UserID, plains["name"])
+		wantNameBidx := h.scopedNameBlindIndex(scope, plains["name"])
+		nameBidxAge := h.classifyNameBlindIndex(row.NameBidx, wantNameBidx, scope, plains["name"])
 		if nameBidxAge == keyAgePrevious || nameBidxAge == keyAgeStale {
 			// The claim, checked against the state the whole sweep is converging
 			// on rather than against the row alone. holder != row.ID is the whole
@@ -1150,18 +1195,18 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 			// given it, in this sweep or any later one.
 			holder, taken := "", false
 			if wantNameBidx != "" {
-				holder, taken = claimedNameBidx[row.UserID+"|"+wantNameBidx]
+				holder, taken = claimedNameBidx[scope+"|"+wantNameBidx]
 			}
 			if taken && holder != row.ID {
 				nameBidxAge = keyAgeCollided
 				wantNameBidx = row.NameBidx
 				slog.Warn("vault: re-encrypt sweep left an entry's name index alone because another "+
-					"entry of the same user already holds it; rename one of the two and the next "+
+					"entry in the same vault scope already holds it; rename one of the two and the next "+
 					"sweep will seal it",
-					"id", row.ID, "user", row.UserID, "holder", holder)
+					"id", row.ID, "scope", scope, "holder", holder)
 			} else {
 				if wantNameBidx != "" {
-					claimedNameBidx[row.UserID+"|"+wantNameBidx] = row.ID
+					claimedNameBidx[scope+"|"+wantNameBidx] = row.ID
 				}
 				needsWrite = true
 			}
@@ -1190,7 +1235,7 @@ func (h *VaultHandler) scanVaultEntries(ctx context.Context, q *db.Queries, sc *
 		}
 		plan.entries = append(plan.entries, rekeyEntryWrite{
 			ticket:         tk,
-			userID:         row.UserID,
+			nameScope:      scope,
 			storedNameBidx: row.NameBidx,
 			params: vaultegress.RekeyEntryParams{
 				EncryptedValue:    newValue,

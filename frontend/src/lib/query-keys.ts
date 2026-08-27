@@ -1,4 +1,7 @@
 export const queryKeys = {
+  ingress: {
+    health: () => ['ingress', 'health'] as const,
+  },
   auth: {
     me: ['auth', 'me'] as const,
     sessions: ['auth', 'sessions'] as const,

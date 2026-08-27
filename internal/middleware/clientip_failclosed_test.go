@@ -6,13 +6,8 @@ import (
 	"testing"
 )
 
-// clientIP is one of the two net.ParseIP call sites the P0-4 primitive sweep
-// allowlisted as fail-CLOSED. The allowlist row in
-// internal/handlers/parseip_primitive_guard_test.go names this test, so the
-// claim is checked rather than asserted.
-//
-// The claim: when net.ParseIP returns nil (which it does for any zoned IPv6
-// literal, "::1%1" included), trustedPeer stays false and the whole
+// The direct-peer parser must fail closed. When parsing fails (including for a
+// zoned IPv6 literal such as "::1%1"), the peer stays untrusted and the whole
 // X-Forwarded-For branch is skipped. The caller therefore loses the ability to
 // name its own client IP, which is the strict direction. A fail-OPEN version of
 // this site would do the opposite: treat the unparseable peer as trusted and let
@@ -37,7 +32,7 @@ func TestClientIPUnparseableRemoteAddrFailsClosed(t *testing.T) {
 			"client 203.0.113.9, got %q. The XFF branch is not reachable, so this test proves nothing.", got)
 	}
 
-	// The zoned spellings net.ParseIP returns nil for. Each must be treated as
+	// Zoned and malformed spellings. Each must be treated as
 	// an UNTRUSTED peer, so the attacker-supplied header is discarded.
 	unparseable := []string{
 		"[::1%1]:5555",

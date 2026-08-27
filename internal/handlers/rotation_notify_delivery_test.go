@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestNotifyOnlyTargetActuallyReachesAChannel(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	dispatchRotationSuccessReal(context.Background(), q, nil,
-		"Prod DB password", "rotated, no delivery targets configured")
+		"entry-standard", "Prod DB password", "rotated, no delivery targets configured")
 
 	select {
 	case got := <-rec.done:
@@ -131,6 +132,51 @@ func newNotifyChannelDB(t *testing.T, events string) *db.Queries {
 		 VALUES ('ch1', 'ops log', 'slog', '{}', ?, 1)`, events); err != nil {
 		t.Fatalf("seed channel: %v", err)
 	}
+	// Rotation notification dispatch now resolves the entry's collection policy
+	// before releasing even its name to an external channel. Keep this delivery
+	// fixture representative by providing a real standard-policy entry instead
+	// of bypassing that fail-closed lookup with an empty ID.
+	if _, err := conn.Exec(`
+		CREATE TABLE collections (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			created_by TEXT NOT NULL DEFAULT '',
+			private_access_policy TEXT NOT NULL DEFAULT 'standard',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE vault_entries (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			secret_owner_user_id TEXT NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			encrypted_value BLOB NOT NULL DEFAULT X'',
+			nonce BLOB NOT NULL DEFAULT X'',
+			encryption_version INTEGER NOT NULL DEFAULT 2,
+			collection_id TEXT,
+			custom_fields TEXT NOT NULL DEFAULT '[]',
+			destination_patterns TEXT NOT NULL DEFAULT '[]',
+			provider TEXT,
+			provider_meta TEXT,
+			rotation_targets TEXT,
+			rotation_log TEXT,
+			last_rotated_at DATETIME,
+			last_rotation_error TEXT,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT INTO vault_entries (id, user_id, secret_owner_user_id, collection_id)
+		VALUES ('entry-standard', 'fixture-user', 'fixture-user', NULL);
+		INSERT INTO collections (id, private_access_policy)
+		VALUES ('collection-sensitive', 'sensitive_private'),
+		       ('collection-full', 'fully_private');
+		INSERT INTO vault_entries (id, user_id, secret_owner_user_id, collection_id)
+		VALUES ('entry-sensitive', 'fixture-user', 'fixture-user', 'collection-sensitive'),
+		       ('entry-full', 'fixture-user', 'fixture-user', 'collection-full');
+	`); err != nil {
+		t.Fatalf("seed standard vault entry: %v", err)
+	}
 
 	q := db.New(conn)
 	// Guard the fixture: with zero enabled channels every assertion above would
@@ -141,4 +187,147 @@ func newNotifyChannelDB(t *testing.T, events string) *db.Queries {
 			len(rows), err)
 	}
 	return q
+}
+
+func TestExternalNotificationMetadataHonoursCollectionPolicy(t *testing.T) {
+	q := newNotifyChannelDB(t, defaultChannelEvents)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		entry string
+		want  bool
+	}{
+		{entry: "entry-standard", want: true},
+		{entry: "entry-sensitive", want: true},
+		{entry: "entry-full", want: false},
+		{entry: "missing-entry", want: false},
+	} {
+		if got := entryAllowsExternalNotificationMetadata(ctx, q, tc.entry); got != tc.want {
+			t.Errorf("entryAllowsExternalNotificationMetadata(%q) = %v, want %v", tc.entry, got, tc.want)
+		}
+	}
+}
+
+// TestQueuedNotificationRechecksPolicyBeforeDelivery closes the asynchronous
+// queue race: the entry is allowed when rotation decides to notify, then its
+// collection becomes fully_private while Dispatch is still preparing the
+// channel. The delivery goroutine must observe the promotion before emitting
+// even the entry name.
+func TestQueuedNotificationRechecksPolicyBeforeDelivery(t *testing.T) {
+	q := newNotifyChannelDB(t, defaultChannelEvents)
+	ctx := context.Background()
+	if !entryAllowsExternalNotificationMetadata(ctx, q, "entry-sensitive") {
+		t.Fatal("fixture entry must initially permit external metadata")
+	}
+
+	// Force Dispatch to pause after its caller's initial policy check but before
+	// it creates the delivery goroutine. Channel config decryption is outside a
+	// DB transaction, so the collection can be promoted while it is paused.
+	if err := q.RekeyNotificationChannelConfig(ctx, db.RekeyNotificationChannelConfigParams{
+		Config:            base64.StdEncoding.EncodeToString([]byte("blocked-fixture")),
+		ConfigNonce:       []byte{1},
+		EncryptionVersion: sql.NullInt64{Int64: 1, Valid: true},
+		ID:                "ch1",
+	}); err != nil {
+		t.Fatalf("mark notification config encrypted: %v", err)
+	}
+
+	decryptEntered := make(chan struct{})
+	releaseDecrypt := make(chan struct{})
+	decrypter := &blockingNotificationDecrypter{
+		entered: decryptEntered,
+		release: releaseDecrypt,
+	}
+
+	logs := &notificationRaceLogRecorder{
+		suppressed: make(chan struct{}, 1),
+		delivered:  make(chan string, 1),
+	}
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	dispatchReturned := make(chan struct{})
+	go func() {
+		defer close(dispatchReturned)
+		dispatchRotationSuccessReal(ctx, q, decrypter,
+			"entry-sensitive", "Client signing key", "rotated successfully")
+	}()
+
+	select {
+	case <-decryptEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch never reached the controlled pre-delivery boundary")
+	}
+
+	if _, err := q.Handle().ExecContext(ctx,
+		`UPDATE collections SET private_access_policy = 'fully_private' WHERE id = 'collection-sensitive'`); err != nil {
+		t.Fatalf("promote collection while notification is queued: %v", err)
+	}
+	if entryAllowsExternalNotificationMetadata(ctx, q, "entry-sensitive") {
+		t.Fatal("promotion did not take effect; the race assertion would be vacuous")
+	}
+	close(releaseDecrypt)
+
+	select {
+	case payload := <-logs.delivered:
+		t.Fatalf("queued notification leaked after fully_private promotion: %s", payload)
+	case <-logs.suppressed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued notification neither delivered nor reported policy suppression")
+	}
+
+	select {
+	case <-dispatchReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not return after releasing channel preparation")
+	}
+	select {
+	case payload := <-logs.delivered:
+		t.Fatalf("queued notification leaked after suppression: %s", payload)
+	default:
+	}
+}
+
+type blockingNotificationDecrypter struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d *blockingNotificationDecrypter) DecryptInstanceConfig(_ []byte, _ []byte, _ int) ([]byte, error) {
+	d.once.Do(func() { close(d.entered) })
+	<-d.release
+	return []byte("{}"), nil
+}
+
+type notificationRaceLogRecorder struct {
+	suppressed chan struct{}
+	delivered  chan string
+}
+
+func (r *notificationRaceLogRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (r *notificationRaceLogRecorder) WithAttrs([]slog.Attr) slog.Handler       { return r }
+func (r *notificationRaceLogRecorder) WithGroup(string) slog.Handler            { return r }
+
+func (r *notificationRaceLogRecorder) Handle(_ context.Context, rec slog.Record) error {
+	switch rec.Message {
+	case "channel dispatcher: notification suppressed by delivery policy":
+		select {
+		case r.suppressed <- struct{}{}:
+		default:
+		}
+	case "trustissues alert":
+		var line strings.Builder
+		line.WriteString(rec.Message)
+		rec.Attrs(func(attr slog.Attr) bool {
+			line.WriteString(" " + attr.Key + "=" + attr.Value.String())
+			return true
+		})
+		select {
+		case r.delivered <- line.String():
+		default:
+		}
+	}
+	return nil
 }

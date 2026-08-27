@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -111,6 +110,18 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeUnauthorized(w, r, "not authenticated")
 		return
 	}
+	// API keys are bearer credentials, not credential-issuing authorities. If a
+	// stolen key can mint a successor, deleting/revoking the stolen row is not
+	// containment: the attacker keeps the child. Require the explicitly stamped
+	// interactive-session principal and fail closed for unknown future auth
+	// methods. Invitation redemption never mints a key; a vault_only owner first
+	// chooses a password, signs in, satisfies any TOTP enrolment gate, and creates
+	// this named credential from that interactive session.
+	if middleware.PrincipalKind(r.Context()) != middleware.PrincipalSession {
+		writeError(w, r, http.StatusForbidden, "interactive_session_required",
+			"an interactive session is required to create API keys")
+		return
+	}
 
 	var req createAPIKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -155,32 +166,6 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		expStr := exp.Format(time.RFC3339)
 		expiresAt = &expStr
 		expiresAtDB = sql.NullTime{Time: exp, Valid: true}
-	}
-
-	// A minted key may never outlive the API key that minted it.
-	//
-	// This route accepts X-API-Key as authentication, so an API key was
-	// sufficient to mint another API key, and omitting expires_in_days produced
-	// expires_at NULL, which the auth path's
-	// `expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`
-	// can never make true. So the vault_only extension key that RedeemInvitation
-	// hands out over a PUBLIC endpoint, documented as "deliberately time-boxed
-	// (invitationAPIKeyTTL) rather than permanent" at 90 days, could mint itself
-	// a permanent successor and keep vault access forever. Revoking the original
-	// does nothing to the child, and nothing in the UI shows it came from a
-	// time-boxed parent.
-	//
-	// Capping rather than refusing keeps the documented flow working: a
-	// vault_only teammate connecting the browser extension still gets a key,
-	// it just cannot reach past the credential that authorised it.
-	if parentExp, viaAPIKey := middleware.APIKeyExpiry(r.Context()); viaAPIKey {
-		if !expiresAtDB.Valid || expiresAtDB.Time.After(parentExp) {
-			expStr := parentExp.Format(time.RFC3339)
-			expiresAt = &expStr
-			expiresAtDB = sql.NullTime{Time: parentExp, Valid: true}
-			slog.Info("api key: capped the new key's expiry to the minting key's",
-				"user_id", userID, "expires_at", expStr)
-		}
 	}
 
 	if err := h.queries.CreateAPIKeyForUser(r.Context(), db.CreateAPIKeyForUserParams{
@@ -240,10 +225,9 @@ func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // --- Admin incident response -------------------------------------------------
 //
 // A leaked key belonging to someone else has to be killable without waiting for
-// that person to log in, and vault_only users cannot reach the settings UI at
-// all. These handlers are wired under the admin route group; the IsAdmin check
-// is repeated here as defense in depth so a future re-wire cannot silently
-// expose another user's keys.
+// that person to log in. These handlers are wired under the admin route group;
+// the IsAdmin check is repeated here as defense in depth so a future re-wire
+// cannot silently expose another user's keys.
 
 // AdminList handles GET /api/admin/users/{id}/api-keys and returns the target
 // user's keys (prefixes only, never the secret), including revoked ones.

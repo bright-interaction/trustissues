@@ -213,10 +213,10 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		return
 	}
 	// Open every candidate name once, up front, rather than per whitelist
-	// entry. EntryNamePlain returns an UNSEALED value unchanged, which is what
-	// keeps the rows the boot sweep deliberately leaves cleartext with an empty
-	// name_bidx (see the UNIQUE-collision branch in vault.go) resolving here
-	// forever. A name_bidx lookup would strand exactly those rows in silence.
+	// entry. EntryNamePlain returns an UNSEALED value unchanged, which keeps a
+	// pre-backfill or interrupted legacy row with an empty/stale name_bidx
+	// resolving until the boot repair can converge it. A bidx-only lookup would
+	// strand exactly those rows in silence.
 	plainNames := make([]string, len(rows))
 	for i := range rows {
 		plainNames[i] = h.vault.EntryNamePlain(rows[i].Name)
@@ -237,8 +237,8 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 		if ambiguous {
 			// Two of this user's personal entries now open to the same name.
 			// UNIQUE(user_id, name) went vacuous at 00040 (randomized
-			// ciphertext never collides) and the blind index that replaced it
-			// is empty on every row the boot sweep skipped, so this is
+			// ciphertext never collides) and pre-backfill or manually damaged
+			// rows can still carry an empty/stale blind index, so this remains
 			// reachable. Handing a machine identity "whichever row SQLite
 			// returned first" is the defect lookupSecretByName was changed to
 			// refuse; refuse it here too rather than resolve it by luck.
@@ -365,10 +365,11 @@ func (h *ServiceSecretsHandler) FetchOwnSecrets(w http.ResponseWriter, r *http.R
 // here, and that is unchanged by this function.
 //
 // It reports ambiguity instead of picking a winner. UNIQUE(user_id, name) went
-// vacuous at 00040 (randomized ciphertext never collides) and the blind index
-// that replaced it is empty on every row the boot sweep skipped, so one user
-// really can hold two personal entries with the same name. Resolving that by
-// row order is how a machine identity silently receives the wrong credential.
+// vacuous at 00040 (randomized ciphertext never collides), and a pre-backfill,
+// interrupted, or damaged row can still have an empty/stale blind index. The
+// boot repair now resolves ordinary same-scope collisions deterministically,
+// but lookup must fail closed while unrepaired duplicates exist. Resolving one
+// by row order is how a machine identity silently receives the wrong credential.
 //
 // AN EMPTY STRING IS NOT A NAME, ON EITHER SIDE, and that is not a style
 // preference. subtle.ConstantTimeCompare returns 1 for TWO ZERO-LENGTH slices:
@@ -524,7 +525,22 @@ func (h *ServiceSecretsHandler) CreateServiceIdentity(w http.ResponseWriter, r *
 		expiresAtStr = &s
 	}
 
-	if err := h.queries.CreateServiceIdentity(r.Context(), db.CreateServiceIdentityParams{
+	// allowed_secrets is durable name metadata. Keep the monotonic latch check
+	// and the insert in one write transaction so a concurrent first promotion
+	// cannot land between authorization and persistence.
+	baseQueries := h.queries
+	tx, queries, err := beginQueriesTx(r.Context(), baseQueries, nil)
+	if err != nil {
+		slog.Error("service_secrets: create snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
+
+	if err := queries.CreateServiceIdentity(r.Context(), db.CreateServiceIdentityParams{
 		ID:              id,
 		Name:            req.Name,
 		Description:     req.Description,
@@ -543,10 +559,15 @@ func (h *ServiceSecretsHandler) CreateServiceIdentity(w http.ResponseWriter, r *
 		writeInternalError(w, r, "failed to create service identity")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		slog.Error("service_secrets: create commit failed", "name", req.Name, "error", err)
+		writeInternalError(w, r, "failed to create service identity")
+		return
+	}
 
 	// Activity-log the mint (actor from request context, target identity,
 	// event). The plaintext key is NEVER logged; only name + id + scope size.
-	LogActivityFromRequest(h.queries, r, "service_identity.created",
+	LogActivityFromRequest(baseQueries, r, "service_identity.created",
 		fmt.Sprintf("Service identity minted: %s (id: %s, allowed_secrets: %d)", req.Name, id, len(req.AllowedSecrets)))
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -570,7 +591,17 @@ func (h *ServiceSecretsHandler) ListServiceIdentities(w http.ResponseWriter, r *
 		writeForbidden(w, r, "admin access required")
 		return
 	}
-	rows, err := h.queries.ListServiceIdentities(r.Context())
+	tx, queries, err := beginQueriesTx(r.Context(), h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		slog.Error("service_secrets: list snapshot failed", "error", err)
+		writeInternalError(w, r, "list failed")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
+	rows, err := queries.ListServiceIdentities(r.Context())
 	if err != nil {
 		slog.Error("service_secrets: list failed", "error", err)
 		writeInternalError(w, r, "list failed")
@@ -606,6 +637,11 @@ func (h *ServiceSecretsHandler) ListServiceIdentities(w http.ResponseWriter, r *
 			entry.OwnerEmail = &s
 		}
 		out = append(out, entry)
+	}
+	if err := tx.Commit(); err != nil {
+		slog.Error("service_secrets: list snapshot commit failed", "error", err)
+		writeInternalError(w, r, "list failed")
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -741,7 +777,17 @@ func (h *ServiceSecretsHandler) GetServiceIdentityAudit(w http.ResponseWriter, r
 		limit = parsed
 	}
 
-	rows, err := h.queries.ListAuditForServiceIdentity(r.Context(), db.ListAuditForServiceIdentityParams{
+	tx, queries, err := beginQueriesTx(r.Context(), h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		slog.Error("service_secrets: audit snapshot failed", "id", id, "error", err)
+		writeInternalError(w, r, "audit list failed")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
+	rows, err := queries.ListAuditForServiceIdentity(r.Context(), db.ListAuditForServiceIdentityParams{
 		ServiceIdentityID: sql.NullString{String: id, Valid: true},
 		Limit:             limit,
 	})
@@ -775,6 +821,11 @@ func (h *ServiceSecretsHandler) GetServiceIdentityAudit(w http.ResponseWriter, r
 			RemoteIP:    row.RemoteIp,
 			OccurredAt:  row.OccurredAt.UTC().Format(time.RFC3339),
 		})
+	}
+	if err := tx.Commit(); err != nil {
+		slog.Error("service_secrets: audit snapshot commit failed", "id", id, "error", err)
+		writeInternalError(w, r, "audit list failed")
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }

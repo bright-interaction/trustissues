@@ -1,6 +1,7 @@
 package capability
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ func validToken() Token {
 	return Token{
 		Secret:   "openai_api_key",
 		SecretID: "abc123",
+		Issuer:   "user-123",
 		Agent:    "test-agent",
 		Dests:    []string{"api.openai.com/v1/*"},
 		Method:   "POST",
@@ -63,12 +65,20 @@ func TestVerify_RejectsTamperedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
-	// Flip a byte in the payload portion.
+	// Flip a decoded payload byte, then retain the original signature. Replacing
+	// the final base64url character is not reliable: depending on payload length,
+	// that character can contain unused low bits and a different spelling may
+	// decode to the exact same bytes.
 	parts := strings.SplitN(signed, ".", 2)
 	if len(parts) != 2 {
 		t.Fatalf("unexpected token shape")
 	}
-	tampered := parts[0][:len(parts[0])-1] + "Z" + "." + parts[1]
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	payload[len(payload)/2] ^= 1
+	tampered := base64.RawURLEncoding.EncodeToString(payload) + "." + parts[1]
 	if _, err := Verify(tampered, k, time.Now()); err == nil {
 		t.Fatal("tampered payload accepted")
 	}
@@ -105,10 +115,11 @@ func TestSign_RequiresFields(t *testing.T) {
 		name string
 		tok  Token
 	}{
-		{"no secret", Token{SecretID: "x", Agent: "a", Dests: []string{"foo"}}},
-		{"no secret_id", Token{Secret: "x", Agent: "a", Dests: []string{"foo"}}},
-		{"no agent", Token{Secret: "x", SecretID: "x", Dests: []string{"foo"}}},
-		{"no dests", Token{Secret: "x", SecretID: "x", Agent: "a"}},
+		{"no secret", Token{SecretID: "x", Issuer: "u", Agent: "a", Dests: []string{"foo"}}},
+		{"no secret_id", Token{Secret: "x", Issuer: "u", Agent: "a", Dests: []string{"foo"}}},
+		{"no issuer", Token{Secret: "x", SecretID: "x", Agent: "a", Dests: []string{"foo"}}},
+		{"no agent", Token{Secret: "x", SecretID: "x", Issuer: "u", Dests: []string{"foo"}}},
+		{"no dests", Token{Secret: "x", SecretID: "x", Issuer: "u", Agent: "a"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Sign(tc.tok, k, time.Minute); err == nil {

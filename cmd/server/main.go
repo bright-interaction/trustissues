@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -73,6 +75,17 @@ func bodyLimits(next http.Handler) http.Handler {
 	})
 }
 
+// apiNoStore keeps authenticated vault metadata, policy decisions and error
+// bodies out of browser/proxy caches on both ingress zones. Applying it to the
+// whole API also covers a response added later without relying on every handler
+// author remembering a password-manager-specific cache header.
+func apiNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // csrfOriginCheck rejects cross-site state-changing requests as defense in
 // depth behind the session cookie's SameSite=Strict attribute. SameSite is a
 // single browser-side control: a browser that does not enforce it, or any
@@ -86,12 +99,14 @@ func bodyLimits(next http.Handler) http.Handler {
 // connector, and service containers for no gain. When one IS present it must
 // point at us.
 //
-// An accepted origin is either the configured BaseURL host or the host the
-// request was actually addressed to. The second is what keeps a stale or unset
-// TRUSTISSUES_BASE_URL from breaking the SPA: a browser sets Origin itself and
-// a cross-site page can never make it equal our own Host.
-func csrfOriginCheck(baseURL string) func(http.Handler) http.Handler {
-	configuredHost := hostOfURL(baseURL)
+// Public and private listeners intentionally have separate accepted origins.
+// Trusting r.Host here would let a caller-selected Host broaden either zone and
+// would also hide a stale connector configuration until a browser is already
+// using it. The server therefore accepts exactly the origin configured for the
+// listener that stamped this request.
+func csrfOriginCheck(publicBaseURL, privateBaseURL string) func(http.Handler) http.Handler {
+	publicOrigin := originOfURL(publicBaseURL)
+	privateOrigin := originOfURL(privateBaseURL)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
@@ -114,13 +129,17 @@ func csrfOriginCheck(baseURL string) func(http.Handler) http.Handler {
 				}
 			}
 
+			configuredOrigin := publicOrigin
+			if timw.IsPrivateIngress(r.Context()) {
+				configuredOrigin = privateOrigin
+			}
 			if origin := r.Header.Get("Origin"); origin != "" {
-				if !csrfHostAllowed(hostOfURL(origin), configuredHost, r) {
+				if !csrfOriginAllowed(originOfURL(origin), configuredOrigin) {
 					rejectCrossSite(w, r, "origin")
 					return
 				}
 			} else if referer := r.Header.Get("Referer"); referer != "" {
-				if !csrfHostAllowed(hostOfURL(referer), configuredHost, r) {
+				if !csrfOriginAllowed(originOfURL(referer), configuredOrigin) {
 					rejectCrossSite(w, r, "referer")
 					return
 				}
@@ -142,6 +161,33 @@ func csrfOriginCheck(baseURL string) func(http.Handler) http.Handler {
 	}
 }
 
+// originOfURL reduces a URL, Origin, or Referer to its canonical
+// scheme://host[:port] origin. Default ports are removed so an explicit :443
+// in configuration compares the same as the Origin browsers normally emit.
+func originOfURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	hostname := strings.ToLower(u.Hostname())
+	if hostname == "" {
+		return ""
+	}
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	host := hostname
+	if strings.Contains(hostname, ":") {
+		host = "[" + hostname + "]"
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host
+}
+
 // hostOfURL reduces a URL (or an Origin header) to its lowercased host:port.
 // Returns an empty string for anything unparseable or host-less, including the
 // literal "null" origin, which callers then treat as not allowed.
@@ -153,12 +199,8 @@ func hostOfURL(raw string) string {
 	return strings.ToLower(u.Host)
 }
 
-// csrfHostAllowed reports whether a request-supplied host is one of ours.
-func csrfHostAllowed(got, configuredHost string, r *http.Request) bool {
-	if got == "" {
-		return false
-	}
-	return got == configuredHost || got == strings.ToLower(r.Host)
+func csrfOriginAllowed(got, configured string) bool {
+	return got != "" && configured != "" && got == configured
 }
 
 func rejectCrossSite(w http.ResponseWriter, r *http.Request, source string) {
@@ -278,8 +320,14 @@ func main() {
 	// creation. umask 0o077 makes new files 0600 and new dirs 0700.
 	syscall.Umask(0o077)
 
-	// Derive rate-limit client IPs from the configured trusted-proxy hop count
-	// so X-Forwarded-For cannot be spoofed to evade limits.
+	// Both conditions are required before forwarding headers are believed: the
+	// direct peer must be explicitly named, and the configured hop count must
+	// select the client from the right side of the chain. RFC1918 alone is never
+	// proxy identity on a shared container bridge.
+	if err := timw.ConfigureTrustedProxyPeers(cfg.TrustedProxyPeers); err != nil {
+		slog.Error("invalid trusted proxy peer set", "error", err)
+		os.Exit(1)
+	}
 	timw.ConfigureProxy(cfg.TrustedProxyHops, false)
 
 	// Ensure the data dir is 0700 and tighten any pre-existing files to 0600
@@ -559,76 +607,90 @@ func main() {
 		frontendDir: cfg.FrontendDir,
 	})
 
-	// Start server.
-	srv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
-		Handler:           r,
-		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		// Go's default is 1 MB for a SINGLE header value, and User-Agent is
-		// stored verbatim in the append-only activity_log, so that default was
-		// the size of one audit row an authenticated caller could choose. The
-		// column is bounded now too (truncateAudit), but bounding it here as
-		// well means the bytes never reach a handler and never sit in memory
-		// 500 times a minute. 16 KB is generous for real headers.
-		MaxHeaderBytes: 16 << 10,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    60 * time.Second,
+	// Pre-bind every configured listener before serving either one. An operator
+	// who enabled private ingress must never get a green public-only boot because
+	// the private connector path was misspelled, unsafe, or already occupied.
+	endpoints := make([]httpEndpoint, 0, 2)
+	if cfg.PrivateSocketPath != "" {
+		privateListener, err := listenPrivateSocket(cfg.PrivateSocketPath)
+		if err != nil {
+			slog.Error("private ingress configuration error", "error", err)
+			os.Exit(1)
+		}
+		privateServer := newTrustIssuesHTTPServer(
+			"unix:"+cfg.PrivateSocketPath,
+			r,
+			timw.IngressPrivate,
+		)
+		endpoints = append(endpoints, httpEndpoint{
+			name: "private", server: privateServer, listener: privateListener,
+		})
 	}
 
-	// Graceful shutdown.
-	//
-	// drained is what makes the 10s budget real. Shutdown closes the listeners
-	// immediately, so ListenAndServe returns ErrServerClosed straight away and
-	// main used to return ~0.3s after SIGTERM with the drain still in progress:
-	// the budget was dead code and every in-flight request was reset on every
-	// deploy. The sharp case is a rotation caught between the provider minting
-	// the successor key and the vault persisting it.
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-
-		slog.Info("shutting down...")
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Error("shutdown error", "error", err)
+	publicAddr := fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port)
+	publicListener, err := net.Listen("tcp", publicAddr)
+	if err != nil {
+		for _, endpoint := range endpoints {
+			_ = endpoint.listener.Close()
 		}
-		// Rotation delivery runs detached from the request, so Shutdown does not
-		// know about it. Waiting here means a restart cannot land between "value
-		// stored, old key revoked upstream" and "delivery finished", which would
-		// otherwise record the rotation as a clean success while the consumer
-		// never got the new key.
-		// 20s, comfortably under the 45s stop_grace_period in docker-compose.yml
-		// and well over a normal delivery. An unbounded wait would just get the
-		// process SIGKILLed at the container's grace period instead.
-		if !vaultHandler.WaitForDelivery(20 * time.Second) {
-			slog.Warn("shutdown: rotation delivery did not finish in time; " +
-				"a rotated value may be stored without having reached its targets, " +
-				"check last_rotation_error after restart")
-		}
-
-		// AFTER the drain, not before: cancelling first would kill the
-		// dispatcher and background work that a still-draining handler depends
-		// on, which is the opposite of draining.
-		appCancel()
-		slog.Info("drain complete")
-	}()
-
-	slog.Info("Trustissues is running", "addr", srv.Addr, "version", Version)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		slog.Error("server error", "error", err)
+		slog.Error("public ingress listen error", "addr", publicAddr, "error", err)
 		os.Exit(1)
 	}
-	// Wait for the drain before main returns, or the deferred dbConn.Close()
-	// and appCancel() fire while handlers are still mid-write.
-	<-drained
+	publicServer := newTrustIssuesHTTPServer(publicAddr, r, timw.IngressPublic)
+	endpoints = append(endpoints, httpEndpoint{
+		name: "public", server: publicServer, listener: publicListener,
+	})
+
+	// Install signal handling before either Serve goroutine starts. Otherwise a
+	// deploy signal in the small window between Serve and signal.Notify would
+	// take the process down with the default action and skip both drains.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	serveErrs := serveHTTPEndpoints(endpoints)
+	slog.Info("Trustissues is running", "addr", publicAddr, "version", Version,
+		"private_ingress_enabled", cfg.PrivateSocketPath != "")
+	if cfg.PrivateSocketPath != "" {
+		slog.Info("private ingress is running", "socket", cfg.PrivateSocketPath,
+			"socket_mode", fmt.Sprintf("%04o", privateSocketMode))
+	}
+
+	// Graceful shutdown. Both listeners drain concurrently under the same 10s
+	// budget; draining one and then the other would let the first consume the
+	// deadline. A Serve failure is treated like SIGTERM: stop accepting traffic
+	// everywhere, drain what is in flight, then exit non-zero.
+	var serveErr error
+	select {
+	case sig := <-sigCh:
+		slog.Info("shutting down...", "signal", sig.String())
+	case serveErr = <-serveErrs:
+		slog.Error("server error; shutting down all ingress listeners", "error", serveErr)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := shutdownHTTPEndpoints(shutdownCtx, endpoints); err != nil {
+		slog.Error("shutdown error", "error", err)
+	}
+	cancel()
+
+	// Rotation delivery runs detached from the request, so HTTP Shutdown does
+	// not know about it. Waiting here means a restart cannot land between "value
+	// stored, old key revoked upstream" and "delivery finished". 20s remains
+	// comfortably under Compose's 45s stop_grace_period.
+	if !vaultHandler.WaitForDelivery(20 * time.Second) {
+		slog.Warn("shutdown: rotation delivery did not finish in time; " +
+			"a rotated value may be stored without having reached its targets, " +
+			"check last_rotation_error after restart")
+	}
+
+	// AFTER both HTTP drains: cancelling first would kill dispatch/background
+	// work that a still-draining handler depends on.
+	appCancel()
+	slog.Info("drain complete")
+	if serveErr != nil {
+		os.Exit(1)
+	}
 }
 
 // routerDeps bundles every handler, limiter, and config value the route
@@ -686,6 +748,7 @@ type routerDeps struct {
 // what main() would have wired, not a parsed approximation of it.
 func newRouter(d routerDeps) *chi.Mux {
 	r := chi.NewRouter()
+	privateIngressConfigured := d.cfg != nil && d.cfg.PrivateSocketPath != ""
 
 	// Global middleware. randomRequestID replaces chimiddleware.RequestID,
 	// whose default id prefix embeds os.Hostname() and would leak the host
@@ -699,11 +762,31 @@ func newRouter(d routerDeps) *chi.Mux {
 	r.Use(chimiddleware.Compress(5))
 	r.Use(timw.SecurityHeaders)
 	r.Use(bodyLimits)
+	// Deployment state, not request data. Handlers use this to make selected
+	// global control-plane routes uniformly private whenever the optional
+	// connector exists, without querying whether protected rows happen to exist.
+	r.Use(timw.StampPrivateIngressConfigured(privateIngressConfigured))
 
 	// Health check (basic liveness).
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+	r.Get("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q}`, Version)
+		w.Header().Set("Cache-Control", "no-store")
+		ingress := "public"
+		baseURL := d.cfg.BaseURL
+		if timw.IsPrivateIngress(req.Context()) {
+			ingress = "private"
+			baseURL = d.cfg.PrivateBaseURL
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			Status                string `json:"status"`
+			Version               string `json:"version"`
+			Ingress               string `json:"ingress"`
+			BaseURL               string `json:"base_url"`
+			PrivateIngressEnabled bool   `json:"private_ingress_enabled"`
+		}{
+			Status: "ok", Version: Version, Ingress: ingress, BaseURL: baseURL,
+			PrivateIngressEnabled: timw.IsPrivateIngressConfigured(req.Context()),
+		})
 	})
 
 	// Capability bridge proxy: AI agents send requests to /proxy/{host}/{path}
@@ -718,13 +801,14 @@ func newRouter(d routerDeps) *chi.Mux {
 
 	// API routes.
 	r.Route("/api", func(r chi.Router) {
+		r.Use(apiNoStore)
 		r.Use(timw.RateLimit(d.apiLimiter))
 		// CSRF defense in depth for every state-changing /api route, including
 		// the public ones (first-run register is the sharpest case). Applied
 		// here rather than globally so the capability proxy, which is not
 		// cookie-authenticated and is called by non-browser agents, is
 		// untouched.
-		r.Use(csrfOriginCheck(d.cfg.BaseURL))
+		r.Use(csrfOriginCheck(d.cfg.BaseURL, d.cfg.PrivateBaseURL))
 
 		// Public routes (no auth), tightly rate limited.
 		r.With(timw.RateLimit(d.loginLimiter)).Get("/auth/status", d.authHandler.Status)
@@ -748,11 +832,11 @@ func newRouter(d routerDeps) *chi.Mux {
 				r.Patch("/me", d.authHandler.UpdateMe)
 				r.Post("/logout", d.authHandler.Logout)
 				r.Post("/change-password", d.authHandler.ChangePassword)
-				// One-time bootstrap for the vault_only password-less redemption
-				// branch (RedeemInvitation in users.go): those accounts have no
-				// password a human ever knew, so this is how they acquire one.
+				// One-time legacy recovery for password_set=0 accounts created by
+				// older releases. Current invitation redemption requires a human
+				// password for every role and cannot create this account shape.
 				// Deliberately in THIS group, not the TOTP-enrolment-gated one
-				// below: a password-less account that has enrolled TOTP but not
+				// below: a migrated account that has enrolled TOTP but not
 				// yet set a password must still be able to reach this endpoint, or
 				// the P0-2 deadlock just relocates here. Rate-limited with the
 				// other sensitive auth routes (login/register/redeem), not the
@@ -951,9 +1035,11 @@ func newRouter(d routerDeps) *chi.Mux {
 					r.HandleFunc("/ai/{provider}/*", d.aiGatewayHandler.Proxy)
 				})
 
-				// AI gateway + MCP config: any user reads status + connection URLs;
-				// only an admin points a provider at a key.
-				r.Get("/settings/ai", d.aiGatewayHandler.GetConfig)
+				// AI gateway + MCP config: ordinary users read status + connection
+				// URLs; only an admin points a provider at a key. vault_only is the
+				// external/client vault role and cannot use either surface, so it must
+				// not learn instance-wide provider or Shield posture here either.
+				r.With(timw.VaultOnlyBlock()).Get("/settings/ai", d.aiGatewayHandler.GetConfig)
 				r.With(timw.AdminOnly()).Put("/settings/ai", d.aiGatewayHandler.UpdateConfig)
 
 				// The capability bridge: MCP (list_secrets + use_secret, with Shield

@@ -249,7 +249,7 @@ func TestSealSecretNameFailsClosed(t *testing.T) {
 		t.Fatalf("corrupt the stored DEK: %v", err)
 	}
 	// Drop the process cache so the next seal has to load the corrupt row.
-	h.auditKey = auditNameKey{}
+	h.auditKey = &auditNameKey{}
 
 	got := h.sealSecretName(ctx, distinctiveName)
 	if strings.Contains(got, distinctiveName) {

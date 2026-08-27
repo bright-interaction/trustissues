@@ -34,7 +34,7 @@ type entryNameOpener interface {
 // invisible from the database and from the return value, and shows up only in
 // the payload an operator's webhook receives.
 type alertDispatcher interface {
-	Dispatch(event, source, host string, data map[string]string)
+	DispatchGuarded(event, source, host string, data map[string]string, guard alerts.DeliveryGuard)
 }
 
 // RunExpiryReminders is the background worker that dispatches
@@ -95,9 +95,14 @@ func checkExpiringSecrets(ctx context.Context, queries *db.Queries, names entryN
 			name = names.EntryNamePlain(row.Name)
 		}
 		slog.Warn("vault secret expiring soon", "entry", name, "expires_at", expires)
-		dispatcher.Dispatch(alerts.EventSecretExpiring, name, "", map[string]string{
+		if !entryAllowsExternalNotificationMetadata(checkCtx, queries, row.ID) {
+			slog.Info("expiry reminders: external notification suppressed by fully-private policy",
+				"entry_id", row.ID)
+			continue
+		}
+		dispatcher.DispatchGuarded(alerts.EventSecretExpiring, name, "", map[string]string{
 			"expires_at":  expires,
 			"window_days": fmt.Sprintf("%d", windowDays),
-		})
+		}, entryExternalNotificationDeliveryGuard(queries, row.ID))
 	}
 }

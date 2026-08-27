@@ -310,15 +310,22 @@ func summarizeDelivery(results []DeliveryResult) (status, summary string) {
 // Same idiom and same justification as providerHTTP.
 var dispatchRotationAlert = dispatchRotationAlertReal
 
-func dispatchRotationAlertReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter, entryName, detail string) {
+func dispatchRotationAlertReal(ctx context.Context, queries *db.Queries, decrypter alerts.ConfigDecrypter,
+	entryID, entryName, detail string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("vault rotation: alert dispatch panicked", "recover", r)
 		}
 	}()
-	alerts.NewChannelDispatcher(ctx, queries, decrypter).Dispatch(
+	if !entryAllowsExternalNotificationMetadata(ctx, queries, entryID) {
+		slog.Info("vault rotation: external partial notification suppressed by fully-private policy",
+			"entry_id", entryID)
+		return
+	}
+	alerts.NewChannelDispatcher(ctx, queries, decrypter).DispatchGuarded(
 		alerts.EventRotationPartial, "", "",
 		map[string]string{"secret": entryName, "detail": detail},
+		entryExternalNotificationDeliveryGuard(queries, entryID),
 	)
 }
 

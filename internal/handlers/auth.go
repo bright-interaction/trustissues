@@ -13,6 +13,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/columncrypto"
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/emailidentity"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/bright-interaction/trustissues/internal/totp"
@@ -23,6 +24,10 @@ import (
 type AuthHandler struct {
 	queries *db.Queries
 	cfg     *config.Config
+	// initialPasswordHasher is injected only so the concurrency regression can
+	// hold two requests after their fast-path read and prove the database CAS is
+	// the authority. Production always uses passwordhash.Hash.
+	initialPasswordHasher func(string) (string, error)
 	// vault is optional and used only by ChangePassword to purge a caller's
 	// own rotation delivery targets as part of full credential invalidation.
 	// Wired by SetVault after construction, matching UserHandler; nil simply
@@ -32,7 +37,7 @@ type AuthHandler struct {
 
 // NewAuthHandler creates a new AuthHandler.
 func NewAuthHandler(queries *db.Queries, cfg *config.Config) *AuthHandler {
-	return &AuthHandler{queries: queries, cfg: cfg}
+	return &AuthHandler{queries: queries, cfg: cfg, initialPasswordHasher: passwordhash.Hash}
 }
 
 // SetVault wires the vault handler used by ChangePassword to purge the
@@ -193,6 +198,13 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 // from admin-created users or invitations.
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
+	// The first account is always an instance admin. Once an operator has
+	// configured the optional private listener, bootstrap belongs to that same
+	// private control plane as every later admin-creation path. Gate before the
+	// user count so the public response is identical before and after setup.
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 	count, err := h.queries.CountUsers(r.Context())
 	if err != nil {
 		logError(r, "register: failed to count users", "error", err)
@@ -209,6 +221,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid request body")
 		return
 	}
+	req.Email = emailidentity.Canonical(req.Email)
 
 	if err := ValidateRequired("email", req.Email); err != nil {
 		writeValidationError(w, r, err.Error())
@@ -332,6 +345,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid request body")
 		return
 	}
+	req.Email = emailidentity.Canonical(req.Email)
 
 	if err := ValidateRequired("email", req.Email); err != nil {
 		writeValidationError(w, r, err.Error())
@@ -743,18 +757,19 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 
 // SetInitialPassword handles POST /api/auth/set-initial-password.
 //
-// This is the other half of P0-2. RedeemInvitation's password-less branch
-// (vault_only extension activation) mints hex(rand 32), hashes it, and
-// discards it: nobody, including the account's own owner, has ever known
-// that password. migration 00043's TOTPVerify fix let those accounts past
-// the enrolment gate without one, but every OTHER password-gated door --
+// This is a legacy recovery path for accounts created before web-first
+// onboarding. Older releases could generate a password for vault_only
+// extension activation and discard it, leaving password_set=0. Current
+// RedeemInvitation requires a human password for every role and cannot create
+// this state. Migration 00043's TOTPVerify exception lets legacy accounts past
+// the enrolment gate, but every OTHER password-gated door --
 // vault Unlock/Rotate/ValidateKey (reauthOrRefuse) and TOTPDisable -- still
 // unconditionally demands a password this account cannot supply. This
-// endpoint is the only way such an account ever acquires a real, known
+// endpoint is the only way such a migrated account ever acquires a real, known
 // password, which is what those doors already assume every caller has.
 //
 // It is deliberately registered inside the /api/auth route group, which
-// sits OUTSIDE RequireTOTPEnrollment (see main.go): a vault_only user who
+// sits OUTSIDE RequireTOTPEnrollment (see main.go): a legacy vault_only user who
 // has enrolled TOTP but not yet set a password must still be able to reach
 // this endpoint, or the enrolment gate just relocates the deadlock one step
 // later instead of closing it.
@@ -770,8 +785,8 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 // path, this handler does NOT call invalidateCredentials. Those two exist to
 // cut off a credential (a password) that might have been stolen; a
 // password_set=0 account has no such credential to protect against, and the
-// API key that authenticated THIS request is, for these accounts, the extension's
-// only means of ever reaching this endpoint again. Revoking it here would
+// API key that authenticated THIS request can be a migrated account's only
+// means of reaching this endpoint. Revoking it here would
 // disconnect the extension in the same request meant to finish connecting
 // it -- exactly the trap that makes the admin reset-password remedy so
 // painful for this account shape (see user_offboard.go). So existing
@@ -798,11 +813,13 @@ func (h *AuthHandler) SetInitialPassword(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// The refusal: this endpoint is a bootstrap for accounts that have never
+	// The fast refusal: this endpoint is recovery for accounts that have never
 	// had a password, not a password-reset bypass for one that has. A caller
 	// with a valid session or API key for an account whose owner already
 	// chose a password gets refused here every time, unconditionally, no
-	// matter how the caller came to hold that credential.
+	// matter how the caller came to hold that credential. This read is not the
+	// write authority: SetInitialPasswordHash repeats the condition atomically
+	// after hashing, closing the two-request check/write race.
 	passwordSet, psErr := h.queries.GetUserPasswordSet(r.Context(), userID)
 	if psErr != nil {
 		logError(r, "set-initial-password: failed to query password-set marker", "error", psErr)
@@ -815,21 +832,38 @@ func (h *AuthHandler) SetInitialPassword(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	newHash, err := passwordhash.Hash(req.Password)
+	newHash, err := h.initialPasswordHasher(req.Password)
 	if err != nil {
 		logError(r, "set-initial-password: failed to hash password", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 
-	// SetPasswordHash sets password_hash and password_set=1 in the same UPDATE
-	// statement, so there is no partial-failure window where the row claims a
-	// password it does not have (or vice versa). See migration 00043.
-	if err := h.queries.SetPasswordHash(r.Context(), db.SetPasswordHashParams{
+	// The compare-and-set is the one-time invariant. Two requests can both pass
+	// the early read while hashing; only the first may change password_set from
+	// zero to one, and the loser must never overwrite the winner's hash.
+	result, err := h.queries.SetInitialPasswordHash(r.Context(), db.SetInitialPasswordHashParams{
 		PasswordHash: newHash,
 		ID:           userID,
-	}); err != nil {
+	})
+	if err != nil {
 		logError(r, "set-initial-password: failed to set password", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	rows, rowsErr := result.RowsAffected()
+	if rowsErr != nil {
+		logError(r, "set-initial-password: failed to verify one-time write", "error", rowsErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if rows == 0 {
+		writeError(w, r, http.StatusConflict, "password_already_set",
+			"this account already has a password; use change-password instead")
+		return
+	}
+	if rows != 1 {
+		logError(r, "set-initial-password: compare-and-set changed unexpected row count", "rows", rows)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
@@ -975,15 +1009,15 @@ func (h *AuthHandler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
 	// session thief does not have is the one that gates the irreversible action.
 	// Disabling already required it; enabling did not, which was the asymmetry.
 	//
-	// THAT REASONING BREAKS for the vault_only extension's password-less
-	// redemption (RedeemInvitation in users.go): the "password" on that account
-	// is hex(rand 32), hashed and immediately discarded, so nobody -- including
-	// the account's own owner -- has ever known it. Requiring it here does not
+	// THAT REASONING BREAKS for legacy vault_only rows with password_set=0.
+	// Older releases could hash and immediately discard a generated password, so
+	// nobody -- including the account's own owner -- has ever known it. Current
+	// invitation redemption cannot create such rows. Requiring it here does not
 	// stop a thief, because a thief cannot produce it either; it just makes
 	// enrolment permanently impossible for the legitimate owner too, which is
 	// exactly what turned into P0-2: an admin enables require_totp, the
-	// vault_only user is 403 everywhere, and the ONLY exit from that 403 demands
-	// a credential that provably does not exist. For that account the API key
+	// migrated vault_only user is 403 everywhere, and the ONLY exit from that
+	// 403 demands a credential that provably does not exist. For that account the API key
 	// (or session) that already got this request past authentication and past
 	// the session_reauth lockout above IS the whole credential; there is no
 	// second factor a thief could be missing that the password would have

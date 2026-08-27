@@ -45,6 +45,15 @@ expiry. The token format is JWT; the session is deliberately not stateless.
 cookies are `Secure`, so they will not be sent over plain HTTP to a non-loopback
 host. This is intentional.
 
+**Optional private ingress.** Internal collections can add an application-owned
+private admission gate through a Unix socket connected to Tailscale Serve or a
+Headscale overlay/TLS proxy. It is disabled by default, never trusts headers or
+source IP to select the zone, requires a private hostname distinct from the
+public one, and does not replace authentication, MFA, roles, or audit. Client
+collections can remain public. This controls inbound authorization; outbound
+rotation/provider traffic is not automatically routed through the overlay. See
+`docs/PRIVATE-INGRESS.md` for policy semantics and the break-glass runbook.
+
 **HTTP hardening.** Security headers are set on every response: a strict
 Content-Security-Policy (`default-src 'self'`), `X-Frame-Options: DENY`,
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
@@ -181,19 +190,25 @@ Trustissues is pre-1.0. Security fixes land on `main`. Run a recent build.
 
 ## Known gaps tracked for the next hardening pass
 
-See THREAT-MODEL.md "Residual risks" (R1 through R7) and DEFERRED.md. The
+See THREAT-MODEL.md "Residual risks" and DEFERRED.md. The
 operator-visible ones: WAL-safe backups, retention, scheduled restore drills and
 failure alerting ship for systemd and cron hosts (`scripts/backup.sh` and
 `docs/BACKUP.md`); off-host replication, container-internal scheduling, a
 real-key decrypt drill, and monitoring the drill timer remain operator work. The
 DB file and its `-wal`/`-shm` are chmodded to 0600 on boot with the data dir 0700
 (still, keep
-`TRUSTISSUES_DATA_DIR` off a shared mount), the app must bind loopback
-(`TRUSTISSUES_BIND_HOST=127.0.0.1`) behind TLS with
-`TRUSTISSUES_TRUSTED_PROXY_HOPS` set to the real proxy count, and a wrong
+`TRUSTISSUES_DATA_DIR` off a shared mount). A host-installed app must bind
+loopback (`TRUSTISSUES_BIND_HOST=127.0.0.1`); the Docker image instead listens
+on its container interface and must publish that port to host loopback only.
+Run either topology behind TLS with
+`TRUSTISSUES_TRUSTED_PROXY_HOPS` set to the real proxy count and
+`TRUSTISSUES_TRUSTED_PROXY_PEERS` narrowed to the proxy's direct IP, and a wrong
 `TRUSTISSUES_VAULT_KEY` now stops the server at boot rather than serving blank
 entries (override with `TRUSTISSUES_ALLOW_KEY_MISMATCH=1` only when the original
 key is gone for good and losing every secret is accepted).
 
 Any user, including `vault_only`, mints their own browser-extension API key from
-Settings > API keys. It is displayed once and stored only as a hash.
+Settings > API keys after signing in interactively (and satisfying required
+TOTP enrolment). It is displayed once and stored only as a hash. An API key
+cannot mint a successor key, so revoking the displayed row is terminal for that
+credential rather than leaving an unlinked descendant alive.

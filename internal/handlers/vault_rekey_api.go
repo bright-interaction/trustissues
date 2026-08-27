@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -35,9 +36,30 @@ import (
 // reassurance an operator wants after finishing one.
 func (h *VaultHandler) VaultKeyStatus(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
-	rep, err := h.RekeyStatus(r.Context())
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	tx, err := h.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault_key: status snapshot failed", "error", err)
+		writeInternalError(w, r, "could not read encryption status")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	if !requireGlobalProtectedPrivateAccess(w, r, qtx) {
+		return
+	}
+	snapshot := *h
+	snapshot.queries = qtx
+	rep, err := snapshot.RekeyStatus(r.Context())
 	if err != nil {
 		logError(r, "vault_key: status scan failed", "error", err)
+		writeInternalError(w, r, "could not read encryption status")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault_key: status snapshot commit failed", "error", err)
 		writeInternalError(w, r, "could not read encryption status")
 		return
 	}
@@ -60,9 +82,14 @@ func (h *VaultHandler) VaultKeyStatus(w http.ResponseWriter, r *http.Request) {
 // table/column they are in, without ever including a value.
 func (h *VaultHandler) VaultKeyRekey(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
-
-	rep, err := h.RekeyVault(r.Context())
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	rep, err := h.rekeyVaultForIngress(r.Context())
 	switch {
+	case errors.Is(err, errRekeyPrivateIngressRequired):
+		writePrivateIngressRequired(w, r)
+		return
 	case errors.Is(err, ErrRekeyInProgress):
 		writeConflict(w, r, "a re-encrypt sweep is already running")
 		return

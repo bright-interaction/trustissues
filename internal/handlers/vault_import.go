@@ -303,28 +303,38 @@ func getFirstField(fields map[string]string, keys []string) string {
 	return ""
 }
 
-// checkConflicts checks for existing entries with the same name
+// personalImportNameSet opens only the user's personal-vault names. Collection
+// names are different uniqueness scopes since 00045 and, more importantly, a
+// fully-private collection name must never be decrypted by a public import.
+func (h *VaultImportHandler) personalImportNameSet(ctx context.Context, queries *db.Queries,
+	userID string) (map[string]struct{}, error) {
+	rows, err := queries.ListPersonalVaultEntryNames(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		plain, err := h.handler.decryptColumn(row.Name, vaultFieldName)
+		if err != nil {
+			return nil, fmt.Errorf("open personal vault entry name %s: %w", row.ID, err)
+		}
+		existing[plain] = struct{}{}
+	}
+	return existing, nil
+}
+
+// checkConflicts checks for existing personal entries with the same name.
 func (h *VaultImportHandler) checkConflicts(ctx context.Context, userID string, entries []ImportEntry) []string {
 	var conflicts []string
-	existing := make(map[string]bool)
-
-	// Get existing entry names for this user
-	names, err := h.handler.queries.ListVaultEntryNamesByUser(ctx, userID)
+	existing, err := h.personalImportNameSet(ctx, h.handler.queries, userID)
 	if err != nil {
 		slog.Error("failed to check existing entries", "error", err)
 		return conflicts
 	}
-	// Stored names are ciphertext since 00040, so the map is built from the
-	// DECRYPTED name. Comparing the import's cleartext against ciphertext would
-	// find no conflict ever, and the import would then hit the unique index and
-	// fail row by row instead of reporting the clash up front.
-	for _, name := range names {
-		existing[h.handler.decryptColumnOrLog(name, "", vaultFieldName)] = true
-	}
 
 	// Check for conflicts
 	for _, entry := range entries {
-		if existing[entry.Name] {
+		if _, found := existing[entry.Name]; found {
 			conflicts = append(conflicts, entry.Name)
 		}
 	}
@@ -489,6 +499,12 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 	defer tx.Rollback()
 
 	qtx := h.handler.queries.WithTx(tx)
+	existingNames, err := h.personalImportNameSet(r.Context(), qtx, userID)
+	if err != nil {
+		logError(r, "failed to check personal import names", "error", err)
+		writeInternalError(w, r, "database error")
+		return
+	}
 
 	// Entries the import could not create. They used to be dropped with only a
 	// slog line, while the response reported just `imported` and the UI showed a
@@ -523,7 +539,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		// Import applied none of them, so a legitimate CSV could write a row the
 		// edit form could never save again (Update re-validates on every save and
 		// the form resubmits every field), and an untrimmed name defeated both
-		// checkConflicts and UNIQUE(user_id, name). Reported as a skip rather
+		// checkConflicts and the scope-bound blind index. Reported as a skip rather
 		// than failing the batch: one bad row out of 400 should not cost the
 		// other 399, and the operator now gets told which one and why.
 		fields := vaultEntryFields{
@@ -535,6 +551,12 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 		entry.Name, entry.URL, entry.Username = fields.Name, fields.URL, fields.Username
+		if _, duplicate := existingNames[entry.Name]; duplicate {
+			skipped = append(skipped, skippedEntry{
+				Name: entry.Name, Reason: "a secret with this name already exists in the personal vault",
+			})
+			continue
+		}
 
 		// Encrypt the value
 		encrypted, nonce, err := h.handler.encrypt([]byte(entry.Value))
@@ -595,7 +617,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 		//  2. Imported names were CLEARTEXT AT REST, which is exactly what 00040
 		//     was written for, defeated on the one path that carries a whole
 		//     password manager at a time.
-		//  3. name_bidx was left empty, so per-user name uniqueness went
+		//  3. name_bidx was left empty, so personal-vault name uniqueness went
 		//     unenforced for imports (the unique index is partial and skips '').
 		encName, encErr := h.handler.encryptColumn(entry.Name)
 		if encErr != nil {
@@ -622,24 +644,23 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			// Imported entries land in the user's PERSONAL vault, so the blind
 			// index is keyed to that scope.
 			UrlBidx: h.handler.urlBlindIndex(bidxScope(userID, sql.NullString{}), entry.URL),
-			// Keyed by the CUSTODIAN alone, not by bidxScope: this index stands
-			// in for UNIQUE(user_id, name), which is per user whatever
-			// collection the entry sits in. Matches Create and migration 00040.
+			// Imports land in the personal u:<user> name scope. Collection imports
+			// use the native path, where each imported collection gets c:<new id>.
 			//
-			// It is also what stops the import wedging the boot backfill. Left
-			// empty the row sits outside the partial unique index, so a name
-			// already taken by another of this user's entries is accepted here
-			// and only collides later, when BackfillMetadataAtRest recomputes
-			// the index and its UPDATE is refused. Filling it in means the clash
-			// is caught by the INSERT below and reported as an ordinary skip.
-			NameBidx: h.handler.nameBlindIndex(userID, entry.Name),
+			// It also keeps duplicate handling at this request boundary. Left
+			// empty, the row sits outside the partial unique index and a name
+			// already taken in this scope is accepted here. The boot repair can
+			// now converge that legacy state by assigning a deterministic
+			// duplicate suffix, but a current import should report the clash as
+			// an ordinary skip instead of silently changing the requested name.
+			NameBidx: h.handler.scopedNameBlindIndex(bidxScope(userID, sql.NullString{}), entry.Name),
 		})
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint") {
 				slog.Warn("skipping duplicate entry", "name", entry.Name)
 				skipped = append(skipped, skippedEntry{
 					Name:   entry.Name,
-					Reason: "a secret with this name already exists (names are unique per user)",
+					Reason: "a secret with this name already exists in the personal vault",
 				})
 				continue
 			}
@@ -647,6 +668,7 @@ func (h *VaultImportHandler) ImportConfirm(w http.ResponseWriter, r *http.Reques
 			skipped = append(skipped, skippedEntry{Name: entry.Name, Reason: "could not be saved (details in server logs)"})
 			continue
 		}
+		existingNames[entry.Name] = struct{}{}
 
 		// Persist the fields the source export carried that have no dedicated
 		// column (Bitwarden `fields` / `login_totp`, LastPass `totp`, 1Password

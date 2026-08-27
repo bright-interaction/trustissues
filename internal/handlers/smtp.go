@@ -3,8 +3,10 @@ package handlers
 import (
 	"crypto/tls"
 	"fmt"
+	"html"
 	"net"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -255,10 +257,11 @@ func sendMailSTARTTLS(addr, host string, auth smtp.Auth, from, to string, msg []
 func buildInvitationHTML(name, code, serverURL string) string {
 	greeting := "Hi"
 	if name != "" {
-		greeting = "Hi " + name
+		greeting = "Hi " + html.EscapeString(name)
 	}
 
 	serverURL = strings.TrimRight(serverURL, "/")
+	inviteURL := serverURL + "/invite?code=" + url.QueryEscape(code)
 
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -274,18 +277,17 @@ func buildInvitationHTML(name, code, serverURL string) string {
       %s, you've been invited to use Trustissues, a secure password manager for your team.
     </p>
     <div style="background:#f1f5f9;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px">
-      <p style="color:#64748b;margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:1px">Your Setup Code</p>
+      <p style="color:#64748b;margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:1px">Your Invitation Code</p>
       <p style="color:#0f172a;margin:0;font-size:32px;font-weight:700;letter-spacing:4px;font-family:monospace">%s</p>
     </div>
-    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:20px;margin-bottom:24px">
-      <p style="color:#64748b;margin:0 0 4px;font-size:13px">Server URL</p>
-      <p style="color:#0f172a;margin:0;font-size:14px;font-family:monospace;word-break:break-all">%s</p>
+    <div style="text-align:center;margin-bottom:24px">
+      <a href="%s" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;border-radius:8px;padding:12px 20px;font-size:14px;font-weight:600">Accept invitation</a>
     </div>
     <h3 style="color:#0f172a;margin:0 0 12px;font-size:15px">Getting Started</h3>
     <ol style="color:#475569;margin:0 0 24px;padding-left:20px;font-size:14px;line-height:2">
-      <li>Open the server URL above (or install the vault browser extension)</li>
-      <li>Choose <strong>"Have a setup code?"</strong></li>
-      <li>Enter your setup code</li>
+      <li>Open the secure invitation link above</li>
+      <li>Choose a password for your account</li>
+      <li>Sign in to review and accept any shared-vault invitations</li>
     </ol>
     <p style="color:#94a3b8;margin:0;font-size:12px">
       This invitation expires in 48 hours. If it has expired, ask your administrator for a new one.
@@ -296,5 +298,5 @@ func buildInvitationHTML(name, code, serverURL string) string {
   </div>
 </div>
 </body>
-</html>`, greeting, code, serverURL)
+</html>`, greeting, html.EscapeString(code), html.EscapeString(inviteURL))
 }

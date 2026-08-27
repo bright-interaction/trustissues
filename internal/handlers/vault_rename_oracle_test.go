@@ -90,15 +90,16 @@ func TestRenameDoesNotProbeTheOwnersPrivateVault(t *testing.T) {
 		}
 	})
 
-	// And the owner keeps the genuinely useful duplicate-name feedback, because
-	// for them the conflicting entry is one they can already see.
-	t.Run("owner still gets duplicate-name feedback", func(t *testing.T) {
+	// Personal and collection vaults are independent name scopes. The owner's
+	// personal label therefore cannot make this shared rename return a different
+	// answer (or block it) either.
+	t.Run("owner can reuse a personal label in the collection", func(t *testing.T) {
 		rec := rename(owner, "user", sharedID, "Acme prod DB")
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("owner renaming onto their own existing name: HTTP %d, want 409: %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK && rec.Code != http.StatusNoContent {
+			t.Fatalf("owner cross-scope rename: HTTP %d: %s", rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "already exists") {
-			t.Errorf("the owner's conflict should say what is wrong, got %s", rec.Body.String())
+		if got := entryNamePlain(t, h, queries, sharedID); got != "Acme prod DB" {
+			t.Fatalf("owner cross-scope rename did not take: name = %q", got)
 		}
 	})
 

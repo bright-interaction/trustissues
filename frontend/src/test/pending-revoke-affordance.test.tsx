@@ -431,6 +431,37 @@ describe('a predecessor id the backend could not characterize', () => {
 });
 
 describe('a provider save must not invent an all-clear the server did not give', () => {
+  it('keeps provider credentials that the ordinary write echo marks withheld', async () => {
+    const user = userEvent.setup();
+    const unlocked = entry({
+      provider_meta: '{"account_id":"acct","application_key":"secondary-secret","region":"old"}',
+    });
+    vaultUpdateMock.mockResolvedValue({
+      ...unlocked,
+      provider_meta: '{"account_id":"acct","region":"new"}',
+      provider_meta_withheld: ['application_key'],
+    });
+
+    const saved: Array<{ provider_meta: string }> = [];
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <RotationManager
+          entry={unlocked}
+          onProviderSaved={(patch) => saved.push({ provider_meta: patch.provider_meta })}
+        />
+      </QueryClientProvider>
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Save provider' }));
+    await waitFor(() => expect(saved).toHaveLength(1));
+    expect(JSON.parse(saved[0].provider_meta)).toEqual({
+      account_id: 'acct',
+      application_key: 'secondary-secret',
+      region: 'new',
+    });
+  });
+
   it('forwards the server\'s pending_revoke instead of hardcoding null', async () => {
     // The server drops the stranded-key markers ONLY when the provider
     // actually changed (reconcileProviderMetaForStorage's `keep` is literally

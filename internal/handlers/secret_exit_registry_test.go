@@ -118,6 +118,14 @@ var theExitList = map[string]exitSite{
 			"receipt. Every response path that emits custom fields goes through here: GET, POST /unlock, " +
 			"the create and update echoes, and the rotate response.",
 	},
+	"vault.go:VaultHandler.providerMetaForCaller": {
+		secret:  "every credential-bearing provider_meta value of the entry being revealed",
+		chooser: "the caller (a read question, not a destination question)",
+		why: "Datadog's app_key is a second live credential rather than provider configuration. Ordinary " +
+			"metadata responses remove it; password-gated unlock and export reach this function, which asks " +
+			"the entry-owner authority before inserting that value into the response. Provider-scoped key " +
+			"declarations keep identifiers such as key_id visible while credential values remain gated.",
+	},
 	"vault.go:VaultHandler.Rotate": {
 		secret:  "the entry being rotated (its NEW value, returned so the operator can copy it)",
 		chooser: "the caller",

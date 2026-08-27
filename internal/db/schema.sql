@@ -29,6 +29,14 @@ CREATE TABLE users (
     CHECK (password_set IN (0, 1))
 );
 
+-- 00046_canonical_email_identity.go. The application and migration parse and
+-- re-serialize a net/mail addr-spec, NFC/lower-normalize its local-part, and
+-- IDNA-normalize its domain to a lower-case A-label. This expression index is
+-- an additional ASCII backstop for direct SQL/older writers; SQLite lower() is
+-- deliberately ASCII-only and is not the full canonicalizer.
+CREATE UNIQUE INDEX idx_users_email_canonical_ascii
+  ON users(lower(trim(email)));
+
 -- 00002_sessions_api_keys.sql
 CREATE TABLE login_attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,9 +120,52 @@ CREATE TABLE collections (
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  -- 00044_collection_private_access_policy.sql. This is an authorization
+  -- input, so unknown values fail at the storage boundary rather than relying
+  -- on every caller to invent the same fallback.
+  private_access_policy TEXT NOT NULL DEFAULT 'standard'
+    CHECK(private_access_policy IN ('standard', 'sensitive_private', 'fully_private')),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Monotonic latch from 00044. Audit rows outlive collections, so after a
+-- fully-private collection has ever existed the global activity/capability
+-- readers must remain private even if that collection is later downgraded or
+-- deleted.
+CREATE TRIGGER collections_private_access_audit_latch_insert
+AFTER INSERT ON collections
+WHEN NEW.private_access_policy = 'fully_private'
+BEGIN
+  INSERT INTO settings (key, value, updated_at)
+  VALUES ('private_access_audit_ever_fully_private', '1', CURRENT_TIMESTAMP)
+  ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = CURRENT_TIMESTAMP;
+END;
+
+CREATE TRIGGER collections_private_access_audit_latch_update
+AFTER UPDATE OF private_access_policy ON collections
+WHEN NEW.private_access_policy = 'fully_private'
+BEGIN
+  INSERT INTO settings (key, value, updated_at)
+  VALUES ('private_access_audit_ever_fully_private', '1', CURRENT_TIMESTAMP)
+  ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = CURRENT_TIMESTAMP;
+END;
+
+CREATE TRIGGER private_access_audit_latch_no_delete
+BEFORE DELETE ON settings
+WHEN OLD.key = 'private_access_audit_ever_fully_private' AND OLD.value = '1'
+BEGIN
+  SELECT RAISE(ABORT, 'private access audit latch is monotonic');
+END;
+
+CREATE TRIGGER private_access_audit_latch_no_downgrade
+BEFORE UPDATE OF value ON settings
+WHEN OLD.key = 'private_access_audit_ever_fully_private'
+  AND OLD.value = '1'
+  AND NEW.value <> '1'
+BEGIN
+  SELECT RAISE(ABORT, 'private access audit latch is monotonic');
+END;
 
 CREATE TABLE collection_members (
   collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
@@ -140,6 +191,8 @@ CREATE TABLE collection_invitations (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (collection_id, email)
 );
+CREATE UNIQUE INDEX idx_collection_invitations_email_canonical_ascii
+  ON collection_invitations(collection_id, lower(trim(email)));
 
 -- 00010_vault.sql
 CREATE TABLE vault_entries (
@@ -168,14 +221,15 @@ CREATE TABLE vault_entries (
   injection_spec TEXT NOT NULL DEFAULT '{}',
   url_bidx TEXT NOT NULL DEFAULT '',
   alias_url_bidx TEXT NOT NULL DEFAULT '',
-  -- 00040_vault_entry_name_at_rest.sql. name is encrypted at rest like the other
-  -- metadata columns; this keyed HMAC carries the per-user uniqueness the inline
-  -- UNIQUE(user_id, name) below can no longer enforce over randomized ciphertext.
+  -- 00040/00045. name is encrypted at rest like the other metadata columns;
+  -- this keyed HMAC carries per-vault-scope uniqueness because randomized
+  -- ciphertext cannot be compared. Its HMAC scope is u:<user> for personal
+  -- entries and c:<collection> for shared entries.
   name_bidx TEXT NOT NULL DEFAULT '',
   collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
   custom_fields TEXT NOT NULL DEFAULT '[]',
-  -- 00034_secret_owner.sql. user_id is the CUSTODIAN (uniqueness scope, listing,
-  -- grantFor); this is the OWNER the exit asks about. They are two columns
+  -- 00034_secret_owner.sql. user_id is the CUSTODIAN (personal-vault scope,
+  -- listing, grantFor); this is the OWNER the exit asks about. They are two columns
   -- because a collection manager can move user_id to their own id through
   -- AdoptAndRenameVaultEntry, and an authority derived from a column the
   -- attacker can write is not an authority. See the migration.
@@ -185,8 +239,12 @@ CREATE TABLE vault_entries (
   UNIQUE(user_id, name)
 );
 
-CREATE UNIQUE INDEX idx_vault_entries_user_name_bidx
-  ON vault_entries(user_id, name_bidx) WHERE name_bidx != '';
+CREATE UNIQUE INDEX idx_vault_entries_personal_name_bidx
+  ON vault_entries(user_id, name_bidx)
+  WHERE name_bidx != '' AND (collection_id IS NULL OR collection_id = '');
+CREATE UNIQUE INDEX idx_vault_entries_collection_name_bidx
+  ON vault_entries(collection_id, name_bidx)
+  WHERE name_bidx != '' AND collection_id IS NOT NULL AND collection_id != '';
 CREATE INDEX idx_vault_entries_url ON vault_entries(url) WHERE url != '';
 CREATE INDEX idx_vault_entries_user ON vault_entries(user_id);
 CREATE INDEX idx_vault_entries_collection ON vault_entries(collection_id) WHERE collection_id IS NOT NULL;

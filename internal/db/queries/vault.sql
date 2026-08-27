@@ -64,7 +64,7 @@ UPDATE vault_entries SET custom_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE
 -- destination ceiling are intentionally absent: native import writes those
 -- only through internal/vaultegress with an egressgate ticket.
 UPDATE vault_entries
-SET collection_id = ?, custom_fields = ?, last_rotated_at = ?,
+SET custom_fields = ?, last_rotated_at = ?,
     created_at = ?, updated_at = ?
 WHERE id = ?;
 
@@ -88,12 +88,10 @@ UPDATE vault_entries SET name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP
 -- name: AdoptAndRenameVaultEntry :exec
 -- Rename an ORPHANED shared entry and take ownership of it in one statement.
 --
--- Uniqueness is UNIQUE(user_id, name), scoped to the entry's creator, so any
--- rename by somebody else asks a question about the creator's private namespace
--- and the answer (409 or 200) is readable by the person asking. Writing the new
--- owner and the new name together moves the uniqueness question into the
--- renamer's OWN namespace, where a conflict is with an entry they can see and
--- saying so leaks nothing. See the rule in vault.go's Update.
+-- Shared-name uniqueness is scoped to collection_id since 00045. Adoption does
+-- not move the row to a different name namespace, but writing the current
+-- collection-scoped token here upgrades pre-00045 custodian-keyed rows while
+-- the row is already being changed.
 --
 -- IT DOES NOT TOUCH secret_owner_user_id, AND THAT IS THE POINT.
 --
@@ -103,16 +101,14 @@ UPDATE vault_entries SET name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP
 -- authorised the cross-entry delivery it exists to refuse, because it resolved
 -- "owner" from the column this statement writes.
 --
--- Adoption is still right and still happens: it moves the UNIQUE(user_id, name)
--- question into the renamer's namespace, which is a NAMESPACE concern. Whose
--- authority governs the plaintext is a different question and lives in a
--- different column, which only internal/vaultegress can write.
+-- Adoption is still right and still happens: it assigns a live custodian to an
+-- orphaned shared entry. Whose authority governs the plaintext is a different
+-- question and lives in a different column, which only internal/vaultegress can
+-- write.
 --
--- name_bidx is written here too, and it MUST be derived under the NEW user_id.
--- The index is keyed by the custodian, so an adoption that carried the old
--- owner's token across would enforce the departing owner's namespace on a row
--- that now lives in the adopter's, which is the opposite of what this statement
--- exists to do.
+-- name_bidx is written here too, and it MUST be derived as c:<collection> by the
+-- caller. Carrying a legacy u:<old custodian> token forward would leave the row
+-- outside the collection's uniqueness constraint.
 UPDATE vault_entries SET user_id = ?, name = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
 
 -- name: UpdateVaultEntryCategory :exec
@@ -255,7 +251,14 @@ FROM vault_entries WHERE user_id = ? AND ((url_bidx != '' AND url_bidx = ?) OR (
 -- keeps seven rounds of scope fixes intact: this statement never authorised
 -- anything, it only narrowed. Returning the name lets the caller narrow on
 -- exactly what it narrowed on before.
-SELECT id, user_id, collection_id, name, encrypted_value, nonce FROM vault_entries;
+-- Include the collection policy so public HTTP reference probes can discard a
+-- fully-private row before decrypting/comparing its name. Delivery still uses
+-- the same rows without that visibility filter; private ingress is an admission
+-- boundary, not an instruction to stop scheduled rotations.
+SELECT v.id, v.user_id, v.collection_id, v.name, v.encrypted_value, v.nonce,
+       c.private_access_policy
+FROM vault_entries AS v
+LEFT JOIN collections AS c ON c.id = v.collection_id;
 
 -- ============================================================================
 -- Import - conflict detection
@@ -263,6 +266,20 @@ SELECT id, user_id, collection_id, name, encrypted_value, nonce FROM vault_entri
 
 -- name: ListVaultEntryNamesByUser :many
 SELECT name FROM vault_entries WHERE user_id = ?;
+
+-- name: ListPersonalVaultEntryNames :many
+-- Import/create conflict checks must never walk collection names. A collection
+-- may be fully private on this ingress, and personal names have a separate
+-- uniqueness scope since 00045 anyway.
+SELECT id, name FROM vault_entries
+WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '');
+
+-- name: ListCollectionVaultEntryNames :many
+-- The caller has already proved membership and the collection's ingress policy
+-- before opening these names. Returning the whole scope also catches indexes
+-- written under the previous key (and pre-00045 custodian-keyed indexes), which
+-- a single current-key equality lookup would silently miss.
+SELECT id, name FROM vault_entries WHERE collection_id = ?;
 
 -- ============================================================================
 -- Import - bulk insert (used inside transaction)
@@ -300,8 +317,8 @@ SELECT id, provider, provider_meta, rotation_targets FROM vault_entries;
 -- name: ListVaultEntriesForMetaAtRestBackfill :many
 -- user_id and collection_id are needed because the URL blind index is keyed per
 -- SCOPE (personal vs a specific collection), so recomputing it requires knowing
--- which scope the row currently lives in. name and name_bidx joined them in
--- 00040: the name index is keyed by user_id alone, which user_id already covers.
+-- which scope the row currently lives in. Since 00045, name and name_bidx use
+-- that same personal/collection scope and the boot sweep converges legacy rows.
 SELECT id, user_id, collection_id, name, url, alias_url, username, category, notes, url_bidx, alias_url_bidx, name_bidx FROM vault_entries;
 
 -- name: UpdateVaultEntryMetaAtRest :exec
@@ -532,12 +549,11 @@ DELETE FROM vault_entries WHERE user_id = ? AND (collection_id IS NULL OR collec
 -- name: ListCollectionVaultEntriesForUser :many
 -- The rows ReassignCollectionVaultEntryOwner will walk, one at a time.
 --
--- A single blanket UPDATE was all-or-nothing: vault_entries still carries
--- UNIQUE(user_id, name), so if the leaver and the new owner both had an entry
--- called "GitHub" (generic names collide constantly in a password manager) the
--- statement aborted and EVERY shared entry kept the deleted user's id, silently,
--- while the confirmation dialog promised the team would keep them.
-SELECT id, name FROM vault_entries
+-- A single blanket UPDATE was all-or-nothing: if a legacy row converging to its
+-- collection-scoped name token collides with an existing name in that
+-- collection, the statement aborts and EVERY shared entry would keep the
+-- deleted user's id while the confirmation dialog promised the team otherwise.
+SELECT id, name, collection_id FROM vault_entries
 WHERE user_id = ? AND collection_id IS NOT NULL AND collection_id != '';
 
 -- Re-owning ONE entry (so a single name collision cannot block the rest) is

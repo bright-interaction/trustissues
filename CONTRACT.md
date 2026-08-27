@@ -219,9 +219,13 @@ Package-private but available to any feature handler placed in
 - Lockout: 5 failed logins per email / 15 min locks the account (429); 20
   per IP blocks credential stuffing. TOTP 2FA on login (`totp_code` field,
   `{"totp_required":true}` signal) with recovery codes.
-- Invitations carry `target_role` (default `vault_only`). Public redeem at
-  `POST /api/invitations/redeem` `{code, password?}`; `vault_only`
-  redemptions receive a `ti_`-prefixed API key for the extension.
-- vault_only semantics: locked to the vault UI. Platform admin routes
-  already exclude them via `AdminOnly`; feature agents must wrap every
-  non-vault route in `timw.VaultOnlyBlock()`.
+- Invitations carry `target_role` (default `vault_only`). Public, same-origin
+  redeem at `POST /api/invitations/redeem` requires `{code, password}` and
+  returns the created user; it never mints an API key. After login (and any
+  required TOTP enrolment), an interactive session creates a named extension
+  key through `POST /api/api-keys`. API-key-authenticated callers cannot mint
+  successor keys.
+- `vault_only` semantics: restricted to Vault plus self-service Account/API-key
+  settings and the onboarding checklist. Platform admin routes already exclude
+  them via `AdminOnly`; feature agents must wrap every unrelated non-vault
+  surface in `timw.VaultOnlyBlock()`.

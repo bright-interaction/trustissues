@@ -263,7 +263,17 @@ type ownershipReport struct {
 // ListUnownedEntries handles GET /api/admin/vault/ownership.
 func (h *VaultHandler) ListUnownedEntries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rows, err := h.queries.ListVaultEntriesWithNoRecordedOwner(ctx)
+	tx, qtx, err := beginQueriesTx(ctx, h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.ownership: snapshot begin failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	txh := *h
+	txh.queries = qtx
+
+	rows, err := qtx.ListVaultEntriesWithNoRecordedOwner(ctx)
 	if err != nil {
 		logError(r, "vault.ownership: list failed", "error", err)
 		writeInternalError(w, r, "internal server error")
@@ -288,7 +298,7 @@ func (h *VaultHandler) ListUnownedEntries(w http.ResponseWriter, r *http.Request
 		}
 		// Best effort. A count that cannot be read leaves the flag false, which
 		// understates the evidence rather than inventing it.
-		if n, cErr := h.queries.CountRecordedAdoptionsForEntry(ctx,
+		if n, cErr := qtx.CountRecordedAdoptionsForEntry(ctx,
 			sql.NullString{String: row.ID, Valid: true}); cErr == nil && n > 0 {
 			e.AdoptionRecorded = true
 		}
@@ -310,15 +320,38 @@ func (h *VaultHandler) ListUnownedEntries(w http.ResponseWriter, r *http.Request
 	// reason this page exists is that an operator with no surface reaches for
 	// sqlite3 instead. The claim route accepts these now; this is how they are
 	// found.
-	expired, xErr := h.expiredOwnerEntries(ctx)
+	expired, xErr := txh.expiredOwnerEntries(ctx)
 	if xErr != nil {
 		logError(r, "vault.ownership: expired-owner scan failed", "error", xErr)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 	report.Entries = append(report.Entries, expired...)
+	policies, policyErr := collectionPolicyMap(ctx, qtx)
+	if policyErr != nil {
+		logError(r, "vault.ownership: private access policy lookup failed", "error", policyErr)
+		writeInternalError(w, r, "private access policy could not be verified")
+		return
+	}
+	visibleEntries := report.Entries[:0]
+	for _, entry := range report.Entries {
+		var collectionID *string
+		if entry.CollectionID != "" {
+			id := entry.CollectionID
+			collectionID = &id
+		}
+		if entryMetadataVisibleOnIngress(ctx, collectionID, policies) {
+			visibleEntries = append(visibleEntries, entry)
+		}
+	}
+	report.Entries = visibleEntries
 
 	report.Total = len(report.Entries)
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.ownership: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	writeJSON(w, http.StatusOK, report)
 }
 
@@ -332,7 +365,7 @@ func (h *VaultHandler) ListUnownedEntries(w http.ResponseWriter, r *http.Request
 // an owner at all, and the oracle decides, one row at a time. Admin-only route,
 // bounded by the instance's own vault.
 func (h *VaultHandler) expiredOwnerEntries(ctx context.Context) ([]unownedEntry, error) {
-	rows, err := h.db.QueryContext(ctx, `
+	rows, err := h.queries.Handle().QueryContext(ctx, `
 		SELECT e.id, e.name, e.user_id, e.collection_id, e.created_at, e.updated_at,
 		       COALESCE(cu.email, ''), COALESCE(c.name, ''),
 		       e.secret_owner_user_id, COALESCE(ou.email, '')
@@ -452,7 +485,22 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	access, err := h.queries.GetVaultEntryAccess(ctx, entryID)
+	// The policy, current ownership, actor's database role and transfer all
+	// belong to one write snapshot. In particular, beginning the transaction
+	// before the first lookup makes a public claim wait for an in-flight policy
+	// promotion and then observe the protected row instead of spending a stale
+	// standard-policy decision after that promotion commits.
+	tx, qtx, txErr := beginQueriesTx(ctx, h.queries, nil)
+	if txErr != nil {
+		logError(r, "vault.ownership: begin failed", "entry", entryID, "error", txErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	txh := *h
+	txh.queries = qtx
+
+	access, err := qtx.GetVaultEntryAccess(ctx, entryID)
 	if err == sql.ErrNoRows {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -460,6 +508,9 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		logError(r, "vault.ownership: access lookup failed", "entry", entryID, "error", err)
 		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if !txh.requireEntryPrivateAccess(w, r, entryID, privateAccessSensitive) {
 		return
 	}
 	// A RECORDED OWNER IS NOT THE SAME AS A LIVE ONE.
@@ -482,7 +533,7 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 	// ownership would be a second transfer path with a friendlier name and the
 	// whole point of the column is that there is one.
 	if access.SecretOwnerUserID != "" {
-		live, lErr := h.recordedOwnerMayDirect(ctx, entryID)
+		live, lErr := txh.recordedOwnerMayDirect(ctx, entryID)
 		if lErr != nil {
 			logError(r, "vault.ownership: could not read the recorded owner", "entry", entryID,
 				"error", lErr)
@@ -509,7 +560,7 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 			// the action to name here, along with what the row currently
 			// authorises, so the admin can tell whether it needs taking.
 			armed := ""
-			if hosts, hErr := h.ownerRecordedDestinations(ctx, entryID); hErr == nil &&
+			if hosts, hErr := txh.ownerRecordedDestinations(ctx, entryID); hErr == nil &&
 				len(hosts.Hosts) > 0 {
 				armed = " This entry currently authorises delivery to: " +
 					strings.Join(hosts.Hosts, ", ") + "."
@@ -532,7 +583,7 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 	proof, pErr := vaultegress.AuthorizeTransfer(vaultegress.TransferRequest{
 		EntryID:              entryID,
 		Actor:                actor,
-		ActorIsInstanceAdmin: h.instanceAdminByRecord(ctx, actor),
+		ActorIsInstanceAdmin: txh.instanceAdminByRecord(ctx, actor),
 		To:                   actor,
 		Why: "ownership repair after migration 00034: the backfill could not prove the custodian " +
 			"deposited this secret, so an instance admin took it deliberately",
@@ -542,28 +593,20 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// ONE TRANSACTION, and the reason is in the next paragraph. Answering the
-	// ownership question re-arms every recorded destination on the row, so the
-	// answer and the disarming have to land together or the unattended sweep can
-	// fire in between with the old evidence and the new authority.
-	tx, txErr := h.db.BeginTx(ctx, nil)
-	if txErr != nil {
-		logError(r, "vault.ownership: begin failed", "entry", entryID, "error", txErr)
+	nameBidx, _, nameErr := h.ownershipTransferNameIndex(ctx, qtx, entryID, actor)
+	if nameErr != nil {
+		logError(r, "vault.ownership: could not derive destination name index", "entry", entryID, "error", nameErr)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
-	qtx := h.queries.WithTx(tx)
 
 	if _, tErr := vaultegress.TransferSecretOwnership(ctx, qtx, proof,
-		vaultegress.TransferOwnershipParams{NewOwnerUserID: actor, ID: entryID}); tErr != nil {
+		vaultegress.TransferOwnershipParams{NewOwnerUserID: actor, ID: entryID, NameBidx: nameBidx}); tErr != nil {
 		if strings.Contains(tErr.Error(), "UNIQUE constraint") {
-			// The transfer moves the custodian as well as the owner, which is
-			// what the one sanctioned statement does, so the entry's name lands
-			// in the admin's UNIQUE(user_id, name) namespace. Say so; renaming
-			// silently would edit an entry the admin is looking at.
-			writeConflict(w, r, "you already have a vault entry with that name. Rename one of them and "+
-				"claim again: taking ownership moves the entry into your namespace")
+			// A collection-scoped clash can occur while a legacy custodian token
+			// converges. Say so; renaming silently would edit an entry the admin is
+			// looking at.
+			writeConflict(w, r, "this collection already has a vault entry with that name. Rename one of them and claim again")
 			return
 		}
 		logError(r, "vault.ownership: transfer failed", "entry", entryID, "error", tErr)
@@ -571,7 +614,7 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	withdrawn, wErr := h.disarmRecordedDestinations(ctx, qtx, entryID, actor)
+	withdrawn, wErr := txh.disarmRecordedDestinations(ctx, qtx, entryID, actor)
 	if wErr != nil {
 		logError(r, "vault.ownership: could not clear the recorded destinations", "entry", entryID,
 			"error", wErr)
@@ -619,18 +662,17 @@ func (h *VaultHandler) ClaimSecretOwnership(w http.ResponseWriter, r *http.Reque
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	if rErr := h.reindexAfterCustodianChange(ctx, qtx, entryID, actor, access.CollectionID); rErr != nil {
+		logError(r, "vault.ownership: reindex failed", "entry", entryID, "error", rErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
 	if cErr := tx.Commit(); cErr != nil {
 		logError(r, "vault.ownership: commit failed", "entry", entryID, "error", cErr)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-
-	// The URL blind index is keyed to bidxScope(user_id, collection_id), so
-	// moving the custodian of a PERSONAL entry invalidates it and autofill would
-	// silently stop offering the entry. Same recompute MoveToCollection does,
-	// for the same reason.
-	h.reindexAfterCustodianChange(r, entryID, actor, access.CollectionID)
 
 	LogActivityFromRequest(h.queries, r, "vault.ownership_claimed", fmt.Sprintf(
 		"Entry %s: secret ownership claimed by admin %s (it had none; %s)%s",
@@ -699,7 +741,17 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if _, err := h.queries.GetVaultEntryAccess(ctx, entryID); err == sql.ErrNoRows {
+	tx, qtx, txErr := beginQueriesTx(ctx, h.queries, nil)
+	if txErr != nil {
+		logError(r, "vault.ownership: restore begin failed", "entry", entryID, "error", txErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	txh := *h
+	txh.queries = qtx
+
+	if _, err := qtx.GetVaultEntryAccess(ctx, entryID); err == sql.ErrNoRows {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	} else if err != nil {
@@ -707,9 +759,12 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	if !txh.requireEntryPrivateAccess(w, r, entryID, privateAccessSensitive) {
+		return
+	}
 
 	var prevOwner, prevCustodian, withdrawnJSON string
-	rErr := h.db.QueryRowContext(ctx,
+	rErr := tx.QueryRowContext(ctx,
 		`SELECT previous_owner_user_id, previous_custodian_user_id, withdrawn_json
 		 FROM secret_ownership_claims WHERE entry_id = ?`, entryID).
 		Scan(&prevOwner, &prevCustodian, &withdrawnJSON)
@@ -738,7 +793,7 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 	// asks; it cannot be mayConfigureDelivery because that one also requires the
 	// principal to be the RECORDED owner, which is exactly what has not happened
 	// yet.
-	if !h.grantFor(ctx, prevOwner, h.instanceAdminByRecord(ctx, prevOwner), entryID).manage {
+	if !txh.grantFor(ctx, prevOwner, txh.instanceAdminByRecord(ctx, prevOwner), entryID).manage {
 		writeConflict(w, r, "the holder recorded on this claim still cannot reach this entry, so "+
 			"returning it would strand the row again. Put back whatever changed first (their "+
 			"collection role, their instance role, or their account), then restore")
@@ -748,7 +803,7 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 	proof, pErr := vaultegress.AuthorizeRestore(vaultegress.RestoreRequest{
 		EntryID:               entryID,
 		Actor:                 actor,
-		ActorIsInstanceAdmin:  h.instanceAdminByRecord(ctx, actor),
+		ActorIsInstanceAdmin:  txh.instanceAdminByRecord(ctx, actor),
 		RecordedPreviousOwner: prevOwner,
 		To:                    prevOwner,
 		Why: "ownership restore: this entry was claimed while its recorded owner could not reach it, " +
@@ -759,20 +814,17 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	tx, txErr := h.db.BeginTx(ctx, nil)
-	if txErr != nil {
-		logError(r, "vault.ownership: restore begin failed", "entry", entryID, "error", txErr)
+	nameBidx, collectionID, nameErr := h.ownershipTransferNameIndex(ctx, qtx, entryID, prevOwner)
+	if nameErr != nil {
+		logError(r, "vault.ownership: restore could not derive destination name index", "entry", entryID, "error", nameErr)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
-	qtx := h.queries.WithTx(tx)
 
 	if _, tErr := vaultegress.TransferSecretOwnership(ctx, qtx, proof,
-		vaultegress.TransferOwnershipParams{NewOwnerUserID: prevOwner, ID: entryID}); tErr != nil {
+		vaultegress.TransferOwnershipParams{NewOwnerUserID: prevOwner, ID: entryID, NameBidx: nameBidx}); tErr != nil {
 		if strings.Contains(tErr.Error(), "UNIQUE constraint") {
-			writeConflict(w, r, "the holder this entry would go back to already has an entry with that "+
-				"name. Rename one of them and restore again: ownership moves the entry into their namespace")
+			writeConflict(w, r, "the destination vault already has an entry with that name. Rename one of them and restore again")
 			return
 		}
 		logError(r, "vault.ownership: restore transfer failed", "entry", entryID, "error", tErr)
@@ -788,16 +840,16 @@ func (h *VaultHandler) RestoreSecretOwnership(w http.ResponseWriter, r *http.Req
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	if xErr := h.reindexAfterCustodianChange(ctx, qtx, entryID, prevOwner, collectionID); xErr != nil {
+		logError(r, "vault.ownership: restore reindex failed", "entry", entryID, "error", xErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
 	if cErr := tx.Commit(); cErr != nil {
 		logError(r, "vault.ownership: restore commit failed", "entry", entryID, "error", cErr)
 		writeInternalError(w, r, "internal server error")
 		return
-	}
-
-	access, aErr := h.queries.GetVaultEntryAccess(ctx, entryID)
-	if aErr == nil {
-		h.reindexAfterCustodianChange(r, entryID, prevOwner, access.CollectionID)
 	}
 
 	LogActivityFromRequest(h.queries, r, "vault.ownership_restored", fmt.Sprintf(
@@ -1029,35 +1081,56 @@ func sortedMetaKeys(m map[string]string) []string {
 	return out
 }
 
-// reindexAfterCustodianChange recomputes the URL blind indexes under the entry's
-// new scope. A failure is logged and not fatal: the ownership move already
-// committed and is the point of the request, whereas a stale index degrades
-// autofill and is repaired by any later save.
-func (h *VaultHandler) reindexAfterCustodianChange(r *http.Request, entryID, newCustodian string,
-	collectionID sql.NullString) {
-
-	ctx := r.Context()
-	meta, err := h.queries.GetVaultEntryMeta(ctx, entryID)
+// ownershipTransferNameIndex derives the required name token before the
+// ownership UPDATE. The transfer and its scope token then land in the same
+// transaction; a post-commit repair would temporarily remove uniqueness and
+// could fail after ownership had already moved.
+func (h *VaultHandler) ownershipTransferNameIndex(ctx context.Context, q *db.Queries,
+	entryID, newCustodian string) (string, sql.NullString, error) {
+	meta, err := q.GetVaultEntryMeta(ctx, entryID)
 	if err != nil {
-		logError(r, "vault.ownership: reindex lookup failed", "entry", entryID, "error", err)
-		return
+		return "", sql.NullString{}, fmt.Errorf("read entry metadata: %w", err)
+	}
+	name, err := h.decryptColumn(meta.Name, vaultFieldName)
+	if err != nil {
+		return "", sql.NullString{}, fmt.Errorf("open entry name: %w", err)
+	}
+	token := h.scopedNameBlindIndex(bidxScope(newCustodian, meta.CollectionID), name)
+	if token == "" {
+		return "", sql.NullString{}, fmt.Errorf("entry name or destination scope is empty")
+	}
+	return token, meta.CollectionID, nil
+}
+
+// reindexAfterCustodianChange recomputes every blind index under the entry's
+// new scope. It runs on the caller's transaction: committing ownership while
+// leaving an old-custodian URL index behind is a partial transfer, and a later
+// best-effort repair can both fail and race a policy promotion.
+func (h *VaultHandler) reindexAfterCustodianChange(ctx context.Context, q *db.Queries,
+	entryID, newCustodian string, collectionID sql.NullString) error {
+	meta, err := q.GetVaultEntryMeta(ctx, entryID)
+	if err != nil {
+		return fmt.Errorf("read transferred entry metadata: %w", err)
 	}
 	scope := bidxScope(newCustodian, collectionID)
-	urlPlain := h.decryptColumnOrLog(meta.Url.String, "", vaultFieldURL)
-	aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", vaultFieldAliasURL)
-	// THE NAME INDEX IS RECOMPUTED HERE, not passed through, and this is the one
-	// caller where that distinction matters. The name index is keyed by the
-	// CUSTODIAN, and this function exists precisely because the custodian just
-	// changed. Carrying the stored token across would leave the departed
-	// custodian's namespace enforcing uniqueness on a row that now belongs to
-	// someone else's, so the new holder could not create an entry under a name
-	// they can plainly see is free, and two entries could collide under the old
-	// holder's. The move path next door does pass it through, correctly, because
-	// a move changes the collection and never the custodian.
-	namePlain := h.decryptColumnOrLog(meta.Name, "", vaultFieldName)
-	if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+	urlPlain, err := h.decryptColumn(meta.Url.String, vaultFieldURL)
+	if err != nil {
+		return fmt.Errorf("open transferred entry URL: %w", err)
+	}
+	aliasPlain, err := h.decryptColumn(meta.AliasUrl.String, vaultFieldAliasURL)
+	if err != nil {
+		return fmt.Errorf("open transferred entry alias URL: %w", err)
+	}
+	// Recompute the name index too. For a shared entry the c:<collection> scope
+	// does not change with its custodian, but a pre-00045 row can still carry the
+	// departed custodian's legacy token. Personal ownership changes use u:<new>.
+	namePlain, err := h.decryptColumn(meta.Name, vaultFieldName)
+	if err != nil {
+		return fmt.Errorf("open transferred entry name: %w", err)
+	}
+	if err := q.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
 		Name:         meta.Name,
-		NameBidx:     h.nameBlindIndex(newCustodian, namePlain),
+		NameBidx:     h.scopedNameBlindIndex(scope, namePlain),
 		Url:          meta.Url,
 		AliasUrl:     meta.AliasUrl,
 		Username:     meta.Username,
@@ -1067,6 +1140,7 @@ func (h *VaultHandler) reindexAfterCustodianChange(r *http.Request, entryID, new
 		AliasUrlBidx: h.urlBlindIndex(scope, aliasPlain),
 		ID:           entryID,
 	}); err != nil {
-		logError(r, "vault.ownership: reindex failed", "entry", entryID, "error", err)
+		return fmt.Errorf("write transferred entry indexes: %w", err)
 	}
+	return nil
 }

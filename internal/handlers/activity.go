@@ -85,6 +85,19 @@ func likePrefixPattern(prefix string) string {
 }
 
 func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	tx, queries, err := beginQueriesTx(r.Context(), h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "activity.list: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 500 {
@@ -132,11 +145,11 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 		prefix = strings.TrimSuffix(actionFilter, "*")
 		exact = ""
 	}
-	total, listErr = h.queries.CountActivityEntriesFiltered(ctx, db.CountActivityEntriesFilteredParams{
+	total, listErr = queries.CountActivityEntriesFiltered(ctx, db.CountActivityEntriesFilteredParams{
 		UserFilter: userFilter, ActionFilter: exact, ActionPrefix: prefix,
 	})
 	if listErr == nil {
-		rows, err := h.queries.ListActivityEntriesFiltered(ctx, db.ListActivityEntriesFilteredParams{
+		rows, err := queries.ListActivityEntriesFiltered(ctx, db.ListActivityEntriesFilteredParams{
 			UserFilter: userFilter, ActionFilter: exact, ActionPrefix: prefix,
 			RowLimit: int64(limit), RowOffset: int64(offset),
 		})
@@ -154,6 +167,11 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "activity.list: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, activityListResponse{
 		Entries: entries,
@@ -165,7 +183,20 @@ func (h *ActivityHandler) List(w http.ResponseWriter, r *http.Request) {
 // matching activity log entries as a CSV download, honoring the same
 // user_id/action filters as the list endpoint.
 func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	tx, queries, err := beginQueriesTx(r.Context(), h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "activity.export_csv: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
+	rows, err := queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
 		UserFilter:   r.URL.Query().Get("user_id"),
 		ActionFilter: exportExactAction(r.URL.Query().Get("action")),
 		ActionPrefix: exportPrefixAction(r.URL.Query().Get("action")),
@@ -211,11 +242,16 @@ func (h *ActivityHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "activity.export_csv: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
 	filename := fmt.Sprintf("trustissues-activity-%s.csv", time.Now().Format("20060102-150405"))
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	// Content-Length makes a truncated transfer detectable by the CLIENT too: a
 	// download cut short no longer looks like a complete file.
 	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
@@ -247,7 +283,20 @@ func csvSafe(v string) string {
 // ExportJSON handles GET /api/activity/export/json (admin only). Streams all
 // matching activity log entries as a JSON array download.
 func (h *ActivityHandler) ExportJSON(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	tx, queries, err := beginQueriesTx(r.Context(), h.queries, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "activity.export_json: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if !requireHistoricalPrivateAuditIngress(w, r, queries) {
+		return
+	}
+	rows, err := queries.ExportActivityEntries(r.Context(), db.ExportActivityEntriesParams{
 		UserFilter:   r.URL.Query().Get("user_id"),
 		ActionFilter: exportExactAction(r.URL.Query().Get("action")),
 		ActionPrefix: exportPrefixAction(r.URL.Query().Get("action")),
@@ -270,6 +319,11 @@ func (h *ActivityHandler) ExportJSON(w http.ResponseWriter, r *http.Request) {
 			UserAgent: nullStringPtr(row.UserAgent),
 			CreatedAt: nullTimeRFC3339(row.CreatedAt),
 		})
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "activity.export_json: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
 	}
 
 	filename := fmt.Sprintf("trustissues-activity-%s.json", time.Now().Format("20060102-150405"))

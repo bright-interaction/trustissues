@@ -16,8 +16,8 @@ import (
 // form resubmits every metadata field, so a 300-character name written by import
 // produced a row the operator could never save again: every edit came back 400
 // about a field they had not touched. The missing trim also defeats
-// checkConflicts, which compares raw names, and UNIQUE(user_id, name), because
-// "GitHub" and "GitHub " are different strings to both.
+// checkConflicts and the scope-bound name index, because "GitHub" and
+// "GitHub " are different strings to both.
 const (
 	maxEntryNameLen     = 255
 	maxEntryValueLen    = 65536

@@ -42,7 +42,8 @@ func collectionRequest(method, path, userID, role, collectionID, body string) *h
 // twice over: the identity fields handed out the display name and user id, and
 // the mere presence of the row answered "is this address registered?". On a
 // shared instance that is client A enumerating client B's staff directory, which
-// is the reason external clients cannot be invited into one instance today.
+// is required for the scoped external-client mode: one client's collection
+// manager must not learn whether an address belongs to another client account.
 //
 // The invariant: a pending seat looks the same whether or not the address
 // matches an account, and identity appears only after the invitee accepts.

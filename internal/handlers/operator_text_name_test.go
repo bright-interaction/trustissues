@@ -9,6 +9,7 @@ import (
 
 	"database/sql"
 
+	"github.com/bright-interaction/trustissues/internal/alerts"
 	"github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/vaultegress"
 )
@@ -35,7 +36,10 @@ type recordingDispatcher struct {
 	data    []map[string]string
 }
 
-func (r *recordingDispatcher) Dispatch(event, source, _ string, data map[string]string) {
+func (r *recordingDispatcher) DispatchGuarded(event, source, _ string, data map[string]string, guard alerts.DeliveryGuard) {
+	if guard != nil && !guard(context.Background()) {
+		return
+	}
 	r.events = append(r.events, event)
 	r.sources = append(r.sources, source)
 	r.data = append(r.data, data)
@@ -127,8 +131,13 @@ func TestCollectionTargetPurgeSummaryNamesEntriesInPlaintext(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create collection: %v", err)
 	}
+	meta, err := queries.GetVaultEntryMeta(ctx, entryID)
+	if err != nil {
+		t.Fatalf("read entry before collection placement: %v", err)
+	}
 	if err := queries.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
 		CollectionID: toNullString(collectionID),
+		NameBidx:     meta.NameBidx,
 		ID:           entryID,
 	}); err != nil {
 		t.Fatalf("move entry into collection: %v", err)

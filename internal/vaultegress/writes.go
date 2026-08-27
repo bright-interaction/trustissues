@@ -193,11 +193,13 @@ type CreateEntryParams struct {
 	AutoRotate           sql.NullInt64
 	UrlBidx              string
 	AliasUrlBidx         string
-	// NameBidx is the keyed token that carries per-user name uniqueness now that
-	// Name is randomized ciphertext. Leaving it empty does not fail: the unique
-	// index is partial and skips '', so the row is simply created outside the
-	// constraint and a duplicate name goes unnoticed.
-	NameBidx string
+	// NameBidx is keyed to the same personal/collection scope recorded by
+	// CollectionID. The two values are written on the INSERT together: inserting
+	// a collection entry as personal and moving it afterwards would ask the
+	// personal vault's uniqueness question first and create an oracle/false
+	// conflict for a name that is legal in the destination collection.
+	NameBidx     string
+	CollectionID sql.NullString
 }
 
 // writer builds the generated querier on the caller's own handle.
@@ -354,6 +356,7 @@ func CreateEntry(ctx context.Context, q *db.Queries, tk egressgate.Ticket, p Cre
 		UrlBidx:              p.UrlBidx,
 		AliasUrlBidx:         p.AliasUrlBidx,
 		NameBidx:             p.NameBidx,
+		CollectionID:         p.CollectionID,
 	})
 }
 

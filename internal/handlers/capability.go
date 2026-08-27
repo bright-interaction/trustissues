@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/trustissues/internal/capability"
 	dbpkg "github.com/bright-interaction/trustissues/internal/db"
 	"github.com/bright-interaction/trustissues/internal/middleware"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 	"github.com/bright-interaction/trustissues/internal/reflectguard"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
@@ -37,7 +38,12 @@ import (
 // See internal/capability/token.go for the token format and
 // internal/database/migrations/00020_capability.sql for the schema.
 type CapabilityHandler struct {
-	db    *sql.DB
+	db *sql.DB
+	// store is the handle used by security-sensitive raw SQL helpers. The
+	// top-level handler points it at db; snapshot clones point it at one
+	// *sql.Tx so policy, ACL, pin, nonce and ciphertext reads cannot silently
+	// escape to another connection.
+	store dbpkg.DBTX
 	vault entrySecretSource
 	// settings reads the ai_key_* rows that PIN an entry to one provider host.
 	// See secret_egress.go: the pin is what stops an editor who can rewrite
@@ -65,6 +71,7 @@ func NewCapabilityHandler(db *sql.DB, vault entrySecretSource, signingKeySource 
 	}
 	return &CapabilityHandler{
 		db:         db,
+		store:      db,
 		vault:      vault,
 		settings:   dbpkg.New(db),
 		signingKey: key,
@@ -77,6 +84,26 @@ func NewCapabilityHandler(db *sql.DB, vault entrySecretSource, signingKeySource 
 		defaultTTL:  5 * time.Minute,
 		maxBodySize: 16 * 1024 * 1024, // 16 MiB; covers OpenAI streaming chunk sizes
 	}, nil
+}
+
+// transactionBound returns a shallow handler clone whose raw SQL and generated
+// settings reads share dbtx. Network clients, crypto and signing state are
+// immutable and safe to share. Audit writes deliberately continue through the
+// original handler after the transaction has ended.
+func (h *CapabilityHandler) transactionBound(dbtx dbpkg.DBTX) *CapabilityHandler {
+	clone := *h
+	clone.store = dbtx
+	clone.settings = dbpkg.New(dbtx)
+	return &clone
+}
+
+// dbtx preserves compatibility with narrow test fixtures that construct a
+// CapabilityHandler literal. Production construction always initializes store.
+func (h *CapabilityHandler) dbtx() dbpkg.DBTX {
+	if h.store != nil {
+		return h.store
+	}
+	return h.db
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -99,6 +126,72 @@ type issueResponse struct {
 	Secret      string `json:"secret"`
 	ExpiresAt   string `json:"expires_at"`
 	NonceLength int    `json:"nonce_length"`
+}
+
+// issueSecuritySnapshot is populated entirely inside one BEGIN IMMEDIATE
+// transaction (the production SQLite DSN's transaction mode). A collection
+// promotion or entry move therefore orders either before this snapshot, in
+// which case public issuance sees the protected policy, or after the mint has
+// linearized. Proxy still revalidates every issued token at spend time.
+type issueSecuritySnapshot struct {
+	entry          capabilityEntryRow
+	lookupErr      error
+	privateBlocked bool
+	agentAllowed   bool
+	aclErr         error
+	pin            egressPin
+	pinErr         error
+	err            error
+}
+
+func (h *CapabilityHandler) captureIssueSecuritySnapshot(ctx context.Context, userID string,
+	req issueRequest) issueSecuritySnapshot {
+	var out issueSecuritySnapshot
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		out.err = err
+		return out
+	}
+	closeWithRollback := func() issueSecuritySnapshot {
+		_ = tx.Rollback()
+		return out
+	}
+	commit := func() issueSecuritySnapshot {
+		if err := tx.Commit(); err != nil {
+			out.err = err
+		}
+		return out
+	}
+
+	txh := h.transactionBound(tx)
+	if req.Secret != "" {
+		out.entry, out.lookupErr = txh.lookupSecretByName(ctx, userID, req.Secret)
+	} else {
+		out.entry, out.lookupErr = txh.lookupSecretByDestination(ctx, userID, req.Destination)
+	}
+	if out.lookupErr != nil {
+		return closeWithRollback()
+	}
+
+	out.privateBlocked = !middleware.IsPrivateIngress(ctx) &&
+		privateIngressRequired(out.entry.PrivateAccessPolicy, privateAccessSensitive)
+	if out.privateBlocked {
+		return commit()
+	}
+
+	out.agentAllowed, out.aclErr = txh.agentCanUse(ctx, req.AgentID, out.entry.ID, userID)
+	if out.aclErr != nil {
+		return closeWithRollback()
+	}
+	if !out.agentAllowed {
+		return commit()
+	}
+
+	out.pin, out.pinErr = providerPinFor(ctx, txh.settings, out.entry.ID)
+	if out.pinErr != nil {
+		return closeWithRollback()
+	}
+	return commit()
 }
 
 // Issue handles POST /api/secrets/issue. Auth is the same
@@ -154,16 +247,19 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var entry capabilityEntryRow
-	var lookupErr error
-	if req.Secret != "" {
-		entry, lookupErr = h.lookupSecretByName(ctx, userID, req.Secret)
-	} else if req.Destination != "" {
-		entry, lookupErr = h.lookupSecretByDestination(ctx, userID, req.Destination)
-	} else {
+	if req.Secret == "" && req.Destination == "" {
 		writeBadRequest(w, r, "either secret or destination required")
 		return
 	}
+
+	snapshot := h.captureIssueSecuritySnapshot(ctx, userID, req)
+	if snapshot.err != nil {
+		slog.Error("capability.issue: security snapshot", "error", snapshot.err)
+		writeInternalError(w, r, "security checks failed")
+		return
+	}
+	entry := snapshot.entry
+	lookupErr := snapshot.lookupErr
 	if errors.Is(lookupErr, sql.ErrNoRows) {
 		h.logCapabilityEvent(ctx, req.AgentID, nil, req.Secret, req.Destination, req.Method, "denied", 0, "secret_not_found", "")
 		writeError(w, r, http.StatusNotFound, "secret_not_found", "no secret matches the requested name or destination")
@@ -185,6 +281,13 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "lookup failed")
 		return
 	}
+	if snapshot.privateBlocked {
+		// Fully-private candidates were hidden by the lookup itself. The only
+		// visible blocked policy here is sensitive_private, whose stable response
+		// directs an authorised client to the optional private URL.
+		writePrivateIngressRequired(w, r)
+		return
+	}
 
 	// ACL: presence of a (agent_id, secret_id) row in capability_grants
 	// authorises. Nothing writes that table today, so in practice every caller
@@ -192,13 +295,12 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	// entry (see agentCanUse). The table stays as the narrowing mechanism for
 	// multi-agent setups; when a writer ships, granting one agent starts
 	// excluding the others for that agent id.
-	allowed, err := h.agentCanUse(ctx, req.AgentID, entry.ID, userID)
-	if err != nil {
-		slog.Error("capability.issue: acl", "error", err)
+	if snapshot.aclErr != nil {
+		slog.Error("capability.issue: acl", "error", snapshot.aclErr)
 		writeInternalError(w, r, "acl check failed")
 		return
 	}
-	if !allowed {
+	if !snapshot.agentAllowed {
 		h.logCapabilityEvent(ctx, req.AgentID, &entry.ID, entry.Name, req.Destination, req.Method, "denied", 0, "agent_not_granted", "")
 		writeError(w, r, http.StatusForbidden, "agent_not_granted", "agent has no grant for this secret")
 		return
@@ -249,7 +351,7 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	// naming the reason instead of a 403 per attempt. This also refuses a token
 	// whose CEILING has already been rewritten off-pin, which is the state the
 	// attack leaves the row in.
-	pin, pinErr := providerPinFor(ctx, h.settings, entry.ID)
+	pin, pinErr := snapshot.pin, snapshot.pinErr
 	if pinErr != nil {
 		slog.Error("capability.issue: could not read the entry's provider pin, denying",
 			"secret_id", entry.ID, "error", pinErr)
@@ -305,6 +407,7 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 	tok := capability.Token{
 		Secret:   entry.Name,
 		SecretID: entry.ID,
+		Issuer:   userID,
 		Agent:    req.AgentID,
 		Dests:    dests,
 		Method:   strings.ToUpper(method),
@@ -331,6 +434,200 @@ func (h *CapabilityHandler) Issue(w http.ResponseWriter, r *http.Request) {
 // ──────────────────────────────────────────────────────────────────────
 // /proxy/{host}/{path...}
 // ──────────────────────────────────────────────────────────────────────
+
+type proxySecurityFailure uint8
+
+const (
+	proxySecurityOK proxySecurityFailure = iota
+	proxySecuritySnapshotFailed
+	proxySecurityPolicyUnreadable
+	proxySecurityPrivateBlocked
+	proxySecurityIssuerUnreadable
+	proxySecurityIssuerRevoked
+	proxySecurityAgentRevoked
+	proxySecurityDestinationMismatch
+	proxySecurityAllowlistUnreadable
+	proxySecurityOutsideCurrentAllowlist
+	proxySecurityMethodMismatch
+	proxySecurityPinUnreadable
+	proxySecurityOutsidePin
+	proxySecurityReplay
+	proxySecurityNonceStoreFailed
+	proxySecurityResolveFailed
+)
+
+type proxySecuritySnapshot struct {
+	failure      proxySecurityFailure
+	cause        error
+	policy       privateaccess.Policy
+	pin          egressPin
+	upstreamPath string
+	plaintext    secretexit.Plaintext
+	spec         InjectionSpec
+}
+
+func capabilityEntryPolicy(ctx context.Context, handle dbpkg.DBTX,
+	entryID string) (privateaccess.Policy, bool, error) {
+	var raw sql.NullString
+	err := handle.QueryRowContext(ctx, `
+SELECT c.private_access_policy
+FROM vault_entries e
+LEFT JOIN collections c ON c.id = e.collection_id
+WHERE e.id = ?`, entryID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return privateaccess.PolicyStandard, false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return privateaccess.PolicyStandard, true, nil
+	}
+	policy, err := storedPrivateAccessPolicy(raw.String)
+	return policy, true, err
+}
+
+// capabilityIssuerCanStillUse binds a bearer-only proxy request back to the
+// human principal who was authorised at mint time. The signed issuer must still
+// exist, be enabled, retain a role allowed to mint, and retain live USE access
+// to this exact entry. A creating owner removed from the collection deliberately
+// fails: their residual recovery read is not a delegation/spend right.
+func (h *CapabilityHandler) capabilityIssuerCanStillUse(ctx context.Context, issuer, entryID string) (bool, error) {
+	if issuer == "" || entryID == "" {
+		return false, nil
+	}
+	var one int
+	err := h.dbtx().QueryRowContext(ctx, `
+SELECT 1
+FROM vault_entries e
+JOIN users u ON u.id = ? AND u.disabled = 0 AND u.role IN ('admin', 'user')
+WHERE e.id = ?
+  AND (
+    (e.collection_id IS NULL AND e.user_id = ?)
+    OR EXISTS (
+      SELECT 1 FROM collection_members cm
+      WHERE cm.collection_id = e.collection_id
+        AND cm.user_id = ?
+        AND cm.accepted_at IS NOT NULL
+    )
+  )`, issuer, entryID, issuer, issuer).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return one == 1, nil
+}
+
+// captureProxySecuritySnapshot is the proxy's database authorization boundary.
+// The production DSN makes this BEGIN IMMEDIATE, so a collection promotion or
+// entry move cannot commit between the policy check and nonce/ciphertext use.
+// The nonce insert and secret row resolve share that transaction as well.
+//
+// No audit write or network call occurs here. Every return closes the
+// transaction; Proxy logs the result afterwards and only then performs the
+// outbound request. A resolve failure still commits a successfully inserted
+// nonce, preserving the prior rule that a token is spent once resolution was
+// attempted rather than becoming retryable on a broken ciphertext row.
+func (h *CapabilityHandler) captureProxySecuritySnapshot(ctx context.Context, tok capability.Token,
+	host, upstreamPath, method string) proxySecuritySnapshot {
+	out := proxySecuritySnapshot{upstreamPath: upstreamPath}
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		out.failure = proxySecuritySnapshotFailed
+		out.cause = err
+		return out
+	}
+	txh := h.transactionBound(tx)
+	rollback := func(failure proxySecurityFailure, cause error) proxySecuritySnapshot {
+		out.failure = failure
+		out.cause = cause
+		_ = tx.Rollback()
+		return out
+	}
+	commit := func() proxySecuritySnapshot {
+		if err := tx.Commit(); err != nil {
+			out.plaintext.Wipe()
+			out.failure = proxySecuritySnapshotFailed
+			out.cause = err
+			return out
+		}
+		out.failure = proxySecurityOK
+		return out
+	}
+
+	policy, found, err := capabilityEntryPolicy(ctx, txh.dbtx(), tok.SecretID)
+	if err != nil {
+		return rollback(proxySecurityPolicyUnreadable, err)
+	}
+	out.policy = policy
+	if found && !middleware.IsPrivateIngress(ctx) &&
+		privateIngressRequired(policy, privateAccessSensitive) {
+		return rollback(proxySecurityPrivateBlocked, nil)
+	}
+
+	issuerAllowed, err := txh.capabilityIssuerCanStillUse(ctx, tok.Issuer, tok.SecretID)
+	if err != nil {
+		return rollback(proxySecurityIssuerUnreadable, err)
+	}
+	if !issuerAllowed {
+		return rollback(proxySecurityIssuerRevoked, nil)
+	}
+	agentAllowed, err := txh.agentCanUse(ctx, tok.Agent, tok.SecretID, tok.Issuer)
+	if err != nil {
+		return rollback(proxySecurityIssuerUnreadable, err)
+	}
+	if !agentAllowed {
+		return rollback(proxySecurityAgentRevoked, nil)
+	}
+
+	if !destMatches(tok.Dests, host, out.upstreamPath) {
+		return rollback(proxySecurityDestinationMismatch, nil)
+	}
+
+	patterns, err := txh.currentDestinationPatterns(ctx, tok.SecretID)
+	if err != nil {
+		return rollback(proxySecurityAllowlistUnreadable, err)
+	}
+	if len(patterns) == 0 || !destMatches(patterns, host, out.upstreamPath) {
+		return rollback(proxySecurityOutsideCurrentAllowlist, nil)
+	}
+	if !capability.MethodMatches(tok, method) {
+		return rollback(proxySecurityMethodMismatch, nil)
+	}
+
+	out.pin, err = providerPinFor(ctx, txh.settings, tok.SecretID)
+	if err != nil {
+		return rollback(proxySecurityPinUnreadable, err)
+	}
+	if out.pin.pinned() && !out.pin.allowsHost(host) {
+		return rollback(proxySecurityOutsidePin, nil)
+	}
+
+	if err := txh.spendNonce(ctx, tok.Nonce, time.Unix(tok.EXP, 0)); err != nil {
+		if errors.Is(err, errNonceAlreadySpent) {
+			return rollback(proxySecurityReplay, err)
+		}
+		return rollback(proxySecurityNonceStoreFailed, err)
+	}
+
+	out.plaintext, out.spec, err = txh.resolveSecret(ctx, tok.SecretID, tok.Secret)
+	if err != nil {
+		// The nonce insert remains durable on this path, matching the old
+		// insert-before-resolve behavior.
+		if commitErr := tx.Commit(); commitErr != nil {
+			out.plaintext.Wipe()
+			out.failure = proxySecuritySnapshotFailed
+			out.cause = commitErr
+			return out
+		}
+		out.failure = proxySecurityResolveFailed
+		out.cause = err
+		return out
+	}
+	return commit()
+}
 
 // Proxy handles every method against /proxy/{host}/{path...}. The host
 // segment is the lowercased upstream host (e.g. api.cloudflare.com); the
@@ -389,110 +686,16 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusUnauthorized, "invalid_capability", err.Error())
 		return
 	}
-
-	if !destMatches(tok.Dests, host, upstreamPath) {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_mismatch", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "destination_mismatch", "token does not authorise this destination")
-		return
-	}
-	// Defense-in-depth: also require the destination to be within the secret's
-	// CURRENT allow-list, not just the token's issue-time Dests. This confines a
-	// token minted before the owner tightened the allow-list (enforcement was
-	// issue-time only) to the current policy. Skipped when the secret has no
-	// allow-list (nothing to tighten against).
-	// The secret's CURRENT allow-list is the ceiling, and an EMPTY one means no agent
-	// access at all.
-	//
-	// This used to be guarded by len(patterns) > 0, so the check was skipped exactly
-	// when the list was empty. Clearing the allow-list is the ONLY way the product
-	// offers to revoke an agent's access to one secret, so the single action meaning
-	// "revoke everything" was the one case not enforced, while merely tightening from
-	// three hosts to one WAS. Every token already outstanding (TTL up to 600s) kept
-	// spending the credential.
-	//
-	// Denying on empty is exactly consistent with issuance, which already refuses:
-	// "this secret has no agent destination allow-list, so no capability token can be
-	// minted for it". A token for a pattern-less secret could never legitimately
-	// exist, so nothing is lost by rejecting one.
-	//
-	// A read error denies too. It used to return nil and skip, so a transient database
-	// error opened the gate.
-	patterns, patErr := h.currentDestinationPatterns(ctx, tok.SecretID)
-	if patErr != nil {
-		slog.Error("capability.proxy: could not read the secret's current allow-list, denying",
-			"secret_id", tok.SecretID, "error", patErr)
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "allowlist_unreadable", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "destination_mismatch", "the secret's current allow-list could not be read")
-		return
-	}
-	if len(patterns) == 0 || !destMatches(patterns, host, upstreamPath) {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_not_in_current_allowlist", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "destination_mismatch", "destination is not in the secret's current allow-list")
-		return
-	}
-	if !capability.MethodMatches(tok, r.Method) {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "method_mismatch", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "method_mismatch", "token does not authorise this method")
-		return
-	}
-
-	// THE PIN. An entry an admin wired into the AI gateway may only be delivered
-	// to that provider's own API host, whatever destination_patterns says.
-	//
-	// Everything above this line trusts a column that any accepted collection
-	// editor can rewrite through PUT /api/vault/{id}, including a public-signup
-	// vault_only account. So the round-2 host-keyed allowlist held and the attack
-	// simply moved the host: rewrite the ceiling to a collector the attacker
-	// controls, mint, and the proxy delivered the OPERATOR's decrypted provider
-	// key there in cleartext, with a 200. Both checks above (token dests and the
-	// entry's CURRENT allow-list) said yes, because both read the rewritten
-	// column.
-	//
-	// The pin comes from settings ai_key_* (an AdminOnly write) joined to the
-	// compile-time aiProviders table, so no caller who can edit the entry can
-	// move it. Enforced HERE, before the nonce is spent and before the secret is
-	// decrypted: a refused call costs the caller nothing and leaks nothing. The
-	// write path refuses the same patterns (VaultHandler.Update), but a delivery
-	// gate is what makes the property hold for rows written by anything else:
-	// an older binary, a restored backup, a future second writer.
-	pin, pinErr := providerPinFor(ctx, h.settings, tok.SecretID)
-	if pinErr != nil {
-		slog.Error("capability.proxy: could not read the entry's provider pin, denying",
-			"secret_id", tok.SecretID, "error", pinErr)
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "egress_pin_unreadable", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "destination_pinned", "the secret's provider binding could not be read")
-		return
-	}
-	if pin.pinned() && !pin.allowsHost(host) {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
-			r.Method, "denied", 0, "destination_outside_provider_pin", tok.Nonce)
-		writeError(w, r, http.StatusForbidden, "destination_pinned",
-			fmt.Sprintf("this secret is the instance's AI provider key; it is only ever delivered to %s, never to %s",
-				pin.describe(), providerAPIHost(host)))
-		return
-	}
-
-	// An LLM provider host is held to the SAME inference allowlist the AI
-	// gateway enforces. This is the second door onto one property.
-	//
-	// The vault entry an admin points ai_key_openai / ai_key_anthropic at is an
-	// ordinary entry, and the natural way to manage a team key is to keep it in
-	// a collection, where every accepted member resolves it through
-	// accessibleEntriesPredicate. So a role-'user' client could mint a token for
-	// api.openai.com/v1/files with DELETE and spend the operator's key on the
-	// files, batch, fine-tuning and assistants APIs, while the gateway's
-	// allowlist guarded a door that caller never used. Scoping one call site and
-	// not its sibling is how this class of fix gets reported as closed and is
-	// not.
-	//
-	// Enforced HERE, before the nonce is spent and before the secret is
-	// decrypted, so a refused call costs the caller nothing and leaks nothing.
-	// The normalized path is what gets forwarded, so the string checked and the
-	// string sent are the same one.
+	// Provider route admission is a pure decision over the already-normalized
+	// request host, method and path. Keep it in the function that actually
+	// builds the outbound request so the structural egress registry can prove
+	// this door still passes through the inference allow-list. Database policy,
+	// ACL, pin, nonce and ciphertext state remain in the transaction below.
 	if clean, isProvider, allowed := allowedProviderRoute(host, r.Method, upstreamPath); isProvider {
 		if !allowed {
-			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
-				r.Method, "denied", 0, "not_an_inference_route", tok.Nonce)
+			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret,
+				host+displayUpstreamPath(upstreamPath), r.Method, "denied", 0,
+				"not_an_inference_route", tok.Nonce)
 			writeError(w, r, http.StatusForbidden, "route_not_allowed",
 				fmt.Sprintf("%s only proxies inference calls; %s %s is not one of them",
 					host, r.Method, displayUpstreamPath(upstreamPath)))
@@ -500,28 +703,92 @@ func (h *CapabilityHandler) Proxy(w http.ResponseWriter, r *http.Request) {
 		}
 		upstreamPath = clean
 	}
-
-	// Replay protection: spend the nonce. Any concurrent re-use loses
-	// the race on the PK insert and gets rejected here. Expired-nonce
-	// rows are pruned by the PruneSpentNonces sweep.
-	if err := h.spendNonce(ctx, tok.Nonce, time.Unix(tok.EXP, 0)); err != nil {
-		if errors.Is(err, errNonceAlreadySpent) {
-			h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "replay", 0, "nonce_already_spent", tok.Nonce)
-			writeError(w, r, http.StatusForbidden, "replay", "capability token already used")
-			return
-		}
-		slog.Error("capability.proxy: spend nonce", "error", err)
+	// Policy, the token/current allow-lists, provider pin, nonce spend and
+	// ciphertext resolve are one database operation. The helper closes its
+	// transaction before this switch, so every audit write below is outside the
+	// authorization transaction and no outbound request can hold a DB lock.
+	snapshot := h.captureProxySecuritySnapshot(ctx, tok, host, upstreamPath, r.Method)
+	upstreamPath = snapshot.upstreamPath
+	switch snapshot.failure {
+	case proxySecurityOK:
+		// Continue below with the resolved plaintext.
+	case proxySecuritySnapshotFailed:
+		slog.Error("capability.proxy: security transaction failed", "secret_id", tok.SecretID, "error", snapshot.cause)
+		writeInternalError(w, r, "security checks failed")
+		return
+	case proxySecurityPolicyUnreadable:
+		slog.Error("private access: capability entry policy lookup failed", "entry", tok.SecretID, "error", snapshot.cause)
+		writeInternalError(w, r, "private access policy could not be verified")
+		return
+	case proxySecurityPrivateBlocked:
+		enforcePrivateAccessPolicy(w, r, snapshot.policy, privateAccessSensitive, true, "secret not found")
+		return
+	case proxySecurityIssuerUnreadable:
+		slog.Error("capability.proxy: issuer authority could not be verified", "secret_id", tok.SecretID, "error", snapshot.cause)
+		writeInternalError(w, r, "capability issuer authority could not be verified")
+		return
+	case proxySecurityIssuerRevoked:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"denied", 0, "issuer_access_revoked", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "capability_issuer_revoked",
+			"the account that issued this capability no longer has permission to use this secret")
+		return
+	case proxySecurityAgentRevoked:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method,
+			"denied", 0, "agent_grant_revoked", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "capability_agent_revoked",
+			"this agent no longer has permission to use this secret")
+		return
+	case proxySecurityDestinationMismatch:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_mismatch", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_mismatch", "token does not authorise this destination")
+		return
+	case proxySecurityAllowlistUnreadable:
+		slog.Error("capability.proxy: could not read the secret's current allow-list, denying",
+			"secret_id", tok.SecretID, "error", snapshot.cause)
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "allowlist_unreadable", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_mismatch", "the secret's current allow-list could not be read")
+		return
+	case proxySecurityOutsideCurrentAllowlist:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "destination_not_in_current_allowlist", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_mismatch", "destination is not in the secret's current allow-list")
+		return
+	case proxySecurityMethodMismatch:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "method_mismatch", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "method_mismatch", "token does not authorise this method")
+		return
+	case proxySecurityPinUnreadable:
+		slog.Error("capability.proxy: could not read the entry's provider pin, denying",
+			"secret_id", tok.SecretID, "error", snapshot.cause)
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "egress_pin_unreadable", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_pinned", "the secret's provider binding could not be read")
+		return
+	case proxySecurityOutsidePin:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+displayUpstreamPath(upstreamPath),
+			r.Method, "denied", 0, "destination_outside_provider_pin", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "destination_pinned",
+			fmt.Sprintf("this secret is the instance's AI provider key; it is only ever delivered to %s, never to %s",
+				snapshot.pin.describe(), providerAPIHost(host)))
+		return
+	case proxySecurityReplay:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "replay", 0, "nonce_already_spent", tok.Nonce)
+		writeError(w, r, http.StatusForbidden, "replay", "capability token already used")
+		return
+	case proxySecurityNonceStoreFailed:
+		slog.Error("capability.proxy: spend nonce", "error", snapshot.cause)
 		writeInternalError(w, r, "nonce store failed")
 		return
-	}
-
-	// Decrypt the secret + look up injection spec.
-	pt, spec, err := h.resolveSecret(ctx, tok.SecretID, tok.Secret)
-	if err != nil {
-		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "resolve_failed: "+err.Error(), tok.Nonce)
+	case proxySecurityResolveFailed:
+		h.logCapabilityEvent(ctx, tok.Agent, &tok.SecretID, tok.Secret, host+upstreamPath, r.Method, "denied", 0, "resolve_failed: "+snapshot.cause.Error(), tok.Nonce)
 		writeInternalError(w, r, "secret resolve failed")
 		return
+	default:
+		slog.Error("capability.proxy: unknown security transaction result", "failure", snapshot.failure)
+		writeInternalError(w, r, "security checks failed")
+		return
 	}
+
+	pt, spec := snapshot.plaintext, snapshot.spec
 	// Wipe the plaintext from memory once forwarding is done.
 	defer pt.Wipe()
 
@@ -934,7 +1201,7 @@ func joinDests(d []string) string {
 // this property had already been closed at the lookup, and leaving a second
 // ownership test behind it is how it stayed broken. A removed member fails both.
 func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, userID string) (bool, error) {
-	row := h.db.QueryRowContext(ctx,
+	row := h.dbtx().QueryRowContext(ctx,
 		`SELECT 1 FROM capability_grants WHERE agent_id = ? AND secret_id = ? AND revoked_at IS NULL`,
 		agentID, secretID)
 	var v int
@@ -945,7 +1212,7 @@ func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, 
 	}
 	// No explicit grant. Permissive when no grants exist for this
 	// agent at all (fresh install convention).
-	row = h.db.QueryRowContext(ctx,
+	row = h.dbtx().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capability_grants WHERE agent_id = ?`, agentID)
 	var n int
 	if err := row.Scan(&n); err != nil {
@@ -958,7 +1225,7 @@ func (h *CapabilityHandler) agentCanUse(ctx context.Context, agentID, secretID, 
 	// explicit grants are configured: the personal owner, or an accepted member
 	// of the collection it lives in. Same predicate as lookupSecretByName, so
 	// the two can never drift apart again.
-	row = h.db.QueryRowContext(ctx,
+	row = h.dbtx().QueryRowContext(ctx,
 		`SELECT 1 FROM vault_entries WHERE id = ? AND `+accessibleEntriesPredicate,
 		secretID, userID, userID, userID)
 	if err := row.Scan(&v); err == nil {
@@ -976,6 +1243,7 @@ type capabilityEntryRow struct {
 	ID                  string
 	Name                string
 	DestinationPatterns string
+	PrivateAccessPolicy privateaccess.Policy
 }
 
 // accessibleEntriesPredicate is the collection-aware scope every capability
@@ -1042,8 +1310,13 @@ func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name
 	// The REACHABILITY predicate is untouched, which is the part that authorises
 	// anything. The name is matched below, on the decrypted value, with the same
 	// byte equality SQL was doing.
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate,
+	rows, err := h.dbtx().QueryContext(ctx,
+		`SELECT id, name, destination_patterns,
+CASE
+  WHEN collection_id IS NULL THEN 'standard'
+  ELSE (SELECT c.private_access_policy FROM collections c WHERE c.id = vault_entries.collection_id)
+END
+FROM vault_entries WHERE `+accessibleEntriesPredicate,
 		userID, userID, userID)
 	if err != nil {
 		return capabilityEntryRow{}, err
@@ -1052,9 +1325,22 @@ func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name
 	var matched []capabilityEntryRow
 	for rows.Next() {
 		var e capabilityEntryRow
-		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
+		var rawPolicy string
+		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns, &rawPolicy); err != nil {
 			return capabilityEntryRow{}, err
 		}
+		policy, err := storedPrivateAccessPolicy(rawPolicy)
+		if err != nil {
+			return capabilityEntryRow{}, err
+		}
+		// Fully-private candidates must not influence not-found/ambiguous
+		// responses on public ingress. Filter before decrypting or comparing the
+		// name, then keep the ordinary per-entry sensitive gate for the one
+		// selected candidate.
+		if !middleware.IsPrivateIngress(ctx) && policy == privateaccess.PolicyFullyPrivate {
+			continue
+		}
+		e.PrivateAccessPolicy = policy
 		e.Name = h.vault.EntryNamePlain(e.Name)
 		if e.Name != name {
 			continue
@@ -1076,8 +1362,13 @@ func (h *CapabilityHandler) lookupSecretByName(ctx context.Context, userID, name
 }
 
 func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userID, dest string) (capabilityEntryRow, error) {
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, name, destination_patterns FROM vault_entries WHERE `+accessibleEntriesPredicate+
+	rows, err := h.dbtx().QueryContext(ctx,
+		`SELECT id, name, destination_patterns,
+CASE
+  WHEN collection_id IS NULL THEN 'standard'
+  ELSE (SELECT c.private_access_policy FROM collections c WHERE c.id = vault_entries.collection_id)
+END
+FROM vault_entries WHERE `+accessibleEntriesPredicate+
 			` AND destination_patterns != '' AND destination_patterns != '[]'`,
 		userID, userID, userID)
 	if err != nil {
@@ -1088,9 +1379,18 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 	var matched []capabilityEntryRow
 	for rows.Next() {
 		var e capabilityEntryRow
-		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns); err != nil {
+		var rawPolicy string
+		if err := rows.Scan(&e.ID, &e.Name, &e.DestinationPatterns, &rawPolicy); err != nil {
 			return capabilityEntryRow{}, err
 		}
+		policy, err := storedPrivateAccessPolicy(rawPolicy)
+		if err != nil {
+			return capabilityEntryRow{}, err
+		}
+		if !middleware.IsPrivateIngress(ctx) && policy == privateaccess.PolicyFullyPrivate {
+			continue
+		}
+		e.PrivateAccessPolicy = policy
 		patterns := parseDestinationPatterns(e.DestinationPatterns)
 		if destMatches(patterns, host, path) {
 			// This lookup does not match ON the name, but it RETURNS one, and the
@@ -1126,7 +1426,7 @@ func (h *CapabilityHandler) lookupSecretByDestination(ctx context.Context, userI
 // error opened the gate.
 func (h *CapabilityHandler) currentDestinationPatterns(ctx context.Context, secretID string) ([]string, error) {
 	var raw sql.NullString
-	if err := h.db.QueryRowContext(ctx,
+	if err := h.dbtx().QueryRowContext(ctx,
 		`SELECT destination_patterns FROM vault_entries WHERE id = ?`, secretID).Scan(&raw); err != nil {
 		return nil, err
 	}
@@ -1191,7 +1491,7 @@ func hostIsWildcarded(pat string) bool {
 }
 
 func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID, secretName string) (secretexit.Plaintext, InjectionSpec, error) {
-	row := h.db.QueryRowContext(ctx,
+	row := h.dbtx().QueryRowContext(ctx,
 		`SELECT encrypted_value, nonce, encryption_version, injection_spec FROM vault_entries WHERE id = ?`,
 		secretID)
 	var ct, nonce []byte
@@ -1211,7 +1511,7 @@ func (h *CapabilityHandler) resolveSecret(ctx context.Context, secretID, secretN
 // spendNonce inserts the nonce into the spent set. PK collision means
 // replay; any other error is a real DB problem.
 func (h *CapabilityHandler) spendNonce(ctx context.Context, nonce string, expiresAt time.Time) error {
-	_, err := h.db.ExecContext(ctx,
+	_, err := h.dbtx().ExecContext(ctx,
 		`INSERT INTO capability_spent_nonces (nonce, expires_at) VALUES (?, ?)`,
 		nonce, expiresAt.UTC().Format(time.RFC3339))
 	if err == nil {

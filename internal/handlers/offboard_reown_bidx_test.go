@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,28 +12,27 @@ import (
 	timw "github.com/bright-interaction/trustissues/internal/middleware"
 )
 
-// WHAT 00040 QUIETLY TURNED OFF, AND WHAT PUTS IT BACK.
+// WHAT 00040 QUIETLY TURNED OFF, AND WHAT 00045 PUTS BACK.
 //
 // Re-ownership on a hard delete has always had to answer one awkward case: the
 // admin taking the leaver's shared entries may already hold an entry by the same
-// name, and "GitHub" collides constantly in a password manager. The answer was
-// to catch the UNIQUE(user_id, name) violation, rename the incoming entry to
-// "<name> (from <leaver>)" and retry, so the team keeps both.
+// name IN THAT COLLECTION, and "GitHub" collides constantly in a password
+// manager. The answer is to catch the collection-scoped name-index violation,
+// rename the incoming entry to "<name> (from <leaver>)" and retry, so the team
+// keeps both.
 //
 // 00040 encrypted the name. That made the inline constraint vacuous ON PURPOSE
 // (a fresh nonce per seal means two equal names no longer produce equal
-// ciphertext) and moved real uniqueness to the partial index over name_bidx,
-// which is keyed by the CUSTODIAN. The transfer changes the custodian and was
-// not updating the token, so two things broke at once and neither raised
-// anything: the collision stopped being detected, and every transferred row was
-// left indexed under the person who had just been deleted.
+// ciphertext) and moved real uniqueness to a partial index over name_bidx. Since
+// 00045, shared names are keyed by COLLECTION rather than custodian: ownership
+// transfer must converge old custodian-keyed rows to that stable scope without
+// making personal entries with the same name collide.
 //
 // Both are asserted here against the real offboard path.
 
-// TestReOwningMovesTheNameIndexToTheNewOwner is the invariant. A row whose
-// name_bidx is keyed to the previous owner is a row that per-user name
-// uniqueness no longer constrains, which is invisible until a duplicate lands.
-func TestReOwningMovesTheNameIndexToTheNewOwner(t *testing.T) {
+// TestReOwningConvergesTheNameIndexToTheCollection is the invariant. Shared
+// namespace identity does not change merely because its custodian does.
+func TestReOwningConvergesTheNameIndexToTheCollection(t *testing.T) {
 	h, queries := newCollectionAuthzEnv(t)
 	leaver := mustUser(t, queries, "leaver-bidx@example.com", "user", "")
 	admin := mustUser(t, queries, "admin-bidx@example.com", "admin", "")
@@ -56,13 +56,14 @@ func TestReOwningMovesTheNameIndexToTheNewOwner(t *testing.T) {
 	if gotOwner != admin {
 		t.Fatalf("the entry was not re-owned at all: user_id = %q, want %q", gotOwner, admin)
 	}
-	if want := h.nameBlindIndex(admin, name); gotBidx != want {
+	want := h.scopedNameBlindIndex(bidxScope(admin,
+		sql.NullString{String: "coll-bidx", Valid: true}), name)
+	if gotBidx != want {
 		if gotBidx == h.nameBlindIndex(leaver, name) {
-			t.Fatalf("the entry moved to %s but its name_bidx is still keyed to the DELETED user. "+
-				"Per-user name uniqueness is no longer enforced for this row, so the new owner can "+
-				"end up holding two entries with the same name and nothing will object", admin)
+			t.Fatalf("the entry moved to %s but its name_bidx is still keyed to the DELETED user; "+
+				"collection-scoped uniqueness no longer constrains this legacy row", admin)
 		}
-		t.Fatalf("name_bidx is neither owner's token: got %q", gotBidx)
+		t.Fatalf("name_bidx = %q, want collection-scoped token %q", gotBidx, want)
 	}
 }
 
@@ -78,8 +79,15 @@ func TestReOwningStillDeDuplicatesACollidingName(t *testing.T) {
 	})
 
 	const shared = "GitHub"
-	// The admin already holds one by this name, personally.
+	// Model an existing legacy row which has already converged to the collection
+	// token, while the leaver's row still carries its pre-00045 personal token.
 	mustEntry(t, h, queries, "entry-admin-own", admin, shared, "admin-value")
+	placeInCollection(t, queries, "entry-admin-own", "coll-dedup")
+	if _, err := h.db.Exec(`UPDATE vault_entries SET name_bidx = ? WHERE id = ?`,
+		h.scopedNameBlindIndex(bidxScope(admin,
+			sql.NullString{String: "coll-dedup", Valid: true}), shared), "entry-admin-own"); err != nil {
+		t.Fatalf("converge existing collection token: %v", err)
+	}
 	// And the leaver has one in the shared collection.
 	mustEntry(t, h, queries, "entry-leaver-shared", leaver, shared, "leaver-value")
 	placeInCollection(t, queries, "entry-leaver-shared", "coll-dedup")
@@ -116,8 +124,9 @@ func TestReOwningStillDeDuplicatesACollidingName(t *testing.T) {
 		Scan(&gotBidx); err != nil {
 		t.Fatalf("raw read bidx: %v", err)
 	}
-	if want := h.nameBlindIndex(admin, opened); gotBidx != want {
-		t.Errorf("name_bidx does not match the de-duplicated name under the new owner")
+	if want := h.scopedNameBlindIndex(bidxScope(admin,
+		sql.NullString{String: "coll-dedup", Valid: true}), opened); gotBidx != want {
+		t.Errorf("name_bidx does not match the de-duplicated name in its collection")
 	}
 
 	// The admin's original is untouched.

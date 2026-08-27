@@ -126,22 +126,27 @@ func TestManagerCanRenameAnEntryStrandedByItsCreator(t *testing.T) {
 		}
 	})
 
-	t.Run("a conflict inside the manager's own namespace is still reported honestly", func(t *testing.T) {
+	t.Run("a conflict inside the collection namespace is still reported honestly", func(t *testing.T) {
 		// A SECOND stranded entry, so the adopt path runs again (the first one
 		// is now owned by the manager, which takes the ordinary owner branch).
 		const secondID = "entry-team-deploy"
 		mustEntry(t, h, queries, secondID, creator, "deploy-key", "value-2")
 		placeInCollection(t, queries, secondID, "coll-team")
-		mustEntry(t, h, queries, "entry-mgr-personal", manager, "my-own-thing", "v")
+		// Since 00045, shared-name uniqueness belongs to the collection, not to
+		// whichever member happens to custody a row. A personal entry with this
+		// name is intentionally a different scope; another entry in coll-team is
+		// the honest conflict this manager is allowed to learn about.
+		mustEntry(t, h, queries, "entry-mgr-collection", manager, "my-own-thing", "v")
+		placeInCollection(t, queries, "entry-mgr-collection", "coll-team")
 
 		rec := httptest.NewRecorder()
 		h.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+secondID, manager, "user", secondID,
 			`{"name":"my-own-thing"}`))
 		if rec.Code != http.StatusConflict {
-			t.Fatalf("adopting onto the manager's OWN existing name: HTTP %d, want 409: %s", rec.Code, rec.Body.String())
+			t.Fatalf("adopting onto the collection's existing name: HTTP %d, want 409: %s", rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "already have") {
-			t.Errorf("the manager's conflict should name their own entry, got %s", rec.Body.String())
+		if !strings.Contains(rec.Body.String(), "already exists") {
+			t.Errorf("the collection conflict should be reported to its manager, got %s", rec.Body.String())
 		}
 		// The refused adoption must leave the entry exactly as it was: name and
 		// owner both unchanged, or a failed rename would still dispossess.

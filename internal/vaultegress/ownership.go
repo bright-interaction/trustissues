@@ -29,11 +29,10 @@ import (
 //
 // AN AUTHORITY DERIVED FROM DATA THE ATTACKER CAN WRITE IS NOT AN AUTHORITY.
 //
-// Taking adoption away was not the fix: adoption is what moves the
-// UNIQUE(user_id, name) question into the renamer's own namespace, which is what
-// stops a rename from being an existence oracle over a colleague's private
-// vault. user_id was simply carrying two meanings, and the attack is exactly
-// that conflation. So there are two columns, and this file owns the second one.
+// Taking adoption away was not the fix: a stranded shared row still needs a live
+// custodian. Since 00045, its name remains in c:<collection> before and after
+// adoption, while user_id continues to carry listing/recovery meaning. There are
+// still two ownership columns, and this file owns the second one.
 //
 //	user_id               the CUSTODIAN. Adoption moves it, deliberately.
 //	secret_owner_user_id  the OWNER. Only the exit asks about it, it is written
@@ -241,14 +240,14 @@ func (p TransferProof) authorizes(entryID, newOwner string) error {
 type TransferOwnershipParams struct {
 	NewOwnerUserID string
 	ID             string
-	// NameBidx is the entry's name blind index recomputed under NewOwnerUserID.
+	// NameBidx is the entry's name blind index recomputed in its destination
+	// personal/collection scope.
 	//
 	// It is a required field rather than an optional one because the token is
-	// keyed by the custodian: leaving it behind indexes the row under the
-	// PREVIOUS owner, which silently stops per-user name uniqueness being
-	// enforced for it. Callers must derive it from the OPENED name, since 00040
-	// made the stored column ciphertext and an index over ciphertext is an index
-	// over a value that changes on every write.
+	// Personal transfers change u:<user>; collection transfers retain
+	// c:<collection> but still recompute to upgrade pre-00045 user-scoped tokens.
+	// Callers derive it from the OPENED name, since 00040 made the stored column
+	// ciphertext and an index over ciphertext changes on every write.
 	NameBidx string
 }
 
@@ -262,6 +261,9 @@ func TransferSecretOwnership(ctx context.Context, q *db.Queries, p TransferProof
 
 	if err := p.authorizes(params.ID, params.NewOwnerUserID); err != nil {
 		return nil, err
+	}
+	if params.NameBidx == "" {
+		return nil, fmt.Errorf("vaultegress: refusing to move the owner of entry %s without its destination-scoped name index", params.ID)
 	}
 	return writer(q).TransferVaultEntrySecretOwner(ctx, egressq.TransferVaultEntrySecretOwnerParams{
 		UserID:            params.NewOwnerUserID,

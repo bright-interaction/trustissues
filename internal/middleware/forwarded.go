@@ -3,6 +3,7 @@ package middleware
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -50,32 +51,33 @@ func forwardedChain(h http.Header, name string) []string {
 	return out
 }
 
-// peerIsPrivate reports the direct socket peer's IP and whether it is loopback
-// or RFC1918, that is, whether the connection came from our own reverse proxy
-// on the container network rather than from the internet.
-//
-// This is deliberately SEPARATE from the trusted-hop count, because the two
-// answer different questions and conflating them cost production its HSTS
-// header. "How many proxies append to X-Forwarded-For" is a statement about the
-// XFF chain's shape. "Did this connection come from our own proxy" is a
-// statement about the socket. An operator who sets TRUSTED_PROXY_HOPS=0 is
-// saying the first thing (attribute rate limits to the direct peer, ignore XFF)
-// and is NOT saying their proxy stopped terminating TLS.
-func peerIsPrivate(r *http.Request) (remoteIP string, private bool) {
+// peerIsConfiguredProxy reports the direct socket peer's IP and whether it is
+// in the operator's explicit proxy set. A private address is not sufficient:
+// production container bridges are shared with unrelated workloads, and any
+// peer we trust here can choose rate-limit and audit identities through XFF.
+func peerIsConfiguredProxy(r *http.Request) (remoteIP string, trusted bool) {
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteIP = r.RemoteAddr
 	}
-	parsed := net.ParseIP(remoteIP)
-	return remoteIP, parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate())
+	parsed, err := netip.ParseAddr(strings.Trim(remoteIP, "[]"))
+	if err != nil || parsed.Zone() != "" {
+		return remoteIP, false
+	}
+	parsed = parsed.Unmap()
+	for _, prefix := range trustedProxyPeers {
+		if prefix.Contains(parsed) {
+			return remoteIP, true
+		}
+	}
+	return remoteIP, false
 }
 
-// peerIsTrustedProxy is peerIsPrivate AND a positive hop count: the gate for
-// reading the X-Forwarded-For chain, where the hop count is what makes the
-// index meaningful.
+// peerIsTrustedProxy is explicit peer trust AND a positive hop count: the gate
+// for reading X-Forwarded-For, where the hop count makes the index meaningful.
 func peerIsTrustedProxy(r *http.Request) (remoteIP string, trusted bool) {
-	remoteIP, private := peerIsPrivate(r)
-	return remoteIP, trustedProxyHops > 0 && private
+	remoteIP, configured := peerIsConfiguredProxy(r)
+	return remoteIP, trustedProxyHops > 0 && configured
 }
 
 // ForwardedProtoHTTPS reports whether the ORIGINAL client reached the edge over
@@ -116,7 +118,7 @@ func peerIsTrustedProxy(r *http.Request) (remoteIP string, trusted bool) {
 // strips the HSTS pin from real users and puts capability tokens on port 80.
 // Given a choice of which way to be wrong, be wrong upward.
 //
-// Gated on peerIsPrivate rather than peerIsTrustedProxy: a caller reaching the
+// Gated on peerIsConfiguredProxy rather than peerIsTrustedProxy: a caller reaching the
 // port directly from a public address still cannot assert its own transport
 // security, but an operator running with TRUSTED_PROXY_HOPS=0 behind a
 // TLS-terminating proxy keeps working.
@@ -124,7 +126,16 @@ func ForwardedProtoHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if _, private := peerIsPrivate(r); !private {
+	// The private listener has an explicit HTTPS origin in configuration and is
+	// reachable only through the application-owned Unix socket. Its local proxy
+	// hop is plaintext HTTP by design, so neither r.TLS nor a TCP peer exists at
+	// this boundary. Treat the listener stamp as the transport contract instead
+	// of trusting an X-Forwarded-Proto header from request data. This preserves
+	// HSTS and keeps minted capability/MCP URLs on https for private users.
+	if IsPrivateIngress(r.Context()) {
+		return true
+	}
+	if _, trusted := peerIsConfiguredProxy(r); !trusted {
 		return false
 	}
 	chain := forwardedChain(r.Header, "X-Forwarded-Proto")

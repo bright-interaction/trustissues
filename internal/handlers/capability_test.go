@@ -109,8 +109,8 @@ func TestRedactUpstreamError(t *testing.T) {
 // a public address, and expect https, which is the permissive behaviour that
 // let any caller on any connection assert its own transport security. The
 // production deploy (nginx -> Caddy -> app, TRUSTED_PROXY_HOPS=2) reaches the
-// server from a private container address, so it still gets https; a caller
-// talking to the port directly no longer does.
+// server from Caddy's explicitly configured container address, so it still gets
+// https; a caller talking to the port directly no longer does.
 func TestProxyBaseURL(t *testing.T) {
 	t.Run("a trusted proxy is believed", func(t *testing.T) {
 		// AT THE PRODUCTION HOP COUNT. This test's comment named hops=2 while the
@@ -118,7 +118,15 @@ func TestProxyBaseURL(t *testing.T) {
 		// a live CRITICAL that only existed at 2. A test that pins production
 		// behaviour has to configure production.
 		middleware.ConfigureProxy(2, false)
-		t.Cleanup(func() { middleware.ConfigureProxy(1, false) })
+		if err := middleware.ConfigureTrustedProxyPeers("10.0.0.2/32"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			middleware.ConfigureProxy(1, false)
+			if err := middleware.ConfigureTrustedProxyPeers("127.0.0.1/32,::1/128"); err != nil {
+				t.Errorf("restore proxy peer defaults: %v", err)
+			}
+		})
 		r := httptest.NewRequest("POST", "/api/secrets/issue", nil)
 		r.Host = "trustissues.example.com"
 		r.RemoteAddr = "10.0.0.2:4444" // the reverse proxy, on the container network
@@ -327,7 +335,7 @@ func TestCapability_E2E_HappyPath(t *testing.T) {
 	// directly via the package against the test upstream host.
 	signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 	freshToken, err := capability.Sign(capability.Token{
-		Secret: "openai_test_key", SecretID: secretID, Agent: agentID,
+		Secret: "openai_test_key", SecretID: secretID, Issuer: userID, Agent: agentID,
 		Dests:  []string{upstreamURL.Host + "/*"},
 		Method: "POST",
 	}, signingKey, time.Minute)
@@ -400,7 +408,7 @@ func TestCapability_E2E_DestinationMismatch(t *testing.T) {
 
 	signingKey, _ := capability.DeriveSigningKey(testCapVaultKey)
 	tok, _ := capability.Sign(capability.Token{
-		Secret: "openai", SecretID: secretID, Agent: agentID,
+		Secret: "openai", SecretID: secretID, Issuer: userID, Agent: agentID,
 		Dests:  []string{"api.openai.com/*"},
 		Method: "POST",
 	}, signingKey, time.Minute)
@@ -513,6 +521,11 @@ func newTestDB(t *testing.T) *sql.DB {
 			totp_enabled INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
+		CREATE TABLE collections (
+			id TEXT PRIMARY KEY,
+			private_access_policy TEXT NOT NULL DEFAULT 'standard'
+				CHECK(private_access_policy IN ('standard', 'sensitive_private', 'fully_private'))
+		);
 		CREATE TABLE vault_entries (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
@@ -584,6 +597,12 @@ func newTestDB(t *testing.T) *sql.DB {
 		BEGIN
 			INSERT OR IGNORE INTO users (id, email)
 			VALUES (NEW.user_id, NEW.user_id || '@fixture.test');
+		END`,
+		`CREATE TRIGGER fixture_seed_collection AFTER INSERT ON vault_entries
+		WHEN NEW.collection_id IS NOT NULL
+		BEGIN
+			INSERT OR IGNORE INTO collections (id, private_access_policy)
+			VALUES (NEW.collection_id, 'standard');
 		END`,
 	}
 	for _, s := range stmts {

@@ -77,21 +77,42 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Admit the operation against one immutable view of the entry. In
+	// particular, the spend/write grants, private-access policy, provider
+	// coordinates and ciphertext must not come from different collection states.
+	// Commit before the provider call: a revoke can take seconds and must not
+	// hold SQLite's writer lock. As with Rotate and ValidateKey, promotion that
+	// committed before this snapshot is enforced; an already-admitted operation
+	// is allowed to finish.
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.pending_revoke.retry: snapshot failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+
 	// The spend right. entryCurrentlyUsableBy has no admin bypass by design (it
 	// answers "may THIS user spend it"), so an instance admin gets an explicit
 	// one here, exactly like ValidateKey.
-	if !middleware.IsAdmin(ctx) && !h.entryCurrentlyUsableBy(ctx, userID, id) {
+	if !middleware.IsAdmin(ctx) && !txHandler.entryCurrentlyUsableBy(ctx, userID, id) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
 	// The write right, ADDITIONALLY: this persists provider_meta on both the
 	// success and the failure path, which ValidateKey never does.
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
+	}
 
-	meta, err := h.queries.GetVaultEntryMeta(ctx, id)
+	meta, err := qtx.GetVaultEntryMeta(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -111,7 +132,7 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	entryRow, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	entryRow, err := qtx.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "entry not found")
 		return
@@ -161,11 +182,16 @@ func (h *VaultHandler) RetryPendingRevoke(w http.ResponseWriter, r *http.Request
 	// silently skipping the AI-gateway pin check and the fail-closed read on a
 	// provider-pin lookup error. See spendProviderSecret's doc: "the three paths
 	// that SPEND"; this endpoint is the fourth.
-	spendCtx, _, egressErr := spendProviderSecret(ctx, h.queries, current, id, provider, providerMeta)
+	spendCtx, _, egressErr := spendProviderSecret(ctx, qtx, current, id, provider, providerMeta)
 	if egressErr != nil {
 		logError(r, "vault.pending_revoke.retry: refusing to spend against this provider configuration",
 			"entry", id, "user", userID, "error", egressErr)
 		writeError(w, r, http.StatusForbidden, "destination_pinned", egressErr.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.pending_revoke.retry: snapshot commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
 		return
 	}
 
@@ -303,12 +329,31 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
+	// This endpoint is metadata-only, so keep authorization, transport policy,
+	// acknowledgement validation and both CAS writes in one write transaction.
+	// A concurrent promotion therefore lands wholly before or after this edit;
+	// a public request can never pass as standard and then mutate a protected
+	// entry.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.pending_revoke.resolve: transaction failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
+	}
 
-	entryRow, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	entryRow, err := qtx.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -332,7 +377,7 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 	entryName := ""
 	provider := ""
 	lastRotationError := ""
-	if metaRow, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr == nil {
+	if metaRow, mErr := qtx.GetVaultEntryMeta(ctx, id); mErr == nil {
 		entryName = h.EntryNamePlain(metaRow.Name)
 		provider = metaRow.Provider.String
 		lastRotationError = metaRow.LastRotationError.String
@@ -349,7 +394,7 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 	// nil: telling the client "resolved, nothing outstanding" while another key is
 	// still live at the vendor is the same false-assurance failure this whole
 	// change exists to remove.
-	result, applied, midFlight, persistErr := h.casEditProviderMeta(ctx, id, provider, targetURL, raw, meta, casToken,
+	result, applied, midFlight, persistErr := txHandler.casEditProviderMeta(ctx, id, provider, targetURL, raw, meta, casToken,
 		func(m map[string]string) {
 			dischargePendingRevokeHead(m)
 		})
@@ -372,7 +417,7 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 	// column without ever touching provider_meta, so the CAS proves nothing
 	// about it. Narrower window than retry (no network call in between) and the
 	// same durable harm if it loses.
-	if freshRow, fErr := h.queries.GetVaultEntryMeta(ctx, id); fErr != nil {
+	if freshRow, fErr := qtx.GetVaultEntryMeta(ctx, id); fErr != nil {
 		logError(r, "vault.pending_revoke.resolve: could not re-read last_rotation_error, leaving it alone",
 			"entry", id, "error", fErr)
 	} else if freshRow.LastRotationError.String != lastRotationError {
@@ -382,9 +427,14 @@ func (h *VaultHandler) ResolvePendingRevoke(w http.ResponseWriter, r *http.Reque
 		// ONLY the key the operator named. The acknowledgement is an explicit
 		// statement about one key ("I have confirmed THAT one is not a concern"),
 		// so it may not settle an alarm about any other.
-		h.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.resolve", id,
+		txHandler.clearRevokeHalfOfRotationError(ctx, r, "vault.pending_revoke.resolve", id,
 			freshRow.LastRotationError.String, freshRow.ProviderMeta,
 			[]string{req.AcknowledgedKeyID})
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.pending_revoke.resolve: commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "failed to resolve the pending revoke")
+		return
 	}
 
 	userID := middleware.GetUserID(r.Context())

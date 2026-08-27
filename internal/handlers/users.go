@@ -3,11 +3,10 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/emailidentity"
 	"github.com/bright-interaction/trustissues/internal/middleware"
 	"github.com/bright-interaction/trustissues/internal/passwordhash"
 	"github.com/go-chi/chi/v5"
@@ -22,8 +22,10 @@ import (
 
 // UserHandler handles admin user CRUD and invitation endpoints.
 type UserHandler struct {
-	queries *db.Queries
-	cfg     *config.Config
+	queries                  *db.Queries
+	cfg                      *config.Config
+	inviteRandom             io.Reader
+	invitationPasswordHasher func(string) (string, error)
 	// vault is optional and used only to detach a disabled user's rotation
 	// delivery targets. Wired by SetVault after construction because the vault
 	// handler is built later in main; nil simply skips the purge, and the
@@ -33,7 +35,12 @@ type UserHandler struct {
 
 // NewUserHandler creates a new UserHandler.
 func NewUserHandler(queries *db.Queries, cfg *config.Config) *UserHandler {
-	return &UserHandler{queries: queries, cfg: cfg}
+	return &UserHandler{
+		queries:                  queries,
+		cfg:                      cfg,
+		inviteRandom:             rand.Reader,
+		invitationPasswordHasher: passwordhash.Hash,
+	}
 }
 
 // SetVault wires the vault handler used to purge rotation targets when an
@@ -69,7 +76,7 @@ type updateUserRequest struct {
 // List handles GET /api/admin/users - returns all users with their vault
 // entry counts.
 func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.queries.ListUsersWithEntryCount(r.Context())
+	rows, err := h.queries.ListUsersWithEntryCount(r.Context(), privateIngressSQLFlag(r.Context()))
 	if err != nil {
 		logError(r, "users.list: query failed", "error", err)
 		writeInternalError(w, r, "internal server error")
@@ -100,6 +107,7 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid request body")
 		return
 	}
+	req.Email = emailidentity.Canonical(req.Email)
 
 	if err := ValidateRequired("email", req.Email); err != nil {
 		writeValidationError(w, r, err.Error())
@@ -118,6 +126,15 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validRoles[req.Role] {
 		writeValidationError(w, r, "role must be one of: admin, user, vault_only")
+		return
+	}
+	// An instance admin is automatically a manager of every collection and has
+	// full use/manage rights over every vault entry. Once the optional private
+	// listener exists, minting that global authority is therefore part of the
+	// private control plane. Gate from the requested role before any account
+	// lookup/insert so the public response cannot reveal whether the address is
+	// already registered. Ordinary user/client creation remains public.
+	if req.Role == middleware.RoleAdmin && !requireConfiguredPrivateControlPlaneIngress(w, r) {
 		return
 	}
 	if req.Name != "" {
@@ -176,6 +193,16 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var req updateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, r, "invalid request body")
+		return
+	}
+
+	// Gate access-expanding request SHAPES before resolving the target. A public
+	// caller receives the same refusal for a missing, disabled, already-enabled,
+	// admin, or non-admin id. Disabling and demotion remain public emergency
+	// reductions; promoting to global admin or re-enabling an account does not.
+	expandsAccess := (req.Role != nil && *req.Role == middleware.RoleAdmin) ||
+		(req.Disabled != nil && !*req.Disabled)
+	if expandsAccess && !requireConfiguredPrivateControlPlaneIngress(w, r) {
 		return
 	}
 
@@ -296,6 +323,12 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 // the vault feature's concern (its FK/cleanup is defined in its own
 // migrations).
 func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	// With the optional connector configured, hard offboarding is uniformly a
+	// private control-plane operation. Gate before reading the target or even
+	// comparing it with the caller so public responses cannot reveal state.
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 	targetID := chi.URLParam(r, "id")
 	callerID := middleware.GetUserID(r.Context())
 
@@ -304,7 +337,26 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := h.queries.GetUserByID(r.Context(), targetID)
+	// Hard deletion is one offboarding mutation, not a DELETE followed by a
+	// best-effort repair. Start the write transaction before reading the target,
+	// collection policy or admin count so a concurrent policy promotion or role
+	// change is observed before any credential, target or vault row is touched.
+	tx, qtx, err := beginQueriesTx(r.Context(), h.queries, nil)
+	if err != nil {
+		logError(r, "users.delete: begin failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	txh := *h
+	txh.queries = qtx
+	if h.vault != nil {
+		txVault := *h.vault
+		txVault.queries = qtx
+		txh.vault = &txVault
+	}
+
+	target, err := qtx.GetUserByID(r.Context(), targetID)
 	if err == sql.ErrNoRows {
 		writeNotFound(w, r, "user not found")
 		return
@@ -315,15 +367,37 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The DELETE below carries its own last-admin guard (see
-	// DeleteUserIfNotLastAdmin), so this pre-check is only a fast, friendly
-	// rejection. The authoritative refusal is the RowsAffected == 0 branch at
-	// the write itself, because a count taken here and a delete run afterwards
-	// are two separate statements and two concurrent deletes both pass a
-	// pre-check.
+	// This friendly pre-check now shares the DELETE's write transaction. The
+	// conditional DELETE remains the final invariant, so the last-admin rule is
+	// still carried by the write even if this handler is changed later.
 	if target.Role == "admin" && target.Disabled == 0 {
-		if err := h.ensureNotLastAdmin(r.Context()); err != nil {
-			writeBadRequest(w, r, err.Error())
+		count, countErr := qtx.CountAdmins(r.Context())
+		if countErr != nil {
+			logError(r, "users.delete: admin count failed", "error", countErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		if count <= 1 {
+			writeBadRequest(w, r, "cannot remove the last active admin")
+			return
+		}
+	}
+	// Hard delete re-owns shared entries and removes collection memberships. It
+	// is not merely incident-response revocation, so only a target whose removal
+	// actually touches a protected collection needs private ingress. Disable and
+	// demotion remain public emergency reductions. Password replacement is gated
+	// separately because an attacker chooses a new login credential, so it is not
+	// a pure reduction. DeleteUserIfNotLastAdmin repeats this predicate on the
+	// write itself to close a concurrent policy-promotion window.
+	if !middleware.IsPrivateIngress(r.Context()) {
+		protected, impactErr := qtx.UserHasProtectedCollectionImpact(r.Context(), targetID)
+		if impactErr != nil {
+			logError(r, "users.delete: protected-impact lookup failed", "error", impactErr)
+			writeInternalError(w, r, "private access policy could not be verified")
+			return
+		}
+		if protected {
+			writePrivateIngressRequired(w, r)
 			return
 		}
 	}
@@ -333,48 +407,53 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// delete previously did none of this, so it was strictly weaker than the
 	// Disable toggle next to it.
 	//
-	// Only the REVERSIBLE half runs here. invalidateCredentials revokes
-	// sessions, API keys and service identities and purges rotation targets,
-	// which is the right outcome for a user being removed and is recoverable
-	// (re-mint, re-add) if the delete is then refused. The IRREVERSIBLE half,
-	// deleting the personal vault, is deliberately deferred until after the
-	// authoritative guard has run.
-	invalidateCredentials(r, h.queries, h.vault, targetID, target.Email, "Deleting")
+	// Every half runs inside this transaction. The strict cleanup revokes
+	// credentials, purges targets, transfers the shared vault and deletes the
+	// personal one. If any step, verification or the authoritative DELETE
+	// refuses, all of those writes roll back together. Operator-facing audit is
+	// emitted only after commit, so sealing names never reaches out to the pool
+	// while this transaction owns SQLite's write connection.
+	cleanupSummary, cleanupErr := txh.hardDeleteCleanup(r.Context(), targetID, target.Email, callerID)
+	if cleanupErr != nil {
+		logError(r, "users.delete: offboarding cleanup failed", "user", targetID, "error", cleanupErr)
+		writeInternalError(w, r, "user was not deleted because offboarding could not be completed safely")
+		return
+	}
+	if verifyErr := txh.verifyHardDeleteCleanup(r.Context(), targetID); verifyErr != nil {
+		logError(r, "users.delete: offboarding cleanup failed", "user", targetID, "error", verifyErr)
+		writeInternalError(w, r, "user was not deleted because offboarding could not be completed safely")
+		return
+	}
 
 	// The guard is ON the delete, so a concurrent second delete cannot slip
 	// between a count and a write and take the last admin with it. The
 	// pre-check above still runs first, because it rejects the ordinary case
 	// BEFORE offboarding side effects; this is the authoritative refusal for
 	// the racing case.
-	result, err := h.queries.DeleteUserIfNotLastAdmin(r.Context(), targetID)
+	result, err := qtx.DeleteUserIfNotLastAdmin(r.Context(), db.DeleteUserIfNotLastAdminParams{
+		ID:             targetID,
+		PrivateIngress: privateIngressSQLFlag(r.Context()),
+	})
 	if err != nil {
 		logError(r, "users.delete: delete failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 	if rows, _ := result.RowsAffected(); rows == 0 {
-		// Zero rows now means EITHER no such user OR the guard refused, and
-		// answering "user not found" for a refusal would be a lie that reads as
-		// "already gone". Ask which one it was.
-		if _, lookupErr := h.queries.GetUserByID(r.Context(), targetID); lookupErr == nil {
-			writeBadRequest(w, r, "cannot remove the last active admin")
-			return
-		}
-		writeNotFound(w, r, "user not found")
+		// Target existence, policy and the admin count were all read after this
+		// transaction acquired the write lock. A zero-row result can therefore
+		// only be the statement's last-admin guard refusing the mutation.
+		writeBadRequest(w, r, "cannot remove the last active admin")
 		return
 	}
 
-	// The vault goes ONLY after the delete is authorized and committed.
-	//
-	// This used to run three statements earlier, before DeleteUserIfNotLastAdmin,
-	// with no transaction spanning the two. So a delete the guard then REFUSED
-	// (the racing last-admin case) or that errored had already hard-deleted every
-	// personal entry the user owned and re-owned their shared entries, and the
-	// API returned failure over a vault that was already gone. There is no undo
-	// for that inside the product: the rows are DELETEd, not soft-deleted, and
-	// the only copy is whatever backup.sh last wrote.
-	h.disposeVaultEntriesOnDelete(r, targetID, target.Email, middleware.GetUserID(r.Context()))
+	if err := tx.Commit(); err != nil {
+		logError(r, "users.delete: commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
+	h.logHardDeleteSummary(r, target.Email, cleanupSummary)
 	LogActivityFromRequest(h.queries, r, "admin.user_deleted",
 		fmt.Sprintf("User %s deleted", target.Email))
 
@@ -389,6 +468,14 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // stolen admin API key uses to escalate to a login it controls. Admins change
 // their own password through ChangePassword instead.
 func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	// Choosing a replacement credential is an access-establishing control-plane
+	// action, even though it also revokes the target's old credentials. A stolen
+	// public admin session could otherwise reset a different administrator and
+	// persist as that account. Gate before resolving either id so public ingress
+	// cannot use response differences as an account or role oracle.
+	if !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 	targetID := chi.URLParam(r, "id")
 	callerID := middleware.GetUserID(r.Context())
 
@@ -430,7 +517,7 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	// SetPasswordHash, not UpdatePasswordHash: an admin choosing this password
 	// on the target's behalf is exactly the kind of human-set password that
 	// TOTPVerify should later accept as proof of identity, including for a
-	// vault_only account that started out password-less. See migration 00043.
+	// legacy password_set=0 account created by an older release.
 	if err := h.queries.SetPasswordHash(r.Context(), db.SetPasswordHashParams{
 		PasswordHash: hash,
 		ID:           targetID,
@@ -492,20 +579,8 @@ type redeemInvitationRequest struct {
 	Password string `json:"password"`
 }
 
-// invitationAPIKeyTTL time-boxes the extension key minted by the PUBLIC redeem
-// endpoint. That key is bootstrapped from an invitation code rather than from a
-// session, so it is never permanent: it ages out on its own, it shows up in the
-// owner's GET /api/api-keys list like any other key, and an admin can revoke it
-// from the admin API-key routes at any time.
-const invitationAPIKeyTTL = 90 * 24 * time.Hour
-
 type redeemInvitationResponse struct {
-	APIKey string `json:"api_key,omitempty"`
-	// When the bootstrapped key expires, so the extension can warn before it
-	// stops working and the user can mint a replacement.
-	APIKeyExpiresAt string `json:"api_key_expires_at,omitempty"`
-	ServerURL       string `json:"server_url"`
-	User            struct {
+	User struct {
 		ID    string `json:"id"`
 		Email string `json:"email"`
 		Name  string `json:"name"`
@@ -516,17 +591,16 @@ type redeemInvitationResponse struct {
 // inviteCharset excludes 0/O/1/I to avoid confusion.
 const inviteCharset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-func generateInviteCode() string {
+func generateInviteCode(random io.Reader) (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback: should never happen
-		return "INV-FALLBK"
+	if _, err := io.ReadFull(random, b); err != nil {
+		return "", fmt.Errorf("read invitation entropy: %w", err)
 	}
 	code := make([]byte, 16)
 	for i := range code {
 		code[i] = inviteCharset[int(b[i])%len(inviteCharset)]
 	}
-	return "INV-" + string(code)
+	return "INV-" + string(code), nil
 }
 
 // ListInvitations handles GET /api/admin/invitations - returns all invitations.
@@ -571,7 +645,7 @@ func (h *UserHandler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Email = strings.TrimSpace(req.Email)
+	req.Email = emailidentity.Canonical(req.Email)
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Email == "" {
 		writeBadRequest(w, r, "email is required")
@@ -588,9 +662,21 @@ func (h *UserHandler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, r, "role must be one of: admin, user, vault_only")
 		return
 	}
+	// Admin invitations delegate the same instance-wide authority as direct
+	// admin creation. Keep ordinary user/vault_only client onboarding public,
+	// but require the configured private control plane to mint an admin bearer
+	// invitation.
+	if req.Role == middleware.RoleAdmin && !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 
 	adminID := middleware.GetUserID(ctx)
-	code := generateInviteCode()
+	code, codeErr := generateInviteCode(h.inviteRandom)
+	if codeErr != nil {
+		logError(r, "invitations.create: secure random source failed", "error", codeErr)
+		writeInternalError(w, r, "failed to create invitation")
+		return
+	}
 	expiresAt := time.Now().UTC().Add(48 * time.Hour)
 
 	// Refuse rather than storing an unrecoverable code: see sealInviteCode.
@@ -715,8 +801,9 @@ func (h *UserHandler) ResendInvitation(w http.ResponseWriter, r *http.Request) {
 
 // RedeemInvitation handles POST /api/invitations/redeem - redeems an
 // invitation code. This endpoint is public (no auth required) but
-// rate-limited. vault_only redemptions get an API key for the browser
-// extension; other roles log in with their password afterwards.
+// rate-limited. Every invitee chooses a password here, then signs in through
+// the ordinary interactive web flow. API keys can only be minted later from
+// that authenticated interactive session.
 func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -732,10 +819,19 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Expire stale invitations
-	h.queries.ExpireStaleInvitations(ctx)
+	codeHash := hashInviteCode(req.Code)
 
-	inv, err := h.queries.GetPendingInvitationByCode(ctx, hashInviteCode(req.Code))
+	// This first lookup is only a preflight. Password hashing is intentionally
+	// kept outside the write transaction, but NONE of the
+	// authority established here is trusted for a write. The invitation is read
+	// again after BEGIN IMMEDIATE below, and the conditional consume travels in
+	// the same transaction as the user and pending-seat writes.
+	if err := h.queries.ExpireStaleInvitations(ctx); err != nil {
+		logError(r, "invitations.redeem: expire stale invitations failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	inv, err := h.queries.GetPendingInvitationByCode(ctx, codeHash)
 	if err == sql.ErrNoRows {
 		writeBadRequest(w, r, "invalid or expired invitation code")
 		return
@@ -745,56 +841,101 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	// The code is itself the high-entropy bearer credential for this invitation,
+	// so its holder may learn that admin onboarding needs the private origin. Gate
+	// before password hashing or any account/key/membership write. Ordinary and
+	// vault_only invitation redemption stays available on public ingress.
+	if inv.TargetRole == middleware.RoleAdmin && !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
 
-	// Use the provided password or generate a random one (vault_only
-	// extension users authenticate with the API key, not the password).
-	//
-	// humanSetPassword records which branch this is BEFORE password gets
-	// overwritten below, and is stored on the row as password_set (migration
-	// 00043). A password minted here is hashed and then discarded a few lines
-	// down: nobody, including the account's own owner, ever learns it, so it
-	// must not be treated as a credential TOTPVerify can demand later. See the
-	// password_set comment on TOTPVerify for why that distinction matters.
-	humanSetPassword := req.Password != ""
+	// Invitations create human accounts, including vault_only client accounts.
+	// Requiring a password for every role makes the web login the sole bootstrap
+	// authority; the public bearer invitation never mints a reusable API key.
 	password := req.Password
 	if password == "" {
-		pwBytes := make([]byte, 32)
-		if _, err := rand.Read(pwBytes); err != nil {
-			// Never fall through with a zeroed buffer: that would be a known
-			// password on a real account.
-			logError(r, "invitations.redeem: failed to generate password", "error", err)
-			writeInternalError(w, r, "internal server error")
-			return
-		}
-		password = hex.EncodeToString(pwBytes)
-	} else if err := validatePasswordWithPolicy(ctx, h.queries, password); err != nil {
+		writeBadRequest(w, r, "password is required for this invitation")
+		return
+	}
+	if err := validatePasswordWithPolicy(ctx, h.queries, password); err != nil {
 		writeBadRequest(w, r, "password "+err.(*ValidationError).Message)
 		return
 	}
 
-	passwordHash, err := passwordhash.Hash(password)
+	passwordHash, err := h.invitationPasswordHasher(password)
 	if err != nil {
 		logError(r, "invitations.redeem: failed to hash password", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 
-	// Check if a user with this email already exists
-	if _, err = h.queries.GetUserIDByEmailForInvite(ctx, inv.Email); err == nil {
-		writeConflict(w, r, "a user with this email already exists")
+	// Production opens SQLite with _txlock=immediate. The transaction therefore
+	// takes the writer lock before this authoritative re-read: deletion,
+	// expiration, another redemption, user creation, and collection-seat claims
+	// cannot interleave between the check and the final conditional consume.
+	tx, qtx, err := beginQueriesTx(ctx, h.queries, nil)
+	if err != nil {
+		logError(r, "invitations.redeem: begin transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() // no-op after Commit
+
+	if err := qtx.ExpireStaleInvitations(ctx); err != nil {
+		logError(r, "invitations.redeem: expire stale invitations in transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	txInv, err := qtx.GetPendingInvitationByCode(ctx, codeHash)
+	if err == sql.ErrNoRows {
+		writeBadRequest(w, r, "invalid or expired invitation code")
+		return
+	}
+	if err != nil {
+		logError(r, "invitations.redeem: transactional invitation query failed", "error", err)
+		writeInternalError(w, r, "internal server error")
 		return
 	}
 
-	passwordSet := int64(0)
-	if humanSetPassword {
-		passwordSet = 1
+	// No product route mutates these fields, but bind the expensive preflight to
+	// the exact row shape that is now authoritative. This also prevents a direct
+	// database edit from switching the bearer to a stronger role between reads.
+	if txInv.ID != inv.ID || txInv.Email != inv.Email || txInv.Name != inv.Name ||
+		txInv.TargetRole != inv.TargetRole {
+		writeBadRequest(w, r, "invalid or expired invitation code")
+		return
 	}
-	userID, err := h.queries.CreateInvitedUser(ctx, db.CreateInvitedUserParams{
-		Email:        inv.Email,
+	if txInv.TargetRole == middleware.RoleAdmin && !requireConfiguredPrivateControlPlaneIngress(w, r) {
+		return
+	}
+	// The preflight password check keeps expensive hashing outside the
+	// transaction, but the policy can change before the writer lock is acquired.
+	// Re-check the current policy while holding that lock.
+	if password == "" {
+		writeBadRequest(w, r, "password is required for this invitation")
+		return
+	}
+	if err := validatePasswordWithPolicy(ctx, qtx, password); err != nil {
+		writeBadRequest(w, r, "password "+err.(*ValidationError).Message)
+		return
+	}
+	identityEmail := emailidentity.Canonical(txInv.Email)
+
+	if _, lookupErr := qtx.GetUserIDByEmailForInvite(ctx, identityEmail); lookupErr == nil {
+		writeConflict(w, r, "a user with this email already exists")
+		return
+	} else if lookupErr != sql.ErrNoRows {
+		logError(r, "invitations.redeem: user lookup failed", "error", lookupErr)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+
+	userID, err := qtx.CreateInvitedUser(ctx, db.CreateInvitedUserParams{
+		Email:        identityEmail,
 		PasswordHash: passwordHash,
-		Name:         toNullString(inv.Name),
-		Role:         inv.TargetRole,
-		PasswordSet:  passwordSet,
+		Name:         toNullString(txInv.Name),
+		Role:         txInv.TargetRole,
+		PasswordSet:  1,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -806,69 +947,47 @@ func (h *UserHandler) RedeemInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The address may have been invited to a collection before it had an
-	// account. This is the client-onboarding path: a manager invites the client,
-	// the operator sends them an instance invitation code, and the collection
-	// seat has to become a pending membership they can accept. See
-	// claimCollectionInvitations.
-	claimCollectionInvitationsBestEffort(ctx, h.queries, userID, inv.Email)
-
-	resp := redeemInvitationResponse{
-		ServerURL: h.cfg.BaseURL,
+	// A seat claim is part of onboarding, not best-effort cleanup. If any claim
+	// fails, rolling back the new account leaves the invitation redeemable after
+	// the underlying problem is repaired instead of stranding a client account.
+	if _, err := claimCollectionInvitations(ctx, qtx, userID, identityEmail); err != nil {
+		logError(r, "invitations.redeem: claim collection invitations failed", "error", err)
+		writeInternalError(w, r, "failed to create user")
+		return
 	}
+
+	resp := redeemInvitationResponse{}
 	resp.User.ID = userID
-	resp.User.Email = inv.Email
-	resp.User.Name = inv.Name
-	resp.User.Role = inv.TargetRole
+	resp.User.Email = txInv.Email
+	resp.User.Name = txInv.Name
+	resp.User.Role = txInv.TargetRole
 
-	// vault_only users get an API key for the browser extension. This is the
-	// one credential this server hands out over an unauthenticated endpoint,
-	// so it is deliberately time-boxed (invitationAPIKeyTTL) rather than
-	// permanent, and it is an ordinary api_keys row: it appears in the owner's
-	// key list, the owner can delete it, and an admin can revoke it.
-	if inv.TargetRole == "vault_only" {
-		keyBytes := make([]byte, 32)
-		if _, err := rand.Read(keyBytes); err != nil {
-			logError(r, "invitations.redeem: failed to generate key", "error", err)
-			writeInternalError(w, r, "failed to create API key")
-			return
-		}
-		rawKey := hex.EncodeToString(keyBytes)
-		fullKey := "ti_" + rawKey
-
-		hash := sha256.Sum256([]byte(fullKey))
-		keyHash := hex.EncodeToString(hash[:])
-
-		now := time.Now().UTC()
-		expiresAt := now.Add(invitationAPIKeyTTL)
-		err = h.queries.CreateAPIKeyForUser(ctx, db.CreateAPIKeyForUserParams{
-			ID:        generateID(),
-			UserID:    userID,
-			Name:      "Vault Extension",
-			KeyHash:   keyHash,
-			KeyPrefix: rawKey[:8],
-			ExpiresAt: sql.NullTime{Time: expiresAt, Valid: true},
-			CreatedAt: sql.NullTime{Time: now, Valid: true},
-		})
-		if err != nil {
-			logError(r, "invitations.redeem: create API key failed", "error", err)
-			writeInternalError(w, r, "failed to create API key")
-			return
-		}
-		resp.APIKey = fullKey
-		resp.APIKeyExpiresAt = expiresAt.Format(time.RFC3339)
+	consume, err := qtx.MarkInvitationRedeemedIfPending(ctx, db.MarkInvitationRedeemedIfPendingParams{
+		RedeemedBy: toNullString(userID),
+		ID:         txInv.ID,
+		CodeHash:   codeHash,
+	})
+	if err != nil {
+		logError(r, "invitations.redeem: consume invitation failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	consumedRows, rowsErr := consume.RowsAffected()
+	if rowsErr != nil || consumedRows != 1 {
+		logError(r, "invitations.redeem: invitation was not consumed",
+			"rows", consumedRows, "error", rowsErr)
+		writeBadRequest(w, r, "invalid or expired invitation code")
+		return
 	}
 
-	// Mark invitation as redeemed
-	if err := h.queries.MarkInvitationRedeemed(ctx, db.MarkInvitationRedeemedParams{
-		RedeemedBy: toNullString(userID),
-		ID:         inv.ID,
-	}); err != nil {
-		logError(r, "invitations.redeem: update invitation failed", "error", err)
+	if err := tx.Commit(); err != nil {
+		logError(r, "invitations.redeem: commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
 	}
 
 	LogActivityFromRequest(h.queries, r, "invitation.redeemed",
-		fmt.Sprintf("Invitation redeemed by %s (role %s)", inv.Email, inv.TargetRole))
+		fmt.Sprintf("Invitation redeemed by %s (role %s)", txInv.Email, txInv.TargetRole))
 
 	writeJSON(w, http.StatusOK, resp)
 }

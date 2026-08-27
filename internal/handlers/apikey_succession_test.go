@@ -2,108 +2,81 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/bright-interaction/trustissues/internal/middleware"
 )
 
-// A minted API key must never outlive the API key that minted it.
+// An API key must not mint a successor at all.
 //
 // POST /api/api-keys accepts X-API-Key as authentication and mounts with neither
-// AdminOnly nor VaultOnlyBlock, so an API key was sufficient to mint another API key:
-// no password, no TOTP, no session. Omitting expires_in_days left expires_at NULL, and
-// the auth path's `expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`
-// can never be true for NULL, so the successor was permanent.
+// AdminOnly nor VaultOnlyBlock, so a stolen API key was sufficient to mint another
+// API key: no password, no TOTP, no session.
 //
-// That voids the one invariant the product documents for a credential it hands out over
-// a PUBLIC endpoint: RedeemInvitation's vault_only extension key is "deliberately
-// time-boxed (invitationAPIKeyTTL) rather than permanent" at 90 days. Anyone who
-// redeemed an invitation could convert that into permanent vault access in one request,
-// revoking the original would not touch the child, and nothing in the UI shows the
-// child came from a time-boxed parent.
-func TestAMintedKeyCannotOutliveItsMinter(t *testing.T) {
+// Capping the child to its parent's expiry did not make single-key revocation
+// terminal: after K minted K2, deleting K left K2 live until that shared deadline.
+// There was no parent linkage for a revoke to traverse. Refusing bearer-to-bearer
+// minting makes the displayed key row the whole authority an operator revokes.
+func TestAPIKeyCannotMintSuccessor(t *testing.T) {
 	vh, queries := newCollectionAuthzEnv(t)
 	h := NewAPIKeyHandler(queries)
-	ctx := context.Background()
 	user := mustUser(t, queries, "succession@example.com", "user", "")
 
-	parentExpiry := time.Now().UTC().Add(90 * 24 * time.Hour).Truncate(time.Second)
-
-	mint := func(t *testing.T, reqCtx context.Context, body string) apiKeyCreateResponse {
-		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/api/api-keys", strings.NewReader(body))
-		req = req.WithContext(context.WithValue(reqCtx, middleware.UserIDKey, user))
-		rec := httptest.NewRecorder()
-		h.Create(rec, req)
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
-		}
-		var out apiKeyCreateResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		return out
+	parentKey := "ti_" + strings.Repeat("a", 64)
+	parentHash := sha256.Sum256([]byte(parentKey))
+	if _, err := vh.db.Exec(`
+		INSERT INTO api_keys (id, user_id, name, key_hash, key_prefix, expires_at)
+		VALUES ('parent-key', ?, 'Invitation bootstrap', ?, 'aaaaaaaa', datetime('now', '+90 days'))`,
+		user, hex.EncodeToString(parentHash[:]),
+	); err != nil {
+		t.Fatalf("seed parent API key: %v", err)
 	}
 
-	t.Run("an unbounded request is capped to the minting key's expiry", func(t *testing.T) {
-		// The exact shape the frontend sends: {"name": "..."} with no expiry.
-		reqCtx := context.WithValue(ctx, middleware.APIKeyExpiryKey, parentExpiry)
-		out := mint(t, reqCtx, `{"name":"extension successor"}`)
-		if out.ExpiresAt == nil {
-			t.Fatal("a key minted BY a time-boxed API key came back with no expiry at all.\n" +
-				"That converts the 90-day vault_only extension credential, handed out over a " +
-				"PUBLIC endpoint, into permanent vault access in one request.")
-		}
-		got, err := time.Parse(time.RFC3339, *out.ExpiresAt)
-		if err != nil {
-			t.Fatalf("bad expiry %q: %v", *out.ExpiresAt, err)
-		}
-		if got.After(parentExpiry) {
-			t.Errorf("successor expires %s, after its minter's %s", got, parentExpiry)
-		}
-	})
+	// Exercise the real authentication middleware so the denial is tied to the
+	// credential presented on the wire, not a hand-built role context.
+	wired := middleware.JWTOrAPIKeyAuth(strings.Repeat("j", 32), vh.db)(http.HandlerFunc(h.Create))
+	req := httptest.NewRequest(http.MethodPost, "/api/api-keys",
+		strings.NewReader(`{"name":"successor"}`))
+	req.Header.Set("X-API-Key", parentKey)
+	rec := httptest.NewRecorder()
+	wired.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "interactive_session_required") {
+		t.Fatalf("API-key-authenticated mint = HTTP %d %s, want interactive-session refusal", rec.Code, rec.Body.String())
+	}
 
-	t.Run("a longer requested expiry is capped too", func(t *testing.T) {
-		reqCtx := context.WithValue(ctx, middleware.APIKeyExpiryKey, parentExpiry)
-		out := mint(t, reqCtx, `{"name":"greedy","expires_in_days":3650}`)
-		if out.ExpiresAt == nil {
-			t.Fatal("no expiry on the successor")
-		}
-		got, _ := time.Parse(time.RFC3339, *out.ExpiresAt)
-		if got.After(parentExpiry) {
-			t.Errorf("a 10-year request produced %s, past the minter's %s; the cap is not applied "+
-				"when the caller asks for longer, which is exactly when it matters", got, parentExpiry)
-		}
-	})
+	var count int
+	if err := vh.db.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE user_id = ?`, user).Scan(&count); err != nil {
+		t.Fatalf("count API keys: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("API-key-authenticated mint left %d keys, want only the parent", count)
+	}
 
-	t.Run("a shorter requested expiry is honoured", func(t *testing.T) {
-		reqCtx := context.WithValue(ctx, middleware.APIKeyExpiryKey, parentExpiry)
-		out := mint(t, reqCtx, `{"name":"short","expires_in_days":1}`)
-		got, _ := time.Parse(time.RFC3339, *out.ExpiresAt)
-		if !got.Before(parentExpiry) {
-			t.Errorf("a 1-day request produced %s; the cap must be a ceiling, not an override", got)
-		}
-	})
+	// Missing/future principal kinds fail closed even if a caller somehow has a
+	// user id; only the explicit interactive-session stamp may pass.
+	unknownReq := httptest.NewRequest(http.MethodPost, "/api/api-keys", strings.NewReader(`{"name":"unknown"}`))
+	unknownReq = unknownReq.WithContext(context.WithValue(unknownReq.Context(), middleware.UserIDKey, user))
+	unknownRec := httptest.NewRecorder()
+	h.Create(unknownRec, unknownReq)
+	if unknownRec.Code != http.StatusForbidden {
+		t.Fatalf("unknown principal mint = HTTP %d %s, want 403", unknownRec.Code, unknownRec.Body.String())
+	}
 
-	t.Run("a session-authenticated mint is not capped", func(t *testing.T) {
-		// No APIKeyExpiryKey in context: an interactive login. The cap exists to
-		// stop a time-boxed credential extending itself, not to change how a
-		// logged-in operator manages their own keys.
-		out := mint(t, ctx, `{"name":"from a real session"}`)
-		if out.ExpiresAt != nil {
-			t.Errorf("a session-authenticated key was capped to %s; the fix has changed behaviour "+
-				"for the interactive path it was not aimed at", *out.ExpiresAt)
-		}
-	})
-
-	_ = vh
+	sessionReq := httptest.NewRequest(http.MethodPost, "/api/api-keys", strings.NewReader(`{"name":"session key"}`))
+	sessionCtx := context.WithValue(sessionReq.Context(), middleware.UserIDKey, user)
+	sessionCtx = context.WithValue(sessionCtx, middleware.PrincipalKindKey, middleware.PrincipalSession)
+	sessionRec := httptest.NewRecorder()
+	h.Create(sessionRec, sessionReq.WithContext(sessionCtx))
+	if sessionRec.Code != http.StatusCreated {
+		t.Fatalf("interactive-session mint = HTTP %d %s, want 201", sessionRec.Code, sessionRec.Body.String())
+	}
 }
 
 // Revoking every key for a user who does not exist must not report success.

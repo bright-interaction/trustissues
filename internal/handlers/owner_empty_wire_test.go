@@ -179,7 +179,8 @@ func TestAnEmptyOwnerIsStillAdministrable(t *testing.T) {
 		t.Fatalf("an instance admin could not take ownership of an unowned row: %v", err)
 	}
 	if _, err := vaultegress.TransferSecretOwnership(ctx, queries, proof,
-		vaultegress.TransferOwnershipParams{NewOwnerUserID: admin, ID: entryID}); err != nil {
+		vaultegress.TransferOwnershipParams{NewOwnerUserID: admin, ID: entryID,
+			NameBidx: h.nameBlindIndex(admin, "legacy-imported-key-2")}); err != nil {
 		t.Fatalf("transfer: %v", err)
 	}
 	access, err := queries.GetVaultEntryAccess(ctx, entryID)

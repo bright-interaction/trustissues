@@ -186,6 +186,13 @@ export default function VaultExportModal({
                 Anyone who can open it can read every exported password. Store it
                 securely and delete it when you are finished.
               </p>
+              <p className="mt-2 text-xs leading-relaxed text-amber-800">
+                An export made on the public URL contains only personal and
+                standard/client vaults. Use your team&apos;s private Tailscale or
+                Headscale URL when you need a complete export that includes
+                protected internal collections. The file records which scope
+                produced it.
+              </p>
             </div>
           </div>
 

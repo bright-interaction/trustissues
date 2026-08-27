@@ -7,13 +7,30 @@
 -- ============================================================================
 
 -- name: CreateCollection :exec
+-- Legacy/internal creation paths intentionally take the schema default. This
+-- keeps native documents from older versions compatible without allowing an
+-- empty string to masquerade as a policy.
 INSERT INTO collections (id, name, description, created_by) VALUES (?, ?, ?, ?);
 
+-- name: CreateCollectionWithPolicy :exec
+-- The live API validates this value with privateaccess.ParseOrDefault before
+-- invoking the query. SQLite's CHECK remains the final closed-vocabulary gate.
+INSERT INTO collections (id, name, description, created_by, private_access_policy)
+VALUES (?, ?, ?, ?, ?);
+
 -- name: GetCollection :one
-SELECT id, name, description, created_by, created_at, updated_at FROM collections WHERE id = ?;
+SELECT id, name, description, created_by, private_access_policy, created_at, updated_at
+FROM collections WHERE id = ?;
 
 -- name: UpdateCollection :exec
-UPDATE collections SET name = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- NULL means the caller omitted the policy. Preserving it here, in the same
+-- statement, avoids both old-client downgrades and a read/modify/write race.
+UPDATE collections
+SET name = sqlc.arg('name'),
+    description = sqlc.arg('description'),
+    private_access_policy = COALESCE(sqlc.narg('private_access_policy'), private_access_policy),
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = sqlc.arg('id');
 
 -- name: RestoreNativeImportedCollectionTimestamps :exec
 -- Native imports create a private copy with a fresh id and fresh authority, but
@@ -26,7 +43,8 @@ DELETE FROM collections WHERE id = ?;
 -- name: ListCollectionsForUser :many
 -- Accepted memberships only. A pending invitation must not surface the
 -- collection (or its entries) until the invitee opts in.
-SELECT c.id, c.name, c.description, c.created_by, c.created_at, c.updated_at, cm.role
+SELECT c.id, c.name, c.description, c.created_by, c.private_access_policy,
+       c.created_at, c.updated_at, cm.role
 FROM collections c
 JOIN collection_members cm ON cm.collection_id = c.id
 WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL
@@ -46,7 +64,8 @@ UPDATE collection_members SET accepted_at = CURRENT_TIMESTAMP
 WHERE collection_id = ? AND user_id = ? AND accepted_at IS NULL;
 
 -- name: ListAllCollections :many
-SELECT id, name, description, created_by, created_at, updated_at FROM collections ORDER BY name ASC;
+SELECT id, name, description, created_by, private_access_policy, created_at, updated_at
+FROM collections ORDER BY name ASC;
 
 -- name: CountCollectionEntries :one
 SELECT COUNT(*) FROM vault_entries WHERE collection_id = ?;
@@ -173,19 +192,22 @@ WHERE collection_id = ? AND role = 'manager' AND accepted_at IS NOT NULL;
 -- Two owner columns, because they answer two questions and conflating them is
 -- what made round 7's gate decorative on one path:
 --
---   user_id               the CUSTODIAN. grantFor's isCreator, the
---                         UNIQUE(user_id, name) namespace, the listing scope. A
---                         collection MANAGER moves it to themselves by adopting
---                         an orphaned entry, which is legitimate and is what
---                         keeps a rename from being an oracle over a colleague's
---                         private vault.
+--   user_id               the CUSTODIAN. grantFor's isCreator and the personal
+--                         listing/name scope. A collection MANAGER moves it to
+--                         themselves by adopting an orphaned shared entry; the
+--                         shared name scope remains c:<collection>.
 --   secret_owner_user_id  the OWNER the EXIT asks about (mayDirectSecretEgress).
 --                         Adoption does not move it, and nothing else in the
 --                         module can: see internal/vaultegress.
 SELECT user_id, secret_owner_user_id, collection_id FROM vault_entries WHERE id = ?;
 
 -- name: SetVaultEntryCollection :exec
-UPDATE vault_entries SET collection_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;
+-- collection_id and name_bidx are one scope fact since 00045. Updating one
+-- without the other either enforces the source vault on the destination or
+-- briefly exposes a destination name to the source scope's uniqueness check.
+UPDATE vault_entries
+SET collection_id = ?, name_bidx = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?;
 
 -- name: ListAccessibleVaultEntries :many
 SELECT e.id, e.user_id, e.collection_id, e.name, e.url, e.alias_url, e.username, e.category, e.notes, e.auto_login, e.rotation_interval_days, e.expires_at, e.last_rotated_at, e.provider, e.provider_meta, e.auto_rotate, e.last_rotation_error, e.created_at, e.updated_at
@@ -221,6 +243,12 @@ WITH accessible AS (
   WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
     AND ((e.collection_id IS NULL AND e.user_id = ?)
      OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
+    AND (sqlc.arg(private_ingress) = 1
+      OR e.collection_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM collections c
+        WHERE c.id = e.collection_id AND c.private_access_policy = 'standard'
+      ))
   LIMIT sqlc.arg(max_rows)
 ), accessible_rows AS (
   SELECT e.id, e.collection_id, e.encrypted_value, e.name, e.url,
@@ -277,6 +305,12 @@ FROM vault_entries e
 WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.disabled = 0)
   AND ((e.collection_id IS NULL AND e.user_id = ?)
    OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
+  AND (sqlc.arg(private_ingress) = 1
+    OR e.collection_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM collections c
+      WHERE c.id = e.collection_id AND c.private_access_policy = 'standard'
+    ))
 ORDER BY e.name ASC;
 
 -- name: MatchAccessibleVaultEntriesByURL :many
@@ -314,5 +348,11 @@ ORDER BY e.name ASC;
 -- name: ListAccessibleVaultEntryNames :many
 -- Names visible to the user (personal + collections) for import conflict checks.
 SELECT e.name FROM vault_entries e
-WHERE (e.collection_id IS NULL AND e.user_id = ?)
-   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL);
+WHERE ((e.collection_id IS NULL AND e.user_id = ?)
+   OR e.collection_id IN (SELECT cm.collection_id FROM collection_members cm WHERE cm.user_id = ? AND cm.accepted_at IS NOT NULL))
+  AND (sqlc.arg(private_ingress) = 1
+    OR e.collection_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM collections c
+      WHERE c.id = e.collection_id AND c.private_access_policy = 'standard'
+    ));

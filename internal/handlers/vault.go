@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bright-interaction/trustissues/internal/config"
 	"github.com/bright-interaction/trustissues/internal/db"
@@ -54,7 +55,10 @@ type VaultHandler struct {
 	// NOT derived from the master key, it is a random key WRAPPED by it, so a
 	// master-key rotation rewraps one settings row instead of rewriting audit rows
 	// the append-only triggers forbid touching.
-	auditKey auditNameKey
+	// Pointer-owned so transaction-scoped handler views share the one cache
+	// instead of copying sync.Once after first use. Copying a used Once is both a
+	// data race hazard and rejected by go vet.
+	auditKey *auditNameKey
 	// delivery tracks the detached rotation-delivery goroutines so shutdown can
 	// wait for them. srv.Shutdown only drains in-flight HTTP requests; a manual
 	// rotate returns as soon as the value is stored and finishes delivery in the
@@ -63,7 +67,9 @@ type VaultHandler struct {
 	// but rotation_log and last_rotation_error were never finalised, so the
 	// rotation was recorded as a clean success while the consumer never received
 	// the new key.
-	delivery sync.WaitGroup
+	// Pointer-owned for the same reason: short-lived handler views must register
+	// delivery work with the process-wide drain group, never copy a WaitGroup.
+	delivery *sync.WaitGroup
 }
 
 // WaitForDelivery blocks until every in-flight rotation delivery has finished,
@@ -154,6 +160,8 @@ func NewVaultHandler(dbConn *sql.DB, queries *db.Queries, cfg *config.Config) *V
 		legacyKey:     cur.legacy,
 		bidxKey:       cur.bidx,
 		keySource:     cur.source,
+		auditKey:      &auditNameKey{},
+		delivery:      &sync.WaitGroup{},
 	}
 	if cfg.VaultKeyPrevious != "" && cfg.VaultKeyPrevious != cfg.VaultKey {
 		prev := deriveVaultKeyMaterial(cfg.VaultKeyPrevious)
@@ -218,23 +226,30 @@ func blindIndexWith(key [32]byte, scope, raw string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// nameBlindIndex derives the keyed lookup value for an entry NAME within one
-// user's namespace. It is what enforces per-user name uniqueness now that the
-// name column holds randomized ciphertext that no SQL constraint can compare.
-//
-// Scoped by USER and not by bidxScope, deliberately. The url index is keyed per
-// scope so a shared collection still autofills for every member; this one stands
-// in for UNIQUE(user_id, name), where user_id is the CUSTODIAN (00034) and the
-// constraint is per user whether or not the entry sits in a collection. Keying
-// it by collection would quietly change which renames are legal.
+// scopedNameBlindIndex derives the keyed lookup value for an entry NAME within
+// one vault scope. Personal entries use u:<user>; shared entries use
+// c:<collection>, exactly like the URL blind index. This is what makes a label
+// such as "GitHub" independently usable in a client collection, an internal
+// collection, and a personal vault without any of those scopes becoming an
+// existence oracle for the others.
 //
 // THE NAME IS NOT NORMALIZED, and that is a decision rather than an omission.
 // SQLite's default BINARY collation made the old constraint byte-exact, so
 // "GitHub" and "github" are two legal entries today. Case-folding here would
 // make them collide, which turns an upgrade into a backfill that cannot complete
 // on a database that is currently valid. Same reasoning for whitespace.
+func (h *VaultHandler) scopedNameBlindIndex(scope, name string) string {
+	return nameBlindIndexWith(h.bidxKey, scope, name)
+}
+
+// nameBlindIndex is the personal-vault convenience form retained for callers
+// and fixtures that have no collection. Production code that may handle a
+// shared entry must call scopedNameBlindIndex with bidxScope(user, collection).
 func (h *VaultHandler) nameBlindIndex(userID, name string) string {
-	return nameBlindIndexWith(h.bidxKey, userID, name)
+	if userID == "" || name == "" {
+		return ""
+	}
+	return h.scopedNameBlindIndex(bidxScope(userID, sql.NullString{}), name)
 }
 
 // EntryNamePlain opens a stored vault_entries.name. It exists so callers that
@@ -244,16 +259,15 @@ func (h *VaultHandler) EntryNamePlain(stored string) string {
 	return h.decryptColumnOrLog(stored, "", vaultFieldName)
 }
 
-func nameBlindIndexWith(key [32]byte, userID, name string) string {
-	if userID == "" || name == "" {
+func nameBlindIndexWith(key [32]byte, scope, name string) string {
+	if scope == "" || name == "" {
 		return ""
 	}
 	mac := hmac.New(sha256.New, key[:])
-	// Domain-separated from the url index by the leading tag, and
-	// length-prefixed on the user id for the same reason blindIndexWith is: a
-	// crafted id must not be able to collide with another user's by shifting the
-	// separator.
-	fmt.Fprintf(mac, "name:v1|%d:%s|%s", len(userID), userID, name)
+	// Domain-separated from the URL index and from 00040's custodian-keyed v1
+	// token. The scope is length-prefixed so a crafted id cannot shift the
+	// separator and collide with a different personal/collection scope.
+	fmt.Fprintf(mac, "name:v2|%d:%s|%s", len(scope), scope, name)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -263,18 +277,63 @@ func nameBlindIndexWith(key [32]byte, userID, name string) string {
 // computed under the old key does not match the new key's value and nothing
 // errors, so a lookup that only asked the current key would report a name as
 // free and let a duplicate through.
-func (h *VaultHandler) nameBlindIndexCandidates(userID, name string) []string {
-	cur := h.nameBlindIndex(userID, name)
+func (h *VaultHandler) nameBlindIndexCandidates(scope, name string) []string {
+	cur := h.scopedNameBlindIndex(scope, name)
 	out := []string{}
 	if cur != "" {
 		out = append(out, cur)
 	}
 	if h.previous != nil {
-		if prev := nameBlindIndexWith(h.previous.bidx, userID, name); prev != "" && prev != cur {
+		if prev := nameBlindIndexWith(h.previous.bidx, scope, name); prev != "" && prev != cur {
 			out = append(out, prev)
 		}
 	}
 	return out
+}
+
+// vaultEntryNameExistsInScope compares opened names, not only the current blind
+// index. That is load-bearing during both upgrades and key rotation: a row may
+// still carry 00040's user-scoped token or the previous key's scope token, and
+// neither equals a freshly computed current-key token. The caller must prove
+// access/private-ingress policy before passing a collection scope here.
+func (h *VaultHandler) vaultEntryNameExistsInScope(ctx context.Context, queries *db.Queries,
+	userID string, collectionID sql.NullString, name, exceptID string) (bool, error) {
+	check := func(id, stored string) (bool, error) {
+		if id == exceptID {
+			return false, nil
+		}
+		plain, err := h.decryptColumn(stored, vaultFieldName)
+		if err != nil {
+			return false, fmt.Errorf("open vault entry name %s: %w", id, err)
+		}
+		return plain == name, nil
+	}
+
+	if collectionID.Valid && collectionID.String != "" {
+		rows, err := queries.ListCollectionVaultEntryNames(ctx, collectionID)
+		if err != nil {
+			return false, fmt.Errorf("list collection entry names: %w", err)
+		}
+		for _, row := range rows {
+			found, err := check(row.ID, row.Name)
+			if err != nil || found {
+				return found, err
+			}
+		}
+		return false, nil
+	}
+
+	rows, err := queries.ListPersonalVaultEntryNames(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("list personal entry names: %w", err)
+	}
+	for _, row := range rows {
+		found, err := check(row.ID, row.Name)
+		if err != nil || found {
+			return found, err
+		}
+	}
+	return false, nil
 }
 
 // urlBlindIndexCandidates returns every index value that could legitimately be
@@ -316,11 +375,12 @@ func (h *VaultHandler) urlBlindIndexCandidates(scope, raw string) []string {
 // maxCustomFields caps how many custom fields an entry may carry.
 const maxCustomFields = 50
 
-// validatePortableCustomFields accepts every legacy label shape that earlier
-// TrustIssues versions could export, while retaining the resource limits and
-// response-only withheld guard that make the payload safe to process. Native
-// import and export use this compatibility contract.
-func validatePortableCustomFields(fields []CustomField) error {
+// validateCustomFieldLimits applies the storage-format resource limits. The
+// allowWithheld switch exists only for Update: ordinary metadata responses carry
+// a blank response-only marker for secret:true fields, and Update merges those
+// markers with the stored values before anything is encrypted. Create, import,
+// export validation, and every persisted representation keep rejecting them.
+func validateCustomFieldLimits(fields []CustomField, allowWithheld bool) error {
 	if len(fields) > maxCustomFields {
 		return fmt.Errorf("too many custom fields (max %d)", maxCustomFields)
 	}
@@ -338,12 +398,20 @@ func validatePortableCustomFields(fields []CustomField) error {
 		// Same class as the refuse-to-overwrite guards on the metadata columns
 		// and on rotation_targets; this surface needs its own because the blank
 		// is one this server produced.
-		if f.Withheld {
+		if f.Withheld && !allowWithheld {
 			return fmt.Errorf("custom field %q was not released to you, so this save would blank it; "+
 				"reload the entry and try again", f.Label)
 		}
 	}
 	return nil
+}
+
+// validatePortableCustomFields accepts every legacy label shape that earlier
+// TrustIssues versions could export, while retaining the resource limits and
+// response-only withheld guard that make the payload safe to process. Native
+// import and export use this compatibility contract.
+func validatePortableCustomFields(fields []CustomField) error {
+	return validateCustomFieldLimits(fields, false)
 }
 
 // validateCustomFields is the live-write counterpart. Labels are identifiers
@@ -359,6 +427,35 @@ func validateCustomFields(fields []CustomField) error {
 		}
 	}
 	return validatePortableCustomFields(fields)
+}
+
+// validateUpdateCustomFields admits the response-only withheld marker just far
+// enough for mergeWithheldCustomFields to restore the stored value. A marker is
+// deliberately narrow: it can represent only a blank secret:true value. It
+// cannot be used to smuggle a client value past validation or turn an ordinary
+// field into a secret without proving which stored field it preserves.
+func validateUpdateCustomFields(fields []CustomField) error {
+	for i := range fields {
+		if fields[i].Withheld {
+			// Portable/native imports deliberately retain legacy labels byte for
+			// byte, including surrounding whitespace and even old empty labels.
+			// This marker came from an ordinary server response and its label is
+			// the identity mergeWithheldCustomFields compares against storage.
+			// Normalizing it here turns the server's own marker into a guaranteed
+			// 409 and makes a no-op save impossible for those restored entries.
+			// Keep it exact; the storage merge still refuses any label/position or
+			// secret-flag mismatch, so this widens preservation, not mutation.
+			if !fields[i].Secret || fields[i].Value != "" {
+				return fmt.Errorf("custom field %q has an invalid withheld marker", fields[i].Label)
+			}
+			continue
+		}
+		fields[i].Label = strings.TrimSpace(fields[i].Label)
+		if fields[i].Label == "" {
+			return fmt.Errorf("custom field label is required")
+		}
+	}
+	return validateCustomFieldLimits(fields, true)
 }
 
 // encryptCustomFields marshals the fields to JSON and encrypts the blob at rest.
@@ -418,17 +515,26 @@ func (h *VaultHandler) decryptCustomFields(stored string) []CustomField {
 // (Plaintext redacts under every verb), and a NEW response path that wants these
 // values has to answer the owner question in the same commit that adds it.
 //
-// A refusal BLANKS the value and marks it withheld rather than dropping the
-// field: the edit form resubmits every field it was shown, so a silently blanked
-// secret would be written back as empty on the next save. VaultHandler.Update
-// refuses an array carrying a withheld marker for the same reason it refuses to
-// overwrite an undecryptable column.
+// A non-reveal response BLANKS the value and marks it withheld rather than
+// dropping the field: the edit form resubmits every field it was shown, so a
+// silently blanked secret would be written back as empty on the next save.
+// VaultHandler.Update restores a marker only when position, label, and
+// secret:true still match the stored field; otherwise it refuses the save.
 func (h *VaultHandler) customFieldsForCaller(ctx context.Context, entryID, entryName, stored,
-	callerID string) []CustomField {
+	callerID string, revealSecrets bool) []CustomField {
 
 	fields := h.decryptCustomFields(stored)
 	for i := range fields {
 		if !fields[i].Secret || fields[i].Value == "" {
+			continue
+		}
+		// Metadata is available to a session or an extension API key without
+		// password reauthentication. Labels and non-secret values remain useful
+		// there, but a credential never does. A blank marker is returned instead
+		// of dropping the field so old clients retain its order and identity.
+		if !revealSecrets {
+			fields[i].Value = ""
+			fields[i].Withheld = true
 			continue
 		}
 		_, released, err := secretexit.ExitString(ctx,
@@ -445,6 +551,105 @@ func (h *VaultHandler) customFieldsForCaller(ctx context.Context, entryID, entry
 		fields[i].Value = released
 	}
 	return fields
+}
+
+// mergeWithheldCustomFields turns metadata-response markers back into the
+// values already stored on the row. It is a preservation operation only: the
+// plaintext is re-encrypted immediately and is never returned to the caller.
+//
+// Custom fields have no durable IDs, and labels need not be unique. Position +
+// label + secret:true is therefore the only unambiguous identity an existing
+// client can echo. If any of those changed, fail closed rather than guess which
+// credential should be copied. A client that wants to reorder or rename a
+// secret field must first use the password-gated unlock response and submit the
+// real value, at which point no withheld marker is involved.
+func (h *VaultHandler) mergeWithheldCustomFields(stored string, incoming []CustomField) ([]CustomField, error) {
+	needsMerge := false
+	for _, field := range incoming {
+		if field.Withheld {
+			needsMerge = true
+			break
+		}
+	}
+	if !needsMerge {
+		return incoming, nil
+	}
+
+	current := h.decryptCustomFields(stored)
+	if len(current) != len(incoming) {
+		return nil, fmt.Errorf("custom fields changed since the withheld response; unlock and try again")
+	}
+	merged := append([]CustomField(nil), incoming...)
+	for i := range merged {
+		if !merged[i].Withheld {
+			continue
+		}
+		if !current[i].Secret || current[i].Withheld || current[i].Label != merged[i].Label {
+			return nil, fmt.Errorf("custom field %q no longer matches the withheld value; unlock and try again",
+				merged[i].Label)
+		}
+		merged[i].Value = current[i].Value
+		merged[i].Withheld = false
+	}
+	return merged, nil
+}
+
+// providerMetaForCaller releases the credential-bearing subset of
+// provider_meta on an explicitly reauthenticated bulk reveal. Ordinary metadata
+// paths use redactCredentialProviderMetaKeys instead and never call this.
+//
+// Most provider_meta fields are identifiers or routing configuration. Only the
+// provider-scoped keys in credentialProviderMetaKeys are secret material, so
+// each of those values goes through the same entry-owner exit as the entry's
+// primary value and secret custom fields. A refusal removes the key and records
+// it in the sibling withheld list; no response ever substitutes an empty value
+// that a client could mistake for a configured credential.
+func (h *VaultHandler) providerMetaForCaller(ctx context.Context, entryID, entryName, provider,
+	raw, callerID string) (string, []string) {
+
+	keys := credentialMetaKeysFor(provider)
+	if len(keys) == 0 {
+		return raw, []string{}
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || fields == nil {
+		return redactCredentialProviderMetaKeys(provider, raw)
+	}
+
+	withheld := []string{}
+	for _, key := range keys {
+		encoded, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			delete(fields, key)
+			withheld = append(withheld, key)
+			continue
+		}
+		if value == "" {
+			continue
+		}
+		_, released, err := secretexit.ExitString(ctx,
+			h.MintedEntrySecret([]byte(value), entryID, entryName),
+			secretexit.ToCaller("the provider metadata credential "+strconv.Quote(key)+" of this entry",
+				callerID))
+		if err != nil {
+			slog.Error("vault: a provider metadata credential was not released",
+				"entry", entryID, "key", key, "caller", callerID, "error", err)
+			delete(fields, key)
+			withheld = append(withheld, key)
+			continue
+		}
+		fields[key], _ = json.Marshal(released)
+	}
+	sort.Strings(withheld)
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return redactCredentialProviderMetaKeys(provider, raw)
+	}
+	return string(out), withheld
 }
 
 // encryptMetaColumnsIfNeeded is the STORAGE-side variant of encryptMetaColumns:
@@ -586,6 +791,12 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("listing vault entries for metadata backfill: %w", err)
 	}
+	// Migration 00045 can bring two legacy custodian-scoped tokens into one
+	// collection scope. Sort by immutable id so fresh convergence chooses the
+	// same base-label holder on every replica/retry. A row already converged by a
+	// partial prior pass naturally keeps its token; later conflicts get stable
+	// suffixes.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 
 	updated := 0
 	for _, row := range rows {
@@ -611,9 +822,9 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			slog.Error("vault: metadata backfill alias_url decrypt failed", "id", row.ID, "error", derr)
 			continue
 		}
-		// The name index is keyed by the CUSTODIAN alone, not by bidxScope: it
-		// stands in for UNIQUE(user_id, name), which is a per-user constraint
-		// regardless of which collection the entry sits in.
+		// Names and URLs share the same explicit personal/collection scope. This
+		// prevents a hidden collection label from constraining (and therefore
+		// being probed through) the custodian's public personal vault.
 		namePlain, derr := h.decryptColumn(row.Name, vaultFieldName)
 		if derr != nil {
 			slog.Error("vault: metadata backfill name decrypt failed", "id", row.ID, "error", derr)
@@ -622,7 +833,7 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 		scope := bidxScope(row.UserID, row.CollectionID)
 		wantURLBidx := h.urlBlindIndex(scope, urlPlain)
 		wantAliasBidx := h.urlBlindIndex(scope, aliasPlain)
-		wantNameBidx := h.nameBlindIndex(row.UserID, namePlain)
+		wantNameBidx := h.scopedNameBlindIndex(scope, namePlain)
 		needsBidx := wantURLBidx != row.UrlBidx || wantAliasBidx != row.AliasUrlBidx ||
 			wantNameBidx != row.NameBidx
 
@@ -645,7 +856,7 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 		if encErr != nil {
 			return updated, fmt.Errorf("encrypt name for %s: %w", row.ID, encErr)
 		}
-		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+		params := db.UpdateVaultEntryMetaAtRestParams{
 			Name:         encName,
 			Url:          toNullString(encURL),
 			AliasUrl:     toNullString(encAlias),
@@ -656,27 +867,34 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 			AliasUrlBidx: wantAliasBidx,
 			NameBidx:     wantNameBidx,
 			ID:           row.ID,
-		}); err != nil {
-			// A NAME COLLISION IS ONE ROW'S PROBLEM, NOT THE TABLE'S.
-			//
-			// This used to return, which aborts the sweep for every row after
-			// it, on every boot, forever. Rows written before the import path
-			// sealed its names carry cleartext names and an empty name_bidx, so
-			// they sit OUTSIDE the partial unique index: two of a user's entries
-			// can already share a name. The first boot that seals them computes
-			// the same index for both, the second UPDATE is refused, and one
-			// duplicate row stops at-rest encryption for the whole table. That
-			// is a wedge anybody who could reach the import could plant.
-			//
-			// So the row is left as it is, loudly, and the sweep goes on. The
-			// row id is safe to log; the name is not, which is why neither the
-			// name nor the index token appears here.
-			if strings.Contains(err.Error(), "UNIQUE constraint") {
-				slog.Error("vault: metadata backfill skipped a row whose name collides with "+
-					"another entry of the same user; rename one of them and it will be "+
-					"encrypted on the next sweep", "id", row.ID, "user", row.UserID)
-				continue
+		}
+		err = h.queries.UpdateVaultEntryMetaAtRest(ctx, params)
+		if err != nil && strings.Contains(err.Error(), "UNIQUE constraint") {
+			// A same-scope duplicate cannot remain forever outside the partial
+			// index: that would make the storage invariant true only for new
+			// installs and could also leave a pre-00040 name in cleartext. Keep
+			// the first (lowest-id) label and deterministically rename later rows.
+			// Every candidate includes a stable entry-derived tag; the bounded
+			// counter handles an existing user-chosen label with the same suffix.
+			for attempt := 1; attempt <= len(rows)+1; attempt++ {
+				dedupName := metadataBackfillDuplicateName(namePlain, row.ID, attempt)
+				params.Name, encErr = h.encryptColumn(dedupName)
+				if encErr != nil {
+					return updated, fmt.Errorf("encrypt de-duplicated name for %s: %w", row.ID, encErr)
+				}
+				params.NameBidx = h.scopedNameBlindIndex(scope, dedupName)
+				err = h.queries.UpdateVaultEntryMetaAtRest(ctx, params)
+				if err == nil {
+					slog.Warn("vault: renamed a legacy duplicate while upgrading collection-scoped names",
+						"id", row.ID, "scope", scope)
+					break
+				}
+				if !strings.Contains(err.Error(), "UNIQUE constraint") {
+					break
+				}
 			}
+		}
+		if err != nil {
 			return updated, fmt.Errorf("persist metadata for %s: %w", row.ID, err)
 		}
 		updated++
@@ -685,6 +903,35 @@ func (h *VaultHandler) BackfillMetadataAtRest() (int, error) {
 		slog.Info("vault: backfilled metadata-at-rest encryption", "rows_updated", updated)
 	}
 	return updated, nil
+}
+
+// metadataBackfillDuplicateName creates a deterministic, length-bounded label
+// for a legacy same-scope duplicate. The hash avoids putting a potentially
+// attacker-shaped/raw id into user-visible text while still being stable across
+// retries. attempt is appended only when a user already chose that first label.
+func metadataBackfillDuplicateName(name, id string, attempt int) string {
+	sum := sha256.Sum256([]byte(id))
+	tag := hex.EncodeToString(sum[:6])
+	suffix := " (duplicate " + tag
+	if attempt > 1 {
+		suffix += "-" + strconv.Itoa(attempt)
+	}
+	suffix += ")"
+
+	prefix := name
+	limit := maxEntryNameLen - len(suffix)
+	if limit < 0 {
+		limit = 0
+	}
+	for len(prefix) > limit {
+		_, size := utf8.DecodeLastRuneInString(prefix)
+		if size <= 0 {
+			prefix = ""
+			break
+		}
+		prefix = prefix[:len(prefix)-size]
+	}
+	return prefix + suffix
 }
 
 // decryptWithKey decrypts data using a specific AES-256-GCM key, for one
@@ -716,8 +963,13 @@ type vaultEntryMeta struct {
 	RotationStatus       string  `json:"rotation_status"`
 	Provider             string  `json:"provider"`
 	ProviderMeta         string  `json:"provider_meta"`
-	AutoRotate           bool    `json:"auto_rotate"`
-	LastRotationError    string  `json:"last_rotation_error"`
+	// ProviderMetaWithheld names secondary credentials that exist in
+	// provider_meta but were removed from this non-reauthenticated response.
+	// No omitempty: [] means the server checked and withheld nothing; a key in
+	// the list means "configured", never "its value is empty".
+	ProviderMetaWithheld []string `json:"provider_meta_withheld"`
+	AutoRotate           bool     `json:"auto_rotate"`
+	LastRotationError    string   `json:"last_rotation_error"`
 	// No omitempty. With it, an entry whose last custom field was just deleted
 	// answered without the key at all, which is indistinguishable from "this
 	// response does not carry custom fields" to any client that merges a write
@@ -743,17 +995,17 @@ type vaultEntryMeta struct {
 }
 
 // CustomField is an arbitrary user-defined field on an entry (Bitwarden-style):
-// a label, a value, and a secret flag that tells the UI to mask the value by
-// default. The whole set is encrypted at rest, so a secret field is protected
-// the same way regardless of the flag; the flag is only a display hint.
+// a label, a value, and a secret flag. The whole set is encrypted at rest; the
+// flag additionally makes the value password-gated on the read path. Ordinary
+// metadata responses retain the label with value="" and withheld=true.
 type CustomField struct {
 	Label  string `json:"label"`
 	Value  string `json:"value"`
 	Secret bool   `json:"secret"`
-	// Withheld marks a secret field whose value the exit did not release to this
-	// caller. Response-only: it is never stored, and Update REFUSES a save that
-	// carries one, because the edit form resubmits every field it was shown and a
-	// blanked value would otherwise be written back over the real one.
+	// Withheld marks a secret field whose value was not returned in this response.
+	// Response-only: it is never stored. Update accepts only its narrow
+	// secret:true/value:"" shape and merges the value from the same stored
+	// position; a mismatch is refused rather than overwriting or guessing.
 	Withheld bool `json:"withheld,omitempty"`
 }
 
@@ -780,6 +1032,7 @@ type vaultEntryFull struct {
 func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultEntryMetaRow,
 	callerID string) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	e := vaultEntryMeta{
 		ID: row.ID,
 		// The projection used to omit collection_id, so every write response
@@ -798,11 +1051,12 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
-		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID),
+		CustomFields:         h.customFieldsForCaller(ctx, row.ID, row.Name, row.CustomFields, callerID, false),
 		DestinationPatterns:  parseDestinationPatterns(row.DestinationPatterns),
 		CreatedAt:            nullTimePtr(row.CreatedAt),
 		UpdatedAt:            nullTimePtr(row.UpdatedAt),
@@ -814,6 +1068,7 @@ func (h *VaultHandler) vaultMetaFromGetRow(ctx context.Context, row db.GetVaultE
 // vaultMetaFromListAllRow converts a db.ListAllVaultEntriesRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -828,7 +1083,8 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
@@ -840,6 +1096,7 @@ func (h *VaultHandler) vaultMetaFromListAllRow(row db.ListAllVaultEntriesRow) va
 // vaultMetaFromListByUserRow converts a db.ListVaultEntriesByUserRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserRow) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -854,7 +1111,8 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
@@ -866,6 +1124,7 @@ func (h *VaultHandler) vaultMetaFromListByUserRow(row db.ListVaultEntriesByUserR
 // vaultMetaFromMatchRow converts a db.MatchVaultEntriesByURLRow to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		Name:                 h.decryptColumnOrLog(row.Name, "", vaultFieldName),
@@ -879,7 +1138,8 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
@@ -893,6 +1153,7 @@ func (h *VaultHandler) vaultMetaFromMatchRow(row db.MatchVaultEntriesByURLRow) v
 // vaultEntryMeta, including which collection the entry belongs to.
 func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntriesRow) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		UserID:               row.UserID,
@@ -908,7 +1169,8 @@ func (h *VaultHandler) vaultMetaFromAccessibleRow(row db.ListAccessibleVaultEntr
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
@@ -931,6 +1193,7 @@ func (h *VaultHandler) vaultMetaFromMatchCollectionRow(row db.MatchCollectionVau
 // to a vaultEntryMeta.
 func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVaultEntriesByURLRow) vaultEntryMeta {
 	raw := h.decryptColumnOrLog(row.ProviderMeta.String, "{}", vaultFieldProviderMeta)
+	safeRaw, providerMetaWithheld := redactCredentialProviderMetaKeys(row.Provider.String, raw)
 	return vaultEntryMeta{
 		ID:                   row.ID,
 		CollectionID:         nullStringPtr(row.CollectionID),
@@ -945,7 +1208,8 @@ func (h *VaultHandler) vaultMetaFromMatchAccessibleRow(row db.MatchAccessibleVau
 		ExpiresAt:            nullTimePtr(row.ExpiresAt),
 		LastRotatedAt:        nullTimePtr(row.LastRotatedAt),
 		Provider:             row.Provider.String,
-		ProviderMeta:         redactReservedProviderMetaKeys(raw),
+		ProviderMeta:         redactReservedProviderMetaKeys(safeRaw),
+		ProviderMetaWithheld: providerMetaWithheld,
 		AutoRotate:           row.AutoRotate.Int64 != 0,
 		LastRotationError:    row.LastRotationError.String,
 		PendingRevoke:        pendingRevokeStatusFrom(raw),
@@ -1337,11 +1601,28 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	isAdmin := middleware.IsAdmin(r.Context())
 	ctx := r.Context()
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.list: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	snapshot := *h
+	snapshot.queries = qtx
+	h = &snapshot
 
 	entries := []vaultEntryMeta{}
+	policies, err := collectionPolicyMap(ctx, qtx)
+	if err != nil {
+		logError(r, "vault.list: private access policy lookup failed", "error", err)
+		writeInternalError(w, r, "private access policy could not be verified")
+		return
+	}
 
 	if isAdmin && r.URL.Query().Get("all") == "true" {
-		rows, err := h.queries.ListAllVaultEntries(ctx)
+		rows, err := qtx.ListAllVaultEntries(ctx)
 		if err != nil {
 			logError(r, "vault.list: query failed", "error", err)
 			writeInternalError(w, r, "internal server error")
@@ -1350,11 +1631,14 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromListAllRow(row)
 			e.CollectionID = nullStringPtr(row.CollectionID)
+			if !entryMetadataVisibleOnIngress(ctx, e.CollectionID, policies) {
+				continue
+			}
 			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
 	} else if isAdmin && r.URL.Query().Get("user_id") != "" {
-		rows, err := h.queries.ListVaultEntriesByUser(ctx, r.URL.Query().Get("user_id"))
+		rows, err := qtx.ListVaultEntriesByUser(ctx, r.URL.Query().Get("user_id"))
 		if err != nil {
 			logError(r, "vault.list: query failed", "error", err)
 			writeInternalError(w, r, "internal server error")
@@ -1362,13 +1646,16 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			e := h.vaultMetaFromListByUserRow(row)
+			if !entryMetadataVisibleOnIngress(ctx, e.CollectionID, policies) {
+				continue
+			}
 			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
 	} else {
 		// Non-admin: personal entries plus entries in collections the user
 		// belongs to. Access is enforced in the query itself.
-		rows, err := h.queries.ListAccessibleVaultEntries(ctx, db.ListAccessibleVaultEntriesParams{
+		rows, err := qtx.ListAccessibleVaultEntries(ctx, db.ListAccessibleVaultEntriesParams{
 			ID:       userID,
 			UserID:   userID,
 			UserID_2: userID,
@@ -1381,6 +1668,9 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			e := h.vaultMetaFromAccessibleRow(row)
 			e.UserID = "" // omitempty will exclude it
+			if !entryMetadataVisibleOnIngress(ctx, e.CollectionID, policies) {
+				continue
+			}
 			e.RotationStatus = computeRotationStatus(e.RotationIntervalDays, e.ExpiresAt, e.LastRotatedAt, e.CreatedAt, &e.LastRotationError)
 			entries = append(entries, e)
 		}
@@ -1393,6 +1683,11 @@ func (h *VaultHandler) List(w http.ResponseWriter, r *http.Request) {
 	// queries now order by id for determinism and the human-facing order is
 	// applied here, on the decrypted name, once for all three branches.
 	sortEntriesByName(entries)
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.list: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	writeJSON(w, http.StatusOK, entries)
 }
 
@@ -1458,15 +1753,11 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If the entry is being created inside a shared collection, the caller must
-	// be an editor or manager of it (or an instance admin). Authorize before we
-	// do any work so a non-member cannot even probe collection ids.
+	// Keep the requested scope as data for now. Its policy and the caller's role
+	// are checked under the same write transaction that inserts the entry below;
+	// checking here would leave a promotion/membership race before the INSERT.
 	var collectionID sql.NullString
 	if req.CollectionID != nil && *req.CollectionID != "" {
-		if !h.canWriteCollection(r, *req.CollectionID) {
-			writeForbidden(w, r, "you do not have write access to that collection")
-			return
-		}
 		collectionID = sql.NullString{String: *req.CollectionID, Valid: true}
 	}
 
@@ -1544,12 +1835,22 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 	entryScope := bidxScope(userID, collectionID)
 	urlBidx := h.urlBlindIndex(entryScope, req.URL)
 	aliasBidx := h.urlBlindIndex(entryScope, req.AliasURL)
+	nameBidx := h.scopedNameBlindIndex(entryScope, req.Name)
 
 	// Use separate INSERT + SELECT instead of RETURNING (mattn/go-sqlite3 has bugs with RETURNING)
 	createExpiresAt, expErr := stringPtrToNullTime(req.ExpiresAt)
 	if expErr != nil {
 		writeValidationError(w, r, expErr.Error())
 		return
+	}
+	encCustomFields := ""
+	if len(req.CustomFields) > 0 {
+		encCustomFields, err = h.encryptCustomFields(req.CustomFields)
+		if err != nil {
+			logError(r, "vault.create: custom fields encrypt failed", "error", err)
+			writeInternalError(w, r, "failed to store secret")
+			return
+		}
 	}
 	// The INSERT carries provider and provider_meta, so it is a host-choosing
 	// write and it goes through the same door as every other one.
@@ -1570,7 +1871,38 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	err = vaultegress.CreateEntry(ctx, h.queries, createTicket, vaultegress.CreateEntryParams{
+	// Take the write lock before the compatibility conflict check. The unique
+	// indexes enforce current-key tokens, while this opened-name check also sees
+	// pre-00045 and previous-key tokens. Holding the lock through INSERT prevents
+	// another writer from changing the answer between those two operations.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.create: begin transaction failed", "error", err)
+		writeInternalError(w, r, "failed to store secret")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	baseQueries := h.queries
+	qtx := baseQueries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+	if collectionID.Valid {
+		if !txHandler.requireWritableCollectionDestination(w, r, collectionID.String) {
+			return
+		}
+	}
+	duplicate, err := h.vaultEntryNameExistsInScope(ctx, qtx, userID, collectionID, req.Name, "")
+	if err != nil {
+		logError(r, "vault.create: name conflict check failed", "error", err)
+		writeInternalError(w, r, "failed to store secret")
+		return
+	}
+	if duplicate {
+		writeConflict(w, r, "a vault entry with that name already exists")
+		return
+	}
+
+	err = vaultegress.CreateEntry(ctx, qtx, createTicket, vaultegress.CreateEntryParams{
 		ID:     entryID,
 		UserID: userID,
 		// The creator is the owner the exit asks about. The two columns are the
@@ -1593,11 +1925,10 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		AutoRotate:           sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},
 		UrlBidx:              urlBidx,
 		AliasUrlBidx:         aliasBidx,
-		// Keyed under the creator, who is the custodian at creation time. This is
-		// what the UNIQUE index actually constrains; the inline UNIQUE(user_id,
-		// name) the error below is caught from can no longer fire, because Name is
-		// now randomized ciphertext.
-		NameBidx: h.nameBlindIndex(userID, req.Name),
+		// Keyed to the destination vault, not to the custodian. CollectionID is
+		// written in this same INSERT so the index and its scope cannot disagree.
+		NameBidx:     nameBidx,
+		CollectionID: collectionID,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -1608,31 +1939,9 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to store secret")
 		return
 	}
-
-	// Place the entry in its collection (CreateVaultEntry always inserts a
-	// personal row; a shared entry is moved into its collection here, after the
-	// caller was authorized above).
-	if collectionID.Valid {
-		if err := h.queries.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
-			CollectionID: collectionID,
-			ID:           entryID,
-		}); err != nil {
-			logError(r, "vault.create: set collection failed", "error", err)
-			writeInternalError(w, r, "failed to store secret")
-			return
-		}
-	}
-
-	// Persist custom fields (encrypted at rest) when present.
-	if len(req.CustomFields) > 0 {
-		enc, cfErr := h.encryptCustomFields(req.CustomFields)
-		if cfErr != nil {
-			logError(r, "vault.create: custom fields encrypt failed", "error", cfErr)
-			writeInternalError(w, r, "failed to store secret")
-			return
-		}
-		if cfErr := h.queries.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
-			CustomFields: enc, ID: entryID,
+	if encCustomFields != "" {
+		if cfErr := qtx.UpdateVaultEntryCustomFields(ctx, db.UpdateVaultEntryCustomFieldsParams{
+			CustomFields: encCustomFields, ID: entryID,
 		}); cfErr != nil {
 			logError(r, "vault.create: custom fields save failed", "error", cfErr)
 			writeInternalError(w, r, "failed to store secret")
@@ -1640,7 +1949,11 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	row, err := h.queries.GetVaultEntryMeta(ctx, entryID)
+	// Seed inside the transaction too. It widens a capability ceiling, so it may
+	// not happen after a protected collection promotion has already committed.
+	txHandler.seedCapabilityDefaults(ctx, qtx, r, entryID, req.Provider, func() bool { return true })
+
+	row, err := qtx.GetVaultEntryMeta(ctx, entryID)
 	if err != nil {
 		logError(r, "vault.create: select after insert failed", "error", err)
 		writeInternalError(w, r, "failed to store secret")
@@ -1649,16 +1962,13 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	entry := h.vaultMetaFromGetRow(ctx, row, userID)
 	entry.CollectionID = nullStringPtr(collectionID)
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.create: commit failed", "error", err)
+		writeInternalError(w, r, "failed to store secret")
+		return
+	}
 
-	// Seed the capability-bridge columns from the provider's defaults so the
-	// secret is immediately usable through /secrets/issue + /proxy (dockyard
-	// did this in its vault-enroll path). Only untouched rows are filled.
-	// The oracle is a constant true for the same reason as the INSERT above: this
-	// caller is the row's user_id, which is the principal the widening right
-	// belongs to.
-	h.seedCapabilityDefaults(ctx, h.queries, r, entryID, req.Provider, func() bool { return true })
-
-	LogActivityFromRequest(h.queries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", h.sealSecretName(r.Context(), req.Name), userID))
+	LogActivityFromRequest(baseQueries, r, "vault.entry_created", fmt.Sprintf("Vault secret created: %s (user: %s)", h.sealSecretName(r.Context(), req.Name), userID))
 
 	writeJSON(w, http.StatusCreated, entry)
 }
@@ -1676,15 +1986,6 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	ctx := r.Context()
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
-		writeNotFound(w, r, "vault entry not found")
-		return
-	}
-	info, err := h.queries.GetVaultEntryAccess(ctx, id)
-	if err != nil {
-		writeNotFound(w, r, "vault entry not found")
-		return
-	}
 	var req struct {
 		CollectionID *string `json:"collection_id"`
 	}
@@ -1693,11 +1994,39 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Authorization, source/destination policy, uniqueness and the move itself
+	// share one write snapshot. BEGIN IMMEDIATE serializes a concurrent policy
+	// promotion or membership change before any of these answers can go stale.
+	baseQueries := h.queries
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.move: begin transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := baseQueries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	info, err := qtx.GetVaultEntryAccess(ctx, id)
+	if err != nil {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+
 	source := ""
 	if info.CollectionID.Valid {
 		source = info.CollectionID.String
 	}
-	if source != "" && !h.canMoveEntryOutOfCollection(r, info.UserID, source) {
+	if source != "" && !txHandler.requireCollectionPrivateAccess(w, r, source, privateAccessSensitive) {
+		return
+	}
+	if source != "" && !txHandler.canMoveEntryOutOfCollection(r, info.UserID, source) {
 		writeForbidden(w, r, "only the entry owner, a manager of the current collection, or an admin can move this entry out of it")
 		return
 	}
@@ -1705,52 +2034,88 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 	var target sql.NullString
 	destination := ""
 	if req.CollectionID != nil && *req.CollectionID != "" {
-		if !h.canWriteCollection(r, *req.CollectionID) {
+		destination = *req.CollectionID
+		if destination != source && !txHandler.requireWritableCollectionDestination(w, r, destination) {
+			return
+		}
+		// Preserve the existing membership check for a same-collection no-op.
+		// A different destination has already performed this check inside the
+		// ordered policy/authority helper above.
+		if destination == source && !txHandler.canWriteCollection(r, destination) {
 			writeForbidden(w, r, "you do not have write access to that collection")
 			return
 		}
-		destination = *req.CollectionID
 		target = sql.NullString{String: destination, Valid: true}
 	}
-	if err := h.queries.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
+	// The collection id and every scope-keyed index move under one write lock.
+	// The opened-name preflight catches legacy and previous-key tokens; the
+	// destination unique index is the final authority for current-key writers.
+	meta, err := qtx.GetVaultEntryMeta(ctx, id)
+	if err != nil {
+		logError(r, "vault.move: reindex lookup failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	namePlain, err := h.decryptColumn(meta.Name, vaultFieldName)
+	if err != nil {
+		logError(r, "vault.move: name decrypt failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	duplicate, err := h.vaultEntryNameExistsInScope(ctx, qtx, info.UserID, target, namePlain, id)
+	if err != nil {
+		logError(r, "vault.move: name conflict check failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if duplicate {
+		writeConflict(w, r, "a vault entry with that name already exists in the destination vault")
+		return
+	}
+	newScope := bidxScope(info.UserID, target)
+	newNameBidx := h.scopedNameBlindIndex(newScope, namePlain)
+	if err := qtx.SetVaultEntryCollection(ctx, db.SetVaultEntryCollectionParams{
 		CollectionID: target,
+		NameBidx:     newNameBidx,
 		ID:           id,
 	}); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			writeConflict(w, r, "a vault entry with that name already exists in the destination vault")
+			return
+		}
 		logError(r, "vault.move: set collection failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-
-	// The blind index is keyed to the entry's scope, so a move invalidates it.
-	// Recompute both indexes under the new scope, otherwise the entry keeps an
-	// index nobody will ever compute again and autofill silently stops offering
-	// it. Recovering the cleartext host requires decrypting the stored url.
-	if meta, mErr := h.queries.GetVaultEntryMeta(ctx, id); mErr != nil {
-		logError(r, "vault.move: reindex lookup failed", "error", mErr)
-	} else {
-		newScope := bidxScope(info.UserID, target)
-		urlPlain := h.decryptColumnOrLog(meta.Url.String, "", vaultFieldURL)
-		aliasPlain := h.decryptColumnOrLog(meta.AliasUrl.String, "", vaultFieldAliasURL)
-		if err := h.queries.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
-			// Passed through untouched. A move changes the collection, not the
-			// custodian, so the name and its user-keyed index are unaffected;
-			// leaving these at their zero value would blank the entry's name.
-			Name:         meta.Name,
-			NameBidx:     meta.NameBidx,
-			Url:          meta.Url,
-			AliasUrl:     meta.AliasUrl,
-			Username:     meta.Username,
-			Category:     meta.Category,
-			Notes:        meta.Notes,
-			UrlBidx:      h.urlBlindIndex(newScope, urlPlain),
-			AliasUrlBidx: h.urlBlindIndex(newScope, aliasPlain),
-			ID:           id,
-		}); err != nil {
-			logError(r, "vault.move: reindex failed", "error", err)
-		}
+	urlPlain, err := h.decryptColumn(meta.Url.String, vaultFieldURL)
+	if err != nil {
+		logError(r, "vault.move: url decrypt failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	aliasPlain, err := h.decryptColumn(meta.AliasUrl.String, vaultFieldAliasURL)
+	if err != nil {
+		logError(r, "vault.move: alias url decrypt failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if err := qtx.UpdateVaultEntryMetaAtRest(ctx, db.UpdateVaultEntryMetaAtRestParams{
+		Name: meta.Name, NameBidx: newNameBidx, Url: meta.Url, AliasUrl: meta.AliasUrl,
+		Username: meta.Username, Category: meta.Category, Notes: meta.Notes,
+		UrlBidx: h.urlBlindIndex(newScope, urlPlain), AliasUrlBidx: h.urlBlindIndex(newScope, aliasPlain),
+		ID: id,
+	}); err != nil {
+		logError(r, "vault.move: reindex failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.move: commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
 	}
 
-	storedName, nameErr := h.queries.GetVaultEntryName(ctx, id)
+	storedName, nameErr := baseQueries.GetVaultEntryName(ctx, id)
 	name := h.EntryNamePlain(storedName)
 	if nameErr != nil {
 		name = "(unknown)"
@@ -1766,7 +2131,7 @@ func (h *VaultHandler) MoveToCollection(w http.ResponseWriter, r *http.Request) 
 	//
 	// 00036 recorded this as a residual and called it "a self-inflicted denial of
 	// service on one row". It is neither self-inflicted nor one row.
-	LogActivityFromRequest(h.queries, r, "vault.entry_moved", fmt.Sprintf(
+	LogActivityFromRequest(baseQueries, r, "vault.entry_moved", fmt.Sprintf(
 		"Vault entry moved: %s (id: %s, from: %s, to: %s)",
 		h.sealSecretName(r.Context(), scrubEntryIDLookalikes(name)), id, collectionLabel(source), collectionLabel(destination)))
 	w.WriteHeader(http.StatusNoContent)
@@ -1889,12 +2254,6 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
 
-	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
-		writeNotFound(w, r, "vault entry not found")
-		return
-	}
-
 	var req struct {
 		Name      *string `json:"name"`
 		Value     *string `json:"value"`
@@ -1944,10 +2303,35 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.CustomFields != nil {
-		if err := validateCustomFields(*req.CustomFields); err != nil {
+		if err := validateUpdateCustomFields(*req.CustomFields); err != nil {
 			writeBadRequest(w, r, err.Error())
 			return
 		}
+	}
+
+	// From authorization through the final write, use one immediate transaction.
+	// A collection promotion, membership revocation or entry move either commits
+	// before this snapshot (and is enforced) or after this update (which
+	// linearizes first); it can no longer land between the gate and the mutation.
+	baseHandler := h
+	baseQueries := h.queries
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.update: begin transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
+	qtx := baseQueries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+	h = &txHandler
+	if _, canWrite := h.entryAccess(r, id); !canWrite {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	if !h.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
 	}
 
 	// Refuse the whole request if any encrypted column on this entry cannot be
@@ -1975,7 +2359,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Name != nil || req.URL != nil || req.AliasURL != nil || req.Username != nil ||
 		req.Category != nil || req.Notes != nil || req.CustomFields != nil ||
 		req.DestinationPatterns != nil || req.Value != nil {
-		damaged, metaErr := h.queries.GetVaultEntryMeta(ctx, id)
+		damaged, metaErr := qtx.GetVaultEntryMeta(ctx, id)
 		if metaErr != nil {
 			// Fail closed. Skipping the check on a read error is how a guard
 			// quietly stops guarding.
@@ -2000,12 +2384,9 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	// May this caller ADD or WIDEN a destination this secret is delivered to?
 	//
-	// Computed BEFORE the transaction opens, deliberately: mayDirectSecretEgress
-	// reads through h.queries (the pool), and a pool read issued while this
-	// handler holds the SQLite write lock contends with it on a second
-	// connection. That is the measured 5.3s stall documented on
-	// seedCapabilityDefaults, and the answer does not depend on anything the
-	// transaction writes.
+	// Computed through the transaction-bound query set. Reaching for the pool
+	// here would both contend with our own write lock and detach this authority
+	// decision from the policy/membership snapshot above.
 	//
 	// manage is not enough for this, and that gap is the round-3 blocker: an
 	// accepted collection editor (a role a public-signup vault_only account can
@@ -2043,19 +2424,23 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// first append for why writing them inside the transaction is a 5s stall.
 	var deferredActivity []queuedActivity
 
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		logError(r, "vault.update: begin transaction failed", "error", err)
-		writeInternalError(w, r, "internal server error")
-		return
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
-	qtx := h.queries.WithTx(tx)
-
 	// Custom fields: nil means "unchanged"; a present (even empty) array replaces
-	// the set. Encrypted at rest.
+	// the set. Encrypted at rest. Secret values withheld from an ordinary
+	// metadata response are merged from the transaction's stored snapshot before
+	// sealing, so echoing that response cannot blank a second credential.
 	if req.CustomFields != nil {
-		if enc, cfErr := h.encryptCustomFields(*req.CustomFields); cfErr != nil {
+		current, cfErr := qtx.GetVaultEntryMeta(ctx, id)
+		if cfErr != nil {
+			logError(r, "vault.update: load custom fields for preservation failed", "entry", id, "error", cfErr)
+			writeInternalError(w, r, "internal server error")
+			return
+		}
+		merged, cfErr := h.mergeWithheldCustomFields(current.CustomFields, *req.CustomFields)
+		if cfErr != nil {
+			writeError(w, r, http.StatusConflict, "withheld_field_changed", cfErr.Error())
+			return
+		}
+		if enc, cfErr := h.encryptCustomFields(merged); cfErr != nil {
 			logError(r, "vault.update: custom fields encrypt failed", "error", cfErr)
 			writeInternalError(w, r, "internal server error")
 			return
@@ -2237,24 +2622,14 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Done FIRST so a refused rename leaves the rest of the entry untouched.
 	if req.Name != nil {
 		newName := *req.Name
-		// Who owns the entry decides whether a rename may be attempted at all.
+		// Migration 00045 moved the uniqueness question into the vault that
+		// displays the entry: u:<owner> for personal entries and c:<collection>
+		// for shared ones. The duplicate check below therefore consults only a
+		// namespace the caller can already list; it no longer probes the creator's
+		// personal vault when this is a collection entry.
 		//
-		// UNIQUE(user_id, name) is scoped to the entry's CREATOR, and a shared
-		// entry keeps its creator's user_id forever. So an editor in a shared
-		// collection renaming somebody else's entry ran a query against a vault
-		// they have no read path to: a 409 meant "the creator holds an entry with
-		// exactly that name privately", and a 204 meant they do not. That is an
-		// existence oracle over another user's personal vault, spendable one
-		// guessed name at a time, and on a shared instance the creator is
-		// somebody else's client.
-		//
-		// The refusal is therefore constant: it does not consult the creator's
-		// namespace, so it says the same thing whether or not the name is taken
-		// there. The owner and an instance admin keep the precise duplicate-name
-		// feedback below, because for them the conflicting entry is one they can
-		// already see (an admin lists every entry with ?all=true).
-		//
-		// A rename by a non-owner is also a correctness problem in its own right:
+		// Who may rename remains deliberately narrower than who may edit. A rename
+		// by an arbitrary editor is a correctness problem in its own right:
 		// the name is the lookup key for service_identities.allowed_secrets and
 		// for MCP list_secrets/use_secret, so renaming another user's entry
 		// silently breaks resolution they configured and cannot see was broken.
@@ -2266,17 +2641,11 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// THE RULE, in full, because the first cut of this fix silently took
 		// renaming away from collection MANAGERS and did not say so:
 		//
-		//  1. the entry's creator and an instance admin rename freely, with the
-		//     precise 409 duplicate-name feedback, since the conflicting entry
-		//     is one they can already see;
+		//  1. the entry's creator and an instance admin rename freely;
 		//  2. a MANAGER of the collection may rename an entry whose creator has
 		//     left that collection, and doing so ADOPTS it (user_id and name are
-		//     written in one statement). Adoption is what makes it safe: the
-		//     uniqueness question moves into the manager's own namespace, so the
-		//     answer is about entries they can see and the creator's private
-		//     vault is never consulted. It is unconditional on that path, not a
-		//     fallback after a conflict, because a fallback would be the oracle
-		//     again by its timing;
+		//     written in one statement). Adoption supplies a live custodian; the
+		//     uniqueness scope stays c:<collection> before and after;
 		//  3. everyone else, including a manager while the creator is still an
 		//     accepted member of the collection, gets the constant 403. The
 		//     creator is right there and can do it themselves, and the name is
@@ -2290,7 +2659,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		// departed creator's residual recovery READ on that one entry
 		// (grantFor row 7), so a manager takes responsibility for a secret that
 		// was stranded in their collection. Rule 3 keeps the creator's own
-		// namespace unreadable while they are still a colleague.
+		// responsibility with the colleague who can still maintain it.
 		//
 		// ADOPTION MOVES THE CUSTODIAN AND NOT THE OWNER. Rule 2 was also, until
 		// this round, a two-call route to becoming the principal the EXIT asks
@@ -2320,12 +2689,22 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if newName != currentName {
+			duplicate, dupErr := h.vaultEntryNameExistsInScope(ctx, qtx, ownerID,
+				access.CollectionID, newName, id)
+			if dupErr != nil {
+				logError(r, "vault.update: name conflict check failed", "entry", id, "error", dupErr)
+				writeInternalError(w, r, "internal server error")
+				return
+			}
+			if duplicate {
+				writeConflict(w, r, "a vault entry with that name already exists in this vault")
+				return
+			}
 			switch {
 			case middleware.IsAdmin(ctx) || userID == ownerID:
-				// The name stays in the OWNER's namespace on an ordinary rename, so
-				// the index is derived under ownerID rather than under whoever is
-				// making the call: an admin renaming somebody else's entry must not
-				// move it into their own namespace.
+				// The name stays in the entry's personal/collection scope on an
+				// ordinary rename. An admin acting on somebody else's personal entry
+				// therefore still derives u:<owner>, never u:<admin>.
 				encName, encErr := h.encryptColumn(newName)
 				if encErr != nil {
 					logError(r, "vault.update: encrypt name failed", "error", encErr)
@@ -2333,7 +2712,9 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if err := qtx.UpdateVaultEntryName(ctx, db.UpdateVaultEntryNameParams{
-					Name: encName, NameBidx: h.nameBlindIndex(ownerID, newName), ID: id,
+					Name:     encName,
+					NameBidx: h.scopedNameBlindIndex(bidxScope(ownerID, access.CollectionID), newName),
+					ID:       id,
 				}); err != nil {
 					if strings.Contains(err.Error(), "UNIQUE constraint") {
 						writeConflict(w, r, "a vault entry with that name already exists")
@@ -2344,11 +2725,8 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case h.managerMayAdoptOrphanedEntry(ctx, userID, ownerID, access.CollectionID):
-				// Adoption moves the custodian, so the index moves with it: derived
-				// under the ADOPTER's id, which is what puts the uniqueness question
-				// in their namespace. Deriving it under ownerID here would keep
-				// enforcing the departed owner's namespace on a row they no longer
-				// hold.
+				// Adoption moves the custodian but not the vault scope: this path is
+				// collection-only, so both before and after use c:<collection>.
 				encName, encErr := h.encryptColumn(newName)
 				if encErr != nil {
 					logError(r, "vault.update: encrypt name failed", "error", encErr)
@@ -2356,7 +2734,9 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if err := qtx.AdoptAndRenameVaultEntry(ctx, db.AdoptAndRenameVaultEntryParams{
-					UserID: userID, Name: encName, NameBidx: h.nameBlindIndex(userID, newName), ID: id,
+					UserID: userID, Name: encName,
+					NameBidx: h.scopedNameBlindIndex(bidxScope(userID, access.CollectionID), newName),
+					ID:       id,
 				}); err != nil {
 					if strings.Contains(err.Error(), "UNIQUE constraint") {
 						// The conflict is inside the manager's OWN namespace, so
@@ -2589,6 +2969,44 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 				metaSource = *req.ProviderMeta
 			}
 			keepMarkers := provider == current.Provider.String
+			// Credential classifications accept historical case/whitespace
+			// spellings even though provider execution remains registry-exact. A
+			// spelling-only normalization is therefore the SAME credential scope:
+			// preserve Datadog's app_key while the provider tag moves from
+			// "Datadog" to "datadog", rather than treating it as another vendor.
+			sameCredentialScope := strings.EqualFold(strings.TrimSpace(provider),
+				strings.TrimSpace(current.Provider.String))
+			credentialReconciled := false
+			// Ordinary entry responses omit provider_meta credentials such as
+			// Datadog's app_key. The frontend performs a full-column replacement,
+			// so an untouched save sends that key as missing/blank. Merge only
+			// inside the same canonical provider scope; moving to another provider
+			// must not carry credentials across vendors.
+			if req.ProviderMeta != nil && sameCredentialScope {
+				var preserveErr error
+				metaSource, _, preserveErr = preserveCredentialProviderMetaForStorage(
+					provider, metaSource, beforeMeta)
+				if preserveErr != nil {
+					writeValidationError(w, r, preserveErr.Error())
+					return
+				}
+			}
+			if !keepMarkers && !sameCredentialScope {
+				// A provider-only update starts with the STORED metadata, not client
+				// input. Without stripping the old provider's credential keys here,
+				// changing Datadog to (say) Grafana carries app_key into the new row.
+				// The ordinary response then applies the NEW provider's redaction
+				// rules, does not recognise Datadog's key, and returns the credential
+				// to the API-key caller that made the change. Strip the OLD provider's
+				// declared credential keys before both the egress decision and storage.
+				// This also handles a full client-supplied replacement: a credential
+				// belonging to the abandoned provider never follows it to another
+				// vendor merely because the client echoed stale unlocked metadata.
+				var stripped []string
+				metaSource, stripped = redactCredentialProviderMetaKeys(
+					current.Provider.String, metaSource)
+				credentialReconciled = len(stripped) > 0
+			}
 			if !keepMarkers && beforeMeta[pendingRevokeURL] != "" {
 				// CHANGING THE PROVIDER DISCARDS A LIVE KEY'S ONLY RECORD.
 				//
@@ -2621,6 +3039,7 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 			}
 			metaToStore, metaReconciled := reconcileProviderMetaForStorage(
 				metaSource, beforeMeta, keepMarkers)
+			metaReconciled = metaReconciled || credentialReconciled
 			// afterMeta is what the egress gate reasons over, so it has to agree
 			// with what is about to be written.
 			afterMeta = ParseProviderMeta(metaToStore)
@@ -2783,9 +3202,13 @@ func (h *VaultHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	// Everything below performs post-commit audit/CAS work and response reads.
+	// Restore the pool-backed handler; using qtx after Commit returns ErrTxDone
+	// and can silently drop the audit row this transaction queued.
+	h = baseHandler
 
 	for _, a := range deferredActivity {
-		LogActivityFromRequest(h.queries, r, a.action, a.detail)
+		LogActivityFromRequest(baseQueries, r, a.action, a.detail)
 	}
 
 	// SETTLE THE PROVIDER_META WRITE-BACK ALARMS, if the operator just wrote that
@@ -2897,15 +3320,29 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	userID := middleware.GetUserID(r.Context())
 	ctx := r.Context()
+	baseQueries := h.queries
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.delete: begin transaction failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := baseQueries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
 
 	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
 		return
 	}
 
 	// Get the entry name for logging
-	name, err := h.queries.GetVaultEntryName(ctx, id)
+	name, err := qtx.GetVaultEntryName(ctx, id)
 	if err == sql.ErrNoRows {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -2917,7 +3354,7 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// row is gone, this line IS the record of what was deleted.
 	name = h.EntryNamePlain(name)
 
-	result, err := h.queries.DeleteVaultEntry(ctx, id)
+	result, err := qtx.DeleteVaultEntry(ctx, id)
 	if err != nil {
 		logError(r, "vault.delete: delete failed", "error", err)
 		writeInternalError(w, r, "internal server error")
@@ -2929,8 +3366,13 @@ func (h *VaultHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.delete: commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
-	LogActivityFromRequest(h.queries, r, "vault.entry_deleted", fmt.Sprintf("Vault secret deleted: %s (user: %s)", h.sealSecretName(r.Context(), name), userID))
+	LogActivityFromRequest(baseQueries, r, "vault.entry_deleted", fmt.Sprintf("Vault secret deleted: %s (user: %s)", h.sealSecretName(r.Context(), name), userID))
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -3082,14 +3524,32 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind transport policy, write authority and the exact ciphertext/provider
+	// snapshot this operation will use. The transaction is committed before any
+	// provider network call, so it is brief; an operation already admitted may
+	// finish, while a promotion committed before this point is enforced.
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.rotate: snapshot failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+
 	// Authorize: personal owner/admin, or editor/manager in the entry's collection.
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
 		return
 	}
 
 	// Check if this entry has a provider that supports auto-rotation
-	meta, err := h.queries.GetVaultEntryMeta(ctx, id)
+	meta, err := qtx.GetVaultEntryMeta(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -3113,7 +3573,6 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// anywhere except through secretexit.Exit. Holding them as strings is what
 	// used to make the delivery path's destination question invisible.
 	var newValue secretexit.Plaintext
-	var oldValue secretexit.Plaintext // current plaintext, needed by provider.Rotate()
 	// Deferred until after the CAS: writing either of these before it would move
 	// updated_at and make the compare-and-swap reject the handler's own write.
 	var pendingRevokeWarn string
@@ -3130,7 +3589,7 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// filter returned sql.ErrNoRows for on-demand entries) the zero-value
 	// nonce would reach h.decrypt. Ownership + meta were already verified
 	// above, so a failure here is a genuine load error, not a missing entry.
-	entryRow, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	entryRow, err := qtx.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
 		logError(r, "vault.rotate: load entry for rotation failed", "entry", id, "error", err)
 		writeInternalError(w, r, "failed to load secret for rotation")
@@ -3146,6 +3605,12 @@ func (h *VaultHandler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// recovered once the underlying cause is fixed.
 	oldValue, decErr := h.OpenEntrySecret(entryRow.EncryptedValue, entryRow.Nonce,
 		int(entryRow.EncryptionVersion.Int64), entryOrigin(id, meta.Name))
+	if err := tx.Commit(); err != nil {
+		oldValue.Wipe()
+		logError(r, "vault.rotate: snapshot commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	if decErr != nil {
 		logError(r, "vault.rotate: decrypt failed, refusing to rotate", "entry", id, "error", decErr)
 		recordRotationFailure(ctx, h.queries, h, id, meta.Name, providerName,
@@ -3720,6 +4185,16 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	if !h.reauthOrRefuse(w, r, ctx, userID, req.Password) {
 		return
 	}
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.validate: snapshot failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
 
 	// The SPEND right, not the read right. This handler decrypts the stored
 	// value and authenticates with it against the provider, so it is a live use
@@ -3740,12 +4215,15 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	// for plaintext, so refusing them a validity check protects nothing and just
 	// breaks the operator flow. Round 10 tightened this without restoring the
 	// bypass that entryAccess had.
-	if !middleware.IsAdmin(ctx) && !h.entryCurrentlyUsableBy(ctx, userID, id) {
+	if !middleware.IsAdmin(ctx) && !txHandler.entryCurrentlyUsableBy(ctx, userID, id) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
+	}
 
-	meta, err := h.queries.GetVaultEntryMeta(ctx, id)
+	meta, err := qtx.GetVaultEntryMeta(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
@@ -3763,7 +4241,7 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Decrypt the value
-	entryRow, err := h.queries.GetVaultEntryForRotation(ctx, id)
+	entryRow, err := qtx.GetVaultEntryForRotation(ctx, id)
 	if err != nil {
 		writeNotFound(w, r, "entry not found")
 		return
@@ -3776,6 +4254,11 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer plaintext.Wipe()
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.validate: snapshot commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
 	providerMeta := ParseProviderMeta(h.decryptColumnOrLog(meta.ProviderMeta.String, "{}", vaultFieldProviderMeta))
 	// Validate AUTHENTICATES with the decrypted key against the provider, so it
@@ -3827,6 +4310,17 @@ func (h *VaultHandler) ValidateKey(w http.ResponseWriter, r *http.Request) {
 // GetTargets handles GET /api/vault/{id}/targets - returns rotation targets for an entry.
 func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	tx, err := h.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.targets: snapshot failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback()
+	qtx := h.queries.WithTx(tx)
+	snapshot := *h
+	snapshot.queries = qtx
+	h = &snapshot
 	// WRITE access, not read. Rotation targets are a management surface and
 	// they carry OTHER people's credentials: webhook HMAC signing secrets and
 	// forgejo auth_token references, configured by other members.
@@ -3844,12 +4338,24 @@ func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
-	raw, err := h.queries.GetVaultEntryTargets(r.Context(), id)
+	if !h.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
+	}
+	raw, err := qtx.GetVaultEntryTargets(r.Context(), id)
 	if err != nil {
 		writeNotFound(w, r, "vault entry not found")
 		return
 	}
 	targets := ParseRotationTargets(h.decryptColumnOrLog(raw.String, "[]", vaultFieldRotationTargets))
+	if !middleware.IsPrivateIngress(r.Context()) && h.rotationTargetReferencesNeedPrivate(r.Context(), targets) {
+		writePrivateIngressRequired(w, r)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.targets: snapshot commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	// The version pins the view the client is editing. UpdateTargets is a full
 	// replace, so a panel held open across an offboarding would otherwise
 	// resubmit the departed member's purged webhook, and since that target is no
@@ -3868,8 +4374,23 @@ func (h *VaultHandler) GetTargets(w http.ResponseWriter, r *http.Request) {
 // reload_endpoint) are cut.
 func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	baseQueries := h.queries
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		logError(r, "vault.targets: transaction failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback()
+	qtx := baseQueries.WithTx(tx)
+	snapshot := *h
+	snapshot.queries = qtx
+	h = &snapshot
 	if _, canWrite := h.entryAccess(r, id); !canWrite {
 		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	if !h.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
 		return
 	}
 	userID := middleware.GetUserID(r.Context())
@@ -3877,7 +4398,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// Load what is stored BEFORE overwriting, so unchanged rows keep their
 	// original attribution (see below).
 	existingTargets := ""
-	if cur, curErr := h.queries.GetVaultEntryTargets(r.Context(), id); curErr == nil {
+	if cur, curErr := qtx.GetVaultEntryTargets(r.Context(), id); curErr == nil {
 		existingTargets = cur.String
 	}
 
@@ -3992,6 +4513,15 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A target references a second secret by name. On public ingress, a
+	// protected reference and a missing/ambiguous one take the exact same path:
+	// neither is resolved, returned, or persisted. This both removes the hidden
+	// name oracle and prevents a standard carrier from becoming a public control
+	// plane for a protected token.
+	if !middleware.IsPrivateIngress(r.Context()) && h.rotationTargetReferencesNeedPrivate(r.Context(), targets) {
+		writePrivateIngressRequired(w, r)
+		return
+	}
 
 	// THE AUTH_TOKEN QUESTION, ASKED AT THE WRITE BECAUSE THE EXIT ASKS IT AT
 	// DELIVERY.
@@ -4026,7 +4556,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 	// pattern this audit stream keeps re-finding. Refused at the write AND at
 	// delivery (DeliverRotatedKey), so a row planted by anything else is refused
 	// too.
-	pin, pinErr := providerPinFor(r.Context(), h.queries, id)
+	pin, pinErr := providerPinFor(r.Context(), qtx, id)
 	if pinErr != nil {
 		logError(r, "vault.targets: could not read the entry's provider pin", "entry", id, "error", pinErr)
 		writeInternalError(w, r, "internal server error")
@@ -4105,7 +4635,7 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to update targets")
 		return
 	}
-	if err := vaultegress.SetRotationTargets(r.Context(), h.queries, tk, vaultegress.RotationTargetsParams{
+	if err := vaultegress.SetRotationTargets(r.Context(), qtx, tk, vaultegress.RotationTargetsParams{
 		RotationTargets: toNullString(encTargets),
 		ID:              id,
 	}); err != nil {
@@ -4113,8 +4643,13 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "failed to update targets")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.updateTargets: commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "failed to update targets")
+		return
+	}
 
-	LogActivityFromRequest(h.queries, r, "vault.targets_updated", fmt.Sprintf("Rotation targets updated for vault entry %s (user: %s, targets: %d)", id, userID, len(targets)))
+	LogActivityFromRequest(baseQueries, r, "vault.targets_updated", fmt.Sprintf("Rotation targets updated for vault entry %s (user: %s, targets: %d)", id, userID, len(targets)))
 
 	writeJSON(w, http.StatusOK, targets)
 }
@@ -4122,11 +4657,6 @@ func (h *VaultHandler) UpdateTargets(w http.ResponseWriter, r *http.Request) {
 // UpdateSchedule handles PUT /api/vault/{id}/schedule - sets rotation interval and auto-rotate.
 func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, canWrite := h.entryAccess(r, id); !canWrite {
-		writeNotFound(w, r, "vault entry not found")
-		return
-	}
-
 	var req struct {
 		RotationIntervalDays int  `json:"rotation_interval_days"`
 		AutoRotate           bool `json:"auto_rotate"`
@@ -4144,8 +4674,25 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		logError(r, "vault.schedule: transaction failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	txHandler := *h
+	txHandler.queries = qtx
+	if _, canWrite := txHandler.entryAccess(r, id); !canWrite {
+		writeNotFound(w, r, "vault entry not found")
+		return
+	}
+	if !txHandler.requireEntryPrivateAccess(w, r, id, privateAccessSensitive) {
+		return
+	}
 
-	if err := h.queries.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{
+	if err := qtx.UpdateVaultEntryRotationInterval(ctx, db.UpdateVaultEntryRotationIntervalParams{
 		RotationIntervalDays: sql.NullInt64{Int64: int64(req.RotationIntervalDays), Valid: req.RotationIntervalDays > 0},
 		ID:                   id,
 	}); err != nil {
@@ -4154,7 +4701,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch current provider info to update auto_rotate
-	current, err := h.queries.GetVaultEntryMeta(ctx, id)
+	current, err := qtx.GetVaultEntryMeta(ctx, id)
 	if err != nil {
 		writeInternalError(w, r, "failed to fetch entry")
 		return
@@ -4175,7 +4722,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		After:   providerDestinations(current.Provider.String, scheduleMeta),
 		Covers:  providerDestinationCovers,
 		MayRedirect: func() bool {
-			return h.mayDirectSecretEgress(ctx, middleware.GetUserID(ctx), middleware.IsAdmin(ctx), id)
+			return txHandler.mayDirectSecretEgress(ctx, middleware.GetUserID(ctx), middleware.IsAdmin(ctx), id)
 		},
 	})
 	if schedTkErr != nil {
@@ -4183,7 +4730,7 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
-	if err := vaultegress.SetProvider(ctx, h.queries, scheduleTicket, vaultegress.ProviderParams{
+	if err := vaultegress.SetProvider(ctx, qtx, scheduleTicket, vaultegress.ProviderParams{
 		Provider:     current.Provider,
 		ProviderMeta: current.ProviderMeta,
 		AutoRotate:   sql.NullInt64{Int64: boolToInt64(req.AutoRotate), Valid: true},
@@ -4194,13 +4741,19 @@ func (h *VaultHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return updated entry
-	row, err := h.queries.GetVaultEntryMeta(ctx, id)
+	row, err := qtx.GetVaultEntryMeta(ctx, id)
 	if err != nil {
 		writeInternalError(w, r, "internal server error")
 		return
 	}
+	entry := h.vaultMetaFromGetRow(ctx, row, middleware.GetUserID(ctx))
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.schedule: commit failed", "entry", id, "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 
-	writeJSON(w, http.StatusOK, h.vaultMetaFromGetRow(ctx, row, middleware.GetUserID(ctx)))
+	writeJSON(w, http.StatusOK, entry)
 }
 
 // Match handles GET /api/vault/match?url=... and returns vault entries whose
@@ -4226,6 +4779,17 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "invalid URL")
 		return
 	}
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logError(r, "vault.match: snapshot failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	qtx := h.queries.WithTx(tx)
+	snapshot := *h
+	snapshot.queries = qtx
+	h = &snapshot
 
 	entries := []vaultEntryMeta{}
 	seen := map[string]bool{}
@@ -4242,7 +4806,7 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 	// two while a master-key rotation is in flight. appendRow dedupes, so an entry
 	// whose index has already been converted cannot appear twice.
 	for _, personalBidx := range h.urlBlindIndexCandidates(bidxScope(userID, sql.NullString{}), rawURL) {
-		personalRows, err := h.queries.MatchPersonalVaultEntriesByURL(ctx, db.MatchPersonalVaultEntriesByURLParams{
+		personalRows, err := qtx.MatchPersonalVaultEntriesByURL(ctx, db.MatchPersonalVaultEntriesByURLParams{
 			UserID:       userID,
 			UrlBidx:      personalBidx,
 			AliasUrlBidx: personalBidx,
@@ -4259,15 +4823,24 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 
 	// ListCollectionsForUser returns accepted memberships only, so a pending
 	// invitation contributes nothing to autofill.
-	cols, err := h.queries.ListCollectionsForUser(ctx, userID)
+	cols, err := qtx.ListCollectionsForUser(ctx, userID)
 	if err != nil {
 		logError(r, "vault.match: collection lookup failed", "error", err)
 		writeInternalError(w, r, "internal server error")
 		return
 	}
 	for _, c := range cols {
+		visible, policyErr := privateMetadataVisible(ctx, c.PrivateAccessPolicy)
+		if policyErr != nil {
+			logError(r, "vault.match: private access policy lookup failed", "collection", c.ID, "error", policyErr)
+			writeInternalError(w, r, "private access policy could not be verified")
+			return
+		}
+		if !visible {
+			continue
+		}
 		for _, cb := range h.urlBlindIndexCandidates(bidxScope("", sql.NullString{String: c.ID, Valid: true}), rawURL) {
-			rows, cErr := h.queries.MatchCollectionVaultEntriesByURL(ctx, db.MatchCollectionVaultEntriesByURLParams{
+			rows, cErr := qtx.MatchCollectionVaultEntriesByURL(ctx, db.MatchCollectionVaultEntriesByURLParams{
 				CollectionID: sql.NullString{String: c.ID, Valid: true},
 				UrlBidx:      cb,
 				AliasUrlBidx: cb,
@@ -4282,6 +4855,11 @@ func (h *VaultHandler) Match(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		logError(r, "vault.match: snapshot commit failed", "error", err)
+		writeInternalError(w, r, "internal server error")
+		return
+	}
 	writeJSON(w, http.StatusOK, entries)
 }
 

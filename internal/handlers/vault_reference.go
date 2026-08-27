@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/bright-interaction/trustissues/internal/db"
+	"github.com/bright-interaction/trustissues/internal/privateaccess"
 	"github.com/bright-interaction/trustissues/internal/secretexit"
 )
 
@@ -50,6 +51,46 @@ var errAmbiguousVaultReference = errors.New("vault reference is ambiguous: more 
 // row at the one place it is asked at all. See internal/secretexit.
 func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userID string) (secretexit.Plaintext, error) {
 	var none secretexit.Plaintext
+	row, err := h.resolveVaultReferenceRowFor(ctx, name, userID)
+	if err != nil {
+		return none, err
+	}
+
+	// The origin is the REFERENCED entry, not the entry whose rotation is
+	// running. That single argument is the round-6 fix: the exit asks the owner
+	// of the secret it is about to send, and the secret it is about to send is
+	// this one.
+	plaintext, err := h.OpenEntrySecret(row.EncryptedValue, row.Nonce, 2,
+		entryOrigin(row.ID, name))
+	if err != nil {
+		return none, fmt.Errorf("decrypt vault reference %q: %w", name, err)
+	}
+	return plaintext, nil
+}
+
+// resolveVaultReferenceRowFor performs the reference's name and authority
+// resolution without opening its value. HTTP policy gates use this form to
+// decide whether a target references protected metadata; decrypting the secret
+// merely to learn its entry id would widen the amount of plaintext handled by
+// a request that may ultimately be refused.
+func (h *VaultHandler) resolveVaultReferenceRowFor(ctx context.Context, name, userID string) (db.ResolveVaultReferenceRow, error) {
+	return h.resolveVaultReferenceRowForVisibility(ctx, name, userID, false)
+}
+
+// resolvePublicVaultReferenceRowFor is the metadata-safe form used only while
+// deciding whether a public HTTP target-management request must move to private
+// ingress. A fully-private row is removed before its encrypted name is opened or
+// compared, so adding an accessible hidden entry with the same exact name cannot
+// turn an otherwise-valid standard reference from 200 into 403 through an
+// ambiguity. The ordinary resolver above intentionally keeps every row because
+// scheduled delivery and private management are not public metadata probes.
+func (h *VaultHandler) resolvePublicVaultReferenceRowFor(ctx context.Context, name, userID string) (db.ResolveVaultReferenceRow, error) {
+	return h.resolveVaultReferenceRowForVisibility(ctx, name, userID, true)
+}
+
+func (h *VaultHandler) resolveVaultReferenceRowForVisibility(ctx context.Context, name, userID string,
+	hideFullyPrivate bool) (db.ResolveVaultReferenceRow, error) {
+	var none db.ResolveVaultReferenceRow
 	if name == "" || userID == "" {
 		return none, sql.ErrNoRows
 	}
@@ -70,6 +111,18 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 	// and which is deliberately unchanged.
 	var named []db.ResolveVaultReferenceRow
 	for _, row := range all {
+		if hideFullyPrivate && row.CollectionID.Valid && row.CollectionID.String != "" {
+			if !row.PrivateAccessPolicy.Valid {
+				return none, fmt.Errorf("vault reference %q collection policy is missing", name)
+			}
+			policy, err := storedPrivateAccessPolicy(row.PrivateAccessPolicy.String)
+			if err != nil {
+				return none, err
+			}
+			if policy == privateaccess.PolicyFullyPrivate {
+				continue
+			}
+		}
 		if h.decryptColumnOrLog(row.Name, "", vaultFieldName) == name {
 			named = append(named, row)
 		}
@@ -93,16 +146,7 @@ func (h *VaultHandler) resolveVaultReferenceFor(ctx context.Context, name, userI
 		return none, fmt.Errorf("%w: %q", errAmbiguousVaultReference, name)
 	}
 
-	// The origin is the REFERENCED entry, not the entry whose rotation is
-	// running. That single argument is the round-6 fix: the exit asks the owner
-	// of the secret it is about to send, and the secret it is about to send is
-	// this one.
-	plaintext, err := h.OpenEntrySecret(reachable[0].EncryptedValue, reachable[0].Nonce, 2,
-		entryOrigin(reachable[0].ID, name))
-	if err != nil {
-		return none, fmt.Errorf("decrypt vault reference %q: %w", name, err)
-	}
-	return plaintext, nil
+	return reachable[0], nil
 }
 
 // queuedActivity is an activity-log row queued during a transaction and written

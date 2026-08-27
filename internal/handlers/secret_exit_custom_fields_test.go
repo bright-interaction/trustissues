@@ -71,18 +71,17 @@ func (e *customFieldEnv) storedCustomFields(t *testing.T) string {
 	return row.CustomFields
 }
 
-// TestSecretCustomFieldsGoThroughTheExit is the positive control and the
-// defensive half in one, because either alone would be misleading: a gate that
-// refuses everybody has not fixed anything, and a gate that refuses nobody is
-// not a gate.
-func TestSecretCustomFieldsGoThroughTheExit(t *testing.T) {
+// TestSecretCustomFieldsRequireAReveal is the positive control and the
+// defensive half in one: ordinary metadata withholds the value, while the
+// password-gated reveal mode still releases it to the owner and refuses an
+// unrelated principal.
+func TestSecretCustomFieldsRequireAReveal(t *testing.T) {
 	env := newCustomFieldEnv(t)
 	ctx := context.Background()
 
-	// POSITIVE CONTROL, on a real route. PUT /api/vault/{id} echoes the entry it
-	// just saved, and that echo is one of the response paths that carries custom
-	// fields. The owner has to get their own secret field back, byte for byte,
-	// exactly as before this change.
+	// An ordinary write echo is metadata, not a reveal. Possession of a session
+	// or extension API key is sufficient to reach it, so it must not contain the
+	// secondary credential even for the owner.
 	rec := httptest.NewRecorder()
 	env.h.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+env.entry,
 		env.owner, "user", env.entry, `{"notes":"unchanged"}`))
@@ -97,16 +96,27 @@ func TestSecretCustomFieldsGoThroughTheExit(t *testing.T) {
 	for _, f := range out.CustomFields {
 		got[f.Label] = f
 	}
-	if got["recovery-pin"].Value != env.secret {
-		t.Fatalf("THE FEATURE IS BROKEN. The owner's own secret custom field came back as %q, want "+
-			"the stored value. Routing it through the exit must not stop it reaching the person who "+
-			"deposited it.", got["recovery-pin"].Value)
+	if got["recovery-pin"].Value != "" {
+		t.Fatalf("ordinary update response leaked the secret custom field: %q", got["recovery-pin"].Value)
 	}
-	if got["recovery-pin"].Withheld {
-		t.Error("the owner's own field was marked withheld")
+	if !got["recovery-pin"].Withheld {
+		t.Error("ordinary update response blanked the secret without marking it withheld")
 	}
 	if got["account-region"].Value != "eu-north-1" {
 		t.Errorf("the ordinary custom field did not survive: %q", got["account-region"].Value)
+	}
+
+	// POSITIVE CONTROL. Unlock/export call the same function with revealSecrets,
+	// and the owner receives the field byte-for-byte through the exit.
+	revealed := env.h.customFieldsForCaller(ctx, env.entry, env.name,
+		env.storedCustomFields(t), env.owner, true)
+	byLabel := map[string]CustomField{}
+	for _, f := range revealed {
+		byLabel[f.Label] = f
+	}
+	if byLabel["recovery-pin"].Value != env.secret || byLabel["recovery-pin"].Withheld {
+		t.Fatalf("password-gated reveal did not release the owner's custom field: %+v",
+			byLabel["recovery-pin"])
 	}
 
 	// THE DEFENSIVE HALF. The exit asks grantFor(...).read about the entry the
@@ -114,8 +124,9 @@ func TestSecretCustomFieldsGoThroughTheExit(t *testing.T) {
 	// than inferred from how the row was obtained. This drives the converter with
 	// a principal the entry's owner does not admit, which is what a list query
 	// that widened by accident would hand it.
-	refused := env.h.customFieldsForCaller(ctx, env.entry, env.name, env.storedCustomFields(t), env.outsider)
-	byLabel := map[string]CustomField{}
+	refused := env.h.customFieldsForCaller(ctx, env.entry, env.name,
+		env.storedCustomFields(t), env.outsider, true)
+	byLabel = map[string]CustomField{}
 	for _, f := range refused {
 		byLabel[f.Label] = f
 	}
@@ -131,36 +142,42 @@ func TestSecretCustomFieldsGoThroughTheExit(t *testing.T) {
 		len(env.secret))
 }
 
-// TestASaveCannotWriteBackAWithheldCustomField closes the hazard the blanking
-// introduces.
+// TestASavePreservesAWithheldCustomField closes the hazard the blanking
+// introduces without making ordinary edits unusable.
 //
 // The edit form resubmits every field it was shown. A secret field the exit
 // withheld comes back blank, so a save would replace a live credential with an
 // empty string, permanently, with a 200 and a success toast. Same class as the
 // refuse-to-overwrite guards on the metadata columns and on rotation_targets,
 // and this one is sharper because the blank is one this server produced.
-func TestASaveCannotWriteBackAWithheldCustomField(t *testing.T) {
+func TestASavePreservesAWithheldCustomField(t *testing.T) {
 	env := newCustomFieldEnv(t)
 
 	body := `{"custom_fields":[{"label":"recovery-pin","value":"","secret":true,"withheld":true},` +
-		`{"label":"account-region","value":"eu-north-1"}]}`
+		`{"label":"account-region","value":"eu-west-1"}]}`
 	rec := httptest.NewRecorder()
 	env.h.Update(rec, vaultAuthzRequest(http.MethodPut, "/api/vault/"+env.entry,
 		env.owner, "user", env.entry, body))
-	if rec.Code == http.StatusOK || rec.Code == http.StatusNoContent {
-		t.Fatal("a save carrying a withheld field was accepted, so the blank this server rendered " +
-			"just overwrote the real secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a safe save carrying a withheld marker was refused (%d): %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "not released") {
-		t.Errorf("the refusal does not say why: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), env.secret) {
+		t.Fatal("the preservation response revealed the secret it merged from storage")
 	}
 
 	// AND THE STORED VALUE IS UNTOUCHED.
 	after := env.h.decryptCustomFields(env.storedCustomFields(t))
 	for _, f := range after {
-		if f.Label == "recovery-pin" && f.Value != env.secret {
-			t.Fatalf("the stored secret custom field is now %q; the refusal came after the write", f.Value)
+		switch f.Label {
+		case "recovery-pin":
+			if f.Value != env.secret {
+				t.Fatalf("the stored secret custom field is now %q after marker preservation", f.Value)
+			}
+		case "account-region":
+			if f.Value != "eu-west-1" {
+				t.Fatalf("the legitimate ordinary-field edit was lost: %q", f.Value)
+			}
 		}
 	}
-	t.Logf("save with a withheld field refused %d, stored value intact", rec.Code)
+	t.Logf("save with a withheld field returned %d, stored secret intact", rec.Code)
 }

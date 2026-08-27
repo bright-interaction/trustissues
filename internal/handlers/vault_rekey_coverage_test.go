@@ -281,7 +281,7 @@ var notKeyedColumns = map[string]string{
 	// exists to stop the members list answering "does this address have an
 	// account", not to protect the address at rest.
 	"collection_invitations.collection_id": "FK to collections",
-	"collection_invitations.email":         "the invited address, plaintext, lower-cased by the handler",
+	"collection_invitations.email":         "the invited address, plaintext, canonicalized by the handler",
 	"collection_invitations.role":          "role label, CHECK-constrained vocabulary",
 	"collection_invitations.invited_by":    "FK to users",
 	"collection_invitations.created_at":    "timestamp",
@@ -309,18 +309,19 @@ var notKeyedColumns = map[string]string{
 	"secret_ownership_claims.withdrawn_json":             "JSON of the ceiling and provider_meta keys the claim cleared, plaintext, never sealed",
 
 	// collections + membership: names and roles.
-	"collection_members.collection_id": "FK",
-	"collection_members.user_id":       "FK",
-	"collection_members.role":          "role label",
-	"collection_members.added_at":      "timestamp",
-	"collection_members.accepted_at":   "timestamp",
-	"collection_members.invited_by":    "FK to users",
-	"collections.id":                   "surrogate key",
-	"collections.name":                 "collection name, plaintext",
-	"collections.description":          "plaintext",
-	"collections.created_by":           "FK to users",
-	"collections.created_at":           "timestamp",
-	"collections.updated_at":           "timestamp",
+	"collection_members.collection_id":  "FK",
+	"collection_members.user_id":        "FK",
+	"collection_members.role":           "role label",
+	"collection_members.added_at":       "timestamp",
+	"collection_members.accepted_at":    "timestamp",
+	"collection_members.invited_by":     "FK to users",
+	"collections.id":                    "surrogate key",
+	"collections.name":                  "collection name, plaintext",
+	"collections.description":           "plaintext",
+	"collections.private_access_policy": "plaintext access-policy enum; not derived from the vault key",
+	"collections.created_by":            "FK to users",
+	"collections.created_at":            "timestamp",
+	"collections.updated_at":            "timestamp",
 
 	// invitations: only `code` is keyed (registered). code_hash is what redemption
 	// looks up and is one-way.
@@ -423,8 +424,8 @@ var notKeyedColumns = map[string]string{
 	"users.updated_at":           "timestamp",
 	"users.totp_last_step":       "last spent TOTP time step, a replay watermark",
 	"users.password_set": "boolean marker (migration 00043): whether a human ever set a password " +
-		"this account's owner could supply, vs. one minted and discarded by password-less invitation " +
-		"redemption. Not derived from or encrypted with the vault key.",
+		"this account's owner could supply, vs. one minted and discarded by a legacy pre-web-first " +
+		"release. Current invitation redemption always sets it. Not derived from or encrypted with the vault key.",
 
 	// vault_entries: the keyed columns come from the registry. Everything below is
 	// deliberately NOT encrypted, and two of them are worth reading twice.

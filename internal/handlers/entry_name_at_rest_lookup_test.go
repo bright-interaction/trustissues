@@ -166,18 +166,17 @@ func TestServiceFetchResolvesASealedName(t *testing.T) {
 // TestServiceFetchStillResolvesAPre00040Row is the guard against somebody
 // "simplifying" the Go-side name match into `WHERE name_bidx = ?`.
 //
-// The boot sweep in vault.go leaves a row DELIBERATELY cleartext with an empty
-// name_bidx when sealing it would collide on UNIQUE(user_id, name_bidx), and it
-// leaves it that way forever, on purpose, so that one duplicate name cannot
-// wedge at-rest encryption for the whole table. Those rows sit outside the
-// partial unique index. A bidx lookup returns nothing for them while the fetch
-// they belong to reports success, which is a quieter version of the exact bug
-// this round is fixing.
+// A pre-backfill, interrupted, or manually damaged row can have a cleartext
+// name and empty name_bidx. The current boot sweep repairs that state, including
+// same-scope collisions, but request-time lookup must remain safe before the
+// repair has run successfully. Such rows sit outside the partial unique index;
+// a bidx-only lookup returns nothing for them while the fetch they belong to
+// reports success, a quieter version of the exact bug this test guards.
 func TestServiceFetchStillResolvesAPre00040Row(t *testing.T) {
 	vh, queries := newCollectionAuthzEnv(t)
 	owner := mustUser(t, queries, "legacy-owner@example.com", "admin", "")
 
-	// A row in the shape the sweep leaves behind: cleartext name, empty bidx.
+	// A row in the shape found before a successful sweep: cleartext name, empty bidx.
 	// Written with raw SQL because production has no way to create one any more,
 	// which is precisely why it needs a test. Only the NAME is legacy-shaped:
 	// the value is sealed properly so the test fails on the lookup if it fails
@@ -195,7 +194,7 @@ func TestServiceFetchStillResolvesAPre00040Row(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("an unswept pre-00040 row stopped resolving: %d %s. "+
 			"If this broke because the lookup moved to name_bidx, that is the wrong fix: "+
-			"vault.go leaves UNIQUE-colliding rows cleartext with an empty bidx forever",
+			"request-time compatibility must survive until the boot repair succeeds",
 			rec.Code, rec.Body.String())
 	}
 	var resp fetchSecretsResponse
@@ -207,10 +206,9 @@ func TestServiceFetchStillResolvesAPre00040Row(t *testing.T) {
 	}
 }
 
-// seedUnsweptCleartextNameRow writes the row the boot sweep leaves behind when
-// sealing a name would collide on UNIQUE(user_id, name_bidx): the name stays
-// cleartext and name_bidx stays empty, forever, deliberately. The VALUE is
-// sealed normally, because the legacy shape being tested is about the name.
+// seedUnsweptCleartextNameRow writes a pre-backfill/interrupted legacy shape:
+// cleartext name and empty name_bidx. The VALUE is sealed normally, because the
+// compatibility behavior being tested is about the name.
 func seedUnsweptCleartextNameRow(t *testing.T, vh *VaultHandler, entryID, ownerID, name, value string) {
 	t.Helper()
 	ct, nonce, err := vh.EncryptValue([]byte(value))
@@ -268,10 +266,10 @@ func TestServiceFetchKeepsBothAuthorizationPredicates(t *testing.T) {
 }
 
 // TestServiceFetchRefusesAnAmbiguousName. Two of one user's personal entries
-// really can open to the same name, and this test builds the shape production
-// builds it in: one entry written normally (sealed name, blind index) and one
-// left cleartext with an empty name_bidx by the sweep's UNIQUE-collision
-// branch. The inline UNIQUE(user_id, name) does not fire, because "AMBIGUOUS"
+// can temporarily open to the same name before boot repair, and this test builds
+// that compatibility shape: one entry written normally (sealed name, blind
+// index) and one pre-backfill row with an empty name_bidx. The inline
+// UNIQUE(user_id, name) does not fire, because "AMBIGUOUS"
 // and "enc:v1:..." are different strings, and the partial unique index does not
 // either, because it excludes the empty bidx. Resolving the tie by row order
 // hands a machine identity whichever credential SQLite returned first, with
@@ -384,9 +382,9 @@ func TestMCPListSecretsNeverShipsCiphertext(t *testing.T) {
 	}
 }
 
-// TestMCPListSecretsListsAPre00040Row is the other half of the bidx guard: the
-// rows the boot sweep deliberately leaves cleartext with an empty name_bidx are
-// still the caller's secrets and must still be advertised.
+// TestMCPListSecretsListsAPre00040Row is the other half of the bidx guard: a
+// row not yet repaired by the boot sweep is still the caller's secret and must
+// still be advertised safely.
 func TestMCPListSecretsListsAPre00040Row(t *testing.T) {
 	h, vh, queries := newRealMCPEnv(t)
 	user := mustUser(t, queries, "legacy@example.com", "user", "")

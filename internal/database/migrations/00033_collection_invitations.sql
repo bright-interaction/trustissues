@@ -23,9 +23,10 @@
 -- list just stops reading identity out of it until the invite is accepted.
 CREATE TABLE collection_invitations (
   collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-  -- Lower-cased by the handler, the same normalisation AddMember already
-  -- applies before GetUserByEmail, so re-inviting the same person in a
-  -- different case updates the seat instead of adding a second one.
+  -- Canonicalized by the handler to a bare, NFC-normalized, lower-cased
+  -- addr-spec, the same representation AddMember applies before
+  -- GetUserByEmail, so equivalent spellings update the seat instead of adding
+  -- a second one.
   email TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'editor', 'manager')),
   invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
